@@ -11,7 +11,9 @@ use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
-        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time},
+        metrics::{
+            Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
+        },
         stream::RecordBatchStreamAdapter,
         SendableRecordBatchStream,
     },
@@ -153,6 +155,7 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
 pub trait MetricsExt {
     fn find_count(&self, name: &str) -> Option<Count>;
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)>;
+    fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)>;
 }
 
 impl MetricsExt for MetricsSet {
@@ -175,11 +178,19 @@ impl MetricsExt for MetricsSet {
             _ => None,
         })
     }
+
+    fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)> {
+        self.iter().filter_map(|m| match m.value() {
+            MetricValue::Gauge { name, gauge } => Some((name, gauge)),
+            _ => None,
+        })
+    }
 }
 
 pub trait ExecutionPlanMetricsSetExt {
     fn new_count(&self, name: &'static str, partition: usize) -> Count;
     fn new_time(&self, name: &'static str, partition: usize) -> Time;
+    fn new_gauge(&self, name: &'static str, partition: usize) -> Gauge;
 }
 
 impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
@@ -203,6 +214,17 @@ impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
                 time: time.clone(),
             });
         time
+    }
+
+    fn new_gauge(&self, name: &'static str, partition: usize) -> Gauge {
+        let gauge = Gauge::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Gauge {
+                name: Cow::Borrowed(name),
+                gauge: gauge.clone(),
+            });
+        gauge
     }
 }
 

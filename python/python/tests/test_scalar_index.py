@@ -1592,6 +1592,37 @@ def test_zonemap_index(tmp_path: Path):
     assert result.num_rows == 8142  # 51..8192
 
 
+def test_zonemap_zone_size(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"x": range(64 * 1024)}), tmp_path)
+
+    def get_bytes_read():
+        scan_stats = None
+
+        def scan_stats_callback(stats: lance.ScanStatistics):
+            nonlocal scan_stats
+            scan_stats = stats
+
+        ds.scanner(filter="x = 7", scan_stats_callback=scan_stats_callback).to_table()
+
+        return scan_stats.bytes_read
+
+    ds.create_scalar_index(
+        "x",
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 64}),
+    )
+
+    small_bytes_read = get_bytes_read()
+
+    ds.create_scalar_index(
+        "x",
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 16 * 1024}),
+    )
+
+    large_bytes_read = get_bytes_read()
+
+    assert small_bytes_read < large_bytes_read
+
+
 def test_bloomfilter_index(tmp_path: Path):
     """Test create bloomfilter index"""
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
@@ -1710,26 +1741,19 @@ def test_null_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    def check(has_index: bool):
+    def check():
         assert dataset.to_table(filter="x IS NULL").num_rows == 1
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 3
         assert dataset.to_table(filter="x > 0").num_rows == 3
         assert dataset.to_table(filter="x < 5").num_rows == 3
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
-        # Note: there is a bit of discrepancy here.  Datafusion does not consider
-        # NULL==NULL when doing an IN operation due to classic SQL shenanigans.
-        # We should decide at some point which behavior we want and make this
-        # consistent.
-        if has_index:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
-        else:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
 
-    check(False)
+    check()
     dataset.create_scalar_index("x", index_type="BITMAP")
-    check(True)
+    check()
     dataset.create_scalar_index("x", index_type="BTREE")
-    check(True)
+    check()
 
 
 def test_nan_handling(tmp_path: Path):

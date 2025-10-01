@@ -6,7 +6,9 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
-    format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
+    format::pb21::{
+        compressive_encoding::Compression, BufferCompression, CompressiveEncoding, PageLayout,
+    },
 };
 
 use arrow_array::{make_array, Array, StructArray, UInt64Array};
@@ -244,7 +246,10 @@ async fn test_decode(
                 }
             }
         }
-        offset += batch_size as usize;
+        offset += batch.num_rows();
+    }
+    if let Some(expected) = expected.as_ref() {
+        assert_eq!(offset, expected.len());
     }
 }
 
@@ -318,7 +323,7 @@ pub async fn check_round_trip_encoding_generated(
     test_cases: TestCases,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for page_size in [4096, 1024 * 1024] {
+    for page_size in test_cases.page_sizes.iter().copied() {
         debug!("Testing random data with a page size of {}", page_size);
         let encoder_factory = |version: LanceFileVersion| {
             let encoding_strategy = default_encoding_strategy(version);
@@ -366,7 +371,7 @@ fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
     }
 }
 
-type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
+type EncodingVerificationFn = dyn Fn(&[EncodedColumn], &LanceFileVersion);
 
 // The default will just test the full read
 #[derive(Clone)]
@@ -483,9 +488,9 @@ impl TestCases {
         self
     }
 
-    fn verify_encoding(&self, encoding: &[EncodedColumn]) {
+    fn verify_encoding(&self, encoding: &[EncodedColumn], version: &LanceFileVersion) {
         if let Some(verify_encoding) = self.verify_encoding.as_ref() {
-            verify_encoding(encoding);
+            verify_encoding(encoding, version);
         }
     }
 
@@ -600,6 +605,39 @@ pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
     chain
 }
 
+fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) -> Result<()> {
+    // Extract encodings from the page layout
+    use crate::format::pb21::page_layout::Layout;
+    if let Some(ref layout_type) = layout.layout {
+        match layout_type {
+            Layout::MiniBlockLayout(mini_block) => {
+                // Check value compression
+                if let Some(ref value_comp) = mini_block.value_compression {
+                    let chain = extract_array_encoding_chain(value_comp);
+                    actual_chain.extend(chain);
+                }
+            }
+            Layout::FullZipLayout(full_zip) => {
+                // Check value compression in full zip layout
+                if let Some(ref value_comp) = full_zip.value_compression {
+                    let chain = extract_array_encoding_chain(value_comp);
+                    actual_chain.extend(chain);
+                }
+            }
+            Layout::AllNullLayout(_) => {
+                // No value encoding for all null
+            }
+            Layout::BlobLayout(blob) => {
+                if let Some(inner_layout) = &blob.inner_layout {
+                    collect_page_encoding(inner_layout.as_ref(), actual_chain)?
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Verify that a single page contains the expected encoding
 fn verify_page_encoding(
     page: &EncodedPage,
@@ -614,29 +652,7 @@ fn verify_page_encoding(
 
     match &page.description {
         PageEncoding::Structural(layout) => {
-            // Extract encodings from the page layout
-            use crate::format::pb21::page_layout::Layout;
-            if let Some(ref layout_type) = layout.layout {
-                match layout_type {
-                    Layout::MiniBlockLayout(mini_block) => {
-                        // Check value compression
-                        if let Some(ref value_comp) = mini_block.value_compression {
-                            let chain = extract_array_encoding_chain(value_comp);
-                            actual_chain.extend(chain);
-                        }
-                    }
-                    Layout::FullZipLayout(full_zip) => {
-                        // Check value compression in full zip layout
-                        if let Some(ref value_comp) = full_zip.value_compression {
-                            let chain = extract_array_encoding_chain(value_comp);
-                            actual_chain.extend(chain);
-                        }
-                    }
-                    Layout::AllNullLayout(_) => {
-                        // No value encoding for all null
-                    }
-                }
-            }
+            collect_page_encoding(layout, &mut actual_chain)?;
         }
         PageEncoding::Legacy(_) => {
             // We don't need to care about legacy.
@@ -842,7 +858,7 @@ async fn check_round_trip_encoding_inner(
 
     let mut external_buffers = writer.new_external_buffers();
     let encoded_columns = encoder.finish(&mut external_buffers).await.unwrap();
-    test_cases.verify_encoding(&encoded_columns);
+    test_cases.verify_encoding(&encoded_columns, &file_version);
     for buffer in external_buffers.take_buffers() {
         writer.write_lance_buffer(buffer);
     }

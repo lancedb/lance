@@ -171,7 +171,7 @@ impl VectorStore for FlatFloatStorage {
         self.row_ids.values().iter()
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type)
     }
 
@@ -329,7 +329,7 @@ impl VectorStore for FlatBinStorage {
         self.row_ids.values().iter()
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type)
     }
 

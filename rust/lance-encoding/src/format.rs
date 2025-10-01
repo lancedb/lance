@@ -323,6 +323,12 @@ impl ProtobufUtils21 {
         }
     }
 
+    pub fn constant(value: Option<bytes::Bytes>) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Constant(pb21::Constant { value })),
+        }
+    }
+
     pub fn fsl(
         items_per_value: u64,
         has_validity: bool,
@@ -567,6 +573,23 @@ impl ProtobufUtils21 {
             num_items,
             num_visible_items,
         )
+    }
+
+    pub fn blob_layout(
+        inner_layout: pb21::PageLayout,
+        def_meaning: &[DefinitionInterpretation],
+    ) -> pb21::PageLayout {
+        pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::BlobLayout(Box::new(
+                pb21::BlobLayout {
+                    inner_layout: Some(Box::new(inner_layout)),
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            ))),
+        }
     }
 
     pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> pb21::PageLayout {

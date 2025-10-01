@@ -609,6 +609,30 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
 
 
+def test_index_size_stats(tmp_path: Path):
+    num_rows = 512
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(num_rows * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    index_name = "vec_idx"
+    dataset.create_index(
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+    )
+
+    # Expect to see non-zero sizes here but all sizes are zero
+    stats = dataset.stats.index_stats(index_name)
+    stats = stats["indices"][0]
+    assert stats["partitions"][0]["size"] + stats["partitions"][1]["size"] == num_rows
+
+
 def test_ivf_flat_over_binary_vector(tmp_path):
     dim = 128
     nvec = 1000
@@ -641,6 +665,53 @@ def test_create_ivf_sq_index(dataset, tmp_path):
         num_partitions=4,
     )
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_ivf_rq_index():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+    assert ds.list_indices()[0]["fields"] == ["vector"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Creating empty vector indices with train=False is not yet implemented",
+    ):
+        ds.delete("id>=0")
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+            replace=True,
+        )
+
+    zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(zero_vectors, type=pa.list_(pa.float32(), 128))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.zeros(128),
+            "k": 10,
+        }
+    )
+    assert res.num_rows == 10
+    assert res["_distance"].to_numpy().min() == 0.0
+    assert res["_distance"].to_numpy().max() == 0.0
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):

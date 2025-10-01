@@ -10,12 +10,12 @@ use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
-use jni::objects::{JByteArray, JMap, JObject, JString, JValue};
+use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::jbyte;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
-    UpdateMap, UpdateMapEntry,
+    UpdateMap, UpdateMapEntry, UpdateMode,
 };
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -168,6 +168,25 @@ impl IntoJava for &IndexMetadata {
     }
 }
 
+impl IntoJava for &UpdateMode {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let name = match self {
+            UpdateMode::RewriteRows => "RewriteRows",
+            UpdateMode::RewriteColumns => "RewriteColumns",
+        };
+        let update_mode_type_class = "com/lancedb/lance/operation/Update$UpdateMode";
+        env.get_static_field(
+            update_mode_type_class,
+            name,
+            format!("L{};", update_mode_type_class),
+        )?
+        .l()
+        .map_err(|e| {
+            Error::runtime_error(format!("failed to get {}: {}", update_mode_type_class, e))
+        })
+    }
+}
+
 impl FromJObjectWithEnv<RewriteGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<RewriteGroup> {
         let old_fragments: Vec<Fragment> =
@@ -292,6 +311,21 @@ impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
             .extract_object(env)?;
 
         Ok(DataReplacementGroup(fragment_id, new_file))
+    }
+}
+
+impl FromJObjectWithEnv<UpdateMode> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<UpdateMode> {
+        let s = env
+            .call_method(self, "toString", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let s: String = env.get_string(&JString::from(s))?.into();
+        let t = if s == "RewriteRows" {
+            UpdateMode::RewriteRows
+        } else {
+            UpdateMode::RewriteColumns
+        };
+        Ok(t)
     }
 }
 
@@ -460,10 +494,10 @@ fn convert_to_java_operation_inner<'local>(
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
-            fields_modified: _,
+            fields_modified,
             mem_wal_to_merge: _,
-            fields_for_preserving_frag_bitmap: _,
-            update_mode: _,
+            fields_for_preserving_frag_bitmap,
+            update_mode,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -472,14 +506,31 @@ fn convert_to_java_operation_inner<'local>(
             let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
-
+            let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
+            let fields_for_preserving_frag_bitmap =
+                JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
+            let update_mode = match update_mode {
+                Some(update_mode) => update_mode.into_java(env),
+                None => Ok(JObject::null()),
+            }?;
+            let update_mode_optional = env
+                .call_static_method(
+                    "java/util/Optional",
+                    "ofNullable",
+                    "(Ljava/lang/Object;)Ljava/util/Optional;",
+                    &[JValue::Object(&update_mode)],
+                )?
+                .l()?;
             Ok(env.new_object(
                 "com/lancedb/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
                     JValue::Object(&new_fragments_obj),
+                    JValueGen::Object(&fields_modified),
+                    JValueGen::Object(&fields_for_preserving_frag_bitmap),
+                    JValue::Object(&update_mode_optional),
                 ],
             )?)
         }
@@ -886,14 +937,30 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
+            let fields_modified = env
+                .call_method(java_operation, "fieldsModified", "()[J", &[])?
+                .l()?;
+            let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
+
+            let fields_for_preserving_frag_bitmap = env
+                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
+                .l()?;
+            let fields_for_preserving_frag_bitmap =
+                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+
+            let update_mode: Option<UpdateMode> =
+                env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
+                    update_mode.extract_object(env)
+                })?;
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified: vec![],
+                fields_modified,
                 mem_wal_to_merge: None,
-                update_mode: None,
-                fields_for_preserving_frag_bitmap: vec![],
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             }
         }
         "DataReplacement" => {

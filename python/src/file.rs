@@ -41,7 +41,7 @@ use lance_io::{
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
-    pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
+    pyclass, pyfunction, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -678,6 +678,11 @@ impl LanceFileReader {
     pub fn num_rows(&mut self) -> u64 {
         self.inner.num_rows()
     }
+}
+
+#[pyfunction(name = "stable_version")]
+pub fn stable_version() -> PyResult<String> {
+    Ok(LanceFileVersion::Stable.resolve().to_string())
 }
 
 #[cfg(test)]

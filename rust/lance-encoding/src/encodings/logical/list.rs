@@ -143,10 +143,7 @@ impl<'a> StructuralListSchedulingJob<'a> {
 }
 
 impl StructuralSchedulingJob for StructuralListSchedulingJob<'_> {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>> {
         self.child.schedule_next(context)
     }
 }
@@ -164,7 +161,7 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
-    fn accept_page(&mut self, child: crate::decoder::LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
 
@@ -534,9 +531,7 @@ mod tests {
             .with_range(1..3)
             .with_range(2..4)
             .with_indices(vec![1])
-            .with_indices(vec![2])
-            // TODO (https://github.com/lancedb/lance/issues/4782)
-            .with_max_file_version(LanceFileVersion::V2_0);
+            .with_indices(vec![2]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
             &test_cases,

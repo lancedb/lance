@@ -59,6 +59,7 @@ use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
+mod branch_location;
 pub mod builder;
 pub mod cleanup;
 mod delta;
@@ -84,12 +85,14 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::Tags;
+use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, UpdateMapEntry};
 use self::write::write_fragments_internal;
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
+use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -147,7 +150,7 @@ pub struct Dataset {
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
-    pub tags: Tags,
+    pub refs: Refs,
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
@@ -190,7 +193,7 @@ impl From<&Manifest> for Version {
         Self {
             version: m.version,
             timestamp: m.timestamp(),
-            metadata: BTreeMap::default(),
+            metadata: m.summary().into(),
         }
     }
 }
@@ -381,9 +384,23 @@ impl Dataset {
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         match ref_ {
-            refs::Ref::Version(version) => self.checkout_by_version_number(version).await,
-            refs::Ref::Tag(tag) => self.checkout_by_tag(tag.as_str()).await,
+            refs::Ref::Version(branch, version_number) => {
+                self.checkout_by_ref(version_number, branch).await
+            }
+            refs::Ref::Tag(tag_name) => {
+                let tag_contents = self.tags().get(tag_name.as_str()).await?;
+                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch)
+                    .await
+            }
         }
+    }
+
+    pub fn tags(&self) -> Tags<'_> {
+        self.refs.tags()
+    }
+
+    pub fn branches(&self) -> Branches<'_> {
+        self.refs.branches()
     }
 
     /// Check out the latest version of the dataset
@@ -401,10 +418,80 @@ impl Dataset {
         Ok(())
     }
 
-    fn already_checked_out(&self, location: &ManifestLocation) -> bool {
+    /// Check out the latest version of the branch
+    pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
+        self.checkout_by_ref(None, Some(branch.to_string())).await
+    }
+
+    /// This is a two-phase operation:
+    /// - Create the branch dataset by shallow cloning.
+    /// - Create the branch metadata (a.k.a. `BranchContents`).
+    ///
+    /// These two phases are not atomic. We consider `BranchContents` as the source of truth
+    /// for the branch.
+    ///
+    /// The cleanup procedure should:
+    /// - Clean up zombie branch datasets that have no related `BranchContents`.
+    /// - Delete broken `BranchContents` entries that have no related branch dataset.
+    ///
+    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
+    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
+    /// failure if we use the same name to `create_branch`. In that case, you need to call
+    /// `force_delete_branch` to interactively clean up the zombie dataset.
+    pub async fn create_branch(
+        &mut self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+        let branch_location = self.find_branch_location(branch)?;
+        let clone_op = Operation::Clone {
+            is_shallow: true,
+            ref_name: source_branch.clone(),
+            ref_version: version_number,
+            ref_path: String::from(self.uri()),
+            branch_name: Some(branch.to_string()),
+        };
+        let transaction = Transaction::new(version_number, clone_op, None, None);
+
+        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+            .with_store_params(store_params.unwrap_or_default())
+            .with_object_store(Arc::new(self.object_store().clone()))
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        let dataset = builder.execute(transaction).await?;
+
+        // Create BranchContents after shallow_clone
+        self.branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+        Ok(dataset)
+    }
+
+    pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
+        self.branches().delete(branch, false).await
+    }
+
+    /// Delete the branch even if the BranchContents is not found.
+    /// This could be useful when we have zombie branches and want to clean them up immediately.
+    pub async fn force_delete_branch(&mut self, branch: &str) -> Result<()> {
+        self.branches().delete(branch, true).await
+    }
+
+    pub async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {
+        self.branches().list().await
+    }
+
+    fn already_checked_out(
+        &self,
+        location: &ManifestLocation,
+        branch_name: Option<String>,
+    ) -> bool {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
-        self.manifest.version == location.version
+        self.manifest.branch == branch_name
+            && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_location
@@ -414,39 +501,56 @@ impl Dataset {
             })
     }
 
-    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
-        let base_path = self.base.clone();
-        let manifest_location = self
-            .commit_handler
-            .resolve_version_location(&base_path, version, &self.object_store.inner)
-            .await?;
+    async fn checkout_by_ref(
+        &self,
+        version_number: Option<u64>,
+        branch: Option<String>,
+    ) -> Result<Self> {
+        let new_location = if self.manifest.branch.as_ref() != branch.as_ref() {
+            if let Some(branch_name) = branch.as_deref() {
+                self.find_branch_location(branch_name)?
+            } else {
+                self.branch_location().find_main()?
+            }
+        } else {
+            self.branch_location()
+        };
 
-        if self.already_checked_out(&manifest_location) {
+        let manifest_location = if let Some(version_number) = version_number {
+            self.commit_handler
+                .resolve_version_location(
+                    &new_location.path,
+                    version_number,
+                    &self.object_store.inner,
+                )
+                .await?
+        } else {
+            self.commit_handler
+                .resolve_latest_location(&new_location.path, &self.object_store)
+                .await?
+        };
+
+        if self.already_checked_out(&manifest_location, branch.clone()) {
             return Ok(self.clone());
         }
 
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &self.uri,
+            &new_location.uri,
             self.session.as_ref(),
         )
         .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
-            base_path,
-            self.uri.clone(),
+            new_location.path,
+            new_location.uri,
             Arc::new(manifest),
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
         )
-    }
-
-    async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
-        let version = self.tags.get_version(tag).await?;
-        self.checkout_by_version_number(version).await
     }
 
     pub(crate) async fn load_manifest(
@@ -557,10 +661,14 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
-        let tags = Tags::new(
+        let refs = Refs::new(
             object_store.clone(),
             commit_handler.clone(),
-            base_path.clone(),
+            BranchLocation {
+                path: base_path.clone(),
+                uri: uri.clone(),
+                branch: manifest.branch.clone(),
+            },
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
@@ -573,7 +681,7 @@ impl Dataset {
             manifest_location,
             commit_handler,
             session,
-            tags,
+            refs,
             fragment_bitmap,
             metadata_cache,
             index_cache,
@@ -627,6 +735,23 @@ impl Dataset {
     /// Get the fully qualified URI of this dataset.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    pub fn branch_location(&self) -> BranchLocation {
+        BranchLocation {
+            path: self.base.clone(),
+            uri: self.uri.clone(),
+            branch: self.manifest.branch.clone(),
+        }
+    }
+
+    pub fn find_branch_location(&self, branch_name: &str) -> Result<BranchLocation> {
+        let current_location = BranchLocation {
+            path: self.base.clone(),
+            uri: self.uri.clone(),
+            branch: self.manifest.branch.clone(),
+        };
+        current_location.find_branch(Some(branch_name.to_string()))
     }
 
     /// Get the full manifest of the dataset version.
@@ -734,7 +859,7 @@ impl Dataset {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location) {
+        if self.already_checked_out(&location, self.manifest.branch.clone()) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -1719,27 +1844,46 @@ impl Dataset {
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
-        store_params: ObjectStoreParams,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        let (version_number, ref_name) = match ref_ {
-            refs::Ref::Version(version) => (version, None),
-            refs::Ref::Tag(tag) => (self.tags.get_version(tag.as_str()).await?, Some(tag)),
-        };
+        let ref_ = version.into();
+        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
             ref_path: String::from(self.base.clone()),
+            branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params)
+            .with_store_params(store_params.unwrap_or_default())
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         builder.execute(transaction).await
+    }
+
+    async fn resolve_reference(&self, reference: refs::Ref) -> Result<(Option<String>, u64)> {
+        match reference {
+            refs::Ref::Version(branch, version_number) => {
+                if let Some(version_number) = version_number {
+                    Ok((branch, version_number))
+                } else {
+                    let version_number = self
+                        .commit_handler
+                        .resolve_latest_location(&self.base, &self.object_store)
+                        .await?
+                        .version;
+                    Ok((branch, version_number))
+                }
+            }
+            refs::Ref::Tag(tag_name) => {
+                let tag_contents = self.tags().get(tag_name.as_str()).await?;
+                Ok((tag_contents.branch, tag_contents.version))
+            }
+        }
     }
 
     /// Run a SQL query against the dataset.
@@ -2380,10 +2524,13 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use crate::datafusion::LanceTableProvider;
+    use crate::dataset::refs::branch_contents_path;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
+    use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -3015,12 +3162,12 @@ mod tests {
 
         // Create tag and shallow clone
         dataset
-            .tags
+            .tags()
             .create("test_tag", original_version)
             .await
             .unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .shallow_clone(cloned_uri, "test_tag", None)
             .await
             .unwrap();
 
@@ -3135,13 +3282,13 @@ mod tests {
         for path in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
             current_dataset
-                .tags
+                .tags()
                 .create("v1", current_dataset.latest_version_id().await.unwrap())
                 .await
                 .unwrap();
 
             current_dataset = current_dataset
-                .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
+                .shallow_clone(clone_path, "v1", None)
                 .await
                 .unwrap();
             current_dataset = write_dataset(
@@ -4477,39 +4624,39 @@ mod tests {
         dataset.delete("i > 50").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 0);
 
-        let bad_tag_creation = dataset.tags.create("tag1", 3).await;
+        let bad_tag_creation = dataset.tags().create("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
-            "Version not found error: version 3 does not exist"
+            "Version not found error: version Main::3 does not exist"
         );
 
-        let bad_tag_deletion = dataset.tags.delete("tag1").await;
+        let bad_tag_deletion = dataset.tags().delete("tag1").await;
         assert_eq!(
             bad_tag_deletion.err().unwrap().to_string(),
             "Ref not found error: tag tag1 does not exist"
         );
 
-        dataset.tags.create("tag1", 1).await.unwrap();
+        dataset.tags().create("tag1", 1).await.unwrap();
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 1);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
 
-        let another_bad_tag_creation = dataset.tags.create("tag1", 1).await;
+        let another_bad_tag_creation = dataset.tags().create("tag1", 1).await;
         assert_eq!(
             another_bad_tag_creation.err().unwrap().to_string(),
             "Ref conflict error: tag tag1 already exists"
         );
 
-        dataset.tags.delete("tag1").await.unwrap();
+        dataset.tags().delete("tag1").await.unwrap();
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 0);
 
-        dataset.tags.create("tag1", 1).await.unwrap();
-        dataset.tags.create("tag2", 1).await.unwrap();
-        dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
+        dataset.tags().create("tag1", 1).await.unwrap();
+        dataset.tags().create("tag2", 1).await.unwrap();
+        dataset.tags().create("v1.0.0-rc1", 2).await.unwrap();
 
-        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
+        let default_order = dataset.tags().list_tags_ordered(None).await.unwrap();
         let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             default_names,
@@ -4518,7 +4665,7 @@ mod tests {
         );
 
         let asc_order = dataset
-            .tags
+            .tags()
             .list_tags_ordered(Some(Ordering::Less))
             .await
             .unwrap();
@@ -4530,7 +4677,7 @@ mod tests {
         );
 
         let desc_order = dataset
-            .tags
+            .tags()
             .list_tags_ordered(Some(Ordering::Greater))
             .await
             .unwrap();
@@ -4541,7 +4688,7 @@ mod tests {
             "Descending ordering mismatch"
         );
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 3);
 
         let bad_checkout = dataset.checkout_version("tag3").await;
         assert_eq!(
@@ -4560,23 +4707,23 @@ mod tests {
         assert_eq!(first_ver.version().version, 1);
 
         // test update tag
-        let bad_tag_update = dataset.tags.update("tag3", 1).await;
+        let bad_tag_update = dataset.tags().update("tag3", 1).await;
         assert_eq!(
             bad_tag_update.err().unwrap().to_string(),
             "Ref not found error: tag tag3 does not exist"
         );
 
-        let another_bad_tag_update = dataset.tags.update("tag1", 3).await;
+        let another_bad_tag_update = dataset.tags().update("tag1", 3).await;
         assert_eq!(
             another_bad_tag_update.err().unwrap().to_string(),
             "Version not found error: version 3 does not exist"
         );
 
-        dataset.tags.update("tag1", 2).await.unwrap();
+        dataset.tags().update("tag1", 2).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        dataset.tags.update("tag1", 1).await.unwrap();
+        dataset.tags().update("tag1", 1).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
     }
@@ -6891,6 +7038,8 @@ mod tests {
         writer.write_batch(&batch).await.unwrap();
         writer.finish().await.unwrap();
 
+        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
+
         // find the datafile we want to replace
         let new_data_file = DataFile {
             path: "test.lance".to_string(),
@@ -6898,8 +7047,8 @@ mod tests {
             fields: vec![1],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };
@@ -6953,8 +7102,8 @@ mod tests {
             fields: vec![0],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };
@@ -7694,6 +7843,352 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
     }
 
+    async fn prepare_json_dataset() -> (Dataset, String) {
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter One",
+              "Content": "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+          }"#,
+            r#"{
+             "Title": "Fairy Talest",
+             "Content": "Once upon a time, on a bitterly cold New Year's Eve, a little girl...",
+             "Author": "ANDERSEN",
+             "Price": 50,
+             "Language": ["english", "chinese"]
+          }"#,
+        ]));
+        let json_col = "json_field".to_string();
+
+        // Prepare dataset
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        (dataset, json_col)
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_match_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col, with max token len 10 and enable stemming,
+        // lower case, and remove stop words
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .max_token_length(Some(10))
+                    .stem(true)
+                    .lower_case(true)
+                    .remove_stop_words(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query with token length exceed max token length
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,harrypotter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        // Match query with stemming
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,onc".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        // Match query with lower case
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,DURSLEY".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        // Match query with stop word
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,and".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_flat_match_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append data
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter Two",
+              "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+            }"#,
+        ]));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        dataset.append(stream, None).await.unwrap();
+
+        // Test match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,harrypotter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_phrase_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false)
+                    .with_position(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test phrase query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new("Title,str,harrypotter one chapter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new("Title,str,harrypotter chapter one".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_multimatch_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test multi match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::MultiMatch(MultiMatchQuery {
+                match_queries: vec![
+                    MatchQuery::new("Title,str,harrypotter".to_string())
+                        .with_column(Some(json_col.clone())),
+                    MatchQuery::new("Language,str,english".to_string())
+                        .with_column(Some(json_col.clone())),
+                ],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_boolean_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test boolean query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Boolean(BooleanQuery {
+                should: vec![],
+                must: vec![
+                    FtsQuery::Match(
+                        MatchQuery::new("Language,str,english".to_string())
+                            .with_column(Some(json_col.clone())),
+                    ),
+                    FtsQuery::Match(
+                        MatchQuery::new("Title,str,harrypotter".to_string())
+                            .with_column(Some(json_col.clone())),
+                    ),
+                ],
+                must_not: vec![],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+    }
+
     #[tokio::test]
     async fn test_sql_contains_tokens() {
         let text_col = Arc::new(StringArray::from(vec![
@@ -7861,5 +8356,279 @@ mod tests {
             results.column(0).as_any().downcast_ref::<T>().unwrap(),
             values
         )
+    }
+
+    // This test covers
+    // 1. Create branch from main, a branch and a global tag
+    // 2. Write to each created branch and verify data
+    // 2. Load branch from nested uris
+    // 3. Checkout branch from main, a branch and a global tag
+    // 4. List branches and verify branch metadata
+    // 5. Delete branches
+    // 6. Delete zombie branches
+    #[tokio::test]
+    async fn test_branch() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let data_storage_version = LanceFileVersion::Stable;
+
+        // Generate consistent test data batches
+        let generate_data = |prefix: &str, start_id: i32, row_count: u64| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(start_id, 1))
+                .col("value", array::fill_utf8(format!("{prefix}_data")))
+                .into_reader_rows(RowCount::from(row_count), BatchCount::from(1))
+        };
+
+        // Reusable dataset writer with configurable mode
+        async fn write_dataset(
+            uri: &str,
+            data_reader: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 20,
+                data_storage_version: Some(version),
+                mode,
+                ..Default::default()
+            };
+            Dataset::write(data_reader, uri, Some(params))
+                .await
+                .unwrap()
+        }
+
+        // Unified dataset scanning and row counting
+        async fn collect_rows(dataset: &Dataset) -> (usize, Vec<RecordBatch>) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            (batches.iter().map(|b| b.num_rows()).sum(), batches)
+        }
+
+        // Phase 1: Create empty dataset, write data batch 1, create branch1 based on version_number, write data batch 2
+        let mut dataset = write_dataset(
+            test_uri,
+            generate_data("batch1", 0, 50),
+            WriteMode::Create,
+            data_storage_version,
+        )
+        .await;
+
+        let original_version = dataset.version().version;
+        assert_eq!(original_version, 1);
+
+        // Create branch1 on the latest version and write data batch 2
+        let mut branch1_dataset = dataset
+            .create_branch("branch1", original_version, None)
+            .await
+            .unwrap();
+        assert_eq!(branch1_dataset.uri, format!("{}/tree/branch1", test_uri));
+
+        branch1_dataset = write_dataset(
+            branch1_dataset.uri(),
+            generate_data("batch2", 50, 30),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Phase 2: Create branch2 based on branch1's latest version_number, write data batch 3
+        let mut branch2_dataset = branch1_dataset
+            .create_branch(
+                "dev/branch2",
+                ("branch1", branch1_dataset.version().version),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            branch2_dataset.uri,
+            format!("{}/tree/dev/branch2", test_uri)
+        );
+
+        branch2_dataset = write_dataset(
+            branch2_dataset.uri(),
+            generate_data("batch3", 80, 20),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Phase 3: Create a tag on branch2, the actual tag content is under root dataset
+        // create branch3 based on that tag, write data batch 4
+        branch2_dataset
+            .tags()
+            .create_on_branch(
+                "tag1",
+                branch2_dataset.version().version,
+                Some("dev/branch2"),
+            )
+            .await
+            .unwrap();
+
+        let mut branch3_dataset = branch2_dataset
+            .create_branch("feature/nathan/branch3", "tag1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            branch3_dataset.uri,
+            format!("{}/tree/feature/nathan/branch3", test_uri)
+        );
+
+        branch3_dataset = write_dataset(
+            branch3_dataset.uri(),
+            generate_data("batch4", 100, 25),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Verify data correctness and independence of each branch
+        // Main branch only has data 1 (50 rows)
+        let main_dataset = Dataset::open(test_uri).await.unwrap();
+        let (main_rows, _) = collect_rows(&main_dataset).await;
+        assert_eq!(main_rows, 50); // only batch1
+        assert_eq!(main_dataset.version().version, 1);
+
+        // branch1 has data 1 + 2 (80 rows)
+        let updated_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
+        let (branch1_rows, _) = collect_rows(&updated_branch1).await;
+        assert_eq!(branch1_rows, 80); // batch1+batch2
+        assert_eq!(updated_branch1.version().version, 2);
+
+        // branch2 has data 1 + 2 + 3 (100 rows)
+        let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();
+        let (branch2_rows, _) = collect_rows(&updated_branch2).await;
+        assert_eq!(branch2_rows, 100); // batch1+batch2+batch3
+        assert_eq!(updated_branch2.version().version, 3);
+
+        // branch3 has data 1 + 2 + 3 + 4 (125 rows)
+        let updated_branch3 = Dataset::open(branch3_dataset.uri()).await.unwrap();
+        let (branch3_rows, _) = collect_rows(&updated_branch3).await;
+        assert_eq!(branch3_rows, 125); // batch1+batch2+batch3+batch4
+        assert_eq!(updated_branch3.version().version, 4);
+
+        // Use list_branches to get branch list and verify each field of branch_content
+        let branches = dataset.list_branches().await.unwrap();
+        assert_eq!(branches.len(), 3);
+        assert!(branches.contains_key("branch1"));
+        assert!(branches.contains_key("dev/branch2"));
+        assert!(branches.contains_key("feature/nathan/branch3"));
+
+        // Verify branch1 content
+        let branch1_content = branches.get("branch1").unwrap();
+        assert_eq!(branch1_content.parent_branch, None); // Created based on main branch
+        assert_eq!(branch1_content.parent_version, 1);
+        assert!(branch1_content.create_at > 0);
+        assert!(branch1_content.manifest_size > 0);
+
+        // Verify branch2 content
+        let branch2_content = branches.get("dev/branch2").unwrap();
+        assert_eq!(branch2_content.parent_branch.as_deref().unwrap(), "branch1");
+        assert_eq!(branch2_content.parent_version, 2);
+        assert!(branch2_content.create_at > 0);
+        assert!(branch2_content.manifest_size > 0);
+        assert!(branch2_content.create_at >= branch1_content.create_at);
+
+        // Verify branch3 content
+        let branch3_content = branches.get("feature/nathan/branch3").unwrap();
+        // Created based on tag pointed to branch2
+        assert_eq!(
+            branch3_content.parent_branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(branch3_content.parent_version, 3);
+        assert!(branch3_content.create_at > 0);
+        assert!(branch3_content.manifest_size > 0);
+        assert!(branch3_content.create_at >= branch2_content.create_at);
+
+        // Verify checkout_branch
+        let checkout_branch1 = main_dataset.checkout_branch("branch1").await.unwrap();
+        let checkout_branch2 = checkout_branch1
+            .checkout_branch("dev/branch2")
+            .await
+            .unwrap();
+        let checkout_branch2_tag = checkout_branch1.checkout_version("tag1").await.unwrap();
+        let checkout_branch3 = checkout_branch2_tag
+            .checkout_branch("feature/nathan/branch3")
+            .await
+            .unwrap();
+        let checkout_branch3_at_version3 = checkout_branch2
+            .checkout_version(("feature/nathan/branch3", 3))
+            .await
+            .unwrap();
+        assert_eq!(checkout_branch3.version().version, 4);
+        assert_eq!(checkout_branch3_at_version3.version().version, 3);
+        assert_eq!(checkout_branch2.version().version, 3);
+        assert_eq!(checkout_branch2_tag.version().version, 3);
+        assert_eq!(checkout_branch1.version().version, 2);
+        assert_eq!(checkout_branch3.count_rows(None).await.unwrap(), 125);
+        assert_eq!(
+            checkout_branch3_at_version3.count_rows(None).await.unwrap(),
+            100
+        );
+        assert_eq!(checkout_branch2.count_rows(None).await.unwrap(), 100);
+        assert_eq!(checkout_branch2_tag.count_rows(None).await.unwrap(), 100);
+        assert_eq!(checkout_branch1.count_rows(None).await.unwrap(), 80);
+        assert_eq!(
+            checkout_branch3.manifest.branch.as_deref().unwrap(),
+            "feature/nathan/branch3"
+        );
+        assert_eq!(
+            checkout_branch3_at_version3
+                .manifest
+                .branch
+                .as_deref()
+                .unwrap(),
+            "feature/nathan/branch3"
+        );
+        assert_eq!(
+            checkout_branch2.manifest.branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(
+            checkout_branch2_tag.manifest.branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(
+            checkout_branch1.manifest.branch.as_deref().unwrap(),
+            "branch1"
+        );
+
+        let mut dataset = main_dataset;
+        // Finally delete all branches
+        dataset.delete_branch("branch1").await.unwrap();
+        dataset.delete_branch("dev/branch2").await.unwrap();
+        // Test deleting zombie branch
+        let root_location = dataset.refs.root().unwrap();
+        let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
+        dataset.object_store.delete(&branch_file).await.unwrap();
+        // Now "feature/nathan/branch3" is a zombie branch
+        // Use delete_branch to verify if the directory is cleaned up
+        dataset
+            .force_delete_branch("feature/nathan/branch3")
+            .await
+            .unwrap();
+        let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
+        assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
+
+        // Verify list_branches is empty
+        let branches_after_delete = dataset.list_branches().await.unwrap();
+        assert!(branches_after_delete.is_empty());
+
+        // Verify branch directories are all deleted cleanly
+        let branches = dataset
+            .object_store
+            .read_dir(Path::parse(test_dir.path().join("tree").to_str().unwrap()).unwrap())
+            .await
+            .unwrap();
+        assert!(branches.is_empty());
     }
 }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
-
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -650,12 +650,30 @@ impl FtsQueryNode for BooleanQuery {
     }
 }
 
-pub fn collect_tokens(
+pub fn collect_query_tokens(
     text: &str,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
     inclusive: Option<&HashSet<String>>,
 ) -> Vec<String> {
-    let mut stream = tokenizer.token_stream(text);
+    let mut stream = tokenizer.token_stream_for_search(text);
+    let mut tokens = Vec::new();
+    while let Some(token) = stream.next() {
+        if let Some(inclusive) = inclusive {
+            if !inclusive.contains(&token.text) {
+                continue;
+            }
+        }
+        tokens.push(token.text.to_owned());
+    }
+    tokens
+}
+
+pub fn collect_doc_tokens(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    inclusive: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let mut stream = tokenizer.token_stream_for_doc(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
         if let Some(inclusive) = inclusive {

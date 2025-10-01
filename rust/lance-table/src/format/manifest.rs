@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
@@ -15,6 +11,9 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
@@ -43,6 +42,9 @@ pub struct Manifest {
     /// Dataset version
     pub version: u64,
 
+    /// Branch name, None if the dataset is the main branch.
+    pub branch: Option<String>,
+
     /// Version of the writer library that wrote this manifest.
     pub writer_version: Option<WriterVersion>,
 
@@ -70,7 +72,7 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far  
+    /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
@@ -124,6 +126,49 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Default)]
+pub struct ManifestSummary {
+    pub total_fragments: u64,
+    pub total_data_files: u64,
+    pub total_files_size: u64,
+    pub total_deletion_files: u64,
+    pub total_data_file_rows: u64,
+    pub total_deletion_file_rows: u64,
+    pub total_rows: u64,
+}
+
+impl From<ManifestSummary> for BTreeMap<String, String> {
+    fn from(summary: ManifestSummary) -> Self {
+        let mut stats_map = Self::new();
+        stats_map.insert(
+            "total_fragments".to_string(),
+            summary.total_fragments.to_string(),
+        );
+        stats_map.insert(
+            "total_data_files".to_string(),
+            summary.total_data_files.to_string(),
+        );
+        stats_map.insert(
+            "total_files_size".to_string(),
+            summary.total_files_size.to_string(),
+        );
+        stats_map.insert(
+            "total_deletion_files".to_string(),
+            summary.total_deletion_files.to_string(),
+        );
+        stats_map.insert(
+            "total_data_file_rows".to_string(),
+            summary.total_data_file_rows.to_string(),
+        );
+        stats_map.insert(
+            "total_deletion_file_rows".to_string(),
+            summary.total_deletion_file_rows.to_string(),
+        );
+        stats_map.insert("total_rows".to_string(), summary.total_rows.to_string());
+        stats_map
+    }
+}
+
 impl Manifest {
     pub fn new(
         schema: Schema,
@@ -139,6 +184,7 @@ impl Manifest {
             schema,
             local_schema,
             version: 1,
+            branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -174,6 +220,7 @@ impl Manifest {
             schema,
             local_schema,
             version: previous.version + 1,
+            branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -197,11 +244,13 @@ impl Manifest {
     /// Performs a shallow_clone of the manifest entirely in memory without:
     /// - Any persistent storage operations
     /// - Modifications to the original data
+    /// - If the shallow clone is for branch, ref_name is the source branch
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
         ref_path: String,
         ref_base_id: u32,
+        branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
         let cloned_fragments = self
@@ -229,6 +278,7 @@ impl Manifest {
             schema: self.schema.clone(),
             local_schema: self.local_schema.clone(),
             version: self.version,
+            branch: branch_name,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
@@ -477,6 +527,52 @@ impl Manifest {
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
     }
+
+    /// Get the summary information of a manifest.
+    ///
+    /// This function calculates various statistics about the manifest, including:
+    /// - total_files_size: Total size of all data files in bytes
+    /// - total_fragments: Total number of fragments in the dataset
+    /// - total_data_files: Total number of data files across all fragments
+    /// - total_deletion_files: Total number of deletion files
+    /// - total_data_file_rows: Total number of rows in data files
+    /// - total_deletion_file_rows: Total number of deleted rows in deletion files
+    /// - total_rows: Total number of rows in the dataset
+    pub fn summary(&self) -> ManifestSummary {
+        // Calculate total fragments
+        let mut summary =
+            self.fragments
+                .iter()
+                .fold(ManifestSummary::default(), |mut summary, f| {
+                    // Count data files in the current fragment
+                    summary.total_data_files += f.files.len() as u64;
+                    // Sum the number of rows for the current fragment (if available)
+                    if let Some(num_rows) = f.num_rows() {
+                        summary.total_rows += num_rows as u64;
+                    }
+                    // Sum file sizes for all data files in the current fragment (if available)
+                    for data_file in &f.files {
+                        if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                            summary.total_files_size += size_bytes.get();
+                        }
+                    }
+                    // Check and count if the current fragment has a deletion file
+                    if f.deletion_file.is_some() {
+                        summary.total_deletion_files += 1;
+                    }
+                    // Sum the number of deleted rows from the deletion file (if available)
+                    if let Some(deletion_file) = &f.deletion_file {
+                        if let Some(num_deleted) = deletion_file.num_deleted_rows {
+                            summary.total_deletion_file_rows += num_deleted as u64;
+                        }
+                    }
+                    summary
+                });
+        summary.total_fragments = self.fragments.len() as u64;
+        summary.total_data_file_rows = summary.total_rows + summary.total_deletion_file_rows;
+
+        summary
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -675,6 +771,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             schema,
             local_schema,
             version: p.version,
+            branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -730,6 +827,7 @@ impl From<&Manifest> for pb::Manifest {
                 .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
                 .collect(),
             version: m.version,
+            branch: m.branch.clone(),
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -833,7 +931,8 @@ impl SelfDescribingFileReader for FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::format::DataFile;
+    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use std::num::NonZero;
 
     use super::*;
 
@@ -989,5 +1088,119 @@ mod tests {
         config.remove("other-key");
         manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
+    }
+
+    #[test]
+    fn test_manifest_summary() {
+        // Step 1: test empty manifest summary
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", arrow_schema::DataType::Int64, false),
+            ArrowField::new("name", arrow_schema::DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let empty_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let empty_summary = empty_manifest.summary();
+        assert_eq!(empty_summary.total_rows, 0);
+        assert_eq!(empty_summary.total_files_size, 0);
+        assert_eq!(empty_summary.total_fragments, 0);
+        assert_eq!(empty_summary.total_data_files, 0);
+        assert_eq!(empty_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_summary.total_data_file_rows, 0);
+        assert_eq!(empty_summary.total_deletion_files, 0);
+
+        // Step 2: write empty files and verify summary
+        let empty_fragments = vec![
+            Fragment::with_file_legacy(0, "empty_file1.lance", &schema, Some(0)),
+            Fragment::with_file_legacy(1, "empty_file2.lance", &schema, Some(0)),
+        ];
+
+        let empty_files_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(empty_fragments),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let empty_files_summary = empty_files_manifest.summary();
+        assert_eq!(empty_files_summary.total_rows, 0);
+        assert_eq!(empty_files_summary.total_files_size, 0);
+        assert_eq!(empty_files_summary.total_fragments, 2);
+        assert_eq!(empty_files_summary.total_data_files, 2);
+        assert_eq!(empty_files_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_files_summary.total_data_file_rows, 0);
+        assert_eq!(empty_files_summary.total_deletion_files, 0);
+
+        // Step 3: write real data and verify summary
+        let real_fragments = vec![
+            Fragment::with_file_legacy(0, "data_file1.lance", &schema, Some(100)),
+            Fragment::with_file_legacy(1, "data_file2.lance", &schema, Some(250)),
+            Fragment::with_file_legacy(2, "data_file3.lance", &schema, Some(75)),
+        ];
+
+        let real_data_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(real_fragments),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let real_data_summary = real_data_manifest.summary();
+        assert_eq!(real_data_summary.total_rows, 425); // 100 + 250 + 75
+        assert_eq!(real_data_summary.total_files_size, 0); // Zero for unknown
+        assert_eq!(real_data_summary.total_fragments, 3);
+        assert_eq!(real_data_summary.total_data_files, 3);
+        assert_eq!(real_data_summary.total_deletion_file_rows, 0);
+        assert_eq!(real_data_summary.total_data_file_rows, 425);
+        assert_eq!(real_data_summary.total_deletion_files, 0);
+
+        let file_version = LanceFileVersion::default();
+        // Step 4: write deletion files and verify summary
+        let mut fragment_with_deletion = Fragment::new(0)
+            .with_file(
+                "data_with_deletion.lance",
+                vec![0, 1],
+                vec![0, 1],
+                &file_version,
+                NonZero::new(1000),
+            )
+            .with_physical_rows(50);
+        fragment_with_deletion.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(10),
+            base_id: None,
+        });
+
+        let manifest_with_deletion = Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_deletion]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let deletion_summary = manifest_with_deletion.summary();
+        assert_eq!(deletion_summary.total_rows, 40); // 50 - 10
+        assert_eq!(deletion_summary.total_files_size, 1000);
+        assert_eq!(deletion_summary.total_fragments, 1);
+        assert_eq!(deletion_summary.total_data_files, 1);
+        assert_eq!(deletion_summary.total_deletion_file_rows, 10);
+        assert_eq!(deletion_summary.total_data_file_rows, 50);
+        assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        //Just verify the transformation is OK
+        let stats_map: BTreeMap<String, String> = deletion_summary.into();
+        assert_eq!(stats_map.len(), 7)
     }
 }
