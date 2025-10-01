@@ -198,9 +198,10 @@ jobs:
     runs-on: ubuntu-latest
     # needs: [linux, mac, windows]
     needs: [linux]
+    permissions:
+      issues: write
     if: always()
     steps:
-      - uses: actions/checkout@v4
       - uses: ./.github/actions/create-failure-issue
         with:
           job-results: ${{ toJSON(needs) }}
