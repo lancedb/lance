@@ -2057,7 +2057,7 @@ impl Transaction {
     fn retain_relevant_indices(
         indices: &mut Vec<IndexMetadata>,
         schema: &Schema,
-        _fragments: &[Fragment],
+        fragments: &[Fragment],
     ) {
         let field_ids = schema
             .fields_pre_order()
@@ -2095,6 +2095,11 @@ impl Transaction {
         // Build a set of UUIDs to keep based on retention rules
         let mut uuids_to_keep = std::collections::HashSet::new();
 
+        let existing_fragments = fragments
+            .iter()
+            .map(|f| f.id as u32)
+            .collect::<RoaringBitmap>();
+
         // For each group of indices with the same name
         for (_, same_name_indices) in indices_by_name {
             if same_name_indices.len() > 1 {
@@ -2102,7 +2107,7 @@ impl Transaction {
                 let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
                     same_name_indices.iter().partition(|index| {
                         index
-                            .fragment_bitmap
+                            .effective_fragment_bitmap(&existing_fragments)
                             .as_ref()
                             .is_none_or(|bitmap| bitmap.is_empty())
                     });
