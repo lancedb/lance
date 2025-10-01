@@ -3903,8 +3903,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_with_nullable_struct_list_schema_mismatch() {
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().to_str().unwrap().to_string();
+        let test_uri = TempStrDir::default();
 
         let struct_fields = Fields::from(vec![
             Arc::new(ArrowField::new("company_id", DataType::Int64, true)),
@@ -3972,9 +3971,9 @@ mod test {
         .unwrap();
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-        Dataset::write(reader, path.as_str(), None).await.unwrap();
+        Dataset::write(reader, &test_uri, None).await.unwrap();
 
-        let dataset = Dataset::open(path.as_str()).await.unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
         let mut scan = dataset.scan();
         scan.filter("cid = '1'").unwrap();
 
