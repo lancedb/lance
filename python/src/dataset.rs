@@ -1742,6 +1742,9 @@ impl Dataset {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
+                    if let Some(lance_tokenizer) = kwargs.get_item("lance_tokenizer")? {
+                        params = params.lance_tokenizer(lance_tokenizer.extract()?);
+                    }
                     if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
                         params = params.base_tokenizer(base_tokenizer.extract()?);
                     }

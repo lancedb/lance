@@ -2397,12 +2397,12 @@ class LanceDataset(pa.dataset.Dataset):
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
-                if not pa.types.is_string(value_type) and not pa.types.is_large_string(
-                    value_type
-                ):
+                if (not pa.types.is_string(value_type)
+                        and not pa.types.is_large_string(value_type)
+                        and not _is_json_column(field)):
                     raise TypeError(
                         f"INVERTED index column {column} must be string, large string"
-                        " or list of strings, but got {value_type}"
+                        " list of strings or json, but got {value_type}"
                     )
 
             if pa.types.is_duration(field_type):
@@ -3450,6 +3450,18 @@ class LanceDataset(pa.dataset.Dataset):
             return None
 
         return ivf.centroids
+
+
+def _is_json_column(field: pyarrow.lib.Field):
+    field_type = field.type
+    if hasattr(field_type, "storage_type"):
+        field_type = field_type.storage_type
+
+    if not pa.types.is_large_binary(field_type):
+        return False
+    if b'ARROW:extension:name' in field.metadata:
+        return field.metadata[b'ARROW:extension:name'] == b"lance.json"
+    return False
 
 
 class SqlQuery:
