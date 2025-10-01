@@ -1,0 +1,47 @@
+[package]
+name = "lance-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Graph query engine for Lance datasets with Cypher support"
+
+[dependencies]
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-sql.workspace = true
+futures.workspace = true
+lance-arrow.workspace = true
+lance-core.workspace = true
+lance-datafusion.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Graph-specific dependencies
+petgraph = "0.6"
+nom = "7.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+lance = { workspace = true }
+futures.workspace = true
+
+[[bench]]
+name = "graph_execution"
+harness = false
+
+
+[lints]
+workspace = true

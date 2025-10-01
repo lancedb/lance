@@ -70,6 +70,7 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod graph;
 pub(crate) mod indices;
 pub(crate) mod reader;
 pub(crate) mod scanner;
@@ -249,6 +250,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     register_datagen(py, m)?;
     register_indices(py, m)?;
+    graph::register_graph_module(py, m)?;
     Ok(())
 }
 

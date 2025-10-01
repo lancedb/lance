@@ -4554,6 +4554,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-graph"
+version = "0.37.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "criterion",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "datafusion-sql",
+ "futures",
+ "lance",
+ "lance-arrow",
+ "lance-core",
+ "lance-datafusion",
+ "nom 7.1.3",
+ "petgraph 0.6.5",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lance-index"
 version = "0.37.0"
 dependencies = [
