@@ -454,8 +454,15 @@ mod tests {
             "Should have multiple fragments for testing"
         );
 
-        // Test fragments() method with specific fragment IDs
-        let selected_fragments = vec![fragment_ids[0], fragment_ids[1]];
+        // Test fragments() method with specific fragment IDs and ensure duplicate/out-of-order fragments are handled properly
+        let selected_fragments = vec![
+            fragment_ids[1],
+            fragment_ids[0],
+            fragment_ids[1],
+            fragment_ids[2],
+        ];
+        let selected_fragments_expected = vec![fragment_ids[0], fragment_ids[1], fragment_ids[2]];
+
         let mut builder =
             CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                 .name("fragment_index".to_string())
@@ -468,7 +475,7 @@ mod tests {
         let fragment_bitmap = index_metadata.fragment_bitmap.unwrap();
         let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
         assert_eq!(
-            indexed_fragments, selected_fragments,
+            indexed_fragments, selected_fragments_expected,
             "Index should only cover the selected fragments"
         );
 
