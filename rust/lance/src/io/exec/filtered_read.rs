@@ -419,7 +419,7 @@ impl FilteredReadStream {
         let io_parallelism = dataset.object_store.io_parallelism();
         let fragment_readahead = options
             .fragment_readahead
-            .unwrap_or_else(|| ((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2)))
+            .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             .max(1);
 
         let fragments = options
