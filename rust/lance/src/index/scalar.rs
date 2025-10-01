@@ -530,6 +530,7 @@ mod tests {
     };
     use arrow_schema::DataType;
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
     use lance_index::pbold::NGramIndexDetails;
@@ -752,11 +753,10 @@ mod tests {
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with BTree index
         let source_reader = lance_datagen::gen_batch()
@@ -857,11 +857,10 @@ mod tests {
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with low cardinality column for bitmap index
         let source_reader = lance_datagen::gen_batch()
@@ -938,11 +937,10 @@ mod tests {
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with text column for inverted index
         let source_reader = lance_datagen::gen_batch()
@@ -1080,11 +1078,10 @@ mod tests {
         use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with ZoneMap index
         let source_reader = lance_datagen::gen_batch()

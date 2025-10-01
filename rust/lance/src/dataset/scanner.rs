@@ -3561,12 +3561,12 @@ pub mod test_dataset {
         ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{ArrowError, DataType};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
         scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams},
         IndexType,
     };
-    use tempfile::{tempdir, TempDir};
 
     use crate::arrow::*;
     use crate::dataset::WriteParams;
@@ -3582,7 +3582,7 @@ pub mod test_dataset {
     //
     // An IVF-PQ index with 2 partitions is trained on this data
     pub struct TestVectorDataset {
-        pub tmp_dir: TempDir,
+        pub tmp_dir: TempStrDir,
         pub schema: Arc<ArrowSchema>,
         pub dataset: Dataset,
         dimension: u32,
@@ -3601,8 +3601,7 @@ pub mod test_dataset {
             stable_row_ids: bool,
             dimension: u32,
         ) -> Result<Self> {
-            let tmp_dir = tempdir()?;
-            let path = tmp_dir.path().to_str().unwrap();
+            let path = TempStrDir::default();
 
             // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
             let metadata: HashMap<String, String> =
@@ -3655,10 +3654,10 @@ pub mod test_dataset {
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-            let dataset = Dataset::write(reader, path, Some(params)).await?;
+            let dataset = Dataset::write(reader, &path, Some(params)).await?;
 
             Ok(Self {
-                tmp_dir,
+                tmp_dir: path,
                 schema,
                 dataset,
                 dimension,
@@ -3750,6 +3749,7 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_arrow::SchemaExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
@@ -3762,7 +3762,6 @@ mod test {
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
 
     use super::*;
     use crate::arrow::*;
@@ -3799,8 +3798,8 @@ mod test {
             .collect();
 
         for use_filter in [false, true] {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = &test_dir;
             let write_params = WriteParams {
                 max_rows_per_file: 40,
                 max_rows_per_group: 10,
@@ -4017,8 +4016,8 @@ mod test {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
@@ -4652,8 +4651,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -4726,8 +4725,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]))
@@ -4816,8 +4815,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]))
@@ -4883,8 +4882,8 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("filterable", DataType::Int32, true),
@@ -4957,8 +4956,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "ls",
@@ -5013,8 +5012,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "ls",
@@ -5095,8 +5094,8 @@ mod test {
             .collect();
         let batches =
             RecordBatchIterator::new(input_batches.clone().into_iter().map(Ok), schema.clone());
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
@@ -5164,8 +5163,8 @@ mod test {
             VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = &test_dir;
 
             // make dataset
             let schema = Arc::new(ArrowSchema::new(vec![
@@ -5385,8 +5384,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut data_gen = BatchGenerator::new().col(Box::new(
             IncrementingInt32::new().named("Filter_me".to_owned()),
         ));
@@ -5418,8 +5417,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
         Dataset::write(
@@ -5466,8 +5465,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut data_gen =
             BatchGenerator::new().col(Box::new(RandomVector::new().named("vec".to_owned())));
         Dataset::write(
@@ -5526,7 +5525,7 @@ mod test {
     }
 
     struct ScalarIndexTestFixture {
-        _test_dir: TempDir,
+        _test_dir: TempStrDir,
         dataset: Dataset,
         sample_query: Arc<dyn Array>,
         delete_query: Arc<dyn Array>,
@@ -5557,8 +5556,8 @@ mod test {
 
     impl ScalarIndexTestFixture {
         async fn new(data_storage_version: LanceFileVersion, use_stable_row_ids: bool) -> Self {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = &test_dir;
 
             // Write 1000 rows.  Train indices.  Then write 1000 new rows with the same vector data.
             // Then delete a row from the trained data.
@@ -6341,8 +6340,8 @@ mod test {
             .collect();
         let batches =
             RecordBatchIterator::new(input_batches.clone().into_iter().map(Ok), schema.clone());
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
@@ -7518,8 +7517,8 @@ mod test {
         columns: (bool, bool),
     ) {
         let (with_row_id, with_row_address) = columns;
-        let test_dir = tempdir().unwrap();
-        let uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let uri = &test_dir;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("data_item_id", arrow_schema::DataType::Int32, false),
@@ -7956,8 +7955,8 @@ mod test {
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
 
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
@@ -8003,8 +8002,8 @@ mod test {
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
 
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();

@@ -178,8 +178,8 @@ mod test {
 
     #[tokio::test]
     async fn test_must_set_on_creation() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap();
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &tmp_dir;
 
         let batch = sequence_batch(0..10);
         let reader =
@@ -249,8 +249,8 @@ mod test {
             enable_stable_row_ids: true,
             ..Default::default()
         };
-        let temp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = temp_dir.path().to_str().unwrap();
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
@@ -292,8 +292,8 @@ mod test {
             }
         }
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = temp_dir.path().to_str().unwrap();
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
         let mut start = 0;
         // Just do one first to create the dataset.
         write_batch(tmp_path, &mut start).await.unwrap();

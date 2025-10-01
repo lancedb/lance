@@ -26,7 +26,7 @@ impl TempDir {
         Ok(Self { tempdir })
     }
 
-    fn norm_path(&self) -> String {
+    pub fn path_str(&self) -> String {
         if cfg!(windows) {
             self.tempdir.path().to_str().unwrap().replace("\\", "/")
         } else {
@@ -39,7 +39,7 @@ impl TempDir {
     }
 
     pub fn obj_path(&self) -> ObjPath {
-        ObjPath::parse(self.norm_path()).unwrap()
+        ObjPath::parse(self.path_str()).unwrap()
     }
 }
 
@@ -99,7 +99,7 @@ impl TempStrDir {
 impl Default for TempStrDir {
     fn default() -> Self {
         let tempdir = TempDir::default();
-        let string = tempdir.norm_path();
+        let string = tempdir.path_str();
         Self {
             _tempdir: tempdir,
             string,
@@ -150,7 +150,7 @@ impl TempFile {
         Self { temppath }
     }
 
-    fn norm_path(&self) -> String {
+    fn path_str(&self) -> String {
         if cfg!(windows) {
             self.temppath.path().to_str().unwrap().replace("\\", "/")
         } else {
@@ -163,7 +163,7 @@ impl TempFile {
     }
 
     pub fn obj_path(&self) -> ObjPath {
-        ObjPath::parse(self.norm_path()).unwrap()
+        ObjPath::parse(self.path_str()).unwrap()
     }
 }
 
@@ -230,7 +230,7 @@ pub struct TempStdPath {
 impl Default for TempStdPath {
     fn default() -> Self {
         let tempdir = TempDir::default();
-        let path = format!("{}/some_file", tempdir.norm_path());
+        let path = format!("{}/some_file", tempdir.path_str());
         let path = PathBuf::from(path);
         Self {
             _tempdir: tempdir,

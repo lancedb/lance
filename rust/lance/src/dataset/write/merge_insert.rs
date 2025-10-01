@@ -2060,6 +2060,7 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
     use lance_index::scalar::ScalarIndexParams;
@@ -2069,7 +2070,6 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
-    use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
     // Used to validate that futures returned are Send.
@@ -2958,8 +2958,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexed_merge_insert() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
@@ -4013,9 +4013,8 @@ mod tests {
         use lance_core::utils::testing::MockClock;
         let clock = MockClock::new();
 
-        let tmpdir = tempdir().unwrap();
-        let dataset_uri = tmpdir.path().join("test_dataset");
-        let dataset_path = dataset_uri.to_str().unwrap();
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("{}/{}", tmpdir, "test_dataset");
 
         // Create initial dataset with auto cleanup interval of 1 version
         let data = lance_datagen::gen_batch()
@@ -4042,7 +4041,7 @@ mod tests {
         // Start at 1 second after epoch
         clock.set_system_time(chrono::Duration::seconds(1));
 
-        let dataset = Dataset::write(data, dataset_path, Some(write_params))
+        let dataset = Dataset::write(data, &dataset_uri, Some(write_params))
             .await
             .unwrap();
         assert_eq!(dataset.version().version, 1);
@@ -4091,7 +4090,7 @@ mod tests {
         assert_eq!(dataset2_extra.version().version, 3);
 
         // Load the dataset from disk to check versions
-        let ds_check1 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+        let ds_check1 = DatasetBuilder::from_uri(&dataset_uri).load().await.unwrap();
 
         // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
         assert!(
@@ -4127,7 +4126,7 @@ mod tests {
         assert_eq!(dataset3.version().version, 4);
 
         // Load the dataset from disk to check versions
-        let ds_check2 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+        let ds_check2 = DatasetBuilder::from_uri(&dataset_uri).load().await.unwrap();
 
         // Version 2 should still exist because skip_auto_cleanup was enabled
         assert!(
@@ -4285,11 +4284,10 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         )
         .unwrap();
 
-        let tempdir = tempdir().unwrap();
-        let dataset_uri = tempdir.path().join("test_dataset");
+        let tempdir = TempStrDir::default();
         let dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
-            dataset_uri.to_str().unwrap(),
+            &tempdir,
             None,
         )
         .await

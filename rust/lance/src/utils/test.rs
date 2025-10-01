@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
-use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -746,7 +746,7 @@ pub fn copy_dir_all(
 ///
 /// The `table_path` should be relative to `test_data/` at the root of the
 /// repo.
-pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
+pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     use std::path::PathBuf;
 
     let mut src = PathBuf::new();
@@ -754,9 +754,9 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
     src.push("../../test_data");
     src.push(table_path);
 
-    let test_dir = TempStdDir::default();
+    let test_dir = TempDir::default();
 
-    copy_dir_all(src.as_path(), &test_dir)?;
+    copy_dir_all(src.as_path(), test_dir.std_path())?;
 
     Ok(test_dir)
 }
@@ -900,7 +900,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let struct_fields: ArrowFields = vec![
             ArrowField::new("f1", DataType::Utf8, true),
@@ -934,13 +934,7 @@ mod tests {
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
             let fragment = generator
-                .make_fragment(
-                    tmp_dir.path().to_str().unwrap(),
-                    &data,
-                    &schema,
-                    &mut rng,
-                    2,
-                )
+                .make_fragment(tmp_dir.as_str(), &data, &schema, &mut rng, 2)
                 .await;
 
             assert!(fragment.files.len() > 1, "Expected multiple files");
@@ -974,7 +968,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
@@ -1005,11 +999,11 @@ mod tests {
         let seed = 42;
         let generator = TestDatasetGenerator::new(data.clone(), data_storage_version).seed(seed);
 
-        let path = tmp_dir.path().join("ds1");
-        let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+        let path = format!("{}/ds1", tmp_dir.as_str());
+        let dataset = generator.make_hostile(&path).await;
 
-        let path2 = tmp_dir.path().join("ds2");
-        let dataset2 = generator.make_hostile(path2.to_str().unwrap()).await;
+        let path2 = format!("{}/ds2", tmp_dir.as_str());
+        let dataset2 = generator.make_hostile(&path2).await;
 
         // Given the same seed, should produce the same layout.
         assert_eq!(dataset.schema(), dataset2.schema());
@@ -1028,8 +1022,8 @@ mod tests {
             let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
-                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
-                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+                let path = format!("{}/test_ds_{}_{}", tmp_dir.as_str(), num_cols, i);
+                let dataset = generator.make_hostile(&path).await;
 
                 let field_structure = get_field_structure(&dataset);
 
