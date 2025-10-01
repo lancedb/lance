@@ -37,7 +37,7 @@ runs:
         **Run URL:** $RUN_URL
 
         Please investigate the failed jobs and address any issues." \
-            --label "ci-failure"
+            --label "ci"
 
           echo "Issue created successfully"
         else
