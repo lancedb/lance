@@ -12,6 +12,7 @@ pub mod hash;
 pub mod mask;
 pub mod parse;
 pub mod path;
+pub mod tempfile;
 pub mod testing;
 pub mod tokio;
 pub mod tracing;

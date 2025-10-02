@@ -292,24 +292,22 @@ mod tests {
     use futures::TryStreamExt;
     use lance_arrow::DataTypeExt;
     use lance_io::stream::RecordBatchStream;
-    use tempfile::{tempdir, TempDir};
 
-    use lance_core::{Error, Result};
+    use lance_core::{utils::tempfile::TempStrDir, Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
 
     use crate::{utils::test::TestDatasetGenerator, Dataset};
 
     struct BlobTestFixture {
-        _test_dir: TempDir,
+        _test_dir: TempStrDir,
         dataset: Arc<Dataset>,
         data: Vec<RecordBatch>,
     }
 
     impl BlobTestFixture {
         async fn new() -> Self {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
 
             let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
@@ -321,7 +319,7 @@ mod tests {
 
             let dataset = Arc::new(
                 TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
-                    .make_hostile(test_uri)
+                    .make_hostile(&test_dir)
                     .await,
             );
 

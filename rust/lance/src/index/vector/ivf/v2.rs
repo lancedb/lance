@@ -658,6 +658,7 @@ mod tests {
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
@@ -687,7 +688,6 @@ mod tests {
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
-    use tempfile::tempdir;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
@@ -906,8 +906,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = match dataset {
             Some((dataset, vectors)) => (dataset, vectors),
             None => generate_test_dataset::<T>(test_uri, range).await,
@@ -968,8 +968,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1074,8 +1074,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1104,8 +1104,8 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         // compact after delete all rows
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1394,8 +1394,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
 
@@ -1468,8 +1468,8 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
         test_index(
             v1_params,
@@ -1518,8 +1518,8 @@ mod tests {
         index: (VectorIndexParams, IndexType),
     ) {
         let (params, index_type) = index;
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 4;
         let (mut dataset, _) = match params.metric_type {
@@ -1568,8 +1568,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_stats_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 500;
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -1627,8 +1627,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1739,8 +1739,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_with_zero_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
         let vector_field = schema.field(1).clone();
         let zero_batch = RecordBatch::try_new(
@@ -1876,7 +1876,8 @@ mod tests {
     #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
 
         // Just make sure we can query the index.
         let dataset = Dataset::open(test_uri).await.unwrap();
@@ -1954,8 +1955,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_with_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1983,8 +1984,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_with_many_invalid_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         // we use 8192 batch size by default, so we need to generate 8192 * 2 vectors to get 2 batches
         // generate 2 batches, and the first batch's vectors are all with NaN
