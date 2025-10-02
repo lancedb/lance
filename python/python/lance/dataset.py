@@ -2404,7 +2404,6 @@ class LanceDataset(pa.dataset.Dataset):
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
-        one_pass_ivfpq: bool = False,
         train: bool = True,
         *,
         target_partition_size: Optional[int] = None,
@@ -2473,8 +2472,6 @@ class LanceDataset(pa.dataset.Dataset):
             Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
             values are present (and otherwise will not). Disables the null filter used
             for nullable columns. Obtains a small speed boost.
-        one_pass_ivfpq: bool
-            Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
         train : bool, default True
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
@@ -2642,14 +2639,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
             )
-        if index_type != "IVF_PQ" and one_pass_ivfpq:
-            raise ValueError(
-                f'one_pass_ivfpq requires index_type="IVF_PQ", got {index_type}'
-            )
 
         # Handle timing for various parts of accelerated builds
         timers = {}
-        if one_pass_ivfpq and accelerator is not None:
+        if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
                 one_pass_train_ivf_pq_on_accelerator,
@@ -2757,49 +2750,6 @@ class LanceDataset(pa.dataset.Dataset):
                             "precomputed_partition_dataset must have only one files"
                         )
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
-
-            if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
-                LOGGER.info("Computing new precomputed partition dataset")
-                # Use accelerator to train ivf centroids
-                from .vector import (
-                    compute_partitions,
-                    train_ivf_centroids_on_accelerator,
-                )
-
-                timers["ivf_train:start"] = time.time()
-                if num_partitions is None:
-                    num_rows = self.count_rows()
-                    num_partitions = _target_partition_size_to_num_partitions(
-                        num_rows, target_partition_size
-                    )
-                ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_train:end"] = time.time()
-                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
-                LOGGER.info("ivf training time: %ss", ivf_train_time)
-                timers["ivf_assign:start"] = time.time()
-                num_sub_vectors_cur = None
-                if "PQ" in index_type and pq_codebook is None:
-                    # compute residual subspace columns in the same pass
-                    num_sub_vectors_cur = num_sub_vectors
-                partitions_file = compute_partitions(
-                    self,
-                    column[0],
-                    kmeans,
-                    batch_size=20480,
-                    num_sub_vectors=num_sub_vectors_cur,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_assign:end"] = time.time()
-                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
-                LOGGER.info("ivf transform time: %ss", ivf_assign_time)
-                kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
                 raise ValueError(
