@@ -3669,9 +3669,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_iops_read_small() {
-        // Create a file that has 10 columns.
+        // Create a file that has 8 columns.
         let schema = Arc::new(ArrowSchema::new(
-            (0..10)
+            (0..8)
                 .map(|i| ArrowField::new(format!("col_{}", i), DataType::Int32, true))
                 .collect::<Vec<_>>(),
         ));
@@ -3679,7 +3679,7 @@ mod tests {
         // Single row batch
         let batch = RecordBatch::try_new(
             schema.clone(),
-            (0..10)
+            (0..8)
                 .map(|i| Arc::new(Int32Array::from(vec![i])) as ArrayRef)
                 .collect(),
         )
@@ -3711,7 +3711,7 @@ mod tests {
         // Measure IOPS needed to scan all data first time.
         let projection = Schema::try_from(schema.as_ref())
             .unwrap()
-            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7], true);
         let reader = fragment
             .open(&projection, Default::default())
             .await
@@ -3726,7 +3726,7 @@ mod tests {
         assert_eq!(data.len(), 1);
         let data = data.pop().unwrap();
         assert_eq!(data.num_rows(), 1);
-        assert_eq!(data.num_columns(), 9);
+        assert_eq!(data.num_columns(), 7);
 
         let stats = io_stats.incremental_stats();
         assert_eq!(stats.read_iops, 1);

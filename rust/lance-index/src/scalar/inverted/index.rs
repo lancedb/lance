@@ -14,7 +14,6 @@ use std::{
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
-use crate::scalar::inverted::builder::flatten_string_list;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
@@ -73,6 +72,7 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
@@ -152,7 +152,7 @@ impl DeepSizeOf for TokenSetFormat {
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
 }
@@ -212,7 +212,7 @@ impl InvertedIndex {
         }
     }
 
-    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+    pub fn tokenizer(&self) -> Box<dyn LanceTokenizer> {
         self.tokenizer.clone()
     }
 
@@ -492,7 +492,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(text, &mut tokenizer, None);
+        let tokens = collect_query_tokens(text, &mut tokenizer, None);
 
         let (doc_ids, _) = self
             .bm25_search(
@@ -2290,7 +2290,7 @@ pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
+    tokenizer: Option<Box<dyn LanceTokenizer>>,
 ) -> Result<Vec<u64>> {
     if batches.is_empty() {
         return Ok(vec![]);
@@ -2317,12 +2317,12 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
+    tokenizer: Option<Box<dyn LanceTokenizer>>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_tokens(query, &mut tokenizer, None)
+    let query_tokens = collect_query_tokens(query, &mut tokenizer, None)
         .into_iter()
         .collect::<HashSet<_>>();
 
@@ -2331,7 +2331,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_tokens(doc, &mut tokenizer, Some(&query_tokens));
+            let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, Some(&query_tokens));
             if !doc_tokens.is_empty() {
                 results.push(row_id_array.value(i));
                 assert!(doc.contains(query));
@@ -2348,7 +2348,7 @@ pub fn flat_bm25_search(
     doc_col: &str,
     query_tokens: &HashSet<String>,
     nq: &HashMap<String, usize>,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
     avgdl: f32,
     num_docs: usize,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
@@ -2360,7 +2360,7 @@ pub fn flat_bm25_search(
             continue;
         };
 
-        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
+        let doc_tokens = collect_doc_tokens(doc, tokenizer, Some(query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
         let mut doc_token_count = HashMap::new();
         for token in doc_tokens {
@@ -2392,8 +2392,8 @@ pub fn flat_bm25_search_stream(
     query: String,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
-    let mut tokenizer = index.tokenizer.clone();
-    let tokens = collect_tokens(&query, &mut tokenizer, None)
+    let mut tokenizer = Box::new(index.tokenizer.clone());
+    let tokens = collect_query_tokens(&query, &mut tokenizer, None)
         .into_iter()
         .sorted_unstable()
         .collect::<HashSet<_>>();
@@ -2408,17 +2408,6 @@ pub fn flat_bm25_search_stream(
     }
     let stream = input.map(move |batch| {
         let batch = batch?;
-
-        // Flat if doc_col is a list
-        let batch = match batch[&doc_col].data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => batch,
-            DataType::List(_) => flatten_string_list::<i32>(&batch, &batch[&doc_col])?,
-            DataType::LargeList(_) => flatten_string_list::<i64>(&batch, &batch[&doc_col])?,
-            _ => panic!(
-                "Expecting Utf8, LargeUtf8, List(Utf8) or LargeList(Utf8), found {:?}",
-                batch[&doc_col].data_type()
-            ),
-        };
 
         let batch = flat_bm25_search(
             batch,

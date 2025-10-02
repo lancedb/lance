@@ -273,7 +273,7 @@ message Variable {
 // There is no output.
 message Constant {
   // The value (TODO: define encoding for literals?)
-  bytes value = 1;
+  optional bytes value = 1;
 }
 
 // A compression scheme in which a single fixed-width block is "packed" into

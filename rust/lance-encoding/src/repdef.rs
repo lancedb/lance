@@ -799,7 +799,7 @@ impl RepDefBuilder {
 
     /// The builder is "empty" if there is no repetition and no nulls.  In this case we don't need
     /// to store anything to disk (except the description)
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.repdefs
             .iter()
             .all(|r| matches!(r, RawRepDef::Validity(ValidityDesc { validity: None, .. })))

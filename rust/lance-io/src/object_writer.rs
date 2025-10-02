@@ -548,11 +548,9 @@ mod tests {
     async fn test_abort_write() {
         let store = LanceObjectStore::memory();
 
-        let mut object_writer = futures::executor::block_on(async move {
-            ObjectWriter::new(&store, &Path::from("/foo"))
-                .await
-                .unwrap()
-        });
+        let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
+            .await
+            .unwrap();
         object_writer.abort().await;
     }
 }
