@@ -395,18 +395,9 @@ version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff6e472cdea888a4bd64f342f09b3f50e1886d32afe8df3d663c01140b811b18"
 dependencies = [
- "event-listener 5.4.0",
+ "event-listener",
  "event-listener-strategy",
  "pin-project-lite",
-]
-
-[[package]]
-name = "async-priority-channel"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acde96f444d31031f760c5c43dc786b97d3e1cb2ee49dd06898383fe9a999758"
-dependencies = [
- "event-listener 4.0.3",
 ]
 
 [[package]]
@@ -2212,17 +2203,6 @@ checksum = "ca81e6b4777c89fd810c25a4be2b1bd93ea034fbe58e6a75216a34c6b82c539b"
 
 [[package]]
 name = "event-listener"
-version = "4.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b215c49b2b248c855fb73579eb1f4f26c38ffdc12973e20e07b91d78d5646e"
-dependencies = [
- "concurrent-queue",
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
-name = "event-listener"
 version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3492acde4c3fc54c845eaab3eed8bd00c7a7d881f78bfc801e43a93dec1331ae"
@@ -2238,7 +2218,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
- "event-listener 5.4.0",
+ "event-listener",
  "pin-project-lite",
 ]
 
@@ -2338,7 +2318,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3110,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3172,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3190,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3199,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3234,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3264,7 +3244,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3281,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3318,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3352,7 +3332,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3414,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3424,7 +3404,6 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "arrow-select",
- "async-priority-channel",
  "async-recursion",
  "async-trait",
  "aws-config",
@@ -3454,7 +3433,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3481,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3504,7 +3483,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3855,7 +3834,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-utils",
- "event-listener 5.4.0",
+ "event-listener",
  "futures-util",
  "loom",
  "parking_lot",
