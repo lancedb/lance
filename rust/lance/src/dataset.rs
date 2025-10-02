@@ -240,6 +240,16 @@ pub struct ReadParams {
     pub file_reader_options: Option<FileReaderOptions>,
 }
 
+/// A file referenced by a dataset version, including both its absolute path
+/// and its relative path within the dataset structure.
+#[derive(Clone, Debug)]
+pub struct ReferencedFile {
+    /// Absolute path to the file
+    pub path: String,
+    /// Relative path within the dataset (e.g., "data/file.lance", "_versions/1.manifest")
+    pub relative_path: String,
+}
+
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     #[deprecated(
@@ -761,6 +771,141 @@ impl Dataset {
 
     pub fn manifest_location(&self) -> &ManifestLocation {
         &self.manifest_location
+    }
+
+    /// Get a list of all files referenced by the current version of the dataset.
+    ///
+    /// This returns information about all data files, deletion files, transaction files,
+    /// index directories, and the manifest file itself. Each file includes both its
+    /// absolute path (for reading) and relative path within the dataset (for copying
+    /// to a new location).
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`ReferencedFile`] structs, each containing:
+    /// - `path`: Absolute path to the file
+    /// - `relative_path`: Path relative to the dataset root (e.g., "data/file.lance")
+    ///
+    /// For data files and deletion files that have a `base_id`, the paths will be
+    /// resolved using the corresponding `BasePath` from the manifest.
+    pub async fn referenced_files(&self) -> Result<Vec<ReferencedFile>> {
+        use lance_table::io::deletion::deletion_file_path;
+
+        let mut files = Vec::new();
+        let manifest = &self.manifest;
+        let indices = self.load_indices().await?;
+
+        // Helper function to resolve base path
+        let resolve_base_path = |base_id: Option<u32>| -> Result<Path> {
+            if let Some(id) = base_id {
+                if let Some(base_path) = manifest.base_paths.get(&id) {
+                    Ok(Path::parse(&base_path.path)?)
+                } else {
+                    Err(Error::invalid_input(
+                        format!("base_id {} not found in manifest base_paths", id),
+                        location!(),
+                    ))
+                }
+            } else {
+                Ok(self.base.clone())
+            }
+        };
+
+        // Helper to convert Path to String, ensuring leading slash for absolute paths
+        let path_to_string = |path: &Path| -> String {
+            let s = path.to_string();
+            // If the path looks like an absolute path (starts with a drive/root indicator),
+            // ensure it has a leading slash
+            if !s.starts_with('/') && !s.starts_with("\\") && !s.contains("://") {
+                format!("/{}", s)
+            } else {
+                s
+            }
+        };
+
+        // Helper to remove prefix and get relative path
+        let remove_prefix = |path: &Path, prefix: &Path| -> Path {
+            let relative_parts = path.prefix_match(prefix);
+            if relative_parts.is_none() {
+                return path.clone();
+            }
+            Path::from_iter(relative_parts.unwrap())
+        };
+
+        // Add data files
+        for fragment in manifest.fragments.iter() {
+            for file in fragment.files.iter() {
+                let base = resolve_base_path(file.base_id)?;
+                let file_path = if let Some(base_path_entry) =
+                    file.base_id.and_then(|id| manifest.base_paths.get(&id))
+                {
+                    if base_path_entry.is_dataset_root {
+                        base.child(DATA_DIR).child(file.path.as_str())
+                    } else {
+                        base.child(file.path.as_str())
+                    }
+                } else {
+                    self.data_dir().child(file.path.as_str())
+                };
+                let relative_path = remove_prefix(&file_path, &self.base);
+                files.push(ReferencedFile {
+                    path: path_to_string(&file_path),
+                    relative_path: relative_path.to_string(),
+                });
+            }
+
+            // Add deletion files
+            if let Some(deletion_file) = &fragment.deletion_file {
+                let base = resolve_base_path(deletion_file.base_id)?;
+                let del_path = deletion_file_path(&base, fragment.id, deletion_file);
+                let relative_path = remove_prefix(&del_path, &self.base);
+                files.push(ReferencedFile {
+                    path: path_to_string(&del_path),
+                    relative_path: relative_path.to_string(),
+                });
+            }
+        }
+
+        // Add transaction file
+        if let Some(tx_path) = &manifest.transaction_file {
+            let tx_full_path = self.base.child("_transactions").child(tx_path.as_str());
+            let relative_path = remove_prefix(&tx_full_path, &self.base);
+            files.push(ReferencedFile {
+                path: path_to_string(&tx_full_path),
+                relative_path: relative_path.to_string(),
+            });
+        }
+
+        // Add index directories
+        for index in indices.iter() {
+            let base = resolve_base_path(index.base_id)?;
+            let index_dir = if let Some(base_path_entry) =
+                index.base_id.and_then(|id| manifest.base_paths.get(&id))
+            {
+                if base_path_entry.is_dataset_root {
+                    base.child(INDICES_DIR).child(index.uuid.to_string())
+                } else {
+                    base.child(index.uuid.to_string())
+                }
+            } else {
+                self.indices_dir().child(index.uuid.to_string())
+            };
+            let relative_path = remove_prefix(&index_dir, &self.base);
+            files.push(ReferencedFile {
+                path: path_to_string(&index_dir),
+                relative_path: relative_path.to_string(),
+            });
+        }
+
+        // Add the manifest file itself
+        let manifest_path = self.manifest_location.path.clone();
+        let relative_path = remove_prefix(&manifest_path, &self.base);
+        files.push(ReferencedFile {
+            path: path_to_string(&manifest_path),
+            relative_path: relative_path.to_string(),
+        });
+
+        Ok(files)
     }
 
     async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
