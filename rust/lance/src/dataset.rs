@@ -1900,7 +1900,8 @@ impl Dataset {
             .manifest()
             .data_storage_format
             .lance_file_version()
-            .unwrap()
+            .unwrap_or(LanceFileVersion::Legacy)
+            .resolve()
         {
             LanceFileVersion::Legacy => matches!(
                 datatype,
@@ -1911,9 +1912,7 @@ impl Dataset {
                     | DataType::FixedSizeBinary(_)
                     | DataType::FixedSizeList(_, _)
             ),
-            LanceFileVersion::V2_0 | LanceFileVersion::Stable => {
-                !matches!(datatype, DataType::Struct(..))
-            }
+            LanceFileVersion::V2_0 => !matches!(datatype, DataType::Struct(..)),
             _ => true,
         }
     }

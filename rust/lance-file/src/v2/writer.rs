@@ -142,7 +142,7 @@ impl FileWriter {
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
         if let Some(format_version) = options.format_version {
-            if format_version > LanceFileVersion::Stable
+            if format_version.is_unstable()
                 && WARNED_ON_UNSTABLE_API
                     .compare_exchange(
                         false,
@@ -787,6 +787,7 @@ mod tests {
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
+    use lance_io::object_writer::ObjectWriter;
     use lance_io::utils::CachedFileSize;
 
     #[tokio::test]
