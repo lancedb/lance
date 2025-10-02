@@ -178,12 +178,12 @@ impl AsRef<str> for TempStrDir {
 /// used as a standard library path.
 #[derive(Default)]
 pub struct TempStdDir {
-    _tempdir: TempDir,
+    tempdir: TempDir,
 }
 
 impl AsRef<StdPath> for TempStdDir {
     fn as_ref(&self) -> &StdPath {
-        self._tempdir.std_path()
+        self.tempdir.std_path()
     }
 }
 
@@ -191,7 +191,7 @@ impl Deref for TempStdDir {
     type Target = StdPath;
 
     fn deref(&self) -> &Self::Target {
-        self._tempdir.std_path()
+        self.tempdir.std_path()
     }
 }
 
@@ -250,12 +250,12 @@ impl Default for TempFile {
 /// It is useful when you need to create a temporary file that is only used as a standard library path.
 #[derive(Default)]
 pub struct TempStdFile {
-    _tempfile: TempFile,
+    tempfile: TempFile,
 }
 
 impl AsRef<StdPath> for TempStdFile {
     fn as_ref(&self) -> &StdPath {
-        self._tempfile.std_path()
+        self.tempfile.std_path()
     }
 }
 
@@ -263,7 +263,7 @@ impl Deref for TempStdFile {
     type Target = StdPath;
 
     fn deref(&self) -> &Self::Target {
-        self._tempfile.std_path()
+        self.tempfile.std_path()
     }
 }
 

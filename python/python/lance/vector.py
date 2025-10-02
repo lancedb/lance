@@ -738,7 +738,6 @@ def one_pass_assign_ivf_pq_on_accelerator(
             # Hack for Windows due to
             # https://github.com/apache/arrow-rs-object-store/issues/499
             dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
-        print(f"dst_dataset_uri={dst_dataset_uri}")
     ds = write_dataset(
         rbr,
         dst_dataset_uri,
