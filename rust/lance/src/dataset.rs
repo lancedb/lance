@@ -908,6 +908,150 @@ impl Dataset {
         Ok(files)
     }
 
+    /// Copy all files referenced by the current dataset version to a new location.
+    ///
+    /// This method streams files from the source object store to the destination
+    /// without loading them entirely into memory. Files are copied in parallel
+    /// according to the IO parallelism configured on the source object store.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest` - The destination URI (e.g., "s3://bucket/path", "/local/path")
+    /// * `params` - Optional object store parameters for the destination
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use lance::Dataset;
+    /// # async fn example(dataset: &Dataset) -> lance::Result<()> {
+    /// // Copy to local filesystem
+    /// dataset.copy_dataset("/tmp/dataset_copy", None).await?;
+    ///
+    /// // Copy to S3 with custom params
+    /// let params = ObjectStoreParams { /* ... */ ..Default::default() };
+    /// dataset.copy_dataset("s3://my-bucket/dataset", Some(&params)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_dataset(&self, dest: &str, params: Option<&ObjectStoreParams>) -> Result<()> {
+        use futures::stream::{StreamExt, TryStreamExt};
+        use object_store::path::Path as OSPath;
+
+        // Parse destination and get object store
+        let dest_url = url::Url::parse(dest).map_err(|e| {
+            Error::invalid_input(
+                format!("Invalid destination URL '{}': {}", dest, e),
+                location!(),
+            )
+        })?;
+
+        let registry = self.session.store_registry();
+        let dest_store = registry
+            .get_store(dest_url, params.unwrap_or(&ObjectStoreParams::default()))
+            .await?;
+
+        // Get all referenced files
+        let files = self.referenced_files().await?;
+        let source_base = self.base.clone();
+
+        // Copy files in parallel with streaming
+        futures::stream::iter(files)
+            .map(move |file| {
+                let source_store = self.object_store.clone();
+                let dest_store = dest_store.clone();
+                let source_base = source_base.clone();
+
+                async move {
+                    // Build source path by appending relative path to source base
+                    let source_path = {
+                        let parts: Vec<&str> = file.relative_path.split('/').collect();
+                        parts
+                            .iter()
+                            .fold(source_base.clone(), |path, part| path.child(*part))
+                    };
+
+                    // Build destination path the same way
+                    let dest_path = {
+                        let parts: Vec<&str> = file.relative_path.split('/').collect();
+                        parts
+                            .iter()
+                            .fold(OSPath::from(""), |path, part| path.child(*part))
+                    };
+
+                    // Get streaming read from source
+                    let get_result =
+                        source_store
+                            .inner
+                            .get(&source_path)
+                            .await
+                            .map_err(|e| Error::IO {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Failed to read from source {}: {}",
+                                        file.relative_path, e
+                                    ),
+                                )),
+                                location: location!(),
+                            })?;
+
+                    // Start multipart upload to destination
+                    let mut upload =
+                        dest_store
+                            .inner
+                            .put_multipart(&dest_path)
+                            .await
+                            .map_err(|e| Error::IO {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Failed to start upload to {}: {}",
+                                        file.relative_path, e
+                                    ),
+                                )),
+                                location: location!(),
+                            })?;
+
+                    // Stream bytes from source to destination
+                    let mut stream = get_result.into_stream();
+
+                    while let Some(bytes_result) = stream.next().await {
+                        let bytes = bytes_result.map_err(|e| Error::IO {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to read bytes from {}: {}", file.path, e),
+                            )),
+                            location: location!(),
+                        })?;
+
+                        upload.put_part(bytes.into()).await.map_err(|e| Error::IO {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to write bytes to {}: {}", file.relative_path, e),
+                            )),
+                            location: location!(),
+                        })?;
+                    }
+
+                    // Complete the upload
+                    upload.complete().await.map_err(|e| Error::IO {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to complete upload to {}: {}", file.relative_path, e),
+                        )),
+                        location: location!(),
+                    })?;
+
+                    Ok::<(), Error>(())
+                }
+            })
+            .buffer_unordered(self.object_store.io_parallelism())
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
+
     async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
         if compared_version < 1 {
             return Err(Error::invalid_input(
@@ -8775,5 +8919,103 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_copy_dataset() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use futures::TryStreamExt;
+
+        // Create a source dataset with some data
+        let source_dir = tempdir().unwrap();
+        let source_uri = source_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let num_rows: usize = 100;
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..num_rows as i32).map(|x| x * 2),
+                )),
+            ],
+        )
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_file: 30,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+
+        let source_dataset = Dataset::write(batches, source_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Verify source dataset has expected data
+        assert_eq!(source_dataset.count_rows(None).await.unwrap(), num_rows);
+        assert_eq!(source_dataset.count_fragments(), 4); // 100 rows / 30 per file = 4 files
+
+        // Debug: Check what files are referenced
+        let files = source_dataset.referenced_files().await.unwrap();
+        println!("Referenced files:");
+        for file in &files {
+            println!("  path: {}", file.path);
+            println!("  relative_path: {}", file.relative_path);
+        }
+
+        // Copy dataset to a new location
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().to_str().unwrap();
+        // Convert path to file URL
+        let dest_uri = format!("file://{}", dest_path);
+
+        println!("Copying to: {}", dest_uri);
+        source_dataset.copy_dataset(&dest_uri, None).await.unwrap();
+
+        // Open the destination dataset
+        let dest_dataset = Dataset::open(&dest_uri).await.unwrap();
+
+        // Verify destination dataset has same row count
+        assert_eq!(dest_dataset.count_rows(None).await.unwrap(), num_rows);
+
+        // Verify destination dataset has same fragment count
+        assert_eq!(dest_dataset.count_fragments(), 4);
+
+        // Verify the data matches
+        let source_batches: Vec<RecordBatch> = source_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let dest_batches: Vec<RecordBatch> = dest_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(source_batches.len(), dest_batches.len());
+        for (source_batch, dest_batch) in source_batches.iter().zip(dest_batches.iter()) {
+            assert_eq!(source_batch.num_rows(), dest_batch.num_rows());
+            assert_eq!(source_batch.num_columns(), dest_batch.num_columns());
+            for i in 0..source_batch.num_columns() {
+                assert_eq!(source_batch.column(i), dest_batch.column(i));
+            }
+        }
     }
 }
