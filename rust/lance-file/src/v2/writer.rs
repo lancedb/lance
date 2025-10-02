@@ -781,21 +781,17 @@ mod tests {
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::utils::tempfile::TempObjFile;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_basic_write() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
-        let tmp_path = Path::parse(tmp_path).unwrap();
-        let tmp_path = tmp_path.child("some_file.lance");
+        let tmp_path = TempObjFile::default();
         let obj_store = Arc::new(ObjectStore::local());
 
         let reader = gen_batch()
@@ -820,10 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_empty() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
-        let tmp_path = Path::parse(tmp_path).unwrap();
-        let tmp_path = tmp_path.child("some_file.lance");
+        let tmp_path = TempObjFile::default();
         let obj_store = Arc::new(ObjectStore::local());
 
         let reader = gen_batch()
@@ -864,14 +857,10 @@ mod tests {
             ..Default::default()
         };
 
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().join("test.lance");
+        let path = TempObjFile::default();
         let object_store = ObjectStore::local();
         let mut writer = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path).await.unwrap(),
             lance_schema,
             options,
         )
@@ -883,10 +872,7 @@ mod tests {
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
-            .open_file(
-                &Path::from(path.to_str().unwrap()),
-                &CachedFileSize::unknown(),
-            )
+            .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
@@ -944,14 +930,10 @@ mod tests {
             ..Default::default()
         };
 
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().join("test_env_var.lance");
+        let path = TempObjFile::default();
         let object_store = ObjectStore::local();
         let mut writer = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
         )
@@ -963,10 +945,7 @@ mod tests {
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
-            .open_file(
-                &Path::from(path.to_str().unwrap()),
-                &CachedFileSize::unknown(),
-            )
+            .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
@@ -1086,15 +1065,11 @@ mod tests {
         };
 
         // Write the file
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().join("test_compression_overrides.lance");
+        let path = TempObjFile::default();
         let object_store = ObjectStore::local();
 
         let mut writer = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
         )
@@ -1105,7 +1080,7 @@ mod tests {
         writer.finish().await.unwrap();
 
         // Now write the same data without compression overrides for comparison
-        let path_no_compression = tmp_dir.path().join("test_no_compression.lance");
+        let path_no_compression = TempObjFile::default();
         let default_options = FileWriterOptions {
             format_version: Some(LanceFileVersion::V2_1),
             max_page_bytes: Some(64 * 1024),
@@ -1113,10 +1088,7 @@ mod tests {
         };
 
         let mut writer_no_compression = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path_no_compression.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path_no_compression).await.unwrap(),
             lance_schema.clone(),
             default_options,
         )
@@ -1133,10 +1105,7 @@ mod tests {
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
-            .open_file(
-                &Path::from(path.to_str().unwrap()),
-                &CachedFileSize::unknown(),
-            )
+            .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
 
@@ -1224,8 +1193,7 @@ mod tests {
         )
         .unwrap();
 
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().join("field_metadata_test.lance");
+        let path = TempObjFile::default();
         let object_store = ObjectStore::local();
 
         // Create encoding strategy that will read from field metadata
@@ -1242,10 +1210,7 @@ mod tests {
             ..Default::default()
         };
         let mut writer = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
         )
@@ -1258,10 +1223,7 @@ mod tests {
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
-            .open_file(
-                &Path::from(path.to_str().unwrap()),
-                &CachedFileSize::unknown(),
-            )
+            .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
@@ -1333,8 +1295,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(status_array)]).unwrap();
 
-        let tmp_dir = tempdir().unwrap();
-        let path = tmp_dir.path().join("rle_threshold_test.lance");
+        let path = TempObjFile::default();
         let object_store = ObjectStore::local();
 
         // Create encoding strategy that will read from field metadata
@@ -1351,10 +1312,7 @@ mod tests {
             ..Default::default()
         };
         let mut writer = FileWriter::try_new(
-            object_store
-                .create(&Path::from(path.to_str().unwrap()))
-                .await
-                .unwrap(),
+            object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
         )
@@ -1367,10 +1325,7 @@ mod tests {
         let fs = FsFixture::default();
         let file_scheduler = fs
             .scheduler
-            .open_file(
-                &Path::from(path.to_str().unwrap()),
-                &CachedFileSize::unknown(),
-            )
+            .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
@@ -1421,7 +1376,7 @@ mod tests {
         };
 
         let fs = FsFixture::default();
-        let path = fs.tmp_path.child("large_page_test.lance");
+        let path = fs.tmp_path;
 
         let mut writer = FileWriter::try_new(
             fs.object_store.create(&path).await.unwrap(),

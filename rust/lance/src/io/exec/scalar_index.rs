@@ -768,6 +768,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
         scalar::{
@@ -776,7 +777,6 @@ mod tests {
         },
         DatasetIndexExt, IndexType,
     };
-    use tempfile::{tempdir, TempDir};
 
     use crate::{
         io::exec::scalar_index::MaterializeIndexExec,
@@ -788,12 +788,12 @@ mod tests {
 
     struct TestFixture {
         dataset: Arc<Dataset>,
-        _tmp_dir_guard: TempDir,
+        _tmp_dir_guard: TempStrDir,
     }
 
     async fn test_fixture() -> TestFixture {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())

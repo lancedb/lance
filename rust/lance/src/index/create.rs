@@ -383,9 +383,9 @@ mod tests {
     use arrow_array::RecordBatchIterator;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use std::sync::Arc;
-    use tempfile::tempdir;
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
@@ -421,8 +421,8 @@ mod tests {
         // 5. Verify IndexMetadata contains correct fragment_bitmap
 
         // Create temporary directory for dataset
-        let tmpdir = tempdir().unwrap();
-        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
 
         // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 10);
@@ -494,8 +494,8 @@ mod tests {
         // 4. Verify the final index is properly created and accessible
 
         // Create temporary directory for dataset
-        let tmpdir = tempdir().unwrap();
-        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
 
         // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 15);

@@ -43,6 +43,7 @@ use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     pyclass, pyfunction, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
 };
+use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
@@ -412,9 +413,19 @@ pub async fn object_store_from_uri_or_path(
             return Ok((object_store, child_path));
         }
     }
-    let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
-        PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
-    })?;
+    let regex = Regex::new(r".:\\").unwrap();
+    let adjusted_path;
+    let uri_or_path: &str = if regex.is_match(uri_or_path.as_ref()) {
+        // Windows paths like C:\ currently do not get handled correctly by
+        // Path::parse (https://github.com/apache/arrow-rs-object-store/issues/499)
+        // and we need to change the first \ into a /
+        adjusted_path = uri_or_path.as_ref().to_string().replacen("\\", "/", 1);
+        adjusted_path.as_str()
+    } else {
+        uri_or_path.as_ref()
+    };
+    let path = Path::parse(uri_or_path)
+        .map_err(|e| PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e)))?;
     let object_store = Arc::new(ObjectStore::local());
     Ok((object_store, path))
 }
