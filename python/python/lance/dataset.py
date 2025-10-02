@@ -2790,58 +2790,6 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
 
-            if (
-                pq_codebook is None
-                and accelerator is not None
-                and "precomputed_partitions_file" in kwargs
-                and not one_pass_ivfpq
-            ):
-                LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
-                partitions_file = kwargs["precomputed_partitions_file"]
-                del kwargs["precomputed_partitions_file"]
-
-                partitions_ds = LanceDataset(partitions_file)
-                # Use accelerator to train pq codebook
-                from .vector import (
-                    compute_pq_codes,
-                    train_pq_codebook_on_accelerator,
-                )
-
-                timers["pq_train:start"] = time.time()
-                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
-                    partitions_ds,
-                    metric,
-                    accelerator=accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    dtype=element_type.to_pandas_dtype(),
-                )
-                timers["pq_train:end"] = time.time()
-                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
-                LOGGER.info("pq training time: %ss", pq_train_time)
-                timers["pq_assign:start"] = time.time()
-                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
-                    partitions_ds,
-                    kmeans_list,
-                    batch_size=20480,
-                )
-                timers["pq_assign:end"] = time.time()
-                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
-                LOGGER.info("pq transform time: %ss", pq_assign_time)
-                # Save disk space
-                if precomputed_partition_dataset is not None and os.path.exists(
-                    partitions_file
-                ):
-                    LOGGER.info(
-                        "Temporary partitions file stored at %s,"
-                        "you may want to delete it.",
-                        partitions_file,
-                    )
-
-                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                    shuffle_output_dir, "data"
-                )
-
             if pq_codebook is not None:
                 # User provided IVF centroids
                 if _check_for_numpy(pq_codebook) and isinstance(
