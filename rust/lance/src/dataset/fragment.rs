@@ -2652,8 +2652,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_update() {
-        let test_dir1 = tempdir().unwrap();
-        let test_uri1 = test_dir1.path().to_str().unwrap();
+        let test_dir1 = TempStrDir::default();
+        let test_uri1 = &test_dir1;
         let mut dataset1 = create_dataset_v2(test_uri1).await;
         let _ = dataset1
             .add_columns(
@@ -2663,8 +2663,8 @@ mod tests {
             )
             .await;
         let mut fragment1 = dataset1.get_fragment(0).unwrap();
-        let test_dir2 = tempdir().unwrap();
-        let test_uri2 = test_dir2.path().to_str().unwrap();
+        let test_dir2 = TempStrDir::default();
+        let test_uri2 = &test_dir2;
         let mut dataset2 = create_dataset_v2(test_uri2).await;
         let _ = dataset2
             .add_columns(
