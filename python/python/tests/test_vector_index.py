@@ -1238,6 +1238,53 @@ def test_vector_with_nans(tmp_path: Path):
     assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
 
 
+@pytest.mark.parametrize("special_value", [np.nan, np.inf, 0.0])
+def test_most_vectors_contain_special_values(tmp_path: Path, special_value):
+    DIM = 32
+
+    def generate_table(num_rows: int, num_special: int):
+        rng = np.random.default_rng(7)
+        mat = rng.standard_normal((num_rows, DIM)).astype(np.float32)
+        mat[:num_special, :] = special_value
+        values = pa.array(mat.reshape(-1), type=pa.float32())
+        fsl = pa.FixedSizeListArray.from_arrays(values, DIM)
+        tbl = pa.Table.from_pydict({"vector": fsl})
+        return tbl
+
+    # we require at least 256 valid vectors for training the index
+    ds = lance.write_dataset(generate_table(1000, 1000 - 256), tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=2,
+        num_sub_vectors=4,
+    )
+
+    ds = lance.write_dataset(
+        generate_table(1000, 1000 - 255), tmp_path, mode="overwrite"
+    )
+    if special_value == 0.0:
+        # we can still create the index with zero vectors if the metric is not cosine
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=2,
+            num_sub_vectors=4,
+        )
+    with pytest.raises(
+        Exception, match="Not enough rows to train PQ. Requires 256 rows"
+    ):
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            metric="cosine",
+            num_partitions=2,
+            num_sub_vectors=4,
+            replace=True,
+        )
+
+
 def test_validate_vector_index(tmp_path: Path):
     # make sure the sanity check is correctly catchting issues
     ds = lance.write_dataset(create_table(), tmp_path)
