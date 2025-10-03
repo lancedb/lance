@@ -787,7 +787,6 @@ mod tests {
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
-    use lance_io::object_writer::ObjectWriter;
     use lance_io::utils::CachedFileSize;
 
     #[tokio::test]
