@@ -96,11 +96,9 @@ import "google/protobuf/empty.proto";
 //
 // ## Data Pages
 //
-// A lot of flexibility is provided in how data is stored.  Note that the file
-// layout has no explicit notion of a page (however, it is a part of the column
-// metadata).  A page's buffers do not strictly need to be contiguous on the
-// disk.  However, it is recommended that buffers within a page be grouped
-// together for best performance.
+// A lot of flexibility is provided in how data is stored.  A page's buffers do
+// not strictly need to be contiguous on the disk.  However, it is recommended
+// that buffers within a page be grouped together for best performance.
 //
 // Data pages should be large.  The only time a page should be written to disk
 // is when the writer needs to flush the page to disk because it has accumulated

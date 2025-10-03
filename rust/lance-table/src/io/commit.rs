@@ -1117,6 +1117,8 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::tempfile::TempObjDir;
+
     use super::*;
 
     #[test]
@@ -1208,12 +1210,11 @@ mod tests {
         let (object_store, base) = if lexical_list_store {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
-            tempdir = Some(tempfile::tempdir().unwrap());
-            let base = Path::from_absolute_path(tempdir.as_ref().unwrap().path().to_str().unwrap())
-                .unwrap();
+            tempdir = TempObjDir::default();
+            let path = tempdir.child("base");
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
-            (store, base)
+            (store, path)
         };
 
         // Write 12 manifest files, latest first

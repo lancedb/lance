@@ -770,18 +770,16 @@ pub mod tests {
     use arrow_schema::{Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
         // Create a temporary directory for the index
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -890,10 +888,8 @@ pub mod tests {
         use lance_core::cache::LanceCache;
         use lance_core::utils::mask::RowIdTreeMap;
         use lance_io::object_store::ObjectStore;
-        use object_store::path::Path;
         use std::collections::HashMap;
         use std::sync::Arc;
-        use tempfile::tempdir;
 
         // Adjust these numbers so that:
         //     m * (serialized size per bitmap) > 2^31 bytes.
@@ -913,10 +909,10 @@ pub mod tests {
         }
 
         // Create a temporary store.
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         );
 
@@ -1022,10 +1018,10 @@ pub mod tests {
     #[tokio::test]
     async fn test_bitmap_prewarm() {
         // Create a temporary directory for the index
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1122,10 +1118,10 @@ pub mod tests {
         use arrow_array::UInt32Array;
 
         // Create a temporary store.
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

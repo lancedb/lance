@@ -2,17 +2,90 @@
 
 ## File Structure
 
-Each `.lance` file is the container for the actual data.
+A Lance file is a container for tabular data. The data is stored in "disk pages". Each disk page contains some rows
+for a single column. There may be one or more disk pages per column. Different columns may have different numbers of
+disk pages. Metadata at the end of the file describes where the pages are located and how the data is encoded.
 
-![Format Overview](../../images/format_overview.png)
+![Format Overview](../../images/file_high_level_overview.png)
 
-At the tail of the file, `ColumnMetadata` protobuf blocks are used to describe the encoding of the columns in the file.
+!!! Note
 
-```protobuf
-%%% proto.message.ColumnMetadata %%%
-```
+    This page describes the container specification. We also have a set of default encodings that are used to encode
+    data into disk pages. See the [Encoding Strategy](encoding.md) page for more details.
 
-A `Footer` describes the overall layout of the file. The entire file layout is described here:
+### Disk Pages
+
+Disk pages are designed to be large enough to justify a dedicated I/O operation, even on cloud storage, typically several megabytes. Using a larger page size may reduce the number of I/O operations required to read a file, but it also increases the amount of memory required to write the file. In practice, very large page sizes are not useful when high speed reads are required because large contiguous reads need to be broken into smaller reads for performance (particularly on cloud storage). As a result, a default of 8MB is recommended for the page size and should yield ideal performance on all storage systems.
+
+Disk pages should not generally be opaque. It is possible to read a portion of a disk page when a subset of the rows are
+required. However, the specifics of this process depend on the column encoding which is described in a later section.
+
+### No Row Groups
+
+Unlike similar formats, there is no "row group" concept, only pages. We believe the concept of row groups to be
+fundamentally harmful to performance. If the row group size is too small then columns will be split into "runt pages" which yield poor read performance on cloud storage. If the row group size is too large then a file writer will need
+a large amount of RAM since an entire row group must be buffered in memory before it can be written. Instead, to split
+a file amongst multiple readers we rely on the fact that partial page reads are possible and have minimal read
+amplification. As a result, you can split the file at whatever row boundary you want.
+
+### Buffer Alignment
+
+The file format does not require that buffers be contiguous as buffers are referenced by absolute offsets. In practice,
+we always align buffers to 64 byte boundaries.
+
+### External Buffers
+
+Every page in the file is referenced by an absolute offset. This means that non-page data may be inserted amongst the
+pages. This can be useful for storing extremely large data types which might only fit a few rows per page otherwise. We
+can instead store the data out-of-line and store the locations in a page.
+
+In addition, the file format supports "global buffers" which can be used for auxiliary data. This may be used to
+store a file schema, file indexes, column statistics, or other metadata. References to the global buffers are stored
+in a special spot in the footer.
+
+### Column Descriptors
+
+At the tail of the file is metadata that describes each page in the file, particularly the encoding strategy used.
+This metadata consists of a series of "column descriptors", which are standalone protobuf messages for each column
+in the file. Since each column has its own message there is no need to read all file metadata if you are only interested
+in a subset of the columns. However, in many cases, the column descriptors are small enough that it is cheaper to read
+the entire footer in a single read than split it into multiple reads.
+
+### Offsets & Footer
+
+After the column descriptors there are offset arrays for the column descriptors and global buffers. These simply
+point to the locations of each item. Finally, there is a fixed-size footer which describes the position of the
+offset arrays and start of the metadata section.
+
+### Identifiers and Type Systems
+
+This basic container format has no concept of types. These are added later by the encoding layer. All columns are
+referenced by an integer "column index". All global buffers are referenced by an integer "global buffer index".
+The schema is typically stored in the global buffers, but the file format is unaware of this.
+
+## Reading Strategy
+
+The file metadata will need to be known before reading the data. A simple approach for loading the footer is to
+read one sector from the end (sector depends on the filesystem, 4KiB for local disk, larger for cloud storage). Then
+parse the footer and read the rest of the metadata (at this point the size will be known). This requires 1-2 IOPS. By
+storing the metadata size in some other location (e.g. table manifest) it is possible to always read the footer in
+a single IOP. If there are _many_ columns in the file and only some are desired then it may be better to read
+individual columns instead of reading all column metadata, increasing the number of IOPS but decreasing the amount
+of data read.
+
+Next, to read the data, scan through the pages for each column to determine which pages are needed. Each page stores
+the row offset of the first row in the page. This makes it easy to quickly determine the required pages. The encoding
+information for the page can then be used to determine exactly which byte ranges are needed from the page.
+
+Disk pages should be large enough that there should no significant benefit to sequentially reading the file. However,
+if such a use case is desired then the file can be read sequentially once the metadata is known, assuming you want to
+read all columns in the file.
+
+## Detailed Overview
+
+![Format Overview](../../images/file_overview.png)
+
+A detailed description of the file layout follows:
 
 ```protobuf
 // Note: the number of buffers (BN) is independent of the number of columns (CN)
@@ -22,13 +95,13 @@ A `Footer` describes the overall layout of the file. The entire file layout is d
 //       working with SIMD operations.  4096-byte alignment is common when
 //       working with direct I/O.  In order to ensure these buffers are aligned
 //       writers may need to insert padding before the buffers.
-//       
+//
 //       If direct I/O is required then most (but not all) fields described
 //       below must be sector aligned.  We have marked these fields with an
 //       asterisk for clarity.  Readers should assume there will be optional
 //       padding inserted before these fields.
 //
-//       All footer fields are unsigned integers written with  little endian
+//       All footer fields are unsigned integers written with little endian
 //       byte order.
 //
 // ├──────────────────────────────────┤
@@ -71,55 +144,10 @@ A `Footer` describes the overall layout of the file. The entire file layout is d
 // File Layout-End
 ```
 
-## File Version
+### Column Metadata
 
-The Lance file format has gone through a number of changes including a breaking change from version 1 to version 2.
-There are a number of APIs that allow the file version to be specified.
-Using a newer version of the file format will lead to better compression and/or performance.
-However, older software versions may not be able to read newer files.
+The protobuf messages for the column metadata are as follows:
 
-In addition, the latest version of the file format (next) is unstable and should not be used for production use cases.
-Breaking changes could be made to unstable encodings and that would mean that files written with these encodings are
-no longer readable by any newer versions of Lance. The `next` version should only be used for experimentation and
-benchmarking upcoming features.
-
-The following values are supported:
-
-| Version        | Minimal Lance Version | Maximum Lance Version | Description                                                                                                                                  |
-| -------------- | --------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0.1            | Any                   | Any                   | This is the initial Lance format.                                                                                                            |
-| 2.0            | 0.16.0                | Any                   | Rework of the Lance file format that removed row groups and introduced null support for lists, fixed size lists, and primitives              |
-| 2.1 (unstable) | None                  | Any                   | Enhances integer and string compression, adds support for nulls in struct fields, and improves random access performance with nested fields. |
-| legacy         | N/A                   | N/A                   | Alias for 0.1                                                                                                                                |
-| stable         | N/A                   | N/A                   | Alias for the latest stable version (currently 2.0)                                                                                          |
-| next           | N/A                   | N/A                   | Alias for the latest unstable version (currently 2.1)                                                                                        |
-
-## File Encodings
-
-Lance supports a variety of encodings for different data types.
-The encodings are chosen to give both random access and scan performance.
-Encodings are added over time and may be extended in the future.
-The manifest records a max format version which controls which encodings will be used.
-This allows for a gradual migration to a new data format so that old readers can still read new data while a migration is in progress.
-
-Encodings are divided into "field encodings" and "array encodings".
-Field encodings are consistent across an entire field of data,
-while array encodings are used for individual pages of data within a field.
-Array encodings can nest other array encodings (e.g. a dictionary encoding can bitpack the indices)
-however array encodings cannot nest field encodings.
-For this reason data types such as `Dictionary<UInt8, List<String>>`
-are not yet supported (since there is no dictionary field encoding)
-
-### Encodings Available
-
-| Encoding Name   | Encoding Type  | What it does                                                                                                                                | Supported Versions | When it is applied                                                                      |
-| --------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | --------------------------------------------------------------------------------------- |
-| Basic struct    | Field encoding | Encodes non-nullable struct data                                                                                                            | >= 2.0             | Default encoding for structs                                                            |
-| List            | Field encoding | Encodes lists (nullable or non-nullable)                                                                                                    | >= 2.0             | Default encoding for lists                                                              |
-| Basic Primitive | Field encoding | Encodes primitive data types using separate validity array                                                                                  | >= 2.0             | Default encoding for primitive data types                                               |
-| Value           | Array encoding | Encodes a single vector of fixed-width values                                                                                               | >= 2.0             | Fallback encoding for fixed-width types                                                 |
-| Binary          | Array encoding | Encodes a single vector of variable-width data                                                                                              | >= 2.0             | Fallback encoding for variable-width types                                              |
-| Dictionary      | Array encoding | Encodes data using a dictionary array and an indices array which is useful for large data types with few unique values                      | >= 2.0             | Used on string pages with fewer than 100 unique elements                                |
-| Packed struct   | Array encoding | Encodes a struct with fixed-width fields in a row-major format making random access more efficient                                          | >= 2.0             | Only used on struct types if the field metadata attribute `"packed"` is set to `"true"` |
-| Fsst            | Array encoding | Compresses binary data by identifying common substrings (of 8 bytes or less) and encoding them as symbols                                   | >= 2.1             | Used on string pages that are not dictionary encoded                                    |
-| Bitpacking      | Array encoding | Encodes a single vector of fixed-width values using bitpacking which is useful for integral types that do not span the full range of values | >= 2.1             | Used on integral types                                                                  |
+```protobuf
+%%% proto.message.ColumnMetadata %%%
+```

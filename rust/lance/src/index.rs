@@ -1623,6 +1623,7 @@ mod tests {
     };
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
@@ -1634,7 +1635,6 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
     use std::collections::HashSet;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_recreate_index() {
@@ -1661,8 +1661,8 @@ mod tests {
         )
         .unwrap()];
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
@@ -1710,14 +1710,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_index() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let schema = Schema::new(vec![
             sample_vector_field(),
             Field::new("ints", DataType::Int32, false),
         ]);
         let mut dataset = lance_datagen::rand(&schema)
             .into_dataset(
-                test_dir.path().to_str().unwrap(),
+                &test_dir,
                 FragmentCount::from(1),
                 FragmentRowCount::from(256),
             )
@@ -1764,7 +1764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_index_rows() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 16;
         let column_name = "vec";
         let field = sample_vector_field();
@@ -1779,7 +1779,7 @@ mod tests {
 
         let reader =
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -1999,7 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_ivf_hnsw_sq_delta_indices() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 16;
         let column_name = "vec";
         let field = Field::new(
@@ -2024,7 +2024,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let ivf_params = IvfBuildParams::default();
@@ -2103,15 +2103,13 @@ mod tests {
     async fn test_optimize_fts(#[values(false, true)] with_position: bool) {
         let words = ["apple", "banana", "cherry", "date"];
 
-        let dir = tempdir().unwrap();
+        let dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batch_iterator, &dir, None).await.unwrap();
 
         let params = InvertedIndexParams::default()
             .lower_case(false)
@@ -2296,7 +2294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_too_small_for_pq() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 1536;
 
         let field = Field::new(
@@ -2319,7 +2317,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(1, 8, 96, DistanceType::L2, 1);
@@ -2338,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_bitmap_index() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let field = Field::new("tag", DataType::Utf8, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
@@ -2348,7 +2346,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset
             .create_index(
@@ -2382,7 +2380,7 @@ mod tests {
             ..Default::default()
         };
 
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let field = Field::new("tag", DataType::Utf8, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
@@ -2392,7 +2390,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -2756,7 +2754,8 @@ mod tests {
         // Use test data created with Lance 0.29.0 (before created_at field was added)
         let test_dir =
             copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
@@ -3345,8 +3344,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_shallow_clone_with_index() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create a schema with both vector and scalar columns
         let dimensions = 16u32;
@@ -3414,8 +3413,8 @@ mod tests {
         let mut current_dataset = dataset;
 
         for round in 1..=clone_rounds {
-            let round_clone_dir = test_dir.path().join(format!("clone_round_{}", round));
-            let round_cloned_uri = round_clone_dir.to_str().unwrap();
+            let round_clone_dir = format!("{}/clone_round_{}", test_dir, round);
+            let round_cloned_uri = &round_clone_dir;
             let tag_name = format!("shallow_clone_test_{}", round);
 
             // Create tag for this round (use current dataset for chain cloning)
@@ -3695,16 +3694,16 @@ mod tests {
     async fn test_initialize_indices() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use std::collections::HashSet;
-        use tempfile::tempdir;
 
         // Create source dataset with various index types
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Generate test data using lance_datagen (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -3845,14 +3844,14 @@ mod tests {
     async fn test_initialize_indices_with_missing_field() {
         use crate::dataset::Dataset;
         use arrow_array::types::Int32Type;
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
-        use tempfile::tempdir;
 
         // Test that initialize_indices handles missing fields gracefully
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Create source dataset with extra field
         let source_reader = lance_datagen::gen_batch()
@@ -3899,14 +3898,14 @@ mod tests {
         use crate::dataset::Dataset;
         use crate::index::vector::VectorIndexParams;
         use arrow_array::types::{Float32Type, Int32Type};
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
         use lance_linalg::distance::MetricType;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Create source dataset (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -4082,8 +4081,8 @@ mod tests {
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // Test creating index on nested field with dots using quoted syntax
@@ -4187,8 +4186,8 @@ mod tests {
     #[tokio::test]
     async fn test_btree_index_on_nested_field_with_dots() {
         // Test creating BTree index on nested field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested field containing dots
         let schema = Arc::new(Schema::new(vec![
@@ -4298,8 +4297,8 @@ mod tests {
     #[tokio::test]
     async fn test_bitmap_index_on_nested_field_with_dots() {
         // Test creating Bitmap index on nested field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested field containing dots - using low cardinality for bitmap
         let schema = Arc::new(Schema::new(vec![
@@ -4408,8 +4407,8 @@ mod tests {
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 
         // Test creating Inverted index on nested text field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested text field containing dots
         let schema = Arc::new(Schema::new(vec![

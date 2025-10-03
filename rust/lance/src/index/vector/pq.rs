@@ -626,7 +626,7 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
-    use tempfile::tempdir;
+    use lance_core::utils::tempfile::TempStrDir;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowIdMask;
@@ -663,8 +663,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_l2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
 
@@ -694,8 +694,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_cosine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 

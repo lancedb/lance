@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
+use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -26,7 +27,6 @@ use object_store::{
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tempfile::{tempdir, TempDir};
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -692,7 +692,7 @@ impl DatagenExt for BatchGeneratorBuilder {
 }
 
 pub struct NoContextTestFixture {
-    _tmp_dir: TempDir,
+    _tmp_dir: TempStrDir,
     pub dataset: Dataset,
 }
 
@@ -703,14 +703,17 @@ impl NoContextTestFixture {
             .unwrap();
 
         runtime.block_on(async move {
-            let tempdir = tempdir().unwrap();
-            let tmppath = tempdir.path().to_str().unwrap();
+            let tempdir = TempStrDir::default();
             let dataset = lance_datagen::gen_batch()
                 .col(
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
                 )
-                .into_dataset(tmppath, FragmentCount::from(4), FragmentRowCount::from(100))
+                .into_dataset(
+                    tempdir.as_str(),
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(100),
+                )
                 .await
                 .unwrap();
             Self {
@@ -751,9 +754,9 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     src.push("../../test_data");
     src.push(table_path);
 
-    let test_dir = tempdir().unwrap();
+    let test_dir = TempDir::default();
 
-    copy_dir_all(src.as_path(), test_dir.path())?;
+    copy_dir_all(src.as_path(), test_dir.std_path())?;
 
     Ok(test_dir)
 }
@@ -838,9 +841,12 @@ pub async fn assert_plan_node_equals(
 mod tests {
     use std::sync::Arc;
 
+    use crate::dataset::WriteDestination;
+
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+    use lance_core::utils::tempfile::TempStrDir;
     use rstest::rstest;
 
     #[rstest]
@@ -894,7 +900,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let struct_fields: ArrowFields = vec![
             ArrowField::new("f1", DataType::Utf8, true),
@@ -928,13 +934,7 @@ mod tests {
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
             let fragment = generator
-                .make_fragment(
-                    tmp_dir.path().to_str().unwrap(),
-                    &data,
-                    &schema,
-                    &mut rng,
-                    2,
-                )
+                .make_fragment(tmp_dir.as_str(), &data, &schema, &mut rng, 2)
                 .await;
 
             assert!(fragment.files.len() > 1, "Expected multiple files");
@@ -945,8 +945,17 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
-            assert_ne!(field_ids_frags, field_ids);
+            let mut field_ids = schema
+                .fields_pre_order()
+                .filter_map(|f| {
+                    if data_storage_version < LanceFileVersion::V2_1 || f.children.is_empty() {
+                        Some(f.id)
+                    } else {
+                        // In 2.1+, struct / list fields don't have their own column
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);
@@ -959,7 +968,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
@@ -990,11 +999,11 @@ mod tests {
         let seed = 42;
         let generator = TestDatasetGenerator::new(data.clone(), data_storage_version).seed(seed);
 
-        let path = tmp_dir.path().join("ds1");
-        let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+        let path = format!("{}/ds1", tmp_dir.as_str());
+        let dataset = generator.make_hostile(&path).await;
 
-        let path2 = tmp_dir.path().join("ds2");
-        let dataset2 = generator.make_hostile(path2.to_str().unwrap()).await;
+        let path2 = format!("{}/ds2", tmp_dir.as_str());
+        let dataset2 = generator.make_hostile(&path2).await;
 
         // Given the same seed, should produce the same layout.
         assert_eq!(dataset.schema(), dataset2.schema());
@@ -1013,8 +1022,8 @@ mod tests {
             let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
-                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
-                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+                let path = format!("{}/test_ds_{}_{}", tmp_dir.as_str(), num_cols, i);
+                let dataset = generator.make_hostile(&path).await;
 
                 let field_structure = get_field_structure(&dataset);
 
@@ -1024,6 +1033,12 @@ mod tests {
                     assert_ne!(field_structure[0], field_structure[1]);
                 }
             }
+        }
+    }
+
+    impl<'a> From<&'a TempStrDir> for WriteDestination<'a> {
+        fn from(value: &'a TempStrDir) -> Self {
+            WriteDestination::Uri(value.as_str())
         }
     }
 }

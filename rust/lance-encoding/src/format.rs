@@ -323,6 +323,12 @@ impl ProtobufUtils21 {
         }
     }
 
+    pub fn constant(value: Option<bytes::Bytes>) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Constant(pb21::Constant { value })),
+        }
+    }
+
     pub fn fsl(
         items_per_value: u64,
         has_validity: bool,

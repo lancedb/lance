@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{env, path::PathBuf};
-
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
+use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 
+pub mod lance_tokenizer;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
@@ -20,10 +20,18 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+    JsonTokenizer, LanceTokenizer, TextTokenizer,
+};
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
+    /// lance tokenizer takes care of different data types, such as text, json, etc.
+    /// - 'text': parsing input documents into tokens
+    /// - 'json': parsing input json string into tokens
+    /// - default: text
+    pub(crate) lance_tokenizer: Option<String>,
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
@@ -133,6 +141,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
+            lance_tokenizer: Some("text".to_owned()),
             base_tokenizer,
             language,
             with_position: false,
@@ -145,6 +154,11 @@ impl InvertedIndexParams {
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
         }
+    }
+
+    pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
+        self.lance_tokenizer = Some(lance_tokenizer);
+        self
     }
 
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
@@ -217,7 +231,7 @@ impl InvertedIndexParams {
         self
     }
 
-    pub fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzer> {
+    pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
@@ -246,7 +260,20 @@ impl InvertedIndexParams {
         if self.ascii_folding {
             builder = builder.filter_dynamic(tantivy::tokenizer::AsciiFoldingFilter);
         }
-        Ok(builder.build())
+        let tokenizer = builder.build();
+
+        match self.lance_tokenizer {
+            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
+            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
+            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+            _ => Err(Error::invalid_input(
+                format!(
+                    "unknown lance tokenizer {}",
+                    self.lance_tokenizer.as_ref().unwrap()
+                ),
+                location!(),
+            )),
+        }
     }
 
     fn build_base_tokenizer(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {

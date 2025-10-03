@@ -1298,10 +1298,12 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{stream, StreamExt};
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
+    use lance_core::{
+        cache::LanceCache,
+        utils::{mask::RowIdTreeMap, tempfile::TempObjDir},
+        ROW_ADDR,
+    };
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     use crate::scalar::{
         bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
@@ -1336,10 +1338,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1379,10 +1381,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1449,10 +1451,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_fragments_bloomfilter() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1536,10 +1538,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_nan_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1634,10 +1636,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_complex_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1724,10 +1726,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_string_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1804,10 +1806,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1872,10 +1874,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_data_types_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1934,10 +1936,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_timestamp_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1993,10 +1995,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_timestamp_types_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2073,10 +2075,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_time_types_bloomfilter_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2129,10 +2131,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_bloomfilter_supported_operations() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

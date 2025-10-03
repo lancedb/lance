@@ -530,6 +530,7 @@ mod tests {
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
     use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
@@ -540,7 +541,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
     use tokio::sync::Barrier;
 
     /// Returns a dataset with 3 fragments, each with 10 rows.
@@ -551,7 +551,7 @@ mod tests {
     async fn make_test_dataset(
         version: LanceFileVersion,
         enable_stable_row_ids: bool,
-    ) -> (Arc<Dataset>, TempDir) {
+    ) -> (Arc<Dataset>, TempStrDir) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -574,8 +574,8 @@ mod tests {
             ..Default::default()
         };
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
         let ds = Dataset::write(batches, test_uri, Some(write_params))

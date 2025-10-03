@@ -562,11 +562,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::OnMissing, ROW_ID};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
 
     use crate::{
         dataset::WriteParams,
@@ -576,7 +576,7 @@ mod tests {
 
     struct TestFixture {
         dataset: Arc<Dataset>,
-        _tmp_dir_guard: TempDir,
+        _tmp_dir_guard: TempStrDir,
     }
 
     async fn test_fixture() -> TestFixture {
@@ -617,8 +617,8 @@ mod tests {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let params = WriteParams {
             max_rows_per_file: 10,
             ..Default::default()

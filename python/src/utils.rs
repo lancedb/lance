@@ -20,8 +20,8 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::datatypes::Schema;
 use lance::Result;
-use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
@@ -32,7 +32,6 @@ use lance_index::vector::kmeans::{
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
 use pyo3::intern;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -41,6 +40,7 @@ use pyo3::{
     IntoPyObjectExt,
 };
 
+use crate::file::object_store_from_uri_or_path;
 use crate::RT;
 
 #[pyclass(name = "_KMeans")]
@@ -218,8 +218,8 @@ impl Hnsw {
 
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
-        let object_store = ObjectStore::local();
-        let path = Path::parse(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let (object_store, path) =
+            RT.block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
         let mut writer = RT
             .block_on(
                 Some(py),

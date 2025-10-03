@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use futures::TryStreamExt;
-use lance_core::{cache::LanceCache, datatypes::Schema};
+use lance_core::{cache::LanceCache, datatypes::Schema, utils::tempfile::TempObjFile};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
@@ -14,31 +14,24 @@ use lance_io::{
     utils::CachedFileSize,
     ReadBatchParams,
 };
-use object_store::path::Path;
-use tempfile::TempDir;
 
 use crate::v2::reader::{FileReader, FileReaderOptions};
 
 use super::writer::{FileWriter, FileWriterOptions};
 
 pub struct FsFixture {
-    _tmp_dir: TempDir,
-    pub tmp_path: Path,
+    pub tmp_path: TempObjFile,
     pub object_store: Arc<ObjectStore>,
     pub scheduler: Arc<ScanScheduler>,
 }
 
 impl Default for FsFixture {
     fn default() -> Self {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
-        let tmp_path = Path::parse(tmp_path).unwrap();
-        let tmp_path = tmp_path.child("some_file.lance");
+        let tmp_path = TempObjFile::default();
         let object_store = Arc::new(ObjectStore::local());
         let scheduler =
             ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
         Self {
-            _tmp_dir: tmp_dir,
             object_store,
             tmp_path,
             scheduler,

@@ -20,7 +20,7 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::cache::LanceCache;
+    use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
@@ -189,9 +189,9 @@ mod test {
         }
 
         let make_idx = move |assert_query: Vec<f32>, metric: MetricType| async move {
-            let f = tempfile::NamedTempFile::new().unwrap();
+            let f = TempStdFile::default();
 
-            let reader = LocalObjectReader::open_local_path(f.path(), 64, None)
+            let reader = LocalObjectReader::open_local_path(f, 64, None)
                 .await
                 .unwrap();
 

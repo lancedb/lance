@@ -655,7 +655,7 @@ mod tests {
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
-    use tempfile::{tempdir, TempDir};
+    use lance_core::utils::tempfile::TempStrDir;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -721,7 +721,7 @@ mod tests {
     struct MockDatasetFixture<'a> {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempDir,
+        _tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
         pub clock: MockClock<'a>,
@@ -729,12 +729,12 @@ mod tests {
 
     impl MockDatasetFixture<'_> {
         fn try_new() -> Result<Self> {
-            let tmpdir = tempdir()?;
-            // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
-            let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
+            let tmpdir = TempStrDir::default();
+            let tmpdir_path = tmpdir.as_str();
+            let dataset_path = format!("{}/my_db", tmpdir_path);
             Ok(Self {
                 _tmpdir: tmpdir,
-                dataset_path: format!("{}/my_db", tmpdir_path),
+                dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
                 clock: MockClock::new(),
             })

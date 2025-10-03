@@ -97,16 +97,24 @@ impl KeepFiniteVectors {
     }
 }
 
-fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
+// We compute L2 distance for f16 in f32 space, so f16 vectors will not overflow.
+const MAX_VIABLE_VALUE_F16: half::f16 = half::f16::MAX;
+// The maximum viable value we can compute f32 l2 distance with on vectors < 10_000 dimensions.
+// (f32::MAX / 40_000.0).sqrt() // Only date we can do this with a const fn.
+const MAX_VIABLE_VALUE_F32: f32 = 9.2e+16;
+// We cast final distance to f32, so f64 vectors have the same limit as f32.
+const MAX_VIABLE_VALUE_F64: f64 = MAX_VIABLE_VALUE_F32 as f64;
+
+fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array, max_value: T::Native) -> bool
 where
     T::Native: Float,
 {
     arr.null_count() == 0
-        && !arr
+        && arr
             .as_primitive::<T>()
             .values()
             .iter()
-            .any(|&v| !v.is_finite())
+            .all(|&v| v.abs() <= max_value)
 }
 
 impl Transformer for KeepFiniteVectors {
@@ -135,9 +143,12 @@ impl Transformer for KeepFiniteVectors {
         data.iter().enumerate().for_each(|(idx, arr)| {
             if let Some(data) = arr {
                 let is_valid = match data.data_type() {
-                    DataType::Float16 => is_all_finite::<Float16Type>(&data),
-                    DataType::Float32 => is_all_finite::<Float32Type>(&data),
-                    DataType::Float64 => is_all_finite::<Float64Type>(&data),
+                    // f16 vectors are computed in f32 space, so they will not overflow.
+                    DataType::Float16 => is_all_finite::<Float16Type>(&data, MAX_VIABLE_VALUE_F16),
+                    // f32 vectors must be bounded to avoid overflow in distance computation.
+                    DataType::Float32 => is_all_finite::<Float32Type>(&data, MAX_VIABLE_VALUE_F32),
+                    // f32 vectors are computed in f32 space, so they have the same limit as f64.
+                    DataType::Float64 => is_all_finite::<Float64Type>(&data, MAX_VIABLE_VALUE_F64),
                     DataType::UInt8 => data.null_count() == 0,
                     DataType::Int8 => data.null_count() == 0,
                     _ => false,
@@ -240,6 +251,7 @@ mod tests {
     use arrow_schema::Schema;
     use half::f16;
     use lance_arrow::*;
+    use lance_linalg::distance::L2;
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {
@@ -349,5 +361,51 @@ mod tests {
 
         let dup_drop_result = transformer.transform(&output);
         assert!(dup_drop_result.is_ok());
+    }
+
+    #[test]
+    fn test_is_all_finite() {
+        let array = Float32Array::from(vec![1.0, 2.0]);
+        assert!(is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32));
+
+        let failure_values = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            MAX_VIABLE_VALUE_F32 * 2.0,
+            -MAX_VIABLE_VALUE_F32 * 2.0,
+        ];
+        for &v in &failure_values {
+            let array = Float32Array::from(vec![1.0, v]);
+            assert!(
+                !is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32),
+                "value {} should fail is_all_finite",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_finite_f16() {
+        let v1 = vec![MAX_VIABLE_VALUE_F16; 10_000];
+        let v2 = vec![-MAX_VIABLE_VALUE_F16; 10_000];
+        let distance = f16::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f32() {
+        let v1 = vec![MAX_VIABLE_VALUE_F32; 10_000];
+        let v2 = vec![-MAX_VIABLE_VALUE_F32; 10_000];
+        let distance = f32::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f64() {
+        let v1 = vec![MAX_VIABLE_VALUE_F64; 10_000];
+        let v2 = vec![-MAX_VIABLE_VALUE_F64; 10_000];
+        let distance = f64::l2(&v1, &v2);
+        assert!(distance.is_finite());
     }
 }

@@ -1,38 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::{fmt::Debug, sync::atomic::AtomicU64};
-
+use super::{
+    index::*,
+    merger::{Merger, SizeBasedMerger},
+    InvertedIndexParams,
+};
+use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::iter_str_array;
+use futures::{stream, Stream, StreamExt, TryStreamExt};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
+use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use tempfile::{tempdir, TempDir};
+use std::task::{Context, Poll};
+use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
-
-use super::{
-    index::*,
-    merger::{Merger, SizeBasedMerger},
-    InvertedIndexParams,
-};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -115,10 +118,10 @@ impl InvertedIndexBuilder {
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
     ) -> Self {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempDir::default();
         let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         let src_store = store.unwrap_or_else(|| local_store.clone());
@@ -139,6 +142,10 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
+        let schema = new_data.schema();
+        let doc_col = schema.field(0).name();
+        let new_data = document_input(new_data, doc_col)?;
+
         self.update_index(new_data).await?;
         self.write(dest_store).await?;
         Ok(())
@@ -146,23 +153,6 @@ impl InvertedIndexBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
-        let flatten_stream = stream.map(|batch| {
-            let batch = batch?;
-            let doc_col = batch.column(0);
-            match doc_col.data_type() {
-                datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => Ok(batch),
-                datatypes::DataType::List(_)   => {
-                    flatten_string_list::<i32>(&batch, doc_col)
-                }
-                datatypes::DataType::LargeList(_) => {
-                    flatten_string_list::<i64>(&batch, doc_col)
-                }
-                _ => {
-                   Err(Error::Index { message: format!("expect data type String, LargeString or List of String/LargeString, but got {}", doc_col.data_type()), location: location!() })
-                }
-            }
-        });
-
         let num_workers = *LANCE_FTS_NUM_SHARDS;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -198,7 +188,7 @@ impl InvertedIndexBuilder {
 
         let sender = Arc::new(sender);
 
-        let mut stream = Box::pin(flatten_stream.then({
+        let mut stream = Box::pin(stream.then({
             |batch_result| {
                 let sender = sender.clone();
                 async move {
@@ -523,7 +513,7 @@ impl InnerBuilder {
 
 struct IndexWorker {
     store: Arc<dyn IndexStore>,
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: Box<dyn LanceTokenizer>,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -537,7 +527,7 @@ struct IndexWorker {
 impl IndexWorker {
     async fn new(
         store: Arc<dyn IndexStore>,
-        tokenizer: tantivy::tokenizer::TextAnalyzer,
+        tokenizer: Box<dyn LanceTokenizer>,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
@@ -581,7 +571,7 @@ impl IndexWorker {
             let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
-                let mut token_stream = self.tokenizer.token_stream(doc);
+                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
@@ -778,7 +768,94 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
-pub fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
+/// Flatten the string list stream into a string stream
+pub struct FlattenStream {
+    /// Inner record batch stream with 2 columns:
+    /// 1. doc_col: List(Utf8) or List(LargeUtf8)
+    /// 2. row_id_col: UInt64
+    inner: SendableRecordBatchStream,
+    field_type: DataType,
+    data_type: DataType,
+}
+
+impl FlattenStream {
+    pub fn new(input: SendableRecordBatchStream) -> Self {
+        let schema = input.schema();
+        let field = schema.field(0);
+        let data_type = match field.data_type() {
+            DataType::List(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
+            DataType::List(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
+                DataType::LargeUtf8
+            }
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
+                DataType::LargeUtf8
+            }
+            _ => panic!(
+                "expect data type List(Utf8) or List(LargeUtf8) but got {:?}",
+                field.data_type()
+            ),
+        };
+        Self {
+            inner: input,
+            field_type: field.data_type().clone(),
+            data_type,
+        }
+    }
+}
+
+impl Stream for FlattenStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let doc_col = batch.column(0);
+                let batch = match self.field_type {
+                    DataType::List(_) => flatten_string_list::<i32>(&batch, doc_col).map_err(|e| {
+                        datafusion_common::error::DataFusionError::Execution(format!(
+                            "flatten string list error: {}",
+                            e
+                        ))
+                    }),
+                    DataType::LargeList(_) => {
+                        flatten_string_list::<i64>(&batch, doc_col).map_err(|e| {
+                            datafusion_common::error::DataFusionError::Execution(format!(
+                                "flatten string list error: {}",
+                                e
+                            ))
+                        })
+                    }
+                    _ => unreachable!(
+                        "expect data type List or LargeList but got {:?}",
+                        self.field_type
+                    ),
+                };
+                Poll::Ready(Some(batch))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for FlattenStream {
+    fn schema(&self) -> SchemaRef {
+        let schema = Schema::new(vec![
+            Field::new(
+                self.inner.schema().field(0).name(),
+                self.data_type.clone(),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]);
+
+        Arc::new(schema)
+    }
+}
+
+fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     batch: &RecordBatch,
     doc_col: &Arc<dyn Array>,
 ) -> Result<RecordBatch> {
@@ -1020,4 +1097,44 @@ async fn merge_metadata_files(
     }
 
     Ok(())
+}
+
+/// Convert input stream into a stream of documents.
+///
+/// The input stream must be one of:
+/// 1. Document in Utf8 or LargeUtf8 format.
+/// 2. Document in List(Utf8) or List(LargeUtf8) format.
+/// 3. Json document in LargeBinary format.
+pub fn document_input(
+    input: SendableRecordBatchStream,
+    column: &str,
+) -> Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let field = schema.column_with_name(column).expect_ok()?.1;
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::List(field) | DataType::LargeList(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Ok(Box::pin(FlattenStream::new(input)))
+        }
+        DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
+            Some(name) if name.as_str() == JSON_EXT_NAME => {
+                Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
+            }
+            _ => Err(Error::InvalidInput {
+                source: format!("column {} is not json", column).into(),
+                location: location!(),
+            }),
+        },
+        _ => Err(Error::InvalidInput {
+            source: format!(
+                "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
+                column,
+                field.data_type()
+            )
+            .into(),
+            location: location!(),
+        }),
+    }
 }

@@ -253,8 +253,8 @@ pub mod tests {
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::prelude::SessionContext;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::array;
-    use tempfile::tempdir;
 
     use crate::{
         datafusion::LanceTableProvider,
@@ -263,13 +263,12 @@ pub mod tests {
 
     #[tokio::test]
     pub async fn test_table_provider() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
         let data = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
-                test_uri,
+                &test_uri,
                 FragmentCount::from(10),
                 FragmentRowCount::from(10),
             )

@@ -14,6 +14,7 @@ use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
@@ -760,7 +761,7 @@ struct SpillStreamIter {
     // this struct. When this struct is dropped, the Drop implementation of
     // tempfile::TempDir will delete the temp dir.
     #[allow(dead_code)] // Exists to keep the temp dir alive
-    tmp_dir: tempfile::TempDir,
+    tmp_dir: TempDir,
 }
 
 impl SpillStreamIter {
@@ -769,7 +770,7 @@ impl SpillStreamIter {
         memory_limit: usize,
     ) -> Result<Self> {
         let tmp_dir = tokio::task::spawn_blocking(|| {
-            tempfile::tempdir().map_err(|e| Error::InvalidInput {
+            TempDir::try_new().map_err(|e| Error::InvalidInput {
                 source: format!("Failed to create temp dir: {}", e).into(),
                 location: location!(),
             })
@@ -778,7 +779,7 @@ impl SpillStreamIter {
         .ok()
         .expect_ok()??;
 
-        let tmp_path = tmp_dir.path().join("spill.arrows");
+        let tmp_path = tmp_dir.std_path().join("spill.arrows");
         let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
 
         let sender_handle = tokio::task::spawn(async move {

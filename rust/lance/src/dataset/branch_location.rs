@@ -115,10 +115,10 @@ impl BranchLocation {
 #[cfg(test)]
 mod tests {
     use crate::dataset::branch_location::BranchLocation;
+    use lance_core::utils::tempfile::TempStdDir;
     use object_store::path::Path;
     use std::fs;
     use std::path::PathBuf;
-    use tempfile::tempdir;
 
     // Create a BranchLocation instance for testing
     fn create_branch_location(root_path: PathBuf) -> BranchLocation {
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_find_main_from_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path.clone());
         let main_location = location.find_main().unwrap();
 
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_find_main_from_root() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let mut location = create_branch_location(root_path);
         // Change current branch to Main
         location.branch = None;
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_find_branch_from_same_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let target_branch = location.branch.clone();
         let new_location = location.find_branch(target_branch).unwrap();
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_find_main_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let main_location = location.find_branch(None).unwrap();
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_find_simple_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let new_branch = Some("featureA".to_string());
         let main_location = location.find_main().unwrap();
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_find_complex_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let new_branch = Some("bugfix/issue-123".to_string());
         let main_location = location.find_main().unwrap();
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_find_empty_branch() {
-        let root_path = tempdir().unwrap().path().to_owned();
+        let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let new_branch = Some("".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
