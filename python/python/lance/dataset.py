@@ -2397,9 +2397,11 @@ class LanceDataset(pa.dataset.Dataset):
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
-                if (not pa.types.is_string(value_type)
-                        and not pa.types.is_large_string(value_type)
-                        and not _is_json_column(field)):
+                if (
+                    not pa.types.is_string(value_type)
+                    and not pa.types.is_large_string(value_type)
+                    and not _is_json_column(field)
+                ):
                     raise TypeError(
                         f"INVERTED index column {column} must be string, large string"
                         " list of strings or json, but got {value_type}"
@@ -3459,8 +3461,8 @@ def _is_json_column(field: pyarrow.lib.Field):
 
     if not pa.types.is_large_binary(field_type):
         return False
-    if b'ARROW:extension:name' in field.metadata:
-        return field.metadata[b'ARROW:extension:name'] == b"lance.json"
+    if b"ARROW:extension:name" in field.metadata:
+        return field.metadata[b"ARROW:extension:name"] == b"lance.json"
     return False
 
 
