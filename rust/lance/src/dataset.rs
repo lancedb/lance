@@ -2588,6 +2588,8 @@ mod tests {
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
     use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -8474,6 +8476,142 @@ mod tests {
         .unwrap();
         let plan = format!("{:?}", results);
         assert_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    #[tokio::test]
+    async fn test_fts_filter_vector_search() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ArrowField::new("text", DataType::Utf8, false),
+        ]));
+
+        // Prepare dataset
+        let mut vectors = vec![];
+        for i in 1..=300 {
+            vectors.extend(vec![i as f32; 4]);
+        }
+        let mut text = vec![];
+        for i in 1..=256 {
+            text.push(format!("text {}", i));
+        }
+        for i in 257..=299 {
+            text.push(format!("noop {}", i));
+        }
+        text.push("text 300".to_string());
+
+        let vectors = Float32Array::from(vectors);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(1..=300)),
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, 4).unwrap()),
+                Arc::new(StringArray::from(text)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create index
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().with_position(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Case 1: search with prefilter=true
+        let query_vector = Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]);
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(true)
+            .full_text_search(FullTextSearchQuery::new("text".to_string()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&results[0].schema(), &results).unwrap();
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[300, 256, 255, 254, 253]);
+
+        // Case 2: search with prefilter=false and match query
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .full_text_search(FullTextSearchQuery::new("text".to_string()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&results[0].schema(), &results).unwrap();
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[300]);
+
+        // Case 3: search with prefilter=false and phrase query
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("text".to_string()),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&results[0].schema(), &results).unwrap();
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[300]);
     }
 
     async fn execute_sql(
