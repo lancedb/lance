@@ -3164,7 +3164,6 @@ dependencies = [
  "serde_json",
  "snafu",
  "tantivy",
- "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -3227,6 +3226,7 @@ dependencies = [
  "roaring",
  "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3259,7 +3259,6 @@ dependencies = [
  "pin-project",
  "prost",
  "snafu",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -3347,7 +3346,6 @@ dependencies = [
  "prost-types",
  "roaring",
  "snafu",
- "tempfile",
  "tokio",
  "tracing",
 ]
