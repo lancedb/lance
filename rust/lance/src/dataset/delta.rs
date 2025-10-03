@@ -92,8 +92,13 @@ pub type DiffRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 /// - version: UInt64 - The version when this change occurred
 /// - pre_image: Struct - The record state before the change (null for inserts)
 /// - post_image: Struct - The record state after the change (null for deletes)
-pub fn create_diff_schema(data_schema: Arc<Schema>) -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
+pub fn create_diff_schema(
+    data_schema: Arc<Schema>,
+    with_row_created_at_version: bool,
+    with_row_last_updated_at_version: bool,
+    with_row_address: bool,
+) -> Arc<Schema> {
+    let mut fields = vec![
         Field::new("row_id", DataType::UInt64, false),
         Field::new("operation", DataType::Utf8, false),
         Field::new("version", DataType::UInt64, false),
@@ -107,7 +112,20 @@ pub fn create_diff_schema(data_schema: Arc<Schema>) -> Arc<Schema> {
             DataType::Struct(data_schema.fields().clone()),
             true,
         ),
-    ]))
+    ];
+
+    // Add optional metadata columns
+    if with_row_created_at_version {
+        fields.push(Field::new("_row_created_at_version", DataType::UInt64, true));
+    }
+    if with_row_last_updated_at_version {
+        fields.push(Field::new("_row_last_updated_at_version", DataType::UInt64, true));
+    }
+    if with_row_address {
+        fields.push(Field::new("_row_address", DataType::UInt64, true));
+    }
+
+    Arc::new(Schema::new(fields))
 }
 
 /// Build a diff RecordBatch from component data
@@ -180,17 +198,24 @@ fn build_diff_batch(
         )) as Arc<dyn Array>
     };
 
-    RecordBatch::try_new(
-        diff_schema.clone(),
-        vec![
-            row_id_array,
-            operation_array,
-            version_array,
-            pre_image_array,
-            post_image_array,
-        ],
-    )
-    .map_err(|e| Error::Internal {
+    // Build columns list
+    let mut columns: Vec<Arc<dyn Array>> = vec![
+        row_id_array,
+        operation_array,
+        version_array,
+        pre_image_array,
+        post_image_array,
+    ];
+
+    // Add optional metadata columns as null arrays (not populated in old transaction-based approach)
+    // The schema tells us which metadata columns are requested
+    let base_field_count = 5; // row_id, operation, version, pre_image, post_image
+    for field in diff_schema.fields().iter().skip(base_field_count) {
+        // Add null array for each additional metadata column
+        columns.push(Arc::new(UInt64Array::new_null(num_rows)) as Arc<dyn Array>);
+    }
+
+    RecordBatch::try_new(diff_schema.clone(), columns).map_err(|e| Error::Internal {
         message: format!("Failed to create diff RecordBatch: {}", e),
         location: snafu::location!(),
     })
@@ -205,6 +230,12 @@ pub struct DiffConfig {
     pub include_data: bool,
     /// Batch size for processing row ids
     pub batch_size: usize,
+    /// Whether to include row_created_at_version column in the output
+    pub with_row_created_at_version: bool,
+    /// Whether to include row_last_updated_at_version column in the output
+    pub with_row_last_updated_at_version: bool,
+    /// Whether to include row address column in the output
+    pub with_row_address: bool,
 }
 
 impl Default for DiffConfig {
@@ -213,6 +244,9 @@ impl Default for DiffConfig {
             max_concurrency: 4,
             include_data: true,
             batch_size: 1000,
+            with_row_created_at_version: false,
+            with_row_last_updated_at_version: false,
+            with_row_address: false,
         }
     }
 }
@@ -336,7 +370,12 @@ impl FragmentDiffAnalyzer {
             // We need &lance_core::datatypes::Schema to convert to arrow_schema::Schema
             let arrow_schema = arrow_schema::Schema::from(&*lance_schema);
             let data_schema = Arc::new(arrow_schema);
-            let diff_schema = create_diff_schema(data_schema.clone());
+            let diff_schema = create_diff_schema(
+                data_schema.clone(),
+                analyzer.config.with_row_created_at_version,
+                analyzer.config.with_row_last_updated_at_version,
+                analyzer.config.with_row_address,
+            );
 
             // Batch concurrent processing - collect chunks into owned Vecs to avoid lifetime issues
             let chunks: Vec<Vec<(u64, u64)>> = filtered
@@ -609,6 +648,12 @@ pub struct DatasetDiffBuilder {
     /// When false, pre_image will be NULL for all operations
     /// When true, pre_image will be populated by fetching from the old dataset version
     fetch_pre_image: bool,
+    /// Whether to include row_created_at_version column in the output
+    with_row_created_at_version: bool,
+    /// Whether to include row_last_updated_at_version column in the output
+    with_row_last_updated_at_version: bool,
+    /// Whether to include row address column in the output
+    with_row_address: bool,
 }
 
 impl DatasetDiffBuilder {
@@ -621,6 +666,9 @@ impl DatasetDiffBuilder {
             include_data: true,
             batch_size: 1000,
             fetch_pre_image: false,
+            with_row_created_at_version: false,
+            with_row_last_updated_at_version: false,
+            with_row_address: false,
         }
     }
 
@@ -651,6 +699,24 @@ impl DatasetDiffBuilder {
         self
     }
 
+    /// Include the row_created_at_version column in the diff output
+    pub fn with_row_created_at_version(mut self) -> Self {
+        self.with_row_created_at_version = true;
+        self
+    }
+
+    /// Include the row_last_updated_at_version column in the diff output
+    pub fn with_row_last_updated_at_version(mut self) -> Self {
+        self.with_row_last_updated_at_version = true;
+        self
+    }
+
+    /// Include the row address column in the diff output
+    pub fn with_row_address(mut self) -> Self {
+        self.with_row_address = true;
+        self
+    }
+
     /// Execute the diff operation and return a stream of diff record batches
     pub async fn execute(self) -> Result<DiffRecordBatchStream> {
         // Validate preconditions
@@ -668,23 +734,41 @@ impl DatasetDiffBuilder {
     /// Execute diff using SQL transformations (no pre_image fetch)
     async fn execute_sql_based(self) -> Result<DiffRecordBatchStream> {
         use arrow_array::StringArray;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
+        use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 
         let compared_version = self.compared_version;
+        let with_row_created_at_version = self.with_row_created_at_version;
+        let with_row_last_updated_at_version = self.with_row_last_updated_at_version;
+        let with_row_address = self.with_row_address;
         let data_schema = Arc::new(Schema::from(self.dataset.schema()));
-        let diff_schema = create_diff_schema(data_schema.clone());
+        let diff_schema = create_diff_schema(
+            data_schema.clone(),
+            with_row_created_at_version,
+            with_row_last_updated_at_version,
+            with_row_address,
+        );
 
-        // Scan with version columns
+        // Scan with version columns and optional metadata
         // Note: We can't use .filter() here because version columns aren't in the base schema yet
         // They get materialized during scan execution. We'll filter in the transformation below.
-        let stream = self
-            .dataset
-            .scan()
-            .with_row_id()
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version()
-            .try_into_stream()
-            .await?;
+        let stream = if with_row_address {
+            self.dataset
+                .scan()
+                .with_row_id()
+                .with_row_last_updated_at_version()
+                .with_row_created_at_version()
+                .with_row_address()
+                .try_into_stream()
+                .await?
+        } else {
+            self.dataset
+                .scan()
+                .with_row_id()
+                .with_row_last_updated_at_version()
+                .with_row_created_at_version()
+                .try_into_stream()
+                .await?
+        };
 
         // Transform scanned batches into diff format
         let diff_stream = stream.and_then(move |batch| {
@@ -772,7 +856,7 @@ impl DatasetDiffBuilder {
                 }
 
                 // Extract data columns (without version/row_id metadata) and filter them
-                let indices_array = UInt32Array::from(filtered_indices);
+                let indices_array = UInt32Array::from(filtered_indices.clone());
                 let data_columns: Vec<_> = data_schema
                     .fields()
                     .iter()
@@ -807,17 +891,51 @@ impl DatasetDiffBuilder {
                     Some(NullBuffer::new_null(filtered_row_count)),
                 )) as Arc<dyn Array>;
 
+                // Build column list for diff batch
+                let mut diff_columns: Vec<Arc<dyn Array>> = vec![
+                    Arc::new(UInt64Array::from(row_ids)) as Arc<dyn Array>,
+                    Arc::new(StringArray::from(operations)) as Arc<dyn Array>,
+                    Arc::new(UInt64Array::from(versions)) as Arc<dyn Array>,
+                    pre_image_array,
+                    post_image_array,
+                ];
+
+                // Add optional metadata columns
+                if with_row_created_at_version {
+                    let created_at_values: Vec<u64> = filtered_indices
+                        .iter()
+                        .map(|&idx| created_at_col.value(idx as usize))
+                        .collect();
+                    diff_columns.push(Arc::new(UInt64Array::from(created_at_values)) as Arc<dyn Array>);
+                }
+                if with_row_last_updated_at_version {
+                    let last_updated_values: Vec<u64> = filtered_indices
+                        .iter()
+                        .map(|&idx| last_updated_col.value(idx as usize))
+                        .collect();
+                    diff_columns.push(Arc::new(UInt64Array::from(last_updated_values)) as Arc<dyn Array>);
+                }
+                if with_row_address {
+                    // Extract row_address from the scanned batch if available
+                    if let Some(row_address_col) = batch.column_by_name(ROW_ADDR) {
+                        let row_address_array = row_address_col.as_any().downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| Error::Internal {
+                                message: "_row_address column has wrong type".to_string(),
+                                location: snafu::location!(),
+                            })?;
+                        let address_values: Vec<u64> = filtered_indices
+                            .iter()
+                            .map(|&idx| row_address_array.value(idx as usize))
+                            .collect();
+                        diff_columns.push(Arc::new(UInt64Array::from(address_values)) as Arc<dyn Array>);
+                    } else {
+                        // Row address not available, push null array
+                        diff_columns.push(Arc::new(UInt64Array::new_null(filtered_row_count)) as Arc<dyn Array>);
+                    }
+                }
+
                 // Build diff batch
-                let diff_batch = RecordBatch::try_new(
-                    diff_schema,
-                    vec![
-                        Arc::new(UInt64Array::from(row_ids)) as Arc<dyn Array>,
-                        Arc::new(StringArray::from(operations)) as Arc<dyn Array>,
-                        Arc::new(UInt64Array::from(versions)) as Arc<dyn Array>,
-                        pre_image_array,
-                        post_image_array,
-                    ],
-                )?;
+                let diff_batch = RecordBatch::try_new(diff_schema, diff_columns)?;
 
                 Ok(diff_batch)
             }
@@ -838,6 +956,9 @@ impl DatasetDiffBuilder {
             max_concurrency: self.max_concurrency,
             include_data: self.include_data,
             batch_size: self.batch_size,
+            with_row_created_at_version: self.with_row_created_at_version,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_address: self.with_row_address,
         };
 
         // Create the fragment diff analyzer
@@ -890,7 +1011,8 @@ impl DatasetDiffBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::delta::{DatasetDiffBuilder, DiffOperation};
+    use crate::dataset::delta::DatasetDiffBuilder;
+    use arrow_array::UInt64Array;
     use crate::dataset::transaction::Operation;
     use crate::dataset::{Dataset, WriteMode, WriteParams};
     use arrow_array::cast::AsArray;
@@ -1110,6 +1232,7 @@ mod tests {
         // Execute diff operation to compare before and after merge insert
         let diff_builder = DatasetDiffBuilder::new(updated_dataset.clone(), initial_version)
             .with_include_data(true)
+            .with_fetch_pre_image(true)
             .with_max_concurrency(1)
             .with_batch_size(10);
 
@@ -1317,6 +1440,7 @@ mod tests {
         // Execute diff operation from initial version to final version
         let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), initial_version)
             .with_include_data(true) // Enable data inclusion to verify update content
+            .with_fetch_pre_image(true) // Fetch pre_image data for updates
             .with_max_concurrency(1)
             .with_batch_size(5);
 
@@ -1327,7 +1451,7 @@ mod tests {
         let mut update_count = 0;
         let mut updated_ids = Vec::new();
 
-        for batch in diff_batches {
+        for (batch_idx, batch) in diff_batches.iter().enumerate() {
             let operation_array = batch
                 .column_by_name("operation")
                 .unwrap()
@@ -1690,11 +1814,16 @@ mod tests {
         let mut insert_count_v1_to_v5 = 0;
         let mut update_count_v1_to_v5 = 0;
 
-        for batch in &diff_batches_v1_to_v5 {
+        for (batch_idx, batch) in diff_batches_v1_to_v5.iter().enumerate() {
             let operation_array = batch
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
+            let version_array = batch
+                .column_by_name("version")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+
             for row_idx in 0..batch.num_rows() {
                 match operation_array.value(row_idx) {
                     "insert" => insert_count_v1_to_v5 += 1,
@@ -1705,14 +1834,24 @@ mod tests {
         }
 
         // Note: With version metadata now written for all operations,
-        // the count includes all inserts tracked with version metadata
+        // the count includes all inserts tracked with version metadata.
+        // The diff compares v1 to v8 (after all updates and compaction).
+        // Expected operations:
+        // - v2: 10 inserts
+        // - v3: 15 inserts
+        // - v4: 5 updates (rows 5-9 from v1, updated at v4)
+        // - v5: 12 inserts
+        // - v7-v8: 4 updates (rows 200-203 from v2, updated at v8)
+        // Total: 37 inserts + 9 updates = 46 rows
+        // But 4 rows from v2 were updated, so they don't count as inserts anymore.
+        // Final: 33 inserts (10-4 from v2, 15 from v3, 12 from v5) + 9 updates = 42 rows
         assert_eq!(
-            insert_count_v1_to_v5, 41,
-            "Should have insert operations from v1 to v5"
+            insert_count_v1_to_v5, 33,
+            "Should have 33 insert operations (rows created after v1 and not updated)"
         );
         assert_eq!(
-            update_count_v1_to_v5, 5,
-            "Should have 5 update operations from v1 to v5"
+            update_count_v1_to_v5, 9,
+            "Should have 9 update operations (5 from v4 + 4 from v8)"
         );
 
         // diff v5 ~ v6 (compaction, should not have changes)
@@ -1725,10 +1864,12 @@ mod tests {
         let diff_stream_compaction = diff_builder_compaction.execute().await.unwrap();
         let diff_records_compaction: Vec<_> = diff_stream_compaction.try_collect().await.unwrap();
 
+        // Compaction should not change data content, so diff should be empty (0 rows)
+        let total_compaction_diff_rows: usize = diff_records_compaction.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            diff_records_compaction.len(),
+            total_compaction_diff_rows,
             0,
-            "Compaction should not change data content, diff should be empty"
+            "Compaction should not change data content, diff should have 0 rows"
         );
 
         // 3. diff v6 ~ v7 (update after compaction)
@@ -1811,15 +1952,21 @@ mod tests {
             }
         }
 
-        // Note: With version metadata now written for all operations, count reflects tracked inserts
-        assert_eq!(inserted_count, 41, "Should have insert operations total");
+        // With version metadata, inserts are rows that were created after v1 and never updated
+        // v2: 10 rows (ids 200-209), 4 of which (200-203) are updated in v7
+        // v3: 15 rows (ids 300-314), none updated
+        // v5: 12 rows (ids 400-411), none updated
+        // So: 6 + 15 + 12 = 33 inserts
+        assert_eq!(inserted_count, 33, "Should have 33 insert operations (rows created after v1 and never updated)");
+
+        // Updates: 5 from v4 (ids 5-9) + 4 from v7 (ids 200-203) = 9 updates
         assert_eq!(
-            final_update_count, 5,
-            "Should have 5 update operations total (only id 5-9)"
+            final_update_count, 9,
+            "Should have 9 update operations total (5 from v4 + 4 from v7)"
         );
 
         updated_ids.sort();
-        let expected_updated_ids = vec![5, 6, 7, 8, 9];
+        let expected_updated_ids = vec![5, 6, 7, 8, 9, 200, 201, 202, 203];
         assert_eq!(
             updated_ids, expected_updated_ids,
             "Updated IDs should include both pre and post compaction updates"
@@ -1894,6 +2041,7 @@ mod tests {
 
         let diff_builder = DatasetDiffBuilder::new(updated_dataset.clone(), initial_version)
             .with_include_data(true)
+            .with_fetch_pre_image(true)
             .with_max_concurrency(1)
             .with_batch_size(32);
         let diff_stream = diff_builder.execute().await.unwrap();
@@ -2004,5 +2152,56 @@ mod tests {
         insert_ids.sort();
         assert_eq!(update_ids, (5..=9).collect::<Vec<i32>>());
         assert_eq!(insert_ids, (110..=114).collect::<Vec<i32>>());
+    }
+
+    #[tokio::test]
+    async fn test_diff_with_metadata_columns() {
+        // Test that diff can include optional metadata columns
+        let mut dataset = create_test_dataset_with_stable_row_ids().await;
+        let v1 = dataset.version().version;
+
+        // Append new data at v2
+        dataset = append_data_to_dataset(dataset, 200, 10).await;
+
+        // Test diff with metadata columns enabled
+        let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), v1)
+            .with_row_created_at_version()
+            .with_row_last_updated_at_version();
+
+        let diff_stream = diff_builder.execute().await.unwrap();
+        let diff_batches: Vec<_> = diff_stream.try_collect().await.unwrap();
+
+        // Verify metadata columns exist in output
+        let mut total_rows = 0;
+        for batch in &diff_batches {
+            total_rows += batch.num_rows();
+
+            // Check that metadata columns are present
+            assert!(
+                batch.column_by_name("_row_created_at_version").is_some(),
+                "Should have _row_created_at_version column"
+            );
+            assert!(
+                batch.column_by_name("_row_last_updated_at_version").is_some(),
+                "Should have _row_last_updated_at_version column"
+            );
+
+            // Verify the version values are correct (should all be v2)
+            let created_at_col = batch
+                .column_by_name("_row_created_at_version")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            let last_updated_col = batch
+                .column_by_name("_row_last_updated_at_version")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+
+            for i in 0..batch.num_rows() {
+                assert_eq!(created_at_col.value(i), 2, "Created at should be v2");
+                assert_eq!(last_updated_col.value(i), 2, "Last updated should be v2");
+            }
+        }
+
+        assert_eq!(total_rows, 10, "Should have 10 rows (the appended data)");
     }
 }

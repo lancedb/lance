@@ -1798,21 +1798,13 @@ impl Scanner {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
-        eprintln!("DEBUG create_plan: nearest={:?}, full_text_query={:?}",
-            self.nearest.is_some(), self.full_text_query.is_some());
-
         // Add version columns to projection plan if requested
         if self.legacy_with_row_last_updated_at_version {
-            eprintln!("DEBUG create_plan: calling include_row_last_updated_at_version()");
             self.projection_plan.include_row_last_updated_at_version();
         }
         if self.legacy_with_row_created_at_version {
-            eprintln!("DEBUG create_plan: calling include_row_created_at_version()");
             self.projection_plan.include_row_created_at_version();
         }
-        eprintln!("DEBUG create_plan: physical_projection flags: with_row_last_updated_at_version={}, with_row_created_at_version={}",
-            self.projection_plan.physical_projection.with_row_last_updated_at_version,
-            self.projection_plan.physical_projection.with_row_created_at_version);
 
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
@@ -2007,6 +1999,10 @@ impl Scanner {
             let ordered = if self.ordering.is_some() || self.nearest.is_some() {
                 // If we are sorting the results there is no need to scan in order
                 false
+            } else if projection.with_row_last_updated_at_version || projection.with_row_created_at_version {
+                // Version columns require ordered scanning because version metadata
+                // is indexed by position within each fragment
+                true
             } else {
                 self.ordered
             };
@@ -3194,8 +3190,6 @@ impl Scanner {
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         log::trace!("scan_fragments covered {} fragments", fragments.len());
-        eprintln!("DEBUG scan_fragments: with_row_last_updated_at_version={}, with_row_created_at_version={}",
-            with_row_last_updated_at_version, with_row_created_at_version);
         let config = LanceScanConfig {
             batch_size: self.get_batch_size(),
             batch_readahead: self.batch_readahead,

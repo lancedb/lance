@@ -25,8 +25,8 @@ use crate::rowids::{read_row_ids, RowIdSequence};
 /// and enables zipped iteration without building a map.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct DatasetVersionRun {
-    span: U64Segment,
-    version: u64,
+    pub span: U64Segment,
+    pub version: u64,
 }
 
 impl DatasetVersionRun {
@@ -439,22 +439,16 @@ pub fn build_version_meta(
 ) -> Option<DatasetVersionMeta> {
     if let Some(physical_rows) = fragment.physical_rows {
         if physical_rows > 0 {
-            let row_count = if let Some(row_id_meta) = &fragment.row_id_meta {
-                match row_id_meta {
-                    crate::format::RowIdMeta::Inline(data) => {
-                        let sequence = read_row_ids(data).unwrap();
-                        sequence.len()
-                    }
-                    crate::format::RowIdMeta::External(_file) => {
-                        todo!("Currently, not supported!")
-                    }
-                }
-            } else {
+            // Verify row_id_meta exists (sanity check for stable row IDs)
+            if fragment.row_id_meta.is_none() {
                 panic!("Can not find row id meta, please make sure you have enabled stable row id.")
-            };
+            }
 
+            // Use physical_rows directly as the authoritative row count
+            // This is correct even for compacted fragments where row_id_meta might
+            // have been partially copied
             let version_sequence =
-                DatasetVersionSequence::from_uniform_row_count(row_count, current_version);
+                DatasetVersionSequence::from_uniform_row_count(physical_rows as u64, current_version);
 
             return Some(DatasetVersionMeta::from_sequence(&version_sequence).unwrap());
         }

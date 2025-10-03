@@ -118,16 +118,8 @@ impl Stream for LanceStream {
                 let result = if this.config.with_row_last_updated_at_version
                     || this.config.with_row_created_at_version
                 {
-                    eprintln!("DEBUG: Adding version columns. Config: last_updated={}, created_at={}",
-                        this.config.with_row_last_updated_at_version, this.config.with_row_created_at_version);
                     let schema = RecordBatchStream::schema(this);
-                    eprintln!("DEBUG: Schema before add_version_columns: {:?}", schema);
-                    let result = this.add_version_columns(batch, schema);
-                    if let Ok(ref batch) = result {
-                        eprintln!("DEBUG: Batch after add_version_columns has {} columns: {:?}",
-                            batch.num_columns(), batch.schema());
-                    }
-                    result
+                    this.add_version_columns(batch, schema)
                 } else {
                     Ok(batch)
                 };
@@ -163,6 +155,10 @@ pub struct LanceStream {
     /// (used for version column materialization)
     current_fragment_idx: usize,
     rows_read_in_fragment: usize,
+
+    /// Total number of logical rows read across all fragments
+    /// (used for fragment boundary detection with deletion vectors)
+    total_rows_read: usize,
 }
 
 impl LanceStream {
@@ -172,20 +168,26 @@ impl LanceStream {
         batch: RecordBatch,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
-        use arrow_array::{ArrayRef, UInt64Array};
+        use arrow_array::{Array, ArrayRef, UInt64Array};
         use datafusion::error::DataFusionError;
         use lance_table::rowids::version::DatasetVersionSequence;
 
         let num_rows = batch.num_rows();
 
-        // Determine which fragment this batch belongs to
-        if self.current_fragment_idx >= self.fragments.len() {
-            return Err(DataFusionError::Internal(
-                "Batch read beyond available fragments".to_string(),
-            ));
+        // Use the current tracking state to determine which fragment we're reading from
+        // The tracking is updated after each batch to move to the next fragment when needed
+        let fragment_idx = self.current_fragment_idx;
+        let rows_offset = self.rows_read_in_fragment;
+
+        if fragment_idx >= self.fragments.len() {
+            return Err(DataFusionError::Internal(format!(
+                "Fragment index {} out of bounds (have {} fragments)",
+                fragment_idx,
+                self.fragments.len()
+            )));
         }
 
-        let fragment = &self.fragments[self.current_fragment_idx];
+        let fragment = &self.fragments[fragment_idx];
 
         // Build version arrays from fragment metadata
         let last_updated_array: Option<ArrayRef> = if self.config.with_row_last_updated_at_version {
@@ -201,14 +203,17 @@ impl LanceStream {
                 return Ok(batch);
             };
             let values: Vec<u64> = seq.versions().collect();
-            if values.len() < self.rows_read_in_fragment + num_rows {
+            if values.len() < rows_offset + num_rows {
                 return Err(DataFusionError::Internal(format!(
-                    "Version sequence too short: expected at least {} rows, got {}",
-                    self.rows_read_in_fragment + num_rows,
-                    values.len()
+                    "Version sequence too short: expected at least {} rows, got {}. Fragment id: {}, physical_rows: {:?}, rows_offset: {}",
+                    rows_offset + num_rows,
+                    values.len(),
+                    fragment.id,
+                    fragment.physical_rows,
+                    rows_offset
                 )));
             }
-            let batch_values = &values[self.rows_read_in_fragment..self.rows_read_in_fragment + num_rows];
+            let batch_values = &values[rows_offset..rows_offset + num_rows];
             Some(Arc::new(UInt64Array::from(batch_values.to_vec())))
         } else {
             None
@@ -230,14 +235,17 @@ impl LanceStream {
                 )
             };
             let values: Vec<u64> = seq.versions().collect();
-            if values.len() < self.rows_read_in_fragment + num_rows {
+            if values.len() < rows_offset + num_rows {
                 return Err(DataFusionError::Internal(format!(
-                    "Version sequence too short: expected at least {} rows, got {}",
-                    self.rows_read_in_fragment + num_rows,
-                    values.len()
+                    "Version sequence too short: expected at least {} rows, got {}. Fragment id: {}, physical_rows: {:?}, rows_offset: {}",
+                    rows_offset + num_rows,
+                    values.len(),
+                    fragment.id,
+                    fragment.physical_rows,
+                    rows_offset
                 )));
             }
-            let batch_values = &values[self.rows_read_in_fragment..self.rows_read_in_fragment + num_rows];
+            let batch_values = &values[rows_offset..rows_offset + num_rows];
             Some(Arc::new(UInt64Array::from(batch_values.to_vec())))
         } else {
             None
@@ -259,14 +267,19 @@ impl LanceStream {
             ))
         })?;
 
-        // Track progress through fragment
-        self.rows_read_in_fragment += num_rows;
-        if let Some(physical_rows) = fragment.physical_rows {
-            if self.rows_read_in_fragment >= physical_rows {
-                self.current_fragment_idx += 1;
-                self.rows_read_in_fragment = 0;
-            }
+        // Update tracking for next batch
+        let new_rows_read_in_fragment = rows_offset + num_rows;
+        let logical_rows = fragment.num_rows().unwrap_or(0);
+
+        // If we've read all logical rows from this fragment, move to the next fragment
+        if new_rows_read_in_fragment >= logical_rows {
+            self.current_fragment_idx = fragment_idx + 1;
+            self.rows_read_in_fragment = 0;
+        } else {
+            self.current_fragment_idx = fragment_idx;
+            self.rows_read_in_fragment = new_rows_read_in_fragment;
         }
+        self.total_rows_read += num_rows;
 
         Ok(result_batch)
     }
@@ -478,6 +491,7 @@ impl LanceStream {
             fragments,
             current_fragment_idx: 0,
             rows_read_in_fragment: 0,
+            total_rows_read: 0,
         })
     }
 
@@ -580,6 +594,7 @@ impl LanceStream {
             fragments,
             current_fragment_idx: 0,
             rows_read_in_fragment: 0,
+            total_rows_read: 0,
         })
     }
 }
