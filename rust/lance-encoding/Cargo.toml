@@ -49,7 +49,6 @@ lance-datagen.workspace = true
 arrow-ord.workspace = true
 rand.workspace = true
 rstest.workspace = true
-tempfile.workspace = true
 test-log.workspace = true
 criterion = { workspace = true }
 rand_xoshiro = { workspace = true }

@@ -1531,6 +1531,99 @@ impl FileFragment {
         Ok(self)
     }
 
+    pub async fn update_columns(
+        &mut self,
+        right_stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<(Fragment, Vec<u32>)> {
+        if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the left side fragment",
+                    left_on
+                ),
+                location!(),
+            ));
+        };
+        let right_stream = Box::new(right_stream);
+        let right_schema = right_stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side fragment",
+                    right_on
+                ),
+                location!(),
+            ));
+        };
+        let write_schema = right_schema.as_ref().without_column(right_on);
+        for field in write_schema.fields() {
+            if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} is a reversed metadata column and cannot be updated",
+                        field.name()
+                    ),
+                    location!(),
+                ));
+            }
+            if self.schema().field(field.name()).is_none() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} in right side fragment does not exist in left side fragment",
+                        field.name()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        let write_schema = self.schema().project_by_schema(
+            &write_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+        let read_columns = right_schema.field_names();
+        let mut updater = self
+            .updater(
+                Some(&read_columns),
+                Some((write_schema.clone(), self.schema().clone())),
+                None,
+            )
+            .await?;
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
+        while let Some(batch) = updater.next().await? {
+            let updated_batch = joiner
+                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
+                .await?;
+            updater.update(updated_batch).await?;
+        }
+
+        let mut updated_fragment = updater.finish().await?;
+        // Mark fields in updated data files as obsolete ("tombstone").
+        let updated_fields = updated_fragment.files.last().unwrap().fields.clone();
+        for data_file in &mut updated_fragment.files.iter_mut().rev().skip(1) {
+            for field in &mut data_file.fields {
+                if updated_fields.contains(field) {
+                    // Tombstone these fields
+                    *field = -2;
+                }
+            }
+        }
+        // Remove data files that have become entirely tombstoned.
+        updated_fragment
+            .files
+            .retain(|data_file| data_file.fields.iter().any(|&field| field != -2));
+        let updated_fields = updated_fields
+            .iter()
+            .filter_map(|&i| u32::try_from(i).ok())
+            .collect();
+        // Note: updated field should be returned when committing, waiting to be done
+        Ok((updated_fragment, updated_fields))
+    }
+
     /// Append new columns to the fragment
     ///
     /// This is the fragment-level version of [`Dataset::add_columns`].
@@ -2377,20 +2470,23 @@ impl FragmentReader {
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use tempfile::tempdir;
     use v2::writer::FileWriterOptions;
 
     use super::*;
     use crate::{
-        dataset::{transaction::Operation, InsertBuilder},
+        dataset::{
+            transaction::{Operation, UpdateMode},
+            InsertBuilder,
+        },
         session::Session,
         utils::test::{StatsHolder, TestDatasetGenerator},
     };
@@ -2467,8 +2563,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = &dataset.get_fragments()[2];
         let mut scanner = fragment.scan();
@@ -2510,8 +2606,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_scan_v2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let dataset = create_dataset_v2(test_uri).await;
         let fragment = &dataset.get_fragments()[2];
         let mut scanner = fragment.scan();
@@ -2555,9 +2651,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fragment_update() {
+        let test_dir1 = TempStrDir::default();
+        let test_uri1 = &test_dir1;
+        let mut dataset1 = create_dataset_v2(test_uri1).await;
+        let _ = dataset1
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment1 = dataset1.get_fragment(0).unwrap();
+        let test_dir2 = TempStrDir::default();
+        let test_uri2 = &test_dir2;
+        let mut dataset2 = create_dataset_v2(test_uri2).await;
+        let _ = dataset2
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "2".into())]),
+                None,
+                None,
+            )
+            .await;
+        let fragment2 = dataset2.get_fragment(0).unwrap();
+        let fragment2 = fragment2
+            .delete("_rowid=0 OR _rowid=3")
+            .await
+            .unwrap()
+            .unwrap();
+        let batches = fragment2
+            .scan()
+            .with_row_id()
+            .batch_size(10)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = batches[0].schema_ref().clone();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        ));
+        let (updated_fragment, fields_modified) = fragment1
+            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated_fragment],
+            new_fragments: vec![],
+            fields_modified,
+            mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+        };
+        let new_dataset = Dataset::commit(
+            test_uri1,
+            op,
+            Some(dataset1.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_dataset.get_fragments().len(), 5);
+        let mut scanner = new_dataset.get_fragment(0).unwrap().scan();
+        let batches = scanner
+            .batch_size(10)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 4);
+        let binding = batches[0].column_by_name("col1").unwrap().clone();
+        let _vector = binding.as_any().downcast_ref::<Int64Array>().unwrap();
+        let actual_values = _vector.values();
+        let mut expected_values = vec![2; actual_values.len()];
+        expected_values[0] = -1;
+        expected_values[3] = -1;
+        assert_eq!(
+            actual_values,
+            &expected_values[..],
+            "The vector content did not match the expected values."
+        );
+    }
+
+    #[tokio::test]
     async fn test_out_of_range() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         // Creates 400 rows in 10 fragments
         let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         // Delete last 20 rows in first fragment
@@ -2615,8 +2803,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rowid_rowaddr_only() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         // Creates 400 rows in 10 fragments
         let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         // Delete last 20 rows in first fragment
@@ -2682,8 +2870,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         dataset.delete("i >= 0 and i < 15").await.unwrap();
 
@@ -2774,8 +2962,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let dataset = create_dataset(test_uri, data_storage_version).await;
 
         let version = dataset.version().version;
@@ -2837,8 +3025,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()
@@ -2889,8 +3077,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()
@@ -2954,8 +3142,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recommit_from_file() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         let schema = dataset.schema();
         let dataset_rows = dataset.count_rows(None).await.unwrap();
@@ -3006,8 +3194,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
@@ -3047,8 +3235,8 @@ mod tests {
         data_storage_version: LanceFileVersion,
     ) {
         for with_delete in [true, false] {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = &test_dir;
             let mut dataset = create_dataset(test_uri, data_storage_version).await;
             dataset.validate().await.unwrap();
             assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
@@ -3147,8 +3335,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
@@ -3212,8 +3400,8 @@ mod tests {
         // This test is only for the legacy version of the file format.
         // It ensures that the `max_rows_per_group` property is respected
         // and this property does not exist in V2.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -3299,8 +3487,8 @@ mod tests {
         )?;
 
         // Write batch_i as a fragment
-        let test_dir = tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch_i.clone())], batch_i.schema().clone()),
@@ -3381,8 +3569,8 @@ mod tests {
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )?;
 
-        let test_dir = tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema().clone()),
@@ -3421,8 +3609,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_from_file_v2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let make_gen = || {
             gen_batch()

@@ -41,6 +41,7 @@ mod test {
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
     };
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_table::io::commit::{
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
@@ -193,8 +194,8 @@ mod test {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
         let reader = data_gen.batch(100);
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
         Dataset::write(reader, ds_uri, None).await.unwrap();
 
         // Then try to load the dataset with external store handler set
@@ -219,8 +220,8 @@ mod test {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
         let reader = data_gen.batch(100);
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
         Dataset::write(reader, ds_uri, Some(write_params(handler.clone())))
             .await
             .unwrap();
@@ -244,8 +245,8 @@ mod test {
 
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
 
         Dataset::write(
             data_gen.batch(10),
@@ -294,8 +295,8 @@ mod test {
 
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
 
         let mut ds = Dataset::write(
             data_gen.batch(10),
@@ -329,7 +330,7 @@ mod test {
             .head(&version_six_staging_location)
             .await
             .unwrap()
-            .size as u64;
+            .size;
         store
             .put_if_exists(
                 ds.base.as_ref(),

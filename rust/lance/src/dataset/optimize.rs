@@ -35,8 +35,8 @@
 //! # let mut rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! #
-//! # let test_dir = tempfile::tempdir().unwrap();
-//! # let uri = test_dir.path().to_str().unwrap().to_string();
+//! # let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+//! # let uri = test_dir.to_string();
 //! let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
 //! let data = RecordBatch::try_new(
 //!     schema.clone(),
@@ -990,6 +990,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::Error;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
@@ -1004,7 +1005,6 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
-    use tempfile::tempdir;
     use uuid::Uuid;
 
     #[test]
@@ -1152,8 +1152,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Compact an empty table
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
@@ -1190,8 +1190,8 @@ mod tests {
         data_storage_version: LanceFileVersion,
     ) {
         // Compact a table with nothing to do
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
@@ -1275,8 +1275,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1423,8 +1423,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1512,8 +1512,8 @@ mod tests {
         // For files that have few rows, we don't want to compact just 1 since
         // that won't do anything. But if there are deletions to materialize,
         // we want to do groups of 1. This test checks that.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1589,8 +1589,8 @@ mod tests {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
         // Once committed, can't commit remaining tasks
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 

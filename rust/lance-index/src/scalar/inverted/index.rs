@@ -2440,10 +2440,9 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ::object_store::path::Path;
     use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
-    use tempfile::tempdir;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
@@ -2494,10 +2493,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_to_empty_posting_list() {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2557,10 +2556,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_posting_cache_conflict_across_partitions() {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

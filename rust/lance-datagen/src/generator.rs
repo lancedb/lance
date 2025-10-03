@@ -2500,7 +2500,7 @@ pub mod array {
         let dist = Uniform::new(start_ticks, end_ticks).unwrap();
 
         let data_type = data_type.clone();
-        let sample_fn = move |rng: &mut _| (dist.sample(rng));
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
         let width = data_type
             .primitive_width()
             .map(|width| ByteCount::from(width as u64))

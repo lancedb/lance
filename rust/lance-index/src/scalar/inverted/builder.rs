@@ -21,9 +21,9 @@ use deepsize::DeepSizeOf;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
-use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
+use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
-use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
 // the number of elements in each block
@@ -119,10 +118,10 @@ impl InvertedIndexBuilder {
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
     ) -> Self {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempDir::default();
         let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         let src_store = store.unwrap_or_else(|| local_store.clone());
