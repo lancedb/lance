@@ -1892,6 +1892,12 @@ pub struct FragmentReader {
     /// The fragment metadata (needed for version columns)
     fragment: Arc<Fragment>,
 
+    /// The last_updated_at version sequence (loaded from fragment metadata)
+    last_updated_at_sequence: Option<Arc<lance_table::rowids::version::DatasetVersionSequence>>,
+
+    /// The created_at version sequence (loaded from fragment metadata)
+    created_at_sequence: Option<Arc<lance_table::rowids::version::DatasetVersionSequence>>,
+
     // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,
 
@@ -1921,6 +1927,8 @@ impl Clone for FragmentReader {
             with_row_created_at_version: self.with_row_created_at_version,
             make_deletions_null: self.make_deletions_null,
             fragment: self.fragment.clone(),
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
         }
@@ -1991,6 +1999,8 @@ impl FragmentReader {
             with_row_created_at_version: false,
             make_deletions_null: false,
             fragment,
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
             num_rows,
             num_physical_rows,
         })
@@ -2021,11 +2031,33 @@ impl FragmentReader {
 
     pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
         self.with_row_last_updated_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.last_updated_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.last_updated_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.last_updated_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
         self
     }
 
     pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
         self.with_row_created_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.created_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.created_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.created_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
         self
     }
 
@@ -2198,7 +2230,8 @@ impl FragmentReader {
                 with_row_addr: self.with_row_addr,
                 with_row_last_updated_at_version: self.with_row_last_updated_at_version,
                 with_row_created_at_version: self.with_row_created_at_version,
-                fragment: Some(self.fragment.clone()),
+                last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+                created_at_sequence: self.created_at_sequence.clone(),
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
@@ -2295,7 +2328,8 @@ impl FragmentReader {
             with_row_addr: self.with_row_addr,
             with_row_last_updated_at_version: self.with_row_last_updated_at_version,
             with_row_created_at_version: self.with_row_created_at_version,
-            fragment: Some(self.fragment.clone()),
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params,
             total_num_rows,
         };
@@ -2447,7 +2481,8 @@ impl FragmentReader {
             with_row_addr: self.with_row_addr,
             with_row_last_updated_at_version: self.with_row_last_updated_at_version,
             with_row_created_at_version: self.with_row_created_at_version,
-            fragment: Some(self.fragment.clone()),
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params: ReadBatchParams::Ranges(ranges),
             total_num_rows,
         };

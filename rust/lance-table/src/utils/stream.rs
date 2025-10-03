@@ -21,9 +21,7 @@ use lance_core::{
 use lance_io::ReadBatchParams;
 use tracing::{instrument, Instrument};
 
-use crate::format::Fragment;
 use crate::rowids::RowIdSequence;
-use snafu::location;
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
@@ -182,8 +180,10 @@ pub struct RowIdAndDeletesConfig {
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
-    /// The fragment metadata containing version sequences
-    pub fragment: Option<Arc<Fragment>>,
+    /// The last_updated_at version sequence
+    pub last_updated_at_sequence: Option<Arc<crate::rowids::version::DatasetVersionSequence>>,
+    /// The created_at version sequence
+    pub created_at_sequence: Option<Arc<crate::rowids::version::DatasetVersionSequence>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
@@ -287,28 +287,10 @@ pub fn apply_row_id_and_deletes(
 
     // Add version columns if requested
     let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
-        let fragment = config
-            .fragment
-            .as_ref()
-            .ok_or_else(|| lance_core::Error::Internal {
-                message: "Fragment metadata required for version columns".to_string(),
-                location: location!(),
-            })?;
-
         let mut batch = batch;
 
         if config.with_row_last_updated_at_version {
-            let version_arr = if let Some(version_meta) = &fragment.last_updated_at_version_meta {
-                let sequence =
-                    version_meta
-                        .load_sequence()
-                        .map_err(|e| lance_core::Error::Internal {
-                            message: format!(
-                                "Failed to load last_updated_at version sequence: {}",
-                                e
-                            ),
-                            location: location!(),
-                        })?;
+            let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
                 // Get the range of rows for this batch
                 let selection = config
                     .params
@@ -329,7 +311,7 @@ pub fn apply_row_id_and_deletes(
                     .collect();
                 Arc::new(UInt32Array::from(versions))
             } else {
-                // Default to version 1 if not present
+                // Default to version 1 if sequence not provided
                 Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
             };
             batch =
@@ -337,14 +319,7 @@ pub fn apply_row_id_and_deletes(
         }
 
         if config.with_row_created_at_version {
-            let version_arr = if let Some(version_meta) = &fragment.created_at_version_meta {
-                let sequence =
-                    version_meta
-                        .load_sequence()
-                        .map_err(|e| lance_core::Error::Internal {
-                            message: format!("Failed to load created_at version sequence: {}", e),
-                            location: location!(),
-                        })?;
+            let version_arr = if let Some(sequence) = &config.created_at_sequence {
                 // Get the range of rows for this batch
                 let selection = config
                     .params
@@ -365,7 +340,7 @@ pub fn apply_row_id_and_deletes(
                     .collect();
                 Arc::new(UInt32Array::from(versions))
             } else {
-                // Default to version 1 if not present
+                // Default to version 1 if sequence not provided
                 Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
             };
             batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
@@ -501,7 +476,8 @@ mod tests {
                     with_row_created_at_version: false,
                     deletion_vector: None,
                     row_id_sequence: None,
-                    fragment: None,
+                    last_updated_at_sequence: None,
+                    created_at_sequence: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
                 };
@@ -600,7 +576,8 @@ mod tests {
                                 with_row_created_at_version: false,
                                 deletion_vector: deletion_vector.clone(),
                                 row_id_sequence: None,
-                                fragment: None,
+                                last_updated_at_sequence: None,
+                                created_at_sequence: None,
                                 make_deletions_null,
                                 total_num_rows: 100,
                             };
