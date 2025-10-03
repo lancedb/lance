@@ -2462,8 +2462,8 @@ impl Scanner {
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
-                    expressions::col(ROW_ID, schema.as_ref())?,
-                    ROW_ID.to_string(),
+                    expressions::col(ROW_ADDR, schema.as_ref())?,
+                    ROW_ADDR.to_string(),
                 )];
 
                 let fts_node = Arc::new(UnionExec::new(children));
@@ -2547,8 +2547,8 @@ impl Scanner {
                             joined_plan,
                             plan,
                             vec![(
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
                             )],
                             None,
                             &datafusion_expr::JoinType::Inner,

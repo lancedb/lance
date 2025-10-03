@@ -22,7 +22,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::mask::RowIdTreeMap,
-    Error, Result, ROW_ID,
+    Error, Result, ROW_ADDR,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -570,7 +570,7 @@ impl ScalarIndex for BitmapIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -667,7 +667,7 @@ impl BitmapIndexPlugin {
         let value_type = data_source.schema().field(0).data_type().clone();
         while let Some(batch) = data_source.try_next().await? {
             let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-            let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+            let row_ids = batch.column_by_name(ROW_ADDR).expect_ok()?;
             debug_assert_eq!(row_ids.data_type(), &DataType::UInt64);
 
             let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -707,7 +707,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             });
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
