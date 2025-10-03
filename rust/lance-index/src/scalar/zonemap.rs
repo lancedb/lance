@@ -34,7 +34,7 @@ use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Arr
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
@@ -54,17 +54,17 @@ const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
-struct ZoneMapStatistics {
-    min: ScalarValue,
-    max: ScalarValue,
-    null_count: u32,
+pub struct ZoneMapStatistics {
+    pub min: ScalarValue,
+    pub max: ScalarValue,
+    pub null_count: u32,
     // only apply to float type
-    nan_count: u32,
-    fragment_id: u64,
+    pub nan_count: u32,
+    pub fragment_id: u64,
     // zone_start is the start row of the zone in the fragment, also known
     // as local row offset
-    zone_start: u64,
-    zone_length: usize,
+    pub zone_start: u64,
+    pub zone_length: usize,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -128,6 +128,28 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
+    /// Fetches all zones which contain values matching the given query
+    /// Used in building splits for engines like Spark, Trino, etc.  
+    pub fn fetch_zones_for_query(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<ZoneMapStatistics>> {
+        metrics.record_comparisons(self.zones.len());
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        let mut filtered_zones = Vec::new();
+
+        // Loop through zones and check each one
+        for zone in self.zones.iter() {
+            // Check if this zone matches the query
+            if self.evaluate_zone_against_query(zone, query)? {
+                filtered_zones.push(zone.clone());
+            }
+        }
+        
+        Ok(filtered_zones)
+    }
+
     /// Evaluates whether a zone could potentially contain values matching the query
     /// For NaN, total order is used here
     /// reference: https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp
@@ -1051,8 +1073,10 @@ mod tests {
 
     // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
-    use crate::Index; // Import Index trait to access calculate_included_frags
-    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
+    use crate::Index;
+    // Import Index trait to access calculate_included_frags
+    use roaring::RoaringBitmap;
+    // Import RoaringBitmap for the test
     use std::collections::Bound;
 
     // Adds a _rowaddr column emulating each batch as a new fragment
