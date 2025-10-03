@@ -1392,4 +1392,67 @@ public class DatasetTest {
       }
     }
   }
+
+  // ===== Blob API tests =====
+  @Test
+  void testReadZeroLengthBlob(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadZeroLengthBlob").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(0L), "blobs");
+      assertEquals(1, blobs.size());
+      BlobFile b = blobs.get(0);
+      assertEquals(0L, b.size());
+      assertArrayEquals(new byte[0], b.read());
+      b.close();
+    }
+  }
+
+  @Test
+  void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs");
+      BlobFile b = blobs.get(0);
+      long size = b.size();
+      assertTrue(size >= 1_000_000, "expected large blob size");
+      byte[] p0 = b.readUpTo(256);
+      assertEquals(256, p0.length);
+      assertEquals(256L, b.tell());
+      b.seek(512);
+      byte[] range = b.readUpTo(256);
+      assertEquals(256, range.length);
+      assertEquals(768L, b.tell());
+      b.seek(0);
+      byte[] all = b.read();
+      assertEquals(size, all.length);
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), p0);
+      assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
+      b.close();
+    }
+  }
+
+  @Test
+  void testReadSmallBlobSequentialIntegrity(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadSmallBlobSequentialIntegrity").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs");
+      BlobFile b = blobs.get(0);
+      long size = b.size();
+      assertTrue(size >= 128, "expected small blob size");
+
+      b.seek(0);
+      byte[] c1 = b.readUpTo(64);
+      byte[] c2 = b.readUpTo(64);
+      byte[] rest = b.read();
+      byte[] combined = new byte[c1.length + c2.length + rest.length];
+      System.arraycopy(c1, 0, combined, 0, c1.length);
+      System.arraycopy(c2, 0, combined, c1.length, c2.length);
+      System.arraycopy(rest, 0, combined, c1.length + c2.length, rest.length);
+
+      b.seek(0);
+      byte[] all = b.read();
+      assertArrayEquals(all, combined);
+      b.close();
+    }
+  }
 }
