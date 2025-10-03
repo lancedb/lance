@@ -474,6 +474,8 @@ pub struct LanceScanConfig {
     pub io_buffer_size: u64,
     pub with_row_id: bool,
     pub with_row_address: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
 }
@@ -489,6 +491,8 @@ impl Default for LanceScanConfig {
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: false,
             with_row_address: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
         }

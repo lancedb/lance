@@ -880,29 +880,30 @@ async fn recalc_versions_for_rewritten_fragments(
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
 ) -> Result<()> {
-    // Load old per-row version sequences (fallback to uniform if missing)
-    let mut old_version_sequences: Vec<lance_table::format::DatasetVersionSequence> =
+    // Load old per-row last_updated_at version sequences
+    let mut old_last_updated_sequences: Vec<lance_table::format::DatasetVersionSequence> =
         Vec::with_capacity(old_fragments.len());
+    // Load old per-row created_at version sequences
+    let mut old_created_at_sequences: Vec<lance_table::format::DatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+
     for frag in old_fragments.iter() {
-        let mut seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
+        let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
+            match row_id_meta {
+                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
+                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+            }
+        } else {
+            frag.physical_rows.unwrap_or(0) as u64
+        };
+
+        // Load last_updated_at sequence
+        let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
             version_meta.load_sequence().map_err(|e| Error::Internal {
-                message: format!("Failed to load DatasetVersionSequence: {}", e),
+                message: format!("Failed to load last_updated_at version sequence: {}", e),
                 location: location!(),
             })?
         } else {
-            // Fallback: if no stored version meta, assume all rows last updated at current dataset version
-            let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
-                match row_id_meta {
-                    RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                    RowIdMeta::External(_file) => {
-                        // External not supported in tests / current code path
-                        // Use physical_rows as a fallback
-                        frag.physical_rows.unwrap_or(0) as u64
-                    }
-                }
-            } else {
-                frag.physical_rows.unwrap_or(0) as u64
-            };
             let creation_version = infer_fragment_creation_version(dataset, frag).await?;
             lance_table::format::DatasetVersionSequence::from_uniform_row_count(
                 row_count,
@@ -910,16 +911,30 @@ async fn recalc_versions_for_rewritten_fragments(
             )
         };
 
+        // Load created_at sequence (default to version 1 if missing)
+        let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load created_at version sequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            // Default: treat all rows as created at version 1
+            lance_table::format::DatasetVersionSequence::from_uniform_row_count(row_count, 1)
+        };
+
         // Apply deletion mask if present (positions are local offsets)
         if let Some(deletion_file) = &frag.deletion_file {
             let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
-            seq.mask(deletions.to_sorted_iter())?;
+            last_updated_seq.mask(deletions.to_sorted_iter())?;
+            created_at_seq.mask(deletions.to_sorted_iter())?;
         }
-        old_version_sequences.push(seq);
+
+        old_last_updated_sequences.push(last_updated_seq);
+        old_created_at_sequences.push(created_at_seq);
     }
 
     // Ensure row counts match new fragments total
-    let old_total: u64 = old_version_sequences.iter().map(|s| s.len()).sum();
+    let old_total: u64 = old_last_updated_sequences.iter().map(|s| s.len()).sum();
     let new_total: u64 = new_fragments
         .iter()
         .map(|f| f.physical_rows.unwrap_or(0) as u64)
@@ -927,21 +942,33 @@ async fn recalc_versions_for_rewritten_fragments(
     debug_assert_eq!(old_total, new_total);
 
     // Rechunk version runs aligned to new fragment sizes
-    let chunk_sizes = new_fragments
+    let chunk_sizes: Vec<u64> = new_fragments
         .iter()
-        .map(|f| f.physical_rows.unwrap_or(0) as u64);
-    let new_version_sequences = lance_table::rowids::version::rechunk_version_sequences(
-        old_version_sequences,
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .collect();
+
+    let new_last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_last_updated_sequences,
+        chunk_sizes.clone(),
+        false,
+    )?;
+
+    let new_created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_created_at_sequences,
         chunk_sizes,
         false,
     )?;
 
-    for (fragment, seq) in new_fragments
+    // Set both version metadata on new fragments
+    for ((fragment, last_updated_seq), created_at_seq) in new_fragments
         .iter_mut()
-        .zip(new_version_sequences.into_iter())
+        .zip(new_last_updated_sequences.into_iter())
+        .zip(new_created_at_sequences.into_iter())
     {
         fragment.last_updated_at_version_meta =
-            Some(lance_table::format::DatasetVersionMeta::from_sequence(&seq).unwrap());
+            Some(lance_table::format::DatasetVersionMeta::from_sequence(&last_updated_seq).unwrap());
+        fragment.created_at_version_meta =
+            Some(lance_table::format::DatasetVersionMeta::from_sequence(&created_at_seq).unwrap());
     }
 
     Ok(())

@@ -428,6 +428,10 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
+    /// Whether the user wants the row last updated at version column on top of the projection
+    legacy_with_row_last_updated_at_version: bool,
+    /// Whether the user wants the row created at version column on top of the projection
+    legacy_with_row_created_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -623,6 +627,8 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
+            legacy_with_row_last_updated_at_version: false,
+            legacy_with_row_created_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -707,6 +713,12 @@ impl Scanner {
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
+        }
+        if self.legacy_with_row_last_updated_at_version {
+            self.projection_plan.include_row_last_updated_at_version();
+        }
+        if self.legacy_with_row_created_at_version {
+            self.projection_plan.include_row_created_at_version();
         }
         Ok(self)
     }
@@ -1215,6 +1227,24 @@ impl Scanner {
         self
     }
 
+    /// Instruct the scanner to return row last updated at version column from the dataset.
+    ///
+    /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
+    pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+        self.legacy_with_row_last_updated_at_version = true;
+        // Version column will be added in try_into_scan_plan
+        self
+    }
+
+    /// Instruct the scanner to return row created at version column from the dataset.
+    ///
+    /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
+    pub fn with_row_created_at_version(&mut self) -> &mut Self {
+        self.legacy_with_row_created_at_version = true;
+        // Version column will be added in try_into_scan_plan
+        self
+    }
+
     /// Instruct the scanner to disable automatic projection of scoring columns
     ///
     /// In the future, this will be the default behavior.  This method is useful for
@@ -1406,6 +1436,24 @@ impl Scanner {
                 // Row addr is not last column.  Need to rotate it to the last spot.
                 let row_addr_expr = output_expr.remove(row_addr_pos);
                 output_expr.push(row_addr_expr);
+            }
+        }
+
+        if self.legacy_with_row_last_updated_at_version {
+            if !output_expr.iter().any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION) {
+                return Err(Error::Internal {
+                    message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
+                    location: location!(),
+                });
+            }
+        }
+
+        if self.legacy_with_row_created_at_version {
+            if !output_expr.iter().any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION) {
+                return Err(Error::Internal {
+                    message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
+                    location: location!(),
+                });
             }
         }
 
@@ -1966,6 +2014,8 @@ impl Scanner {
             let scan = self.scan_fragments(
                 projection.with_row_id,
                 self.projection_plan.physical_projection.with_row_addr,
+                self.projection_plan.physical_projection.with_row_last_updated_at_version,
+                self.projection_plan.physical_projection.with_row_created_at_version,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -2655,6 +2705,8 @@ impl Scanner {
                 true,
                 false,
                 false,
+                false,
+                false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),
                 None,
@@ -2836,6 +2888,8 @@ impl Scanner {
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
                 true,
+                false,
+                false,
                 false,
                 false,
                 vector_scan_projection,
@@ -3030,6 +3084,8 @@ impl Scanner {
             let new_data_scan = self.scan_fragments(
                 true,
                 self.projection_plan.physical_projection.with_row_addr,
+                self.projection_plan.physical_projection.with_row_last_updated_at_version,
+                self.projection_plan.physical_projection.with_row_created_at_version,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -3069,6 +3125,8 @@ impl Scanner {
         &self,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_last_updated_at_version: bool,
+        with_row_created_at_version: bool,
         with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
@@ -3087,6 +3145,8 @@ impl Scanner {
         self.scan_fragments(
             with_row_id,
             with_row_address,
+            with_row_last_updated_at_version,
+            with_row_created_at_version,
             with_make_deletions_null,
             projection,
             fragments,
@@ -3100,6 +3160,8 @@ impl Scanner {
         &self,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_last_updated_at_version: bool,
+        with_row_created_at_version: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
@@ -3114,6 +3176,8 @@ impl Scanner {
             io_buffer_size: self.get_io_buffer_size(),
             with_row_id,
             with_row_address,
+            with_row_last_updated_at_version,
+            with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
         };
