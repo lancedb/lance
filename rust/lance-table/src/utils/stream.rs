@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array};
+use arrow_array::{
+    make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
+};
 use arrow_buffer::NullBuffer;
 use futures::{
     future::BoxFuture,
@@ -13,14 +15,14 @@ use futures::{
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
-    ROW_LAST_UPDATED_AT_VERSION_FIELD, ROW_CREATED_AT_VERSION_FIELD,
+    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::{instrument, Instrument};
 
-use crate::rowids::RowIdSequence;
 use crate::format::Fragment;
+use crate::rowids::RowIdSequence;
 use snafu::location;
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
@@ -285,23 +287,28 @@ pub fn apply_row_id_and_deletes(
 
     // Add version columns if requested
     let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
-        let fragment = config.fragment.as_ref().ok_or_else(|| {
-            lance_core::Error::Internal {
+        let fragment = config
+            .fragment
+            .as_ref()
+            .ok_or_else(|| lance_core::Error::Internal {
                 message: "Fragment metadata required for version columns".to_string(),
                 location: location!(),
-            }
-        })?;
+            })?;
 
         let mut batch = batch;
 
         if config.with_row_last_updated_at_version {
             let version_arr = if let Some(version_meta) = &fragment.last_updated_at_version_meta {
-                let sequence = version_meta.load_sequence().map_err(|e| {
-                    lance_core::Error::Internal {
-                        message: format!("Failed to load last_updated_at version sequence: {}", e),
-                        location: location!(),
-                    }
-                })?;
+                let sequence =
+                    version_meta
+                        .load_sequence()
+                        .map_err(|e| lance_core::Error::Internal {
+                            message: format!(
+                                "Failed to load last_updated_at version sequence: {}",
+                                e
+                            ),
+                            location: location!(),
+                        })?;
                 // Get the range of rows for this batch
                 let selection = config
                     .params
@@ -325,17 +332,19 @@ pub fn apply_row_id_and_deletes(
                 // Default to version 1 if not present
                 Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
             };
-            batch = batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
+            batch =
+                batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
         }
 
         if config.with_row_created_at_version {
             let version_arr = if let Some(version_meta) = &fragment.created_at_version_meta {
-                let sequence = version_meta.load_sequence().map_err(|e| {
-                    lance_core::Error::Internal {
-                        message: format!("Failed to load created_at version sequence: {}", e),
-                        location: location!(),
-                    }
-                })?;
+                let sequence =
+                    version_meta
+                        .load_sequence()
+                        .map_err(|e| lance_core::Error::Internal {
+                            message: format!("Failed to load created_at version sequence: {}", e),
+                            location: location!(),
+                        })?;
                 // Get the range of rows for this batch
                 let selection = config
                     .params

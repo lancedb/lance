@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
-use lance_table::format::{Fragment, DatasetVersionSequence};
+use lance_table::format::{DatasetVersionSequence, Fragment};
 use lance_table::rowids::{read_row_ids, RowIdSequence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -74,15 +74,12 @@ impl DiffOperation {
     /// Convert operation to string representation for Arrow arrays
     pub fn as_str(&self) -> &'static str {
         match self {
-            DiffOperation::Insert => "insert",
-            DiffOperation::Update => "update",
-            DiffOperation::Delete => "delete",
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
         }
     }
 }
-
-/// Stream of diff record batches
-pub type DiffRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 
 /// Create the schema for diff results
 ///
@@ -116,13 +113,17 @@ pub fn create_diff_schema(
 
     // Add optional metadata columns
     if with_row_created_at_version {
-        fields.push(Field::new("_row_created_at_version", DataType::UInt64, true));
+        fields.push(Field::new("row_created_at_version", DataType::UInt64, true));
     }
     if with_row_last_updated_at_version {
-        fields.push(Field::new("_row_last_updated_at_version", DataType::UInt64, true));
+        fields.push(Field::new(
+            "row_last_updated_at_version",
+            DataType::UInt64,
+            true,
+        ));
     }
     if with_row_address {
-        fields.push(Field::new("_row_address", DataType::UInt64, true));
+        fields.push(Field::new("row_address", DataType::UInt64, true));
     }
 
     Arc::new(Schema::new(fields))
@@ -147,7 +148,8 @@ fn build_diff_batch(
 
     // Build operation array
     let operation_str = operation.as_str();
-    let operation_array = Arc::new(StringArray::from(vec![operation_str; num_rows])) as Arc<dyn Array>;
+    let operation_array =
+        Arc::new(StringArray::from(vec![operation_str; num_rows])) as Arc<dyn Array>;
 
     // Build version array
     let version_array = Arc::new(UInt64Array::from(versions)) as Arc<dyn Array>;
@@ -156,11 +158,7 @@ fn build_diff_batch(
     let pre_image_array = if let Some(batch) = pre_image_batch {
         // Convert RecordBatch to StructArray
         let arrays: Vec<Arc<dyn Array>> = batch.columns().to_vec();
-        Arc::new(StructArray::new(
-            data_schema.fields().clone(),
-            arrays,
-            None,
-        )) as Arc<dyn Array>
+        Arc::new(StructArray::new(data_schema.fields().clone(), arrays, None)) as Arc<dyn Array>
     } else {
         // Create null struct array
         let arrays: Vec<Arc<dyn Array>> = data_schema
@@ -179,11 +177,7 @@ fn build_diff_batch(
     let post_image_array = if let Some(batch) = post_image_batch {
         // Convert RecordBatch to StructArray
         let arrays: Vec<Arc<dyn Array>> = batch.columns().to_vec();
-        Arc::new(StructArray::new(
-            data_schema.fields().clone(),
-            arrays,
-            None,
-        )) as Arc<dyn Array>
+        Arc::new(StructArray::new(data_schema.fields().clone(), arrays, None)) as Arc<dyn Array>
     } else {
         // Create null struct array
         let arrays: Vec<Arc<dyn Array>> = data_schema
@@ -210,7 +204,7 @@ fn build_diff_batch(
     // Add optional metadata columns as null arrays (not populated in old transaction-based approach)
     // The schema tells us which metadata columns are requested
     let base_field_count = 5; // row_id, operation, version, pre_image, post_image
-    for field in diff_schema.fields().iter().skip(base_field_count) {
+    for _field in diff_schema.fields().iter().skip(base_field_count) {
         // Add null array for each additional metadata column
         columns.push(Arc::new(UInt64Array::new_null(num_rows)) as Arc<dyn Array>);
     }
@@ -284,15 +278,14 @@ impl FragmentDiffAnalyzer {
     pub async fn analyze_fragment(&self, fragment: &Fragment) -> Result<Vec<RecordBatch>> {
         // Load the row version sequence of this fragment
         // If version metadata is missing, skip this fragment (treat as "existed since beginning")
-        let version_sequence = if let Some(version_meta) =
-            fragment.last_updated_at_version_meta.as_ref()
-        {
-            version_meta.load_sequence()?
-        } else {
-            // Fragment predates version tracking or was created before diff support
-            // Skip it from diff results
-            return Ok(Vec::new());
-        };
+        let version_sequence =
+            if let Some(version_meta) = fragment.last_updated_at_version_meta.as_ref() {
+                version_meta.load_sequence()?
+            } else {
+                // Fragment predates version tracking or was created before diff support
+                // Skip it from diff results
+                return Ok(Vec::new());
+            };
 
         // Find updated and inserted records as RecordBatches
         self.find_updated_and_inserted_records(fragment, &version_sequence)
@@ -368,7 +361,7 @@ impl FragmentDiffAnalyzer {
             // Convert lance Schema to arrow Schema
             // lance_schema is Arc<lance_core::datatypes::Schema>
             // We need &lance_core::datatypes::Schema to convert to arrow_schema::Schema
-            let arrow_schema = arrow_schema::Schema::from(&*lance_schema);
+            let arrow_schema = arrow_schema::Schema::from(lance_schema);
             let data_schema = Arc::new(arrow_schema);
             let diff_schema = create_diff_schema(
                 data_schema.clone(),
@@ -394,7 +387,9 @@ impl FragmentDiffAnalyzer {
                 async move {
                     let include_data = analyzer.config.include_data;
 
-                    let projection = super::ProjectionRequest::Schema(Arc::new(analyzer.current_dataset.schema().clone()));
+                    let projection = super::ProjectionRequest::Schema(Arc::new(
+                        analyzer.current_dataset.schema().clone(),
+                    ));
 
                     // batch post_image data
                     let post_image_batch = if include_data {
@@ -497,7 +492,7 @@ impl FragmentDiffAnalyzer {
     }
 
     /// Create a stream of diff record batches for all fragments
-    pub async fn create_diff_stream(self) -> DiffRecordBatchStream {
+    pub async fn create_diff_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
         let fragments = Arc::try_unwrap(self.current_dataset.manifest.fragments.clone())
             .unwrap_or_else(|arc| (*arc).clone());
         let max_concurrency = self.config.max_concurrency;
@@ -718,7 +713,7 @@ impl DatasetDiffBuilder {
     }
 
     /// Execute the diff operation and return a stream of diff record batches
-    pub async fn execute(self) -> Result<DiffRecordBatchStream> {
+    pub async fn execute(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         // Validate preconditions
         self.validate_preconditions().await?;
 
@@ -732,7 +727,7 @@ impl DatasetDiffBuilder {
     }
 
     /// Execute diff using SQL transformations (no pre_image fetch)
-    async fn execute_sql_based(self) -> Result<DiffRecordBatchStream> {
+    async fn execute_sql_based(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         use arrow_array::StringArray;
         use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 
@@ -792,26 +787,26 @@ impl DatasetDiffBuilder {
                 let last_updated_col = batch
                     .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
                     .ok_or_else(|| Error::Internal {
-                        message: "Missing _row_last_updated_at_version column".to_string(),
+                        message: "Missing row_last_updated_at_version column".to_string(),
                         location: snafu::location!(),
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| Error::Internal {
-                        message: "_row_last_updated_at_version has wrong type".to_string(),
+                        message: "row_last_updated_at_version has wrong type".to_string(),
                         location: snafu::location!(),
                     })?;
 
                 let created_at_col = batch
                     .column_by_name(ROW_CREATED_AT_VERSION)
                     .ok_or_else(|| Error::Internal {
-                        message: "Missing _row_created_at_version column".to_string(),
+                        message: "Missing row_created_at_version column".to_string(),
                         location: snafu::location!(),
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| Error::Internal {
-                        message: "_row_created_at_version has wrong type".to_string(),
+                        message: "row_created_at_version has wrong type".to_string(),
                         location: snafu::location!(),
                     })?;
 
@@ -906,31 +901,38 @@ impl DatasetDiffBuilder {
                         .iter()
                         .map(|&idx| created_at_col.value(idx as usize))
                         .collect();
-                    diff_columns.push(Arc::new(UInt64Array::from(created_at_values)) as Arc<dyn Array>);
+                    diff_columns
+                        .push(Arc::new(UInt64Array::from(created_at_values)) as Arc<dyn Array>);
                 }
                 if with_row_last_updated_at_version {
                     let last_updated_values: Vec<u64> = filtered_indices
                         .iter()
                         .map(|&idx| last_updated_col.value(idx as usize))
                         .collect();
-                    diff_columns.push(Arc::new(UInt64Array::from(last_updated_values)) as Arc<dyn Array>);
+                    diff_columns
+                        .push(Arc::new(UInt64Array::from(last_updated_values)) as Arc<dyn Array>);
                 }
                 if with_row_address {
                     // Extract row_address from the scanned batch if available
                     if let Some(row_address_col) = batch.column_by_name(ROW_ADDR) {
-                        let row_address_array = row_address_col.as_any().downcast_ref::<UInt64Array>()
+                        let row_address_array = row_address_col
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
                             .ok_or_else(|| Error::Internal {
-                                message: "_row_address column has wrong type".to_string(),
+                                message: "row_address column has wrong type".to_string(),
                                 location: snafu::location!(),
                             })?;
                         let address_values: Vec<u64> = filtered_indices
                             .iter()
                             .map(|&idx| row_address_array.value(idx as usize))
                             .collect();
-                        diff_columns.push(Arc::new(UInt64Array::from(address_values)) as Arc<dyn Array>);
+                        diff_columns
+                            .push(Arc::new(UInt64Array::from(address_values)) as Arc<dyn Array>);
                     } else {
                         // Row address not available, push null array
-                        diff_columns.push(Arc::new(UInt64Array::new_null(filtered_row_count)) as Arc<dyn Array>);
+                        diff_columns
+                            .push(Arc::new(UInt64Array::new_null(filtered_row_count))
+                                as Arc<dyn Array>);
                     }
                 }
 
@@ -945,7 +947,7 @@ impl DatasetDiffBuilder {
     }
 
     /// Execute diff with pre_image data fetching (original implementation)
-    async fn execute_with_pre_image(self) -> Result<DiffRecordBatchStream> {
+    async fn execute_with_pre_image(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         // Load the old version of the dataset
         let old_dataset = Arc::new(self.dataset.checkout_version(self.compared_version).await?);
 
@@ -1012,7 +1014,6 @@ impl DatasetDiffBuilder {
 #[cfg(test)]
 mod tests {
     use crate::dataset::delta::DatasetDiffBuilder;
-    use arrow_array::UInt64Array;
     use crate::dataset::transaction::Operation;
     use crate::dataset::{Dataset, WriteMode, WriteParams};
     use arrow_array::cast::AsArray;
@@ -1248,14 +1249,8 @@ mod tests {
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let pre_image_array = batch
-                .column_by_name("pre_image")
-                .unwrap()
-                .as_struct();
-            let post_image_array = batch
-                .column_by_name("post_image")
-                .unwrap()
-                .as_struct();
+            let pre_image_array = batch.column_by_name("pre_image").unwrap().as_struct();
+            let post_image_array = batch.column_by_name("post_image").unwrap().as_struct();
 
             for row_idx in 0..batch.num_rows() {
                 let operation = operation_array.value(row_idx);
@@ -1265,8 +1260,14 @@ mod tests {
                         update_count += 1;
 
                         // Verify the record has both pre_image and post_image data
-                        assert!(!pre_image_array.is_null(row_idx), "Update should have pre_image data");
-                        assert!(!post_image_array.is_null(row_idx), "Update should have post_image data");
+                        assert!(
+                            !pre_image_array.is_null(row_idx),
+                            "Update should have pre_image data"
+                        );
+                        assert!(
+                            !post_image_array.is_null(row_idx),
+                            "Update should have post_image data"
+                        );
 
                         // Get ID from post_image
                         let post_id_array = post_image_array
@@ -1373,14 +1374,8 @@ mod tests {
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let pre_image_array = batch
-                .column_by_name("pre_image")
-                .unwrap()
-                .as_struct();
-            let post_image_array = batch
-                .column_by_name("post_image")
-                .unwrap()
-                .as_struct();
+            let pre_image_array = batch.column_by_name("pre_image").unwrap().as_struct();
+            let post_image_array = batch.column_by_name("post_image").unwrap().as_struct();
 
             for row_idx in 0..batch.num_rows() {
                 let operation = operation_array.value(row_idx);
@@ -1388,18 +1383,36 @@ mod tests {
                 match operation {
                     "insert" => {
                         insert_count += 1;
-                        assert!(pre_image_array.is_null(row_idx), "Insert should have no pre_image data");
-                        assert!(!post_image_array.is_null(row_idx), "Insert should have post_image data");
+                        assert!(
+                            pre_image_array.is_null(row_idx),
+                            "Insert should have no pre_image data"
+                        );
+                        assert!(
+                            !post_image_array.is_null(row_idx),
+                            "Insert should have post_image data"
+                        );
                     }
                     "update" => {
                         update_count += 1;
-                        assert!(!pre_image_array.is_null(row_idx), "Update should have pre_image data");
-                        assert!(!post_image_array.is_null(row_idx), "Update should have post_image data");
+                        assert!(
+                            !pre_image_array.is_null(row_idx),
+                            "Update should have pre_image data"
+                        );
+                        assert!(
+                            !post_image_array.is_null(row_idx),
+                            "Update should have post_image data"
+                        );
                     }
                     "delete" => {
                         delete_count += 1;
-                        assert!(!pre_image_array.is_null(row_idx), "Delete should have pre_image data");
-                        assert!(post_image_array.is_null(row_idx), "Delete should have no post_image data");
+                        assert!(
+                            !pre_image_array.is_null(row_idx),
+                            "Delete should have pre_image data"
+                        );
+                        assert!(
+                            post_image_array.is_null(row_idx),
+                            "Delete should have no post_image data"
+                        );
                     }
                     _ => panic!("Unknown operation type: {}", operation),
                 }
@@ -1451,19 +1464,13 @@ mod tests {
         let mut update_count = 0;
         let mut updated_ids = Vec::new();
 
-        for (batch_idx, batch) in diff_batches.iter().enumerate() {
+        for batch in diff_batches.iter() {
             let operation_array = batch
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let pre_image_array = batch
-                .column_by_name("pre_image")
-                .unwrap()
-                .as_struct();
-            let post_image_array = batch
-                .column_by_name("post_image")
-                .unwrap()
-                .as_struct();
+            let pre_image_array = batch.column_by_name("pre_image").unwrap().as_struct();
+            let post_image_array = batch.column_by_name("post_image").unwrap().as_struct();
 
             for row_idx in 0..batch.num_rows() {
                 let operation = operation_array.value(row_idx);
@@ -1471,13 +1478,25 @@ mod tests {
                 match operation {
                     "insert" => {
                         insert_count += 1;
-                        assert!(pre_image_array.is_null(row_idx), "Insert should have no pre_image data");
-                        assert!(!post_image_array.is_null(row_idx), "Insert should have post_image data");
+                        assert!(
+                            pre_image_array.is_null(row_idx),
+                            "Insert should have no pre_image data"
+                        );
+                        assert!(
+                            !post_image_array.is_null(row_idx),
+                            "Insert should have post_image data"
+                        );
                     }
                     "update" => {
                         update_count += 1;
-                        assert!(!pre_image_array.is_null(row_idx), "Update should have pre_image data");
-                        assert!(!post_image_array.is_null(row_idx), "Update should have post_image data");
+                        assert!(
+                            !pre_image_array.is_null(row_idx),
+                            "Update should have pre_image data"
+                        );
+                        assert!(
+                            !post_image_array.is_null(row_idx),
+                            "Update should have post_image data"
+                        );
 
                         // Verify that this is one of the updated records (id 5-9)
                         let post_id_array = post_image_array
@@ -1814,12 +1833,12 @@ mod tests {
         let mut insert_count_v1_to_v5 = 0;
         let mut update_count_v1_to_v5 = 0;
 
-        for (batch_idx, batch) in diff_batches_v1_to_v5.iter().enumerate() {
+        for batch in diff_batches_v1_to_v5.iter() {
             let operation_array = batch
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let version_array = batch
+            let _version_array = batch
                 .column_by_name("version")
                 .unwrap()
                 .as_primitive::<arrow::datatypes::UInt64Type>();
@@ -1865,10 +1884,10 @@ mod tests {
         let diff_records_compaction: Vec<_> = diff_stream_compaction.try_collect().await.unwrap();
 
         // Compaction should not change data content, so diff should be empty (0 rows)
-        let total_compaction_diff_rows: usize = diff_records_compaction.iter().map(|b| b.num_rows()).sum();
+        let total_compaction_diff_rows: usize =
+            diff_records_compaction.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            total_compaction_diff_rows,
-            0,
+            total_compaction_diff_rows, 0,
             "Compaction should not change data content, diff should have 0 rows"
         );
 
@@ -1925,10 +1944,7 @@ mod tests {
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let post_image_array = batch
-                .column_by_name("post_image")
-                .unwrap()
-                .as_struct();
+            let post_image_array = batch.column_by_name("post_image").unwrap().as_struct();
 
             for row_idx in 0..batch.num_rows() {
                 let operation = operation_array.value(row_idx);
@@ -1957,7 +1973,10 @@ mod tests {
         // v3: 15 rows (ids 300-314), none updated
         // v5: 12 rows (ids 400-411), none updated
         // So: 6 + 15 + 12 = 33 inserts
-        assert_eq!(inserted_count, 33, "Should have 33 insert operations (rows created after v1 and never updated)");
+        assert_eq!(
+            inserted_count, 33,
+            "Should have 33 insert operations (rows created after v1 and never updated)"
+        );
 
         // Updates: 5 from v4 (ids 5-9) + 4 from v7 (ids 200-203) = 9 updates
         assert_eq!(
@@ -2055,14 +2074,8 @@ mod tests {
                 .column_by_name("operation")
                 .unwrap()
                 .as_string::<i32>();
-            let pre_image_array = batch
-                .column_by_name("pre_image")
-                .unwrap()
-                .as_struct();
-            let post_image_array = batch
-                .column_by_name("post_image")
-                .unwrap()
-                .as_struct();
+            let pre_image_array = batch.column_by_name("pre_image").unwrap().as_struct();
+            let post_image_array = batch.column_by_name("post_image").unwrap().as_struct();
 
             for row_idx in 0..batch.num_rows() {
                 let operation = operation_array.value(row_idx);
@@ -2178,21 +2191,23 @@ mod tests {
 
             // Check that metadata columns are present
             assert!(
-                batch.column_by_name("_row_created_at_version").is_some(),
-                "Should have _row_created_at_version column"
+                batch.column_by_name("row_created_at_version").is_some(),
+                "Should have row_created_at_version column"
             );
             assert!(
-                batch.column_by_name("_row_last_updated_at_version").is_some(),
-                "Should have _row_last_updated_at_version column"
+                batch
+                    .column_by_name("row_last_updated_at_version")
+                    .is_some(),
+                "Should have row_last_updated_at_version column"
             );
 
             // Verify the version values are correct (should all be v2)
             let created_at_col = batch
-                .column_by_name("_row_created_at_version")
+                .column_by_name("row_created_at_version")
                 .unwrap()
                 .as_primitive::<arrow::datatypes::UInt64Type>();
             let last_updated_col = batch
-                .column_by_name("_row_last_updated_at_version")
+                .column_by_name("row_last_updated_at_version")
                 .unwrap()
                 .as_primitive::<arrow::datatypes::UInt64Type>();
 

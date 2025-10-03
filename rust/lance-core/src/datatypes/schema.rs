@@ -1005,8 +1005,14 @@ impl Debug for Projection {
             .field("field_ids", &self.field_ids)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_addr", &self.with_row_addr)
-            .field("with_row_last_updated_at_version", &self.with_row_last_updated_at_version)
-            .field("with_row_created_at_version", &self.with_row_created_at_version)
+            .field(
+                "with_row_last_updated_at_version",
+                &self.with_row_last_updated_at_version,
+            )
+            .field(
+                "with_row_created_at_version",
+                &self.with_row_created_at_version,
+            )
             .field("blob_handling", &self.blob_handling)
             .finish()
     }
@@ -1146,8 +1152,10 @@ impl Projection {
         self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
         self.with_row_id = self.with_row_id && other.with_row_id;
         self.with_row_addr = self.with_row_addr && other.with_row_addr;
-        self.with_row_last_updated_at_version = self.with_row_last_updated_at_version && other.with_row_last_updated_at_version;
-        self.with_row_created_at_version = self.with_row_created_at_version && other.with_row_created_at_version;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && other.with_row_created_at_version;
         self
     }
 
@@ -1183,8 +1191,10 @@ impl Projection {
         self.field_ids.extend(&other.field_ids);
         self.with_row_id = self.with_row_id || other.with_row_id;
         self.with_row_addr = self.with_row_addr || other.with_row_addr;
-        self.with_row_last_updated_at_version = self.with_row_last_updated_at_version || other.with_row_last_updated_at_version;
-        self.with_row_created_at_version = self.with_row_created_at_version || other.with_row_created_at_version;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version || other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version || other.with_row_created_at_version;
         self
     }
 
@@ -1200,8 +1210,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id |= other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr |= other.fields().iter().any(|f| f.name() == ROW_ADDR);
-        self.with_row_last_updated_at_version |= other.fields().iter().any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
-        self.with_row_created_at_version |= other.fields().iter().any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
+        self.with_row_last_updated_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1221,8 +1237,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id &= !other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr &= !other.fields().iter().any(|f| f.name() == ROW_ADDR);
-        self.with_row_last_updated_at_version &= !other.fields().iter().any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
-        self.with_row_created_at_version &= !other.fields().iter().any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
+        self.with_row_last_updated_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1239,8 +1261,10 @@ impl Projection {
             .collect();
         self.with_row_addr = self.with_row_addr && !other.with_row_addr;
         self.with_row_id = self.with_row_id && !other.with_row_id;
-        self.with_row_last_updated_at_version = self.with_row_last_updated_at_version && !other.with_row_last_updated_at_version;
-        self.with_row_created_at_version = self.with_row_created_at_version && !other.with_row_created_at_version;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && !other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && !other.with_row_created_at_version;
         self
     }
 

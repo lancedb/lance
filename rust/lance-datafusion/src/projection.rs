@@ -53,8 +53,12 @@ impl ProjectionPlan {
             DataType::UInt64,
             true,
         )));
-        fields.push(Arc::new((&*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone()));
-        fields.push(Arc::new((&*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone()));
+        fields.push(Arc::new(
+            (*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone(),
+        ));
+        fields.push(Arc::new(
+            (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
+        ));
         ArrowSchema::new(fields)
     }
 

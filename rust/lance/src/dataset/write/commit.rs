@@ -516,7 +516,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(10),
             last_updated_at_version_meta: None,
-                created_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 

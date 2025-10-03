@@ -9,15 +9,12 @@ use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::Statistics;
 use futures::StreamExt;
-use lance_core::{
-    ROW_CREATED_AT_VERSION_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
-};
+use lance_core::{ROW_CREATED_AT_VERSION_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD};
 use lance_table::format::{DatasetVersionSequence, Fragment};
 
 /// Add version metadata columns (`_row_last_updated_at_version` and `_row_created_at_version`)
@@ -35,7 +32,6 @@ pub struct AddVersionColumnsExec {
     created_at_pos: usize,
     output_schema: SchemaRef,
     properties: PlanProperties,
-    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for AddVersionColumnsExec {
@@ -102,19 +98,19 @@ impl AddVersionColumnsExec {
             created_at_pos: adjusted_created_pos,
             output_schema,
             properties,
-            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
     /// Build version column arrays from fragment metadata
-    fn build_version_arrays(
-        fragment: &Fragment,
-        num_rows: usize,
-    ) -> Result<(ArrayRef, ArrayRef)> {
+    fn build_version_arrays(fragment: &Fragment, num_rows: usize) -> Result<(ArrayRef, ArrayRef)> {
         // Load last_updated_at sequence
         let last_updated_seq = if let Some(meta) = &fragment.last_updated_at_version_meta {
-            meta.load_sequence()
-                .map_err(|e| DataFusionError::Internal(format!("Failed to load last_updated_at version sequence: {}", e)))?
+            meta.load_sequence().map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "Failed to load last_updated_at version sequence: {}",
+                    e
+                ))
+            })?
         } else {
             // Default: fragment predates version tracking, skip or use default
             return Ok((
@@ -125,8 +121,12 @@ impl AddVersionColumnsExec {
 
         // Load created_at sequence (default to version 1 if missing per user specification)
         let created_at_seq = if let Some(meta) = &fragment.created_at_version_meta {
-            meta.load_sequence()
-                .map_err(|e| DataFusionError::Internal(format!("Failed to load created_at version sequence: {}", e)))?
+            meta.load_sequence().map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "Failed to load created_at version sequence: {}",
+                    e
+                ))
+            })?
         } else {
             // Default: treat all rows as created at version 1
             DatasetVersionSequence::from_uniform_row_count(num_rows as u64, 1)
@@ -206,7 +206,6 @@ impl ExecutionPlan for AddVersionColumnsExec {
             created_at_pos: self.created_at_pos,
             output_schema: self.output_schema.clone(),
             properties: self.properties.clone(),
-            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
@@ -274,7 +273,10 @@ impl ExecutionPlan for AddVersionColumnsExec {
             })
         });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 
     fn statistics(&self) -> Result<Statistics> {

@@ -14,7 +14,9 @@ use snafu::location;
 
 use crate::format::pb;
 
-use crate::rowids::version::{created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, DatasetVersionMeta};
+use crate::rowids::version::{
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, DatasetVersionMeta,
+};
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -499,8 +501,7 @@ impl From<&Fragment> for pb::DataFragment {
         });
         let last_updated_at_version_sequence =
             last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
-        let created_at_version_sequence =
-            created_at_version_meta_to_pb(&f.created_at_version_meta);
+        let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),

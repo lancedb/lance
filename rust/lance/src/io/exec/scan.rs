@@ -168,7 +168,7 @@ impl LanceStream {
         batch: RecordBatch,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
-        use arrow_array::{Array, ArrayRef, UInt64Array};
+        use arrow_array::{ArrayRef, UInt64Array};
         use datafusion::error::DataFusionError;
         use lance_table::rowids::version::DatasetVersionSequence;
 
@@ -620,12 +620,12 @@ impl RecordBatchStream for LanceStream {
         }
         if self.config.with_row_last_updated_at_version {
             schema = schema
-                .try_with_column((&*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         if self.config.with_row_created_at_version {
             schema = schema
-                .try_with_column((&*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         Arc::new(schema)
@@ -737,12 +737,12 @@ impl LanceScanExec {
         }
         if config.with_row_last_updated_at_version {
             output_schema = output_schema
-                .try_with_column((&*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         if config.with_row_created_at_version {
             output_schema = output_schema
-                .try_with_column((&*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);

@@ -1441,22 +1441,26 @@ impl Scanner {
             }
         }
 
-        if self.legacy_with_row_last_updated_at_version {
-            if !output_expr.iter().any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION) {
-                return Err(Error::Internal {
-                    message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
-                    location: location!(),
-                });
-            }
+        if self.legacy_with_row_last_updated_at_version
+            && !output_expr
+                .iter()
+                .any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
+        {
+            return Err(Error::Internal {
+                message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
+                location: location!(),
+            });
         }
 
-        if self.legacy_with_row_created_at_version {
-            if !output_expr.iter().any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION) {
-                return Err(Error::Internal {
-                    message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
-                    location: location!(),
-                });
-            }
+        if self.legacy_with_row_created_at_version
+            && !output_expr
+                .iter()
+                .any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION)
+        {
+            return Err(Error::Internal {
+                message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
+                location: location!(),
+            });
         }
 
         Ok(output_expr)
@@ -1999,7 +2003,9 @@ impl Scanner {
             let ordered = if self.ordering.is_some() || self.nearest.is_some() {
                 // If we are sorting the results there is no need to scan in order
                 false
-            } else if projection.with_row_last_updated_at_version || projection.with_row_created_at_version {
+            } else if projection.with_row_last_updated_at_version
+                || projection.with_row_created_at_version
+            {
                 // Version columns require ordered scanning because version metadata
                 // is indexed by position within each fragment
                 true
@@ -2028,8 +2034,12 @@ impl Scanner {
             let scan = self.scan_fragments(
                 projection.with_row_id,
                 self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan.physical_projection.with_row_last_updated_at_version,
-                self.projection_plan.physical_projection.with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_last_updated_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_created_at_version,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -3105,8 +3115,12 @@ impl Scanner {
             let new_data_scan = self.scan_fragments(
                 true,
                 self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan.physical_projection.with_row_last_updated_at_version,
-                self.projection_plan.physical_projection.with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_last_updated_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_created_at_version,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -3142,6 +3156,7 @@ impl Scanner {
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
     /// column as a selection vector. Read more in [crate::io::FileReader].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         with_row_id: bool,
@@ -8235,8 +8250,16 @@ mod test {
             .unwrap();
 
         for i in 0..batch.num_rows() {
-            assert_eq!(last_updated_array.value(i), 1, "All rows last updated at version 1");
-            assert_eq!(created_at_array.value(i), 1, "All rows created at version 1");
+            assert_eq!(
+                last_updated_array.value(i),
+                1,
+                "All rows last updated at version 1"
+            );
+            assert_eq!(
+                created_at_array.value(i),
+                1,
+                "All rows created at version 1"
+            );
         }
     }
 }

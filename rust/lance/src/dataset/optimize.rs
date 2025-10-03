@@ -965,8 +965,9 @@ async fn recalc_versions_for_rewritten_fragments(
         .zip(new_last_updated_sequences.into_iter())
         .zip(new_created_at_sequences.into_iter())
     {
-        fragment.last_updated_at_version_meta =
-            Some(lance_table::format::DatasetVersionMeta::from_sequence(&last_updated_seq).unwrap());
+        fragment.last_updated_at_version_meta = Some(
+            lance_table::format::DatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
+        );
         fragment.created_at_version_meta =
             Some(lance_table::format::DatasetVersionMeta::from_sequence(&created_at_seq).unwrap());
     }
@@ -1134,7 +1135,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
-                created_at_version_meta: None,
+            created_at_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],

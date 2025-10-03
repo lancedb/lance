@@ -270,9 +270,7 @@ pub fn created_at_version_meta_to_pb(
 ) -> Option<pb::data_fragment::CreatedAtVersionSequence> {
     meta.as_ref().map(|m| match m {
         DatasetVersionMeta::Inline(data) => {
-            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(
-                data.clone(),
-            )
+            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.clone())
         }
         DatasetVersionMeta::External(file) => {
             pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
@@ -304,14 +302,11 @@ pub fn write_dataset_versions(sequence: &DatasetVersionSequence) -> Vec<u8> {
 }
 
 /// Deserialize a dataset version sequence from bytes (following RowIdSequence pattern)
-pub fn read_dataset_versions(
-    data: &[u8],
-) -> lance_core::Result<DatasetVersionSequence> {
-    let pb_sequence =
-        pb::DatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
-            message: format!("Failed to decode DatasetVersionSequence: {}", e),
-            location: location!(),
-        })?;
+pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<DatasetVersionSequence> {
+    let pb_sequence = pb::DatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
+        message: format!("Failed to decode DatasetVersionSequence: {}", e),
+        location: location!(),
+    })?;
 
     let segments = pb_sequence
         .runs
@@ -340,8 +335,7 @@ pub fn rechunk_version_sequences(
 ) -> Result<Vec<DatasetVersionSequence>> {
     let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
     let total_chunks = chunk_sizes_vec.len();
-    let mut chunked_sequences: Vec<DatasetVersionSequence> =
-        Vec::with_capacity(total_chunks);
+    let mut chunked_sequences: Vec<DatasetVersionSequence> = Vec::with_capacity(total_chunks);
 
     let mut run_iter = sequences
         .into_iter()
@@ -433,10 +427,7 @@ pub fn rechunk_version_sequences(
 }
 
 /// Build version metadata for a fragment if it has physical rows and no existing metadata.
-pub fn build_version_meta(
-    fragment: &Fragment,
-    current_version: u64,
-) -> Option<DatasetVersionMeta> {
+pub fn build_version_meta(fragment: &Fragment, current_version: u64) -> Option<DatasetVersionMeta> {
     if let Some(physical_rows) = fragment.physical_rows {
         if physical_rows > 0 {
             // Verify row_id_meta exists (sanity check for stable row IDs)
@@ -447,8 +438,10 @@ pub fn build_version_meta(
             // Use physical_rows directly as the authoritative row count
             // This is correct even for compacted fragments where row_id_meta might
             // have been partially copied
-            let version_sequence =
-                DatasetVersionSequence::from_uniform_row_count(physical_rows as u64, current_version);
+            let version_sequence = DatasetVersionSequence::from_uniform_row_count(
+                physical_rows as u64,
+                current_version,
+            );
 
             return Some(DatasetVersionMeta::from_sequence(&version_sequence).unwrap());
         }
@@ -576,13 +569,13 @@ impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for DatasetVersion
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
                 Ok(Self::Inline(data))
             }
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path,
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
+            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
+                file,
+            ) => Ok(Self::External(ExternalFile {
+                path: file.path,
+                offset: file.offset,
+                size: file.size,
+            })),
         }
     }
 }
