@@ -1640,9 +1640,6 @@ impl Dataset {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
-                    if let Some(lance_tokenizer) = kwargs.get_item("lance_tokenizer")? {
-                        params = params.lance_tokenizer(lance_tokenizer.extract()?);
-                    }
                     if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
                         params = params.base_tokenizer(base_tokenizer.extract()?);
                     }
@@ -1668,8 +1665,8 @@ impl Dataset {
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words_file")? {
-                        params = params.custom_stop_words_file(stop_words_file.extract()?);
+                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(stop_words_file.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);

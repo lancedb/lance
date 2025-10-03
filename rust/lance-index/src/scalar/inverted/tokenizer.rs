@@ -4,8 +4,6 @@
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::collections::HashSet;
-use std::io::BufRead;
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -74,8 +72,8 @@ pub struct InvertedIndexParams {
 
     /// use customized stop words.
     /// - `None`: use built-in stop words based on language
-    /// - `Some(file)`: load customized stop words from file
-    pub(crate) custom_stop_words_file: Option<String>,
+    /// - `Some(words)`: use customized stop words
+    pub(crate) custom_stop_words: Option<Vec<String>>,
 
     /// ascii folding
     #[serde(default = "bool_true")]
@@ -156,7 +154,7 @@ impl InvertedIndexParams {
             lower_case: true,
             stem: true,
             remove_stop_words: true,
-            custom_stop_words_file: None,
+            custom_stop_words: None,
             ascii_folding: true,
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
@@ -211,8 +209,8 @@ impl InvertedIndexParams {
         self
     }
 
-    pub fn custom_stop_words_file(mut self, custom_stop_words_file: Option<String>) -> Self {
-        self.custom_stop_words_file = custom_stop_words_file;
+    pub fn custom_stop_words(mut self, custom_stop_words: Option<Vec<String>>) -> Self {
+        self.custom_stop_words = custom_stop_words;
         self
     }
 
@@ -258,16 +256,8 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = match &self.custom_stop_words_file {
-                Some(file) => {
-                    let mut words = HashSet::new();
-                    let file = std::fs::File::open(PathBuf::from(file))?;
-                    let reader = std::io::BufReader::new(file);
-                    for line in reader.lines() {
-                        words.insert(line?);
-                    }
-                    tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned())
-                }
+            let stop_word_filter = match &self.custom_stop_words {
+                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
                 None => {
                     tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
                         Error::invalid_input(

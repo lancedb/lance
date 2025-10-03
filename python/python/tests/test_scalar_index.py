@@ -602,11 +602,6 @@ def test_full_text_search_without_index(dataset):
 
 
 def test_fts_custom_stop_words(tmp_path):
-    # Create a stop words file
-    stop_words_path = tmp_path / "stop_words.txt"
-    with open(stop_words_path, "w") as f:
-        f.write("他们\n")
-
     # Prepare dataset
     set_language_model_path()
     data = pa.table(
@@ -620,7 +615,7 @@ def test_fts_custom_stop_words(tmp_path):
         "INVERTED",
         base_tokenizer="jieba/default",
         remove_stop_words=True,
-        custom_stop_words_file=str(stop_words_path),
+        custom_stop_words=["他们"],
     )
 
     # Search
