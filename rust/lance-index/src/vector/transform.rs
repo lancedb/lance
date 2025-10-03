@@ -110,11 +110,11 @@ where
     T::Native: Float,
 {
     arr.null_count() == 0
-        && !arr
+        && arr
             .as_primitive::<T>()
             .values()
             .iter()
-            .any(|&v| v.abs() > max_value)
+            .all(|&v| v.abs() <= max_value)
 }
 
 impl Transformer for KeepFiniteVectors {
@@ -361,6 +361,28 @@ mod tests {
 
         let dup_drop_result = transformer.transform(&output);
         assert!(dup_drop_result.is_ok());
+    }
+
+    #[test]
+    fn test_is_all_finite() {
+        let array = Float32Array::from(vec![1.0, 2.0]);
+        assert!(is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32));
+
+        let failure_values = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            MAX_VIABLE_VALUE_F32 * 2.0,
+            -MAX_VIABLE_VALUE_F32 * 2.0,
+        ];
+        for &v in &failure_values {
+            let array = Float32Array::from(vec![1.0, v]);
+            assert!(
+                !is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32),
+                "value {} should fail is_all_finite",
+                v
+            );
+        }
     }
 
     #[test]

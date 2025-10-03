@@ -1987,15 +1987,17 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        // we use 8192 batch size by default, so we need to generate 8192 * 2 vectors to get 2 batches
-        // generate 2 batches, and the first batch's vectors are all with NaN
-        let num_rows = 8192 * 2;
+        // we use 8192 batch size by default, so we need to generate 8192 * 3 vectors to get 3 batches
+        // generate 3 batches, and the first batch's vectors are all with NaN
+        let num_rows = 8192 * 3;
         let mut vectors = Vec::new();
         for i in 0..num_rows {
             if i < 8192 {
                 vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
-            } else {
+            } else if i < 8192 * 2 {
                 vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
+            } else {
+                vectors.extend(std::iter::repeat_n(rand::random::<f32>() * 1e20, DIM));
             }
         }
         let schema = Schema::new(vec![Field::new(
