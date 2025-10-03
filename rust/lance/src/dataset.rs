@@ -7660,7 +7660,7 @@ mod tests {
             .unwrap();
 
         // Read back the dataset
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
         let mut scanner = dataset.scan();
         let result_batches = scanner
             .try_into_stream()

@@ -8190,8 +8190,8 @@ mod test {
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         Dataset::write(reader, test_uri, Some(WriteParams::default()))
