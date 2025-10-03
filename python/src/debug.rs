@@ -146,3 +146,38 @@ pub fn list_transactions(
         Ok(transactions)
     })?
 }
+
+/// Get a list of all files referenced by the current version of the dataset.
+///
+/// This returns a list of tuples for all data files, deletion files, transaction files,
+/// index directories, and the manifest file itself. Each tuple contains (absolute_path,
+/// relative_path) where the absolute path is for reading the file and the relative path
+/// is for copying to a new dataset location.
+///
+/// # Arguments
+///
+/// * `dataset` - The Lance dataset to get referenced files from
+///
+/// # Returns
+///
+/// A list of tuples (absolute_path, relative_path). The absolute path is the full path
+/// to the file, and the relative path is the path within the dataset structure
+/// (e.g., "data/file.lance", "_versions/1.manifest").
+#[pyfunction]
+pub fn referenced_files(dataset: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let py = dataset.py();
+    let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+    let dataset_ref = dataset.bind(py).borrow().ds.clone();
+
+    RT.block_on(Some(py), async move {
+        let files = dataset_ref.referenced_files().await.map_err(|err| {
+            PyIOError::new_err(format!("Failed to get referenced files: {:?}", err))
+        })?;
+
+        // Convert ReferencedFile structs to tuples
+        Ok(files
+            .into_iter()
+            .map(|f| (f.path, f.relative_path))
+            .collect())
+    })?
+}
