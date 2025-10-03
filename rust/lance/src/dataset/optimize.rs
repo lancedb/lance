@@ -110,6 +110,7 @@ use tracing::info;
 
 pub mod remapping;
 
+use crate::dataset::delta::infer_fragment_creation_version;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
@@ -768,6 +769,14 @@ async fn rewrite_files(
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+        if dataset.manifest.uses_stable_row_ids() {
+            recalc_versions_for_rewritten_fragments(
+                dataset.as_ref(),
+                &mut new_fragments,
+                &fragments,
+            )
+            .await?;
+        }
 
         if options.defer_index_remap {
             let no_addrs = RoaringTreemap::new();
@@ -860,6 +869,79 @@ async fn rechunk_stable_row_ids(
         // TODO: if large enough, serialize to separate file
         let serialized = lance_table::rowids::write_row_ids(&sequence);
         fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+    }
+
+    Ok(())
+}
+
+/// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
+async fn recalc_versions_for_rewritten_fragments(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    old_fragments: &[Fragment],
+) -> Result<()> {
+    // Load old per-row version sequences (fallback to uniform if missing)
+    let mut old_version_sequences: Vec<lance_table::format::DatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+    for frag in old_fragments.iter() {
+        let mut seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load DatasetVersionSequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            // Fallback: if no stored version meta, assume all rows last updated at current dataset version
+            let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
+                match row_id_meta {
+                    RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
+                    RowIdMeta::External(_file) => {
+                        // External not supported in tests / current code path
+                        // Use physical_rows as a fallback
+                        frag.physical_rows.unwrap_or(0) as u64
+                    }
+                }
+            } else {
+                frag.physical_rows.unwrap_or(0) as u64
+            };
+            let creation_version = infer_fragment_creation_version(dataset, frag).await?;
+            lance_table::format::DatasetVersionSequence::from_uniform_row_count(
+                row_count,
+                creation_version,
+            )
+        };
+
+        // Apply deletion mask if present (positions are local offsets)
+        if let Some(deletion_file) = &frag.deletion_file {
+            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+            seq.mask(deletions.to_sorted_iter())?;
+        }
+        old_version_sequences.push(seq);
+    }
+
+    // Ensure row counts match new fragments total
+    let old_total: u64 = old_version_sequences.iter().map(|s| s.len()).sum();
+    let new_total: u64 = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .sum();
+    debug_assert_eq!(old_total, new_total);
+
+    // Rechunk version runs aligned to new fragment sizes
+    let chunk_sizes = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64);
+    let new_version_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_version_sequences,
+        chunk_sizes,
+        false,
+    )?;
+
+    for (fragment, seq) in new_fragments
+        .iter_mut()
+        .zip(new_version_sequences.into_iter())
+    {
+        fragment.last_updated_at_version_meta =
+            Some(lance_table::format::DatasetVersionMeta::from_sequence(&seq).unwrap());
     }
 
     Ok(())
@@ -1024,6 +1106,8 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],

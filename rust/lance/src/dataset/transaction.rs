@@ -1554,6 +1554,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
             }
@@ -1629,7 +1637,18 @@ impl Transaction {
 
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
+                // Identify fragments that were updated or newly created in this update
+                let mut target_ids: HashSet<u64> = HashSet::new();
+                target_ids.extend(new_fragments.iter().map(|f| f.id));
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
@@ -1653,6 +1672,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
@@ -3403,6 +3430,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3433,6 +3462,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3463,6 +3494,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3496,6 +3529,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3522,6 +3557,8 @@ mod tests {
                 row_id_meta: None,
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3529,6 +3566,8 @@ mod tests {
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3571,6 +3610,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+                created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
