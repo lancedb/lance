@@ -2057,7 +2057,7 @@ impl Transaction {
     fn retain_relevant_indices(
         indices: &mut Vec<IndexMetadata>,
         schema: &Schema,
-        _fragments: &[Fragment],
+        fragments: &[Fragment],
     ) {
         let field_ids = schema
             .fields_pre_order()
@@ -2095,6 +2095,11 @@ impl Transaction {
         // Build a set of UUIDs to keep based on retention rules
         let mut uuids_to_keep = std::collections::HashSet::new();
 
+        let existing_fragments = fragments
+            .iter()
+            .map(|f| f.id as u32)
+            .collect::<RoaringBitmap>();
+
         // For each group of indices with the same name
         for (_, same_name_indices) in indices_by_name {
             if same_name_indices.len() > 1 {
@@ -2102,7 +2107,7 @@ impl Transaction {
                 let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
                     same_name_indices.iter().partition(|index| {
                         index
-                            .fragment_bitmap
+                            .effective_fragment_bitmap(&existing_fragments)
                             .as_ref()
                             .is_none_or(|bitmap| bitmap.is_empty())
                     });
@@ -2129,7 +2134,7 @@ impl Transaction {
                 // Single index - keep it unless it's an empty vector index
                 if let Some(index) = same_name_indices.first() {
                     let is_empty = index
-                        .fragment_bitmap
+                        .effective_fragment_bitmap(&existing_fragments)
                         .as_ref()
                         .is_none_or(|bitmap| bitmap.is_empty());
                     let is_vector = Self::is_vector_index(index);
@@ -3577,5 +3582,451 @@ mod tests {
         } else {
             panic!("Expected Internal error about missing physical rows");
         }
+    }
+
+    // Helper functions for retain_relevant_indices tests
+    fn create_test_index(
+        name: &str,
+        field_id: i32,
+        dataset_version: u64,
+        fragment_bitmap: Option<RoaringBitmap>,
+        is_vector: bool,
+    ) -> IndexMetadata {
+        use prost_types::Any;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let index_details = if is_vector {
+            Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            }))
+        } else {
+            Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.ScalarIndexDetails".to_string(),
+                value: vec![],
+            }))
+        };
+
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            name: name.to_string(),
+            dataset_version,
+            fragment_bitmap,
+            index_details,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        }
+    }
+
+    fn create_system_index(name: &str, field_id: i32) -> IndexMetadata {
+        use prost_types::Any;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            name: name.to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
+            index_details: Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.SystemIndexDetails".to_string(),
+                value: vec![],
+            })),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        }
+    }
+
+    fn create_test_schema(field_ids: &[i32]) -> Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        let fields: Vec<ArrowField> = field_ids
+            .iter()
+            .map(|id| ArrowField::new(format!("field_{}", id), DataType::Int32, false))
+            .collect();
+
+        let arrow_schema = ArrowSchema::new(fields);
+        let mut lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Assign field IDs
+        for (i, field_id) in field_ids.iter().enumerate() {
+            lance_schema.mut_field_by_id(i as i32).unwrap().id = *field_id;
+        }
+
+        lance_schema
+    }
+
+    #[test]
+    fn test_retain_indices_removes_missing_fields() {
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)];
+
+        let mut indices = vec![
+            create_test_index("idx1", 1, 1, Some(RoaringBitmap::from_iter([1])), false),
+            create_test_index("idx2", 2, 1, Some(RoaringBitmap::from_iter([1])), false),
+            create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().all(|idx| idx.fields[0] != 99));
+    }
+
+    #[test]
+    fn test_retain_indices_keeps_system_indices() {
+        use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_system_index(FRAG_REUSE_INDEX_NAME, 99), // Field doesn't exist but should be kept
+            create_system_index(MEM_WAL_INDEX_NAME, 99), // Field doesn't exist but should be kept
+            create_test_index("regular_idx", 99, 1, Some(RoaringBitmap::new()), false), // Should be removed
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+        assert!(indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME));
+    }
+
+    #[test]
+    fn test_retain_indices_keeps_fragment_reuse_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_system_index(FRAG_REUSE_INDEX_NAME, 1),
+            create_test_index("other_idx", 1, 1, Some(RoaringBitmap::new()), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Fragment reuse index should always be kept
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+    }
+
+    #[test]
+    fn test_retain_single_empty_scalar_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::new()), // Empty bitmap
+            false,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Single empty scalar index should be kept
+        assert_eq!(indices.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_single_empty_vector_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::new()), // Empty bitmap
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Single empty vector index should be removed
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_single_nonempty_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut scalar_indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1])),
+            false,
+        )];
+
+        let mut vector_indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Both should be kept
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_single_index_with_none_bitmap() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut scalar_indices = vec![create_test_index("scalar_idx", 1, 1, None, false)];
+        let mut vector_indices = vec![create_test_index("vector_idx", 1, 1, None, true)];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Scalar should be kept, vector should be removed
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_multiple_empty_scalar_indices_keeps_oldest() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::new()), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only the oldest (dataset_version = 1)
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
+    }
+
+    #[test]
+    fn test_retain_multiple_empty_vector_indices_removes_all() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec_idx", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_idx", 1, 2, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // All empty vector indices should be removed
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_mixed_empty_nonempty_keeps_nonempty() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false), // Empty
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::from_iter([1])), false), // Non-empty
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false), // Empty
+            create_test_index("idx", 1, 4, Some(RoaringBitmap::from_iter([1])), false), // Non-empty
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only non-empty indices
+        assert_eq!(indices.len(), 2);
+        assert!(indices
+            .iter()
+            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4));
+    }
+
+    #[test]
+    fn test_retain_mixed_empty_nonempty_vector_keeps_nonempty() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec_idx", 1, 1, Some(RoaringBitmap::new()), true), // Empty
+            create_test_index("vec_idx", 1, 2, Some(RoaringBitmap::from_iter([1])), true), // Non-empty
+            create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),          // Empty
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only non-empty index
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 2);
+    }
+
+    #[test]
+    fn test_retain_fragment_bitmap_with_nonexistent_fragments() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)]; // Only fragments 1 and 2 exist
+
+        let mut indices = vec![create_test_index(
+            "idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3, 4])), // References non-existent fragments 3, 4
+            false,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should still keep the index (effective bitmap will be intersection with existing)
+        assert_eq!(indices.len(), 1);
+        // Original bitmap should be unchanged
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn test_retain_effective_empty_bitmap_single_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(5), Fragment::new(6)];
+
+        // Bitmap references fragments that don't exist, so effective bitmap is empty
+        let mut scalar_indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3])),
+            false,
+        )];
+
+        let mut vector_indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3])),
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Scalar should be kept (single index, even if effective bitmap is empty)
+        // Vector should be removed (empty effective bitmap)
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_different_index_names() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_b", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("idx_c", 1, 1, Some(RoaringBitmap::from_iter([1])), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // idx_a (empty scalar) should be kept, idx_b (empty vector) removed, idx_c (non-empty) kept
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.name == "idx_a"));
+        assert!(indices.iter().any(|idx| idx.name == "idx_c"));
+        assert!(!indices.iter().any(|idx| idx.name == "idx_b"));
+    }
+
+    #[test]
+    fn test_retain_empty_indices_vec() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices: Vec<IndexMetadata> = vec![];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_all_indices_removed() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec1", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec2", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Bad field
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_complex_scenario() {
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)];
+
+        let mut indices = vec![
+            // System index - should always be kept
+            create_system_index(FRAG_REUSE_INDEX_NAME, 1),
+            // Group "idx_a" - all empty scalars, keep oldest
+            create_test_index("idx_a", 1, 3, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
+            create_test_index("idx_a", 1, 2, Some(RoaringBitmap::new()), false),
+            // Group "vec_b" - all empty vectors, remove all
+            create_test_index("vec_b", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_b", 1, 2, Some(RoaringBitmap::new()), true),
+            // Group "idx_c" - mixed empty/non-empty, keep non-empty
+            create_test_index("idx_c", 2, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_c", 2, 2, Some(RoaringBitmap::from_iter([1])), false), // Keep
+            create_test_index("idx_c", 2, 3, Some(RoaringBitmap::from_iter([2])), false), // Keep
+            // Single non-empty - keep
+            create_test_index("idx_d", 1, 1, Some(RoaringBitmap::from_iter([1, 2])), false),
+            // Index with bad field - remove
+            create_test_index("idx_e", 99, 1, Some(RoaringBitmap::from_iter([1])), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Expected: frag_reuse, idx_a (oldest), idx_c (2 non-empty), idx_d = 5 total
+        assert_eq!(indices.len(), 5);
+
+        // Verify system index kept
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+
+        // Verify idx_a kept oldest only
+        let idx_a_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_a").collect();
+        assert_eq!(idx_a_indices.len(), 1);
+        assert_eq!(idx_a_indices[0].dataset_version, 1);
+
+        // Verify vec_b all removed
+        assert!(!indices.iter().any(|idx| idx.name == "vec_b"));
+
+        // Verify idx_c kept non-empty only
+        let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
+        assert_eq!(idx_c_indices.len(), 2);
+        assert!(idx_c_indices
+            .iter()
+            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3));
+
+        // Verify idx_d kept
+        assert!(indices.iter().any(|idx| idx.name == "idx_d"));
+
+        // Verify idx_e removed (bad field)
+        assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
     }
 }

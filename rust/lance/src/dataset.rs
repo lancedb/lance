@@ -4831,17 +4831,19 @@ mod tests {
 
         dataset.delete("true").await.unwrap();
 
-        let indices = dataset.load_indices().await.unwrap();
-        // With the new retention behavior, indices are kept even when all fragments are deleted
-        // This allows the index configuration to persist through data changes
-        assert_eq!(indices.len(), 1);
+        // This behavior will be re-introduced once we work on empty vector index handling.
+        // https://github.com/lancedb/lance/issues/4034
+        // let indices = dataset.load_indices().await.unwrap();
+        // // With the new retention behavior, indices are kept even when all fragments are deleted
+        // // This allows the index configuration to persist through data changes
+        // assert_eq!(indices.len(), 1);
 
-        // Verify the index has an empty effective fragment bitmap
-        let index = &indices[0];
-        let effective_bitmap = index
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-            .unwrap();
-        assert!(effective_bitmap.is_empty());
+        // // Verify the index has an empty effective fragment bitmap
+        // let index = &indices[0];
+        // let effective_bitmap = index
+        //     .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        //     .unwrap();
+        // assert!(effective_bitmap.is_empty());
 
         let mut stream = dataset
             .scan()
