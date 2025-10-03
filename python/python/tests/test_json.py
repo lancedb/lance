@@ -67,6 +67,59 @@ def test_json_basic_write_read():
         assert result_table.num_rows == 5
         assert result_table.column("id").to_pylist() == [1, 2, 3, 4, 5]
 
+def test_json_merge_insert():
+    """Test merging and inserting JSON data into existing dataset."""
+
+    # Create test data with JSON strings
+    base_json_data = [
+        {"name": "Alice", "age": 30, "city": "New York"},
+        {"name": "Bob", "age": 25, "city": "San Francisco"},
+        {"name": "Charlie", "age": 35, "city": "Chicago"},
+        None,  # Test null handling
+        {"nested": {"key": "value", "list": [1, 2, 3]}},
+    ]
+
+    base_json_strings = [json.dumps(d) if d is not None else None for d in base_json_data]
+    base_json_arr = pa.array(base_json_strings, type=pa.json_())
+    base_table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int32()),
+            "data": base_json_arr,
+        }
+    )
+
+    # Write to Lance dataset
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dataset_path = Path(tmpdir) / "json_merge_insert_test.lance"
+
+        # Write the dataset
+        lance.write_dataset(base_table, dataset_path)
+
+        # Read back the dataset
+        dataset = lance.dataset(dataset_path)
+        assert dataset.count_rows() == 5
+
+        # Create new data to merge_insert
+        new_json_data = [
+            {"name": "David", "age": 28, "city": "Boston"},
+            {"name": "Eve", "age": 22, "city": "Seattle"},
+        ]
+        new_json_strings = [json.dumps(d) for d in new_json_data]
+        new_json_arr = pa.array(new_json_strings, type=pa.json_())
+        new_table = pa.table(
+            {
+                "id": pa.array([5, 6], type=pa.int32()),
+                "data": new_json_arr,
+            }
+        )
+
+        # Merge insert new data (id=5 should update, id=6 should insert)
+        rst = dataset.merge_insert("id") \
+                .when_matched_update_all() \
+                .when_not_matched_insert_all() \
+                .execute(new_table)
+        assert dataset.count_rows() == 6
+
 
 def test_json_with_other_types():
     """Test JSON type alongside other data types."""
