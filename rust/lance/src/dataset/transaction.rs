@@ -1696,6 +1696,7 @@ impl Transaction {
                     groups,
                     &mut fragment_id,
                     current_version,
+                    next_row_id.as_ref(),
                 )?;
 
                 if next_row_id.is_some() {
@@ -2259,6 +2260,7 @@ impl Transaction {
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
         version: u64,
+        next_row_id: Option<&u64>,
     ) -> Result<()> {
         for group in groups {
             // If the old fragments are contiguous, find the range
@@ -2280,7 +2282,25 @@ impl Transaction {
                 }
             };
 
-            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id);
+            let mut new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id).collect::<Vec<_>>();
+
+            // Update version metadata for rewritten fragments if stable row IDs are enabled
+            if next_row_id.is_some() {
+                let new_version = version + 1;
+                for fragment in new_fragments.iter_mut() {
+                    // For rewrite operations (compaction, update), all rows are updated
+                    // so we set last_updated_at_version_meta to the new version
+                    let version_meta = lance_table::rowids::version::build_version_meta(fragment, new_version);
+                    fragment.last_updated_at_version_meta = version_meta.clone();
+                    // If there's no created_at metadata yet, initialize it to the new version
+                    // (this can happen for old fragments without version metadata)
+                    if fragment.created_at_version_meta.is_none() {
+                        fragment.created_at_version_meta = version_meta;
+                    }
+                    // Otherwise created_at is preserved from the old fragment
+                }
+            }
+
             if let Some(replace_range) = replace_range {
                 // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
@@ -3263,6 +3283,7 @@ mod tests {
             &rewrite_groups,
             &mut fragment_id,
             version,
+            None,
         )
         .unwrap();
 

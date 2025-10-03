@@ -1325,7 +1325,7 @@ impl Scanner {
     }
 
     /// The Arrow schema of the output, including projections and vector / _distance
-    pub async fn schema(&self) -> Result<SchemaRef> {
+    pub async fn schema(&mut self) -> Result<SchemaRef> {
         let plan = self.create_plan().await?;
         Ok(plan.schema())
     }
@@ -1370,6 +1370,8 @@ impl Scanner {
         let base_schema = Projection::full(self.dataset.clone())
             .with_row_id()
             .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
             .to_schema();
 
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
@@ -1462,7 +1464,7 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
+    pub fn try_into_stream(&mut self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1480,7 +1482,7 @@ impl Scanner {
     }
 
     pub(crate) async fn try_into_dfstream(
-        &self,
+        &mut self,
         mut options: LanceExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
@@ -1493,14 +1495,14 @@ impl Scanner {
         execute_plan(plan, options)
     }
 
-    pub async fn try_into_batch(&self) -> Result<RecordBatch> {
+    pub async fn try_into_batch(&mut self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
         let schema = stream.schema();
         let batches = stream.try_collect::<Vec<_>>().await?;
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+    fn create_count_plan(&mut self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1558,7 +1560,7 @@ impl Scanner {
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
-    pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
+    pub fn count_rows(&mut self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;
@@ -1792,9 +1794,25 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_plan(&mut self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
+
+        eprintln!("DEBUG create_plan: nearest={:?}, full_text_query={:?}",
+            self.nearest.is_some(), self.full_text_query.is_some());
+
+        // Add version columns to projection plan if requested
+        if self.legacy_with_row_last_updated_at_version {
+            eprintln!("DEBUG create_plan: calling include_row_last_updated_at_version()");
+            self.projection_plan.include_row_last_updated_at_version();
+        }
+        if self.legacy_with_row_created_at_version {
+            eprintln!("DEBUG create_plan: calling include_row_created_at_version()");
+            self.projection_plan.include_row_created_at_version();
+        }
+        eprintln!("DEBUG create_plan: physical_projection flags: with_row_last_updated_at_version={}, with_row_created_at_version={}",
+            self.projection_plan.physical_projection.with_row_last_updated_at_version,
+            self.projection_plan.physical_projection.with_row_created_at_version);
 
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
@@ -2098,7 +2116,14 @@ impl Scanner {
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
     ) -> Result<PlannedFilteredScan> {
-        if self.dataset.is_legacy_storage() {
+        // Use legacy path if:
+        // 1. Dataset uses legacy storage format, OR
+        // 2. Version columns are requested (temporary workaround until FilteredReadExec supports them)
+        let use_legacy = self.dataset.is_legacy_storage()
+            || projection.with_row_last_updated_at_version
+            || projection.with_row_created_at_version;
+
+        if use_legacy {
             self.legacy_filtered_read(
                 filter_plan,
                 projection,
@@ -3169,6 +3194,8 @@ impl Scanner {
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         log::trace!("scan_fragments covered {} fragments", fragments.len());
+        eprintln!("DEBUG scan_fragments: with_row_last_updated_at_version={}, with_row_created_at_version={}",
+            with_row_last_updated_at_version, with_row_created_at_version);
         let config = LanceScanConfig {
             batch_size: self.get_batch_size(),
             batch_readahead: self.batch_readahead,
@@ -3543,7 +3570,7 @@ impl Scanner {
     }
 
     #[instrument(level = "info", skip(self))]
-    pub async fn analyze_plan(&self) -> Result<String> {
+    pub async fn analyze_plan(&mut self) -> Result<String> {
         let plan = self.create_plan().await?;
         let res = analyze_plan(
             plan,
@@ -3557,7 +3584,7 @@ impl Scanner {
     }
 
     #[instrument(level = "info", skip(self))]
-    pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
+    pub async fn explain_plan(&mut self, verbose: bool) -> Result<String> {
         let plan = self.create_plan().await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
@@ -8134,5 +8161,88 @@ mod test {
         assert_eq!(unsorted_values[0], 50);
         assert_eq!(unsorted_values[1], 20);
         assert_eq!(unsorted_values[2], 80);
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_version_columns() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        // Create a simple dataset
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version();
+
+        // Check that the schema includes version columns
+        let output_schema = scanner.schema().await.unwrap();
+        assert!(
+            output_schema
+                .column_with_name("_row_last_updated_at_version")
+                .is_some(),
+            "Schema should include _row_last_updated_at_version"
+        );
+        assert!(
+            output_schema
+                .column_with_name("_row_created_at_version")
+                .is_some(),
+            "Schema should include _row_created_at_version"
+        );
+
+        // Actually read the data to ensure version columns are materialized
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        // Verify version columns exist in the output
+        let last_updated = batch
+            .column_by_name("_row_last_updated_at_version")
+            .expect("Should have _row_last_updated_at_version column");
+        let created_at = batch
+            .column_by_name("_row_created_at_version")
+            .expect("Should have _row_created_at_version column");
+
+        // Verify they have the correct values (all rows created in version 1)
+        let last_updated_array = last_updated
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let created_at_array = created_at
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            assert_eq!(last_updated_array.value(i), 1, "All rows last updated at version 1");
+            assert_eq!(created_at_array.value(i), 1, "All rows created at version 1");
+        }
     }
 }

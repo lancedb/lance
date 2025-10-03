@@ -54,6 +54,8 @@ use crate::dataset::scanner::{
     get_default_batch_size, BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD,
 };
 use crate::Dataset;
+use lance_table::format::DatasetVersionSequence;
+use arrow_array::{ArrayRef, UInt64Array};
 
 use super::utils::IoMetrics;
 
@@ -118,6 +120,8 @@ impl ScopedFragmentRead {
         FragReadConfig::default()
             .with_row_id(self.with_deleted_rows || self.projection.with_row_id)
             .with_row_address(self.projection.with_row_addr)
+            .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
+            .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
             .with_reader_priority(self.priority)
     }
@@ -965,6 +969,82 @@ impl FilteredReadStream {
                 output_schema.clone(),
             )))
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1)))
+    }
+
+    /// Add version metadata columns to a batch
+    fn add_version_columns_to_batch(
+        batch: RecordBatch,
+        fragment: &Fragment,
+        schema: &arrow_schema::Schema,
+        with_last_updated: bool,
+        with_created_at: bool,
+    ) -> Result<RecordBatch> {
+        if !with_last_updated && !with_created_at {
+            return Ok(batch);
+        }
+
+        let num_rows = batch.num_rows();
+
+        let last_updated_array: Option<ArrayRef> = if with_last_updated {
+            let seq = if let Some(meta) = &fragment.last_updated_at_version_meta {
+                meta.load_sequence().map_err(|e| Error::Internal {
+                    message: format!("Failed to load last_updated_at version sequence: {}", e),
+                    location: location!(),
+                })?
+            } else {
+                // Default: fragment predates version tracking, use null
+                return Ok(batch);
+            };
+            let values: Vec<u64> = seq.versions().collect();
+            Some(Arc::new(UInt64Array::from(values)))
+        } else {
+            None
+        };
+
+        let created_at_array: Option<ArrayRef> = if with_created_at {
+            let seq = if let Some(meta) = &fragment.created_at_version_meta {
+                meta.load_sequence().map_err(|e| Error::Internal {
+                    message: format!("Failed to load created_at version sequence: {}", e),
+                    location: location!(),
+                })?
+            } else {
+                // Default: treat all rows as created at version 1
+                DatasetVersionSequence::from_uniform_row_count(
+                    fragment.physical_rows.unwrap_or(0) as u64,
+                    1,
+                )
+            };
+            let values: Vec<u64> = seq.versions().collect();
+            Some(Arc::new(UInt64Array::from(values)))
+        } else {
+            None
+        };
+
+        // Append version columns to the batch
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        if let Some(arr) = last_updated_array {
+            // Take only the rows in this batch
+            let arr = arrow::compute::take(&arr, &arrow_array::UInt64Array::from_iter_values(0..num_rows as u64), None)
+                .map_err(|e| Error::Internal {
+                    message: format!("Failed to slice version column: {}", e),
+                    location: location!(),
+                })?;
+            columns.push(arr);
+        }
+        if let Some(arr) = created_at_array {
+            // Take only the rows in this batch
+            let arr = arrow::compute::take(&arr, &arrow_array::UInt64Array::from_iter_values(0..num_rows as u64), None)
+                .map_err(|e| Error::Internal {
+                    message: format!("Failed to slice version column: {}", e),
+                    location: location!(),
+                })?;
+            columns.push(arr);
+        }
+
+        RecordBatch::try_new(Arc::new(schema.clone()), columns).map_err(|e| Error::Internal {
+            message: format!("Failed to create batch with version columns: {}", e),
+            location: location!(),
+        })
     }
 
     fn wrap_with_filter(

@@ -4,7 +4,7 @@
 use super::transaction::Transaction;
 use crate::Dataset;
 use crate::Result;
-use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_array::{Array, RecordBatch, StructArray, UInt32Array, UInt64Array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -667,25 +667,163 @@ impl DatasetDiffBuilder {
 
     /// Execute diff using SQL transformations (no pre_image fetch)
     async fn execute_sql_based(self) -> Result<DiffRecordBatchStream> {
-        use datafusion::logical_expr::{col, lit, Expr};
-        use datafusion::scalar::ScalarValue;
-        use lance_core::{ROW_ID, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+        use arrow_array::StringArray;
+        use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 
-        // Build a scanner that includes version columns and filters to changed rows
-        let scanner = self.dataset
+        let compared_version = self.compared_version;
+        let data_schema = Arc::new(Schema::from(self.dataset.schema()));
+        let diff_schema = create_diff_schema(data_schema.clone());
+
+        // Scan with version columns
+        // Note: We can't use .filter() here because version columns aren't in the base schema yet
+        // They get materialized during scan execution. We'll filter in the transformation below.
+        let stream = self
+            .dataset
             .scan()
             .with_row_id()
-            // TODO: Add version columns via a custom projection or exec node
-            // Filter to rows that changed after compared_version
-            .filter(&format!("{} > {}", ROW_LAST_UPDATED_AT_VERSION, self.compared_version))?;
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
+            .try_into_stream()
+            .await?;
 
-        // For now, since AddVersionColumnsExec integration with Scanner is complex,
-        // fall back to the original implementation
-        // TODO: Complete SQL-based implementation by:
-        // 1. Extending Scanner to support AddVersionColumnsExec
-        // 2. Adding operation column via SQL CASE expression
-        // 3. Projecting to diff schema with NULL pre_image
-        self.execute_with_pre_image().await
+        // Transform scanned batches into diff format
+        let diff_stream = stream.and_then(move |batch| {
+            let diff_schema = diff_schema.clone();
+            let data_schema = data_schema.clone();
+            async move {
+                // Extract version columns
+                let row_id_col = batch
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| Error::Internal {
+                        message: "Missing _rowid column in scan output".to_string(),
+                        location: snafu::location!(),
+                    })?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal {
+                        message: "_rowid column has wrong type".to_string(),
+                        location: snafu::location!(),
+                    })?;
+
+                let last_updated_col = batch
+                    .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                    .ok_or_else(|| Error::Internal {
+                        message: "Missing _row_last_updated_at_version column".to_string(),
+                        location: snafu::location!(),
+                    })?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal {
+                        message: "_row_last_updated_at_version has wrong type".to_string(),
+                        location: snafu::location!(),
+                    })?;
+
+                let created_at_col = batch
+                    .column_by_name(ROW_CREATED_AT_VERSION)
+                    .ok_or_else(|| Error::Internal {
+                        message: "Missing _row_created_at_version column".to_string(),
+                        location: snafu::location!(),
+                    })?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal {
+                        message: "_row_created_at_version has wrong type".to_string(),
+                        location: snafu::location!(),
+                    })?;
+
+                // Build arrays for diff output
+                let num_rows = batch.num_rows();
+                let mut row_ids = Vec::with_capacity(num_rows);
+                let mut versions = Vec::with_capacity(num_rows);
+                let mut operations = Vec::with_capacity(num_rows);
+                let mut filtered_indices = Vec::with_capacity(num_rows);
+
+                for i in 0..num_rows {
+                    let row_id = row_id_col.value(i);
+                    let created_at = created_at_col.value(i);
+                    let last_updated = last_updated_col.value(i);
+
+                    // Skip rows that haven't changed since compared_version
+                    if created_at <= compared_version && last_updated <= compared_version {
+                        continue;
+                    }
+
+                    filtered_indices.push(i as u32);
+                    row_ids.push(row_id);
+
+                    // Determine operation and version
+                    if created_at > compared_version {
+                        operations.push("insert");
+                        versions.push(created_at);
+                    } else if last_updated > compared_version {
+                        operations.push("update");
+                        versions.push(last_updated);
+                    } else {
+                        // This shouldn't happen after the skip check above
+                        unreachable!("Row passed filter but has no changes");
+                    }
+                }
+
+                let filtered_row_count = filtered_indices.len();
+
+                // If no rows passed the filter, skip this batch
+                if filtered_row_count == 0 {
+                    return Ok(RecordBatch::new_empty(diff_schema));
+                }
+
+                // Extract data columns (without version/row_id metadata) and filter them
+                let indices_array = UInt32Array::from(filtered_indices);
+                let data_columns: Vec<_> = data_schema
+                    .fields()
+                    .iter()
+                    .filter_map(|field| {
+                        batch.column_by_name(field.name()).map(|col| {
+                            arrow::compute::take(col.as_ref(), &indices_array, None).unwrap()
+                        })
+                    })
+                    .collect();
+
+                let data_batch = RecordBatch::try_new(data_schema.clone(), data_columns)?;
+
+                // Build post_image struct array
+                let post_image_array = Arc::new(StructArray::new(
+                    data_schema.fields().clone(),
+                    data_batch.columns().to_vec(),
+                    None,
+                )) as Arc<dyn Array>;
+
+                // Build pre_image (always null for SQL-based diff)
+                // Create null arrays with proper types for each field
+                let pre_image_columns: Vec<Arc<dyn Array>> = data_schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        arrow::array::new_null_array(field.data_type(), filtered_row_count)
+                    })
+                    .collect();
+                let pre_image_array = Arc::new(StructArray::new(
+                    data_schema.fields().clone(),
+                    pre_image_columns,
+                    Some(NullBuffer::new_null(filtered_row_count)),
+                )) as Arc<dyn Array>;
+
+                // Build diff batch
+                let diff_batch = RecordBatch::try_new(
+                    diff_schema,
+                    vec![
+                        Arc::new(UInt64Array::from(row_ids)) as Arc<dyn Array>,
+                        Arc::new(StringArray::from(operations)) as Arc<dyn Array>,
+                        Arc::new(UInt64Array::from(versions)) as Arc<dyn Array>,
+                        pre_image_array,
+                        post_image_array,
+                    ],
+                )?;
+
+                Ok(diff_batch)
+            }
+        });
+
+        Ok(Box::pin(diff_stream))
     }
 
     /// Execute diff with pre_image data fetching (original implementation)

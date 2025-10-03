@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array};
 use arrow_buffer::NullBuffer;
 use futures::{
     future::BoxFuture,
@@ -14,11 +14,14 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
     Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD, ROW_CREATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::{instrument, Instrument};
 
 use crate::rowids::RowIdSequence;
+use crate::format::Fragment;
+use snafu::location;
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
@@ -169,10 +172,16 @@ pub struct RowIdAndDeletesConfig {
     pub with_row_id: bool,
     /// Whether to include the row address column in the final batch
     pub with_row_addr: bool,
+    /// Whether to include the last updated at version column in the final batch
+    pub with_row_last_updated_at_version: bool,
+    /// Whether to include the created at version column in the final batch
+    pub with_row_created_at_version: bool,
     /// An optional deletion vector to apply to the batch
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
+    /// The fragment metadata containing version sequences
+    pub fragment: Option<Arc<Fragment>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
@@ -270,6 +279,90 @@ pub fn apply_row_id_and_deletes(
     let batch = if config.with_row_addr {
         let row_addr_arr = row_addrs.unwrap();
         batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
+    } else {
+        batch
+    };
+
+    // Add version columns if requested
+    let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
+        let fragment = config.fragment.as_ref().ok_or_else(|| {
+            lance_core::Error::Internal {
+                message: "Fragment metadata required for version columns".to_string(),
+                location: location!(),
+            }
+        })?;
+
+        let mut batch = batch;
+
+        if config.with_row_last_updated_at_version {
+            let version_arr = if let Some(version_meta) = &fragment.last_updated_at_version_meta {
+                let sequence = version_meta.load_sequence().map_err(|e| {
+                    lance_core::Error::Internal {
+                        message: format!("Failed to load last_updated_at version sequence: {}", e),
+                        location: location!(),
+                    }
+                })?;
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u32> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .map(|v| v as u32)
+                    .collect();
+                Arc::new(UInt32Array::from(versions))
+            } else {
+                // Default to version 1 if not present
+                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+            };
+            batch = batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        if config.with_row_created_at_version {
+            let version_arr = if let Some(version_meta) = &fragment.created_at_version_meta {
+                let sequence = version_meta.load_sequence().map_err(|e| {
+                    lance_core::Error::Internal {
+                        message: format!("Failed to load created_at version sequence: {}", e),
+                        location: location!(),
+                    }
+                })?;
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u32> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .map(|v| v as u32)
+                    .collect();
+                Arc::new(UInt32Array::from(versions))
+            } else {
+                // Default to version 1 if not present
+                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+            };
+            batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        batch
     } else {
         batch
     };
@@ -395,8 +488,11 @@ mod tests {
                     params: params.clone(),
                     with_row_id: true,
                     with_row_addr: false,
+                    with_row_last_updated_at_version: false,
+                    with_row_created_at_version: false,
                     deletion_vector: None,
                     row_id_sequence: None,
+                    fragment: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
                 };
@@ -491,8 +587,11 @@ mod tests {
                                 params: ReadBatchParams::RangeFull,
                                 with_row_id,
                                 with_row_addr: false,
+                                with_row_last_updated_at_version: false,
+                                with_row_created_at_version: false,
                                 deletion_vector: deletion_vector.clone(),
                                 row_id_sequence: None,
+                                fragment: None,
                                 make_deletions_null,
                                 total_num_rows: 100,
                             };
