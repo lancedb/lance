@@ -88,14 +88,14 @@ contains the word "lance," we can retrieve it using a query with "lance".
 
 #### Json Tokenizer
 The Json Tokenizer is responsible for handling JSON-type data, which is the JSON type in arrow format.
-Unlike Text Tokenizer, the Json Tokenizer behaves differently in "query" and "document parsing" scenarios.
+Unlike Text Tokenizer, the Json Tokenizer behaves differently in query and document parsing scenarios.
 
 JSON is a nested structure, a JSON document can always be converted into triplets in format: `path,type,value`. That's
 how lance handle JSON during document parsing, breaking down JSON document into tokens in the triplet format.
 In scenarios where the triplet value is a text, the text value will be further tokenized using the base_tokenizer,
 resulting in multiple triplet tokens.
 
-During "querying," the Json Tokenizer uses the triplet format instead of the JSON format, which simplifies the query
+During querying, the Json Tokenizer uses the triplet format instead of the JSON format, which simplifies the query
 syntax.
 
 The example below shows how the Json Tokenizer works. Assume we have the following JSON document:
