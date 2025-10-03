@@ -2134,7 +2134,7 @@ impl Transaction {
                 // Single index - keep it unless it's an empty vector index
                 if let Some(index) = same_name_indices.first() {
                     let is_empty = index
-                        .fragment_bitmap
+                        .effective_fragment_bitmap(&existing_fragments)
                         .as_ref()
                         .is_none_or(|bitmap| bitmap.is_empty());
                     let is_vector = Self::is_vector_index(index);
