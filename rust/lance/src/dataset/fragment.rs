@@ -1304,7 +1304,7 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false).await
+        self.take_rows(&row_ids, projection, false, false).await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1350,12 +1350,15 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
+        with_row_id: bool,
         with_row_address: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
-                FragReadConfig::default().with_row_address(with_row_address),
+                FragReadConfig::default()
+                    .with_row_id(with_row_id)
+                    .with_row_address(with_row_address),
             )
             .await?;
 
@@ -3088,7 +3091,7 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3107,7 +3110,7 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3117,7 +3120,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false)
+            .take_rows(&[], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3127,7 +3130,7 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), true)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
             .await
             .unwrap();
         assert_eq!(
