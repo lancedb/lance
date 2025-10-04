@@ -5686,17 +5686,13 @@ mod tests {
     #[tokio::test]
     async fn test_fts_unindexed_data() {
         let params = InvertedIndexParams::default();
-        let title_col =
-            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
-        let content_col = GenericStringArray::<i32>::from(vec![
-            "content world",
-            "content database",
-            "content common",
-        ]);
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
-                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
             ])
             .into(),
             vec![
@@ -5707,8 +5703,9 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let test_uri = TempStrDir::default();
-        let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
         dataset
             .create_index(&["title"], IndexType::Inverted, None, &params, true)
             .await
@@ -5724,12 +5721,12 @@ mod tests {
         assert_eq!(results.num_rows(), 3);
 
         // write new data
-        let title_col = GenericStringArray::<i32>::from(vec!["new title"]);
-        let content_col = GenericStringArray::<i32>::from(vec!["new content"]);
+        let title_col = StringArray::from(vec!["new title"]);
+        let content_col = StringArray::from(vec!["new content"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
-                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
             ])
             .into(),
             vec![
@@ -5740,16 +5737,7 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(
-            batches,
-            &test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        dataset.append(batches, None).await.unwrap();
 
         let results = dataset
             .scan()
@@ -5772,12 +5760,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_unindexed_data_on_empty_index() {
-        let test_uri = TempStrDir::default();
-
         // Empty dataset with fts index
         let params = InvertedIndexParams::default();
-        let title_col = GenericStringArray::<i32>::from(Vec::<&str>::new());
-        let content_col = GenericStringArray::<i32>::from(Vec::<&str>::new());
+        let title_col = StringArray::from(Vec::<&str>::new());
+        let content_col = StringArray::from(Vec::<&str>::new());
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 Field::new("title", title_col.data_type().to_owned(), false),
@@ -5792,7 +5778,9 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
         dataset
             .create_index(&["title"], IndexType::Inverted, None, &params, true)
             .await
@@ -5811,13 +5799,9 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         // write new data
-        let title_col =
-            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
-        let content_col = GenericStringArray::<i32>::from(vec![
-            "content world",
-            "content database",
-            "content common",
-        ]);
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 Field::new("title", title_col.data_type().to_owned(), false),
@@ -5832,16 +5816,7 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(
-            batches,
-            &test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        dataset.append(batches, None).await.unwrap();
 
         let results = dataset
             .scan()
@@ -5857,16 +5832,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_without_index() {
-        let test_uri = TempStrDir::default();
-
         // create table without index
-        let title_col =
-            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
-        let content_col = GenericStringArray::<i32>::from(vec![
-            "content world",
-            "content database",
-            "content common",
-        ]);
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 Field::new("title", title_col.data_type().to_owned(), false),
@@ -5881,7 +5850,9 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
 
         // match query on title and content
         let results = dataset
@@ -5898,8 +5869,8 @@ mod tests {
         assert_eq!(results.num_rows(), 3);
 
         // write new data
-        let title_col = GenericStringArray::<i32>::from(vec!["new title"]);
-        let content_col = GenericStringArray::<i32>::from(vec!["new content"]);
+        let title_col = StringArray::from(vec!["new title"]);
+        let content_col = StringArray::from(vec!["new content"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
                 Field::new("title", title_col.data_type().to_owned(), false),
@@ -5914,16 +5885,7 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(
-            batches,
-            &test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        dataset.append(batches, None).await.unwrap();
 
         // match query on title and content
         let results = dataset
