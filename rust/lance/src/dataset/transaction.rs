@@ -171,6 +171,9 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
         config_upsert_values: Option<HashMap<String, String>>,
+        /// Additional path URIs for data file distribution in multi-path layouts
+        /// Used during dataset creation to register additional storage locations
+        initial_data_paths: Option<Vec<String>>,
     },
     /// A new index has been created.
     CreateIndex {
@@ -378,16 +381,19 @@ impl PartialEq for Operation {
                     fragments: a_fragments,
                     schema: a_schema,
                     config_upsert_values: a_config,
+                    initial_data_paths: a_initial,
                 },
                 Self::Overwrite {
                     fragments: b_fragments,
                     schema: b_schema,
                     config_upsert_values: b_config,
+                    initial_data_paths: b_initial,
                 },
             ) => {
                 compare_vec(a_fragments, b_fragments)
                     && a_schema == b_schema
                     && a_config == b_config
+                    && a_initial == b_initial
             }
             (
                 Self::CreateIndex {
@@ -1365,6 +1371,7 @@ impl TransactionBuilder {
         self
     }
 
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1479,10 +1486,49 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let reference_paths = match current_manifest {
+        let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
         };
+
+        // Handle initial_data_paths for both CREATE and OVERWRITE modes
+        if let Operation::Overwrite { initial_data_paths: Some(initial_data_paths), .. } = &self.operation {
+            if current_manifest.is_none() {
+                // CREATE mode: creating new bucket registry
+                // Add the additional buckets (bucket IDs 0, 1, 2, etc.)
+                // Primary bucket is not in base_paths - it's inferred from dataset URI
+                for (i, uri) in initial_data_paths.iter().enumerate() {
+                    let bucket_id = i as u32; // Start from 0
+                    // Store the full URI directly in path field, leave name empty
+                    reference_paths.insert(
+                        bucket_id,
+                        lance_table::format::BasePath {
+                            id: bucket_id,
+                            name: None,
+                            is_dataset_root: false, // This means use path directly and don't append /data
+                            path: uri.to_string(), // Store full URI
+                        },
+                    );
+                }
+            } else {
+                // OVERWRITE mode: replacing existing bucket registry
+                // Clear existing base_paths and create new ones
+                reference_paths.clear();
+                for (i, uri) in initial_data_paths.iter().enumerate() {
+                    let bucket_id = i as u32; // Start from 0     
+                    // Store the full URI directly in path field, leave name empty
+                    reference_paths.insert(
+                        bucket_id,
+                        lance_table::format::BasePath {
+                            id: bucket_id,
+                            name: None,
+                            is_dataset_root: false, // This means use path directly and don't append /data
+                            path: uri.to_string(), // Store full URI
+                        },
+                    );
+                }
+            }
+        }
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1874,23 +1920,40 @@ impl Transaction {
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            let mut prev_manifest = Manifest::new_from_previous(
-                current_manifest,
-                schema,
-                Arc::new(final_fragments),
-                new_blob_version,
-            );
+            // For OVERWRITE operations with initial_data_paths, we need to use the updated reference_paths
+            // instead of copying from the previous manifest
+            if matches!(&self.operation, Operation::Overwrite { initial_data_paths: Some(_), .. }) {
+                let data_storage_format = if let Some(user_requested_version) = user_requested_version {
+                    DataStorageFormat::new(user_requested_version)
+                } else {
+                    current_manifest.data_storage_format.clone()
+                };
+                Manifest::new(
+                    schema,
+                    Arc::new(final_fragments),
+                    data_storage_format,
+                    new_blob_version,
+                    reference_paths,
+                )
+            } else {
+                let mut prev_manifest = Manifest::new_from_previous(
+                    current_manifest,
+                    schema,
+                    Arc::new(final_fragments),
+                    new_blob_version,
+                );
 
-            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
-                (user_requested_version, &self.operation)
-            {
-                // If this is an overwrite operation and the user has requested a specific version
-                // then overwrite with that version.  Otherwise, if the user didn't request a specific
-                // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+                if let (Some(user_requested_version), Operation::Overwrite { .. }) =
+                    (user_requested_version, &self.operation)
+                {
+                    // If this is an overwrite operation and the user has requested a specific version
+                    // then overwrite with that version.  Otherwise, if the user didn't request a specific
+                    // version, then overwrite with whatever version we had before.
+                    prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+                }
+
+                prev_manifest
             }
-
-            prev_manifest
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
@@ -1902,6 +1965,7 @@ impl Transaction {
                 reference_paths,
             )
         };
+
 
         manifest.tag.clone_from(&self.tag);
 
@@ -2448,6 +2512,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
                 config_upsert_values,
+                initial_data_paths,
             })) => {
                 let config_upsert_option = if config_upsert_values.is_empty() {
                     Some(config_upsert_values)
@@ -2462,6 +2527,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                     schema: Schema::from(&Fields(schema)),
                     config_upsert_values: config_upsert_option,
+                    initial_data_paths: if initial_data_paths.is_empty() {
+                        None
+                    } else {
+                        Some(initial_data_paths)
+                    },
                 }
             }
             Some(pb::transaction::Operation::ReserveFragments(
@@ -2692,6 +2762,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     schema,
                     schema_metadata: _schema_metadata, // TODO: handle metadata
                     config_upsert_values,
+                    initial_data_paths,
                 }) => {
                     let config_upsert_option = if config_upsert_values.is_empty() {
                         Some(config_upsert_values)
@@ -2706,6 +2777,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                             .collect::<Result<Vec<_>>>()?,
                         schema: Schema::from(&Fields(schema)),
                         config_upsert_values: config_upsert_option,
+                        initial_data_paths: if initial_data_paths.is_empty() {
+                            None
+                        } else {
+                            Some(initial_data_paths)
+                        },
                     })
                 }
             })
@@ -2825,6 +2901,7 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_data_paths,
             } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -2833,6 +2910,9 @@ impl From<&Transaction> for pb::Transaction {
                     config_upsert_values: config_upsert_values
                         .clone()
                         .unwrap_or(Default::default()),
+                    initial_data_paths: initial_data_paths
+                        .clone()
+                        .unwrap_or_default(),
                 })
             }
             Operation::ReserveFragments { num_fragments } => {
@@ -2973,6 +3053,7 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_data_paths,
             } => {
                 pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -2981,6 +3062,9 @@ impl From<&Transaction> for pb::Transaction {
                     config_upsert_values: config_upsert_values
                         .clone()
                         .unwrap_or(Default::default()),
+                    initial_data_paths: initial_data_paths
+                        .clone()
+                        .unwrap_or_default(),
                 })
             }
             _ => panic!("Invalid blob operation: {:?}", value),
@@ -3073,6 +3157,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments,
             schema,
             config_upsert_values: None,
+            initial_data_paths: _,
         } => schema_fragments_valid(Some(manifest), schema, fragments),
         Operation::Update {
             updated_fragments,

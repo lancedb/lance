@@ -2638,6 +2638,17 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         p.commit_handler = get_commit_handler(options)?;
 
+        // Handle data bucket URIs
+        if let Some(initial_data_paths) = get_dict_opt::<Vec<String>>(options, "initial_data_paths")? {
+            p.initial_data_paths = Some(initial_data_paths);
+        } else {
+        }
+
+        if let Some(target_data_paths) = get_dict_opt::<Vec<String>>(options, "target_data_paths")? {
+            p.target_data_paths = Some(target_data_paths);
+        } else {
+        }
+
         // Handle properties
         if let Some(props) =
             get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?

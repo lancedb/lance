@@ -18,6 +18,8 @@ use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use snafu::location;
+use crate::Error;
 
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
@@ -245,4 +247,42 @@ pub fn wrap_json_stream_for_reading(
         converted_schema,
         converted_stream,
     ))
+}
+
+
+/// Parse a full URI into base URI and relative path components
+/// 
+/// For example: "s3://multi-path-test/test1/subBucket2/data" 
+/// Returns: ("s3://multi-path-test", "test1/subBucket2/data")
+/// 
+/// This is used for data file bases where we need to separate the storage location
+/// (base URI) from the path within that location (relative path).
+/// Parse a full URI into bucket URI and relative path components
+/// 
+/// For example: "s3://multi-path-test/test1/subBucket2/data" 
+/// Returns: ("s3://multi-path-test", "test1/subBucket2/data")
+/// 
+/// Also handles local paths by treating them as file URIs:
+/// "/Users/test/bucket" -> ("file://", "Users/test/bucket")
+pub(crate) fn parse_bucket_uri_and_path(full_uri: &str) -> Result<(String, String)> {
+    let uri_to_parse = if full_uri.contains(':') {
+        // Has scheme, use as-is
+        full_uri.to_string()
+    } else {
+        // No scheme, assume local file path
+        format!("file://{}", full_uri)
+    };
+    
+    let parsed_url = url::Url::parse(&uri_to_parse).map_err(|e| {
+        Error::invalid_input(
+            format!("Invalid URI '{}': {}", full_uri, e),
+            location!(),
+        )
+    })?;
+    
+    let bucket_uri = format!("{}://{}", parsed_url.scheme(), 
+        parsed_url.host_str().unwrap_or(""));
+    let relative_path = parsed_url.path().trim_start_matches('/').to_string();
+    
+    Ok((bucket_uri, relative_path))
 }

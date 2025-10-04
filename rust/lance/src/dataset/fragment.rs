@@ -935,17 +935,34 @@ impl FileFragment {
                 .dataset
                 .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
+            
+            
+            // Get the correct ObjectStore for this file's path
+            let object_store = self.dataset.get_object_store_for_path(data_file.base_id.as_ref())?;
+            
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
+                    // For files with explicit data file bases, we need to create a new scheduler with the correct object store
+                    // instead of reusing the existing one which might be tied to the primary path
+                    if data_file.base_id.is_some() {
+                        (
+                            ScanScheduler::new(
+                                object_store.clone(),
+                                SchedulerConfig::max_bandwidth(&object_store),
+                            ),
+                            read_config.reader_priority.unwrap_or(0),
+                        )
+                    } else {
+                        (
+                            scan_scheduler.clone(),
+                            read_config.reader_priority.unwrap_or(0),
+                        )
+                    }
                 } else {
                     (
                         ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                            object_store.clone(),
+                            SchedulerConfig::max_bandwidth(&object_store),
                         ),
                         0,
                     )
@@ -3168,6 +3185,7 @@ mod tests {
             schema: schema.clone(),
             fragments,
             config_upsert_values: None,
+            initial_data_paths: None,
         };
 
         let new_dataset =
@@ -3277,6 +3295,7 @@ mod tests {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
                 config_upsert_values: None,
+                initial_data_paths: None,
             };
 
             let dataset =
