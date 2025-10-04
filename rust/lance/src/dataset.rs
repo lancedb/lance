@@ -37,8 +37,8 @@ use lance_table::format::{
     pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
+    CommitLock, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
@@ -2475,7 +2475,6 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
-    pub(crate) write_transaction_file: bool, // default true: write external transaction file for backward compatibility
 }
 
 impl Default for ManifestWriteConfig {
@@ -2486,7 +2485,6 @@ impl Default for ManifestWriteConfig {
             use_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
-            write_transaction_file: true,
         }
     }
 }
@@ -2517,7 +2515,7 @@ pub(crate) async fn write_manifest_file(
             indices,
             base_path,
             object_store,
-            lance_table::io::commit::write_manifest_file_to_path,
+            write_manifest_file_to_path,
             naming_scheme,
             transaction.take().map(|tx| tx.into()),
         )
@@ -2540,7 +2538,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::copy_test_data_to_tmp;
+    use crate::utils::test::{copy_test_data_to_tmp, StatsHolder};
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -2882,6 +2880,7 @@ mod tests {
         assert_eq!(get_iops(), 2);
     }
 
+    #[rstest]
     #[tokio::test]
     async fn test_write_params(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -2896,19 +2895,14 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batch = RecordBatch::try_new(
+        let num_rows: usize = 1_000;
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..5))],
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
         )
-        .unwrap();
-        let ds = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            test_uri,
-            None,
-        )
-        .await
-        .unwrap();
-        let ds = Arc::new(ds);
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
         let write_params = WriteParams {
             max_rows_per_file: 100,
@@ -2920,15 +2914,25 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete external transaction file to force inline path usage
-        if let Some(tx_file) = ds2.manifest.transaction_file.as_ref() {
-            let tx_path = ds2.base.child("_transactions").child(tx_file.as_str());
-            let _ = ds2.object_store.inner.delete(&tx_path).await; // ignore errors
-        }
+        assert_eq!(dataset.count_rows(None).await.unwrap(), num_rows);
 
-        // Read should still succeed via inline transaction
-        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
-        assert_eq!(read_tx.read_version, tx.read_version);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 10);
+        assert_eq!(dataset.count_fragments(), 10);
+        for fragment in &fragments {
+            assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
+            let reader = fragment
+                .open(dataset.schema(), FragReadConfig::default())
+                .await
+                .unwrap();
+            // No group / batch concept in v2
+            if data_storage_version == LanceFileVersion::Legacy {
+                assert_eq!(reader.legacy_num_batches(), 10);
+                for i in 0..reader.legacy_num_batches() as u32 {
+                    assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
+                }
+            }
+        }
     }
 
     #[rstest]
@@ -3027,7 +3031,6 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
-                write_transaction_file: true,
             },
             dataset.manifest_location.naming_scheme,
             None,
@@ -8358,18 +8361,18 @@ mod tests {
     }
 
     // Test coverage:
-    // Case 1: write_flag=true, delete external transaction file → read_transaction should prioritize inline and succeed.
-    // Case 2: write_flag=false → only write inline, manifest contains inline section, read_transaction should succeed via inline.
+    // Case 1: delete external transaction file → read_transaction should prioritize inline and succeed.
+    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
     // Case 3: manifest does not contain inline → read_transaction should fall back to external transaction file and succeed.
     #[tokio::test]
-    async fn test_write_inline_transaction() {
+    async fn test_inline_transaction() {
         use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use std::sync::Arc;
 
         async fn create_dataset(rows: i32) -> Arc<Dataset> {
-            let dir = tempdir().unwrap();
-            let uri = dir.path().to_str().unwrap();
+            let dir = TempDir::default();
+            let uri = dir.path_str();
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
                 DataType::Int32,
@@ -8380,9 +8383,13 @@ mod tests {
                 vec![Arc::new(Int32Array::from_iter_values(0..rows))],
             )
             .unwrap();
-            let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
-                .await
-                .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
             Arc::new(ds)
         }
 
@@ -8402,6 +8409,9 @@ mod tests {
             }
         }
 
+        let session = Arc::new(Session::default());
+        let io_stats = Arc::new(StatsHolder::default());
+
         // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
         let ds = create_dataset(5).await;
         let read_version = ds.manifest().version;
@@ -8412,20 +8422,31 @@ mod tests {
             .unwrap();
         delete_external_tx_file(&ds2).await;
         let read_tx = ds2.read_transaction().await.unwrap().unwrap();
-        assert_eq!(read_tx, tx);
+        assert_eq!(read_tx, tx.clone());
 
-        // Case 2: write_flag=false (only write inline), read should succeed via inline transaction
-        let ds = create_dataset(3).await;
-        let tx = make_tx(ds.manifest().version);
-        let ds2 = CommitBuilder::new(ds.clone())
-            .with_write_transaction_file(false)
-            .execute(tx.clone())
+        // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+        let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+            .with_session(session.clone())
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
             .await
             .unwrap();
-        assert!(ds2.manifest.transaction_section.is_some());
-        assert!(ds2.manifest.transaction_file.is_none());
-        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
-        assert_eq!(read_tx, tx);
+        let stats = io_stats.incremental_stats(); // Reset
+        assert!(stats.read_bytes < 64 * 1024);
+        // Because the manifest is so small, we should have opportunistically
+        // cached the transaction in memory already.
+        let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+        let stats = io_stats.incremental_stats();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(inline_tx, tx);
 
         // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
         let ds = create_dataset(2).await;

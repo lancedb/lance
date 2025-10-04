@@ -20,8 +20,11 @@ pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
 pub const FLAG_TABLE_CONFIG: u64 = 8;
 /// Dataset is a shallow clone with external base paths
 pub const FLAG_SHALLOW_CLONE: u64 = 16;
+/// Disable external transaction file
+/// TODO: Add this flag in the future to disable write transaction file.
+pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 32;
+pub const FLAG_UNKNOWN: u64 = 64;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
@@ -83,6 +86,10 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
     writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
+}
+
+pub fn can_read_transaction_file(writer_flags: u64) -> bool {
+    writer_flags & FLAG_DISABLE_TRANSACTION_FILE != 0
 }
 
 #[cfg(test)]
