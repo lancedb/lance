@@ -23,6 +23,7 @@ use assign_action::merge_insert_action;
 
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::conflict_detection::primary_key_filter::PrimaryKeyValue;
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -40,8 +41,8 @@ use crate::{
     Dataset,
 };
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
-    UInt64Array,
+    cast::AsArray, types::UInt64Type, Array, BinaryArray, BooleanArray, Int32Array, Int64Array,
+    RecordBatch, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::NullEquality;
@@ -1395,6 +1396,7 @@ impl MergeInsertJob {
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let collected_primary_keys = merger.collected_primary_keys.clone();
         let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
@@ -1420,7 +1422,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: self.params.mem_wal_to_merge,
+                mem_wal_to_merge: self.params.mem_wal_to_merge.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
             };
@@ -1492,7 +1494,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
-                mem_wal_to_merge: self.params.mem_wal_to_merge,
+                mem_wal_to_merge: self.params.mem_wal_to_merge.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields
                     .iter()
@@ -1510,18 +1512,53 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(
+        // Build primary key Bloom Filter for conflict detection
+        let primary_key_bloom_filter = self
+            .build_primary_key_bloom_filter(&collected_primary_keys)
+            .await
+            .ok();
+
+        let mut transaction = Transaction::new(
             self.dataset.manifest.version,
             operation,
             /*blobs_op=*/ None,
             None,
         );
 
+        // Set the primary key Bloom Filter if successfully built
+        if let Some(filter_data) = primary_key_bloom_filter {
+            transaction.primary_key_bloom_filter = Some(filter_data);
+        }
+
         Ok(UncommittedMergeInsert {
             transaction,
             affected_rows,
             stats,
         })
+    }
+
+    /// Build primary key Bloom Filter for conflict detection
+    async fn build_primary_key_bloom_filter(
+        &self,
+        collected_primary_keys: &Arc<Mutex<Vec<PrimaryKeyValue>>>,
+    ) -> Result<Vec<u8>> {
+        use crate::dataset::conflict_detection::PrimaryKeyBloomFilter;
+
+        // Create a new Bloom Filter for the primary keys
+        let mut bloom_filter = PrimaryKeyBloomFilter::new(self.params.on.clone());
+
+        // Get the collected primary keys from the merger
+        let keys = collected_primary_keys.lock().unwrap();
+
+        // Add each primary key to the Bloom Filter
+        for key in keys.iter() {
+            // Use index as row address for now (in a real implementation,
+            // this would be the actual row address)
+            bloom_filter.insert(key.clone())?;
+        }
+
+        // Serialize the Bloom Filter
+        bloom_filter.to_bytes()
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1762,6 +1799,8 @@ struct Merger {
     enable_stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
+    /// Collection of primary keys for Bloom Filter construction
+    collected_primary_keys: Arc<Mutex<Vec<PrimaryKeyValue>>>,
 }
 
 impl Merger {
@@ -1818,6 +1857,7 @@ impl Merger {
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
+            collected_primary_keys: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1914,7 +1954,7 @@ impl Merger {
         if self.params.when_matched != WhenMatched::DoNothing {
             let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
 
-            if let Some(match_filter) = self.match_filter_expr {
+            if let Some(ref match_filter) = self.match_filter_expr {
                 let unzipped = unzip_batch(&matched, &self.schema);
                 let filtered = match_filter.evaluate(&unzipped)?;
                 match filtered {
@@ -1978,6 +2018,10 @@ impl Merger {
                     self.output_schema.clone(),
                     Vec::from_iter(matched.columns().iter().cloned()),
                 )?;
+
+                // Collect primary keys from matched (updated) rows
+                self.collect_primary_keys_from_batch(&matched)?;
+
                 batches.push(Ok(matched));
             }
         }
@@ -1995,6 +2039,10 @@ impl Merger {
             )?;
 
             merge_statistics.num_inserted_rows += not_matched.num_rows() as u64;
+
+            // Collect primary keys from inserted rows
+            self.collect_primary_keys_from_batch(&not_matched)?;
+
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {
@@ -2033,6 +2081,88 @@ impl Merger {
         }
 
         Ok(stream::iter(batches))
+    }
+
+    /// Collect primary keys from a batch for Bloom Filter construction
+    fn collect_primary_keys_from_batch(&self, batch: &RecordBatch) -> Result<()> {
+        let mut collected_keys = self.collected_primary_keys.lock().unwrap();
+
+        // Extract primary key values from the batch
+        for row_idx in 0..batch.num_rows() {
+            let mut key_values = Vec::new();
+
+            // Handle single or composite primary keys
+            for key_column_name in &self.params.on {
+                if let Some(column) = batch.column_by_name(key_column_name) {
+                    let key_value = self.extract_primary_key_value(column, row_idx)?;
+                    key_values.push(key_value);
+                } else {
+                    // Column not found, skip this batch
+                    return Ok(());
+                }
+            }
+
+            // Create composite key or single key
+            let primary_key = if key_values.len() == 1 {
+                key_values.into_iter().next().unwrap()
+            } else {
+                PrimaryKeyValue::Composite(key_values)
+            };
+
+            collected_keys.push(primary_key);
+        }
+
+        Ok(())
+    }
+
+    /// Extract primary key value from a column at a specific row index
+    fn extract_primary_key_value(
+        &self,
+        column: &Arc<dyn Array>,
+        row_idx: usize,
+    ) -> Result<PrimaryKeyValue> {
+        use arrow::datatypes::DataType;
+
+        if column.is_null(row_idx) {
+            // Handle null values - for now, we'll use a special representation
+            return Ok(PrimaryKeyValue::Binary(vec![0u8; 8])); // Null placeholder
+        }
+
+        match column.data_type() {
+            DataType::Utf8 => {
+                let string_array = column.as_any().downcast_ref::<StringArray>().unwrap();
+                Ok(PrimaryKeyValue::String(
+                    string_array.value(row_idx).to_string(),
+                ))
+            }
+            DataType::Int64 => {
+                let int_array = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                Ok(PrimaryKeyValue::Int64(int_array.value(row_idx)))
+            }
+            DataType::UInt64 => {
+                let uint_array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+                Ok(PrimaryKeyValue::UInt64(uint_array.value(row_idx)))
+            }
+            DataType::UInt32 => {
+                let uint_array = column.as_any().downcast_ref::<UInt32Array>().unwrap();
+                Ok(PrimaryKeyValue::UInt64(uint_array.value(row_idx) as u64))
+            }
+            DataType::Int32 => {
+                let int_array = column.as_any().downcast_ref::<Int32Array>().unwrap();
+                Ok(PrimaryKeyValue::Int64(int_array.value(row_idx) as i64))
+            }
+            DataType::Binary => {
+                let binary_array = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+                Ok(PrimaryKeyValue::Binary(
+                    binary_array.value(row_idx).to_vec(),
+                ))
+            }
+            _ => {
+                // For unsupported types, convert to string representation
+                let display_value = format!("{:?}", column.slice(row_idx, 1));
+                Ok(PrimaryKeyValue::String(display_value))
+            }
+        }
     }
 }
 
