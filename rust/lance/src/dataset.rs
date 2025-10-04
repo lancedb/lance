@@ -8331,7 +8331,6 @@ mod tests {
         )
     }
 
-<<<<<<< HEAD
     #[tokio::test]
     async fn test_limit_pushdown_in_physical_plan() -> Result<()> {
         use tempfile::tempdir;
@@ -8563,7 +8562,8 @@ mod tests {
         assert_eq!(21, batches.len());
 
         Ok(())
-=======
+    }
+
     // This test covers
     // 1. Create branch from main, a branch and a global tag
     // 2. Write to each created branch and verify data
@@ -8837,6 +8837,5 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
->>>>>>> 8027b5c9fece8dd078b842e6d70cf8f75184855a
     }
 }
