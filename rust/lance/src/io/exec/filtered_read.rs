@@ -495,7 +495,12 @@ impl FilteredReadStream {
             .map(|r| r.end - r.start)
             .unwrap_or(u64::MAX);
 
+        // Full fragment ranges to read before applying scan_range_after_filter
         let mut fragments_to_read: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
+        // Fragment ranges to read after applying scan_range_after_filter
+        // Adds an extra map because if scan_range_after_filter cannot be fulfilled we need to
+        // fall back to read the full fragment in fragments_to_read
+        // Used only when index guarantees enough rows to satisfy scan_range_after_filter
         let mut scan_push_down_fragments_to_read: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
 
         // The current offset, includes filtered rows, but not deleted rows
@@ -546,9 +551,7 @@ impl FilteredReadStream {
 
             if to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
-                for (frag_id, ranges) in scan_push_down_fragments_to_read {
-                    fragments_to_read.insert(frag_id, ranges);
-                }
+                fragments_to_read = scan_push_down_fragments_to_read;
                 break;
             }
         }
@@ -642,6 +645,7 @@ impl FilteredReadStream {
                         scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
+                        // Cannot push down skip/take for AtMost
                         let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
                         let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, matched_ranges);
