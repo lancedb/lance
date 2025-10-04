@@ -654,7 +654,7 @@ pub enum PositionRecorder {
 }
 
 impl PositionRecorder {
-    pub fn new(with_position: bool) -> Self {
+    fn new(with_position: bool) -> Self {
         if with_position {
             Self::Position(Vec::new())
         } else {
@@ -662,7 +662,7 @@ impl PositionRecorder {
         }
     }
 
-    pub fn push(&mut self, position: u32) {
+    fn push(&mut self, position: u32) {
         match self {
             Self::Position(positions) => positions.push(position),
             Self::Count(count) => *count += 1,

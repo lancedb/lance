@@ -2142,7 +2142,7 @@ mod tests {
         let data = gen_batch()
             .col("value", array::cycle::<Float64Type>(values.clone()))
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_once_exec(RowCount::from(10), BatchCount::from(100));
+            .into_df_exec(RowCount::from(10), BatchCount::from(100));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
         let plan = Arc::new(SortExec::new([sort_expr].into(), data));
@@ -2184,7 +2184,7 @@ mod tests {
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_once_exec(RowCount::from(1000), BatchCount::from(10));
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
         let plan = Arc::new(SortExec::new([sort_expr].into(), data));
