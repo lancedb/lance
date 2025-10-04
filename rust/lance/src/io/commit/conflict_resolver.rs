@@ -2050,6 +2050,7 @@ mod tests {
                     "overwrite-key".to_string(),
                     "value".to_string(),
                 )])),
+                initial_data_paths: None,
             },
             Operation::Rewrite {
                 groups: vec![RewriteGroup {
@@ -2152,6 +2153,7 @@ mod tests {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
                     schema: lance_core::datatypes::Schema::default(),
                     config_upsert_values: None,
+                    initial_data_paths: None,
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.

@@ -316,6 +316,7 @@ impl DatasetBuilder {
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
+        let store_params = self.options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
@@ -364,6 +365,7 @@ impl DatasetBuilder {
             object_store,
             base_path,
             commit_handler,
+            store_params,
         )
         .await?;
 
@@ -398,6 +400,7 @@ impl DatasetBuilder {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         commit_handler: Arc<dyn CommitHandler>,
+        store_params: ObjectStoreParams,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
@@ -449,6 +452,21 @@ impl DatasetBuilder {
             (manifest, manifest_location)
         };
 
+        // Create extra ObjectStores for multi-path support
+        let mut extra_object_stores = HashMap::new();
+        for (_bucket_id, base_path_entry) in manifest.base_paths.iter() {
+            // All entries in base_paths are additional buckets (primary bucket is not stored here)
+            let full_uri = &base_path_entry.path;
+            let (bucket_uri, _) = crate::dataset::utils::parse_bucket_uri_and_path(full_uri)?;
+            let (extra_object_store, _) = ObjectStore::from_uri_and_params(
+                session.store_registry(),
+                &bucket_uri,
+                &store_params,
+            ).await?;
+            
+            extra_object_stores.insert(bucket_uri, extra_object_store);
+        }
+
         Dataset::checkout_manifest(
             object_store,
             base_path,
@@ -458,6 +476,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             file_reader_options,
+            extra_object_stores,
         )
     }
 }

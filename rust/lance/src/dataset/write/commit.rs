@@ -374,14 +374,51 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                // Create extra ObjectStores for multi-path support (same as Uri case)
+                let mut extra_object_stores = HashMap::new();
+                let default_store_params = ObjectStoreParams::default();
+                let store_params = self.store_params.as_ref().unwrap_or(&default_store_params);
+                for (_bucket_id, base_path_entry) in manifest.base_paths.iter() {
+                    // All entries in base_paths are additional buckets (primary bucket is not stored here)
+                    let full_uri = &base_path_entry.path;
+                    let (bucket_uri, _) = crate::dataset::utils::parse_bucket_uri_and_path(full_uri)?;
+                    let (extra_object_store, _) = lance_io::object_store::ObjectStore::from_uri_and_params(
+                        session.store_registry(),
+                        &bucket_uri,
+                        store_params,
+                    ).await?;
+                    
+                    extra_object_stores.insert(bucket_uri, extra_object_store);
+                }
+                
+                Ok(Dataset {
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    extra_object_stores, // Use the new extra_object_stores
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
+                // Create extra ObjectStores for multi-path support
+                let mut extra_object_stores = HashMap::new();
+                let default_store_params = ObjectStoreParams::default();
+                let store_params = self.store_params.as_ref().unwrap_or(&default_store_params);
+                for (_bucket_id, base_path_entry) in manifest.base_paths.iter() {
+                    // All entries in base_paths are additional buckets (primary bucket is not stored here)
+                    let full_uri = &base_path_entry.path;
+                    let (bucket_uri, _) = crate::dataset::utils::parse_bucket_uri_and_path(full_uri)?; 
+                    let (extra_object_store, _) = lance_io::object_store::ObjectStore::from_uri_and_params(
+                        session.store_registry(),
+                        &bucket_uri,
+                        store_params,
+                    ).await?;
+                    
+                    extra_object_stores.insert(bucket_uri, extra_object_store);
+                }
+                
                 let refs = Refs::new(
                     object_store.clone(),
                     commit_handler.clone(),
@@ -391,6 +428,7 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                
                 Ok(Dataset {
                     object_store,
                     base: base_path,
@@ -404,6 +442,7 @@ impl<'a> CommitBuilder<'a> {
                     fragment_bitmap,
                     metadata_cache,
                     file_reader_options: None,
+                    extra_object_stores,
                 })
             }
         }

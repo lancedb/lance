@@ -68,6 +68,8 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
     // Key-value pairs to merge with existing config.
     map<string, string> config_upsert_values = 4;
+    // Additional path URIs for data file distribution in multi-path layouts
+    repeated string initial_data_paths = 5;
   }
 
   // Add or replace a new secondary index.

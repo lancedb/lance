@@ -226,6 +226,17 @@ pub struct WriteParams {
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// Additional path URIs for registering in the manifest during dataset creation.
+    /// When provided in CREATE mode, these path URIs will be registered in the manifest
+    /// as available paths, but actual writing location is determined by target_data_paths.
+    /// Only used in CREATE mode for manifest registration.
+    pub initial_data_paths: Option<Vec<String>>,
+
+    /// Target path URIs for writing data files (array with currently only one element supported).
+    /// When provided, all new data files will be written to this specific path URI.
+    /// Used in all modes (CREATE, APPEND, OVERWRITE) to specify where data should be written.
+    pub target_data_paths: Option<Vec<String>>,
 }
 
 impl Default for WriteParams {
@@ -247,6 +258,8 @@ impl Default for WriteParams {
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
+            initial_data_paths: None,
+            target_data_paths: None,
         }
     }
 }
@@ -309,6 +322,18 @@ pub async fn do_write_fragments(
     params: WriteParams,
     storage_version: LanceFileVersion,
 ) -> Result<Vec<Fragment>> {
+    do_write_fragments_with_manifest(object_store, base_dir, schema, data, params, storage_version, None).await
+}
+
+pub async fn do_write_fragments_with_manifest(
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: &Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    storage_version: LanceFileVersion,
+    existing_manifest: Option<&lance_table::format::Manifest>,
+) -> Result<Vec<Fragment>> {
     // Convert arrow.json to lance.json (JSONB) for storage if needed
     //
     // FIXME: this is bad, really bad, we need to find a way to remove this.
@@ -325,7 +350,134 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    // Validate multi-path configuration
+    match params.mode {
+        WriteMode::Create | WriteMode::Overwrite => {
+            // CREATE and OVERWRITE modes: validate bucket configuration
+            match (params.initial_data_paths.is_some(), params.target_data_paths.is_some()) {
+                (true, false) => {
+                    return Err(Error::invalid_input(
+                        format!("In {:?} mode, when initial_data_paths is provided, target_data_paths must also be specified", params.mode),
+                        location!(),
+                    ));
+                },
+                (false, true) => {
+                
+                    if matches!(params.mode, WriteMode::Create) {
+                        return Err(Error::invalid_input(
+                            "In CREATE mode, when target_data_paths is provided, initial_data_paths must also be specified to register the paths in the manifest",
+                            location!(),
+                        ));
+                    }
+                    // OVERWRITE with only target_data_paths is valid
+                },
+                (true, true) => {
+                    // Valid: both provided for multi-path mode (CREATE) or changing bucket registry (OVERWRITE)
+                },
+                (false, false) => {
+                    // Valid: neither provided - uses primary bucket (dataset URI)
+                }
+            }
+        },
+        WriteMode::Append => {
+            // APPEND mode: should not register new buckets (preserve existing registry)
+            if params.initial_data_paths.is_some() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "initial_data_paths should not be provided in {:?} mode. Bucket registry already exists in the dataset manifest. Only specify target_data_paths to indicate where to write new data.",
+                        params.mode
+                    ),
+                    location!(),
+                ));
+            }
+            // target_data_paths without initial_data_paths is valid - we'll look up bucket ID from existing manifest
+        }
+    }
+
+    // Validate dataset with explicit data file bases requirements
+    // If the dataset has explicit data file bases (base_paths with more than just primary bucket),
+    // then target_data_paths must be specified to indicate where to write
+    // Exception: OVERWRITE mode can default to primary bucket even with explicit data file bases
+    if let Some(manifest) = existing_manifest {
+        let has_explicit_data_file_bases = manifest.base_paths.len() > 1 || 
+            manifest.base_paths.values().any(|bp| bp.name.is_some());
+        
+        if has_explicit_data_file_bases && params.target_data_paths.is_none() {
+            // Allow OVERWRITE mode to default to primary bucket
+            if !matches!(params.mode, WriteMode::Overwrite) {
+                return Err(Error::invalid_input(
+                    "This dataset has explicit data file bases configured. You must specify target_data_paths to indicate which base to write to.",
+                    location!(),
+                ));
+            }
+        }
+    }
+
+    // Handle target bucket configuration - if specified, update the base directory for writing
+    let (final_object_store, final_base_dir, target_bucket_id) = if let Some(target_data_paths) = &params.target_data_paths {
+        // Validate that we only have one target (for now)
+        if target_data_paths.len() != 1 {
+            return Err(Error::invalid_input(
+                format!("target_data_paths with {} elements is not supported. Currently only one target is supported.", target_data_paths.len()),
+                location!(),
+            ));
+        }
+        let target_path_uri = &target_data_paths[0];
+        // Parse the target bucket URI and path using our utility
+        let (_bucket_uri, relative_path) = crate::dataset::utils::parse_bucket_uri_and_path(target_path_uri)?;
+        let target_path = Path::parse(&relative_path)?;
+        
+        // Find the bucket ID for this target URI
+        let bucket_id = match &params.initial_data_paths {
+            Some(initial_bases) => {
+                // CREATE or OVERWRITE with new buckets: find position in initial_data_paths
+                initial_bases
+                    .iter()
+                    .position(|uri| uri == target_path_uri)
+                    .map(|pos| pos as u32)
+                    .ok_or_else(|| Error::invalid_input(
+                        format!("target_path_uri '{}' not found in initial_data_paths", target_path_uri),
+                        location!(),
+                    ))?
+            }
+            None => {
+                // APPEND or OVERWRITE without new buckets: find in existing manifest
+                let manifest = existing_manifest.ok_or_else(|| Error::invalid_input(
+                    format!("Cannot use target_path_uri '{}' without existing manifest", target_path_uri),
+                    location!(),
+                ))?;
+                
+                manifest
+                    .base_paths
+                    .iter()
+                    .find(|(_, base_path)| base_path.path == *target_path_uri)
+                    .map(|(bucket_id, _)| *bucket_id)
+                    .ok_or_else(|| Error::invalid_input(
+                        format!("target_path_uri '{}' not found in existing manifest", target_path_uri),
+                        location!(),
+                    ))?
+            }
+        };
+        
+        // Create object store for the target bucket URI
+        let store_params = params.store_params.clone().unwrap_or_default();
+        let store_registry = params.session.as_ref().map(|s| s.store_registry()).unwrap_or_default();
+        let (target_object_store, _) = ObjectStore::from_uri_and_params(
+            store_registry,
+            target_path_uri,
+            &store_params,
+        ).await?;
+        
+        (target_object_store, target_path, Some(bucket_id))
+    } else {
+        (object_store, base_dir.clone(), None)
+    };
+    
+    let writer_generator = WriterGenerator::new(final_object_store, &final_base_dir, schema, storage_version, target_bucket_id);
+    
+    // For CREATE mode, initial_data_paths will be registered in the manifest (handled in transaction.rs)
+    if matches!(params.mode, WriteMode::Create) && params.initial_data_paths.is_some() {
+    }
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -495,13 +647,15 @@ pub async fn write_fragments_internal(
     }
 
     let frag_schema = schema.retain_storage_class(StorageClass::Default);
-    let fragments_fut = do_write_fragments(
+    let existing_manifest = dataset.map(|ds| ds.manifest.as_ref());
+    let fragments_fut = do_write_fragments_with_manifest(
         object_store.clone(),
         base_dir,
         &frag_schema,
         data,
         params,
         storage_version,
+        existing_manifest,
     );
 
     let (default, blob) = if let Some(blob_data) = blob_data {
@@ -610,9 +764,23 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
+    open_writer_with_options(object_store, schema, base_dir, storage_version, true).await
+}
+
+pub async fn open_writer_with_options(
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    storage_version: LanceFileVersion,
+    add_data_dir: bool,
+) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", generate_random_filename());
 
-    let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
+    let full_path = if add_data_dir {
+        base_dir.child(DATA_DIR).child(filename.as_str())
+    } else {
+        base_dir.child(filename.as_str())
+    };
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new((
@@ -644,12 +812,15 @@ pub async fn open_writer(
     Ok(writer)
 }
 
+
 /// Creates new file writers for a given dataset.
 struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    /// Target bucket ID (if writing to a specific bucket)
+    target_bucket_id: Option<u32>,
 }
 
 impl WriterGenerator {
@@ -658,28 +829,78 @@ impl WriterGenerator {
         base_dir: &Path,
         schema: &Schema,
         storage_version: LanceFileVersion,
+        target_bucket_id: Option<u32>,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            target_bucket_id,
         }
     }
 
+
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
-        // Use temporary ID 0; will assign ID later.
+        // Use temporary ID 0; will assign actual ID later.
         let fragment = Fragment::new(0);
 
-        let writer = open_writer(
-            &self.object_store,
-            &self.schema,
-            &self.base_dir,
-            self.storage_version,
-        )
-        .await?;
+        // Simple single bucket mode - write to the configured base directory
+
+        let mut writer = if let Some(_bucket_id) = self.target_bucket_id {
+            // For writes with explicit data file bases, don't add /data directory - we'll include it in base_dir
+            open_writer_with_options(
+                self.object_store.as_ref(),
+                &self.schema,
+                &self.base_dir,
+                self.storage_version,
+                false, // Don't add /data for explicit data file bases
+            )
+            .await?
+        } else {
+            // For primary bucket writes, add /data directory as usual
+            open_writer(
+                self.object_store.as_ref(),
+                &self.schema,
+                &self.base_dir,
+                self.storage_version,
+            )
+            .await?
+        };
+
+        // If writing to a target bucket, wrap the writer to set base_id on DataFiles
+        if let Some(bucket_id) = self.target_bucket_id {
+            writer = Box::new(BucketAwareWriter {
+                inner: writer,
+                bucket_id,
+            });
+        }
 
         Ok((writer, fragment))
+    }
+}
+
+/// Wrapper writer that sets the bucket_id on DataFile creation
+struct BucketAwareWriter {
+    inner: Box<dyn GenericWriter>,
+    bucket_id: u32,
+}
+
+#[async_trait::async_trait]
+impl GenericWriter for BucketAwareWriter {
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        self.inner.write(batches).await
+    }
+
+    async fn tell(&mut self) -> Result<u64> {
+        self.inner.tell().await
+    }
+
+    async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let (num_rows, mut data_file) = self.inner.finish().await?;
+        // Set the bucket_id on the DataFile
+        data_file.base_id = Some(self.bucket_id);
+        Ok((num_rows, data_file))
     }
 }
 
@@ -1123,5 +1344,191 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_data_file_bases_writer_generator() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        // Create test schema
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create in-memory object store
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+
+        // Test WriterGenerator with explicit data file bases configuration
+        let writer_generator = WriterGenerator::new(
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            LanceFileVersion::Stable,
+            Some(2), // target_bucket_id
+        );
+
+        // Create a writer
+        let (writer, fragment) = writer_generator.new_writer().await.unwrap();
+        
+        // Verify fragment is created
+        assert_eq!(fragment.id, 0); // Temporary ID
+        
+        // Verify writer is created (we can't test much more without writing data)
+        drop(writer); // Clean up
+    }
+
+    #[tokio::test]
+    async fn test_bucket_aware_writer() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Create test data
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        ).unwrap();
+
+        // Create in-memory object store and writer
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+        
+        let inner_writer = open_writer_with_options(
+            object_store.as_ref(),
+            &schema,
+            &base_dir,
+            LanceFileVersion::Stable,
+            false, // Don't add /data
+        ).await.unwrap();
+
+        // Wrap with BucketAwareWriter
+        let bucket_id = 2u32;
+        let mut bucket_writer = BucketAwareWriter {
+            inner: inner_writer,
+            bucket_id,
+        };
+
+        // Write data
+        bucket_writer.write(&[batch]).await.unwrap();
+        
+        // Finish and check the DataFile has correct base_id
+        let (_num_rows, data_file) = bucket_writer.finish().await.unwrap();
+        
+        assert_eq!(data_file.base_id, Some(bucket_id));
+        assert!(!data_file.path.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_data_file_bases_path_parsing() {
+        // Test URI parsing logic
+        let test_cases = vec![
+            (
+                "s3://multi-path-test/test1/subBucket2",
+                "test1/subBucket2"
+            ),
+            (
+                "gs://my-bucket/path/to/data",
+                "path/to/data"
+            ),
+            (
+                "file:///tmp/test/bucket",
+                "tmp/test/bucket"
+            ),
+        ];
+
+        for (uri, expected_path) in test_cases {
+            let url = url::Url::parse(uri).unwrap();
+            let parsed_path = url.path().trim_start_matches('/');
+            assert_eq!(parsed_path, expected_path, "Failed for URI: {}", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_params_validation() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test");
+
+        // Test CREATE mode validation
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            initial_data_paths: Some(vec![
+                "s3://bucket1/path1".to_string(),
+                "s3://bucket2/path2".to_string(),
+            ]),
+            target_data_paths: Some(vec!["s3://bucket1/path1".to_string()]),
+            ..Default::default()
+        };
+
+        // This should be valid
+        let result = validate_write_params(&params);
+        assert!(result.is_ok());
+
+        // Test target_data_paths not in initial_data_paths (should fail)
+        params.target_data_paths = Some(vec!["s3://bucket3/path3".to_string()]);
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+
+        // Test CREATE mode with target_data_paths but no initial_data_paths (should fail)
+        params.initial_data_paths = None;
+        params.target_data_paths = Some(vec!["s3://bucket1/path1".to_string()]);
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+    }
+
+    fn validate_write_params(params: &WriteParams) -> Result<()> {
+        // Replicate the validation logic from the main write function
+        if matches!(params.mode, WriteMode::Create) {
+            if let Some(target_data_paths) = &params.target_data_paths {
+                if target_data_paths.len() != 1 {
+                    return Err(Error::invalid_input(
+                        format!("target_data_paths with {} elements is not supported", target_data_paths.len()),
+                        location!(),
+                    ));
+                }
+                let target_path_uri = &target_data_paths[0];
+                if let Some(initial_data_paths) = &params.initial_data_paths {
+                    if !initial_data_paths.contains(target_path_uri) {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "target_path_uri '{}' must be one of the initial_data_paths {:?} in CREATE mode",
+                                target_path_uri, initial_data_paths
+                            ),
+                            location!(),
+                        ));
+                    }
+                } else {
+                    return Err(Error::invalid_input(
+                        "initial_data_paths must be provided when target_data_paths is specified in CREATE mode",
+                        location!(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }

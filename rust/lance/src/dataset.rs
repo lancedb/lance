@@ -12,6 +12,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use std::collections::HashMap;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
@@ -51,7 +52,7 @@ use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
@@ -89,6 +90,7 @@ use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, UpdateMapEntry};
+use self::utils::parse_bucket_uri_and_path;
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
@@ -116,6 +118,8 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
 };
+
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -162,6 +166,9 @@ pub struct Dataset {
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+    
+    /// Cache of ObjectStore instances by path URI (for multi-path support)
+    pub(crate) extra_object_stores: HashMap<String, Arc<ObjectStore>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -551,6 +558,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.extra_object_stores.clone(),
         )
     }
 
@@ -661,6 +669,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        extra_object_stores: HashMap<String, Arc<ObjectStore>>,
     ) -> Result<Self> {
         let refs = Refs::new(
             object_store.clone(),
@@ -687,6 +696,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
+            extra_object_stores,
         })
     }
 
@@ -829,6 +839,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 self.file_reader_options.clone(),
+                self.extra_object_stores.clone(), // Blob datasets inherit extra object stores
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1364,8 +1375,10 @@ impl Dataset {
                         location!(),
                     )
                 })?;
-
-                let path = Path::parse(base_path.path.as_str())?;
+                // Parse the full URI to extract the relative path
+                let full_uri = &base_path.path;
+                let (_bucket_uri, relative_path) = parse_bucket_uri_and_path(full_uri)?;
+                let path = Path::parse(&relative_path)?;
                 if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
                 } else {
@@ -1373,6 +1386,37 @@ impl Dataset {
                 }
             }
             None => Ok(self.base.child(DATA_DIR)),
+        }
+    }
+
+    /// Get the ObjectStore for a specific path based on base_id
+    pub(crate) fn get_object_store_for_path(&self, base_id: Option<&u32>) -> Result<Arc<lance_io::object_store::ObjectStore>> {
+        match base_id {
+            Some(bucket_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(bucket_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!("base_path id {} not found", bucket_id),
+                        location!(),
+                    )
+                })?;
+
+                // Parse the full URI to extract bucket URI and relative path
+                let full_uri = &base_path.path;
+                let (bucket_uri, _relative_path) = parse_bucket_uri_and_path(full_uri)?;
+                
+                // Look up in pre-populated cache
+                self.extra_object_stores.get(&bucket_uri)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid_input(
+                        format!("ObjectStore for bucket URI '{}' not found in cache", bucket_uri),
+                        location!(),
+                    ))
+            }
+            None => {
+                // Use the primary dataset's object store
+                Ok(self.object_store.clone())
+            }
         }
     }
 
@@ -1996,6 +2040,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.extra_object_stores.clone(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -2033,6 +2078,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.extra_object_stores.clone(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
@@ -4171,6 +4217,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_data_paths: None,
         };
         let test_dir = TempStdDir::default();
         let test_uri = test_dir.to_str().unwrap();
@@ -4203,6 +4250,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_data_paths: None,
         };
         let test_uri = TempStrDir::default();
         let read_version_0_transaction = Transaction::new(0, operation, None, None);

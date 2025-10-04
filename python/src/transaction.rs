@@ -165,11 +165,18 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let schema = extract_schema(&ob.getattr("new_schema")?)?;
 
                 let fragments = extract_vec(&ob.getattr("fragments")?)?;
+                
+                let initial_data_paths = ob
+                    .getattr("initial_data_paths")
+                    .ok()
+                    .and_then(|attr| attr.extract::<Option<Vec<String>>>().ok())
+                    .flatten();
 
                 let op = Operation::Overwrite {
                     schema,
                     fragments,
                     config_upsert_values: None,
+                    initial_data_paths,
                 };
                 Ok(Self(op))
             }

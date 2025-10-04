@@ -251,6 +251,7 @@ impl<'a> InsertBuilder<'a> {
                     schema,
                     fragments: written_frags.default.0,
                     config_upsert_values,
+                    initial_data_paths: context.params.initial_data_paths.clone(),
                 }
             }
             WriteMode::Overwrite => Operation::Overwrite {
@@ -258,6 +259,7 @@ impl<'a> InsertBuilder<'a> {
                 schema,
                 fragments: written_frags.default.0,
                 config_upsert_values: None,
+                initial_data_paths: context.params.initial_data_paths.clone(),
             },
             WriteMode::Append => Operation::Append {
                 fragments: written_frags.default.0,
@@ -269,6 +271,7 @@ impl<'a> InsertBuilder<'a> {
                 schema: blob.1,
                 fragments: blob.0,
                 config_upsert_values: None,
+                initial_data_paths: context.params.initial_data_paths.clone(),
             },
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
@@ -284,6 +287,7 @@ impl<'a> InsertBuilder<'a> {
         .blobs_op(blobs_op)
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
+        
 
         Ok(transaction)
     }
