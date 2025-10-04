@@ -30,7 +30,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
+use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ADDR, ROW_ID};
 
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -670,11 +670,11 @@ impl JsonIndexPlugin {
                 }
             };
 
-            // Get row_id column
+            // Get row_addr column
             let row_id_column = batch
-                .column_by_name(ROW_ID)
+                .column_by_name(ROW_ADDR)
                 .ok_or_else(|| Error::InvalidInput {
-                    source: "Missing row_id column".into(),
+                    source: "Missing row_addr column".into(),
                     location: location!(),
                 })?
                 .clone();
@@ -682,7 +682,7 @@ impl JsonIndexPlugin {
             // Create new batch with converted values
             let new_schema = Arc::new(Schema::new(vec![
                 ArrowField::new(VALUE_COLUMN_NAME, target_type.clone(), true),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new(ROW_ADDR, DataType::UInt64, false),
             ]));
 
             let new_batch =

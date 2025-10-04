@@ -2125,7 +2125,7 @@ impl Scanner {
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
             self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
-                .with_row_id()
+                .with_row_addr()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
@@ -2462,8 +2462,8 @@ impl Scanner {
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
-                    expressions::col(ROW_ID, schema.as_ref())?,
-                    ROW_ID.to_string(),
+                    expressions::col(ROW_ADDR, schema.as_ref())?,
+                    ROW_ADDR.to_string(),
                 )];
 
                 let fts_node = Arc::new(UnionExec::new(children));
@@ -2547,8 +2547,8 @@ impl Scanner {
                             joined_plan,
                             plan,
                             vec![(
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
                             )],
                             None,
                             &datafusion_expr::JoinType::Inner,
@@ -2652,8 +2652,8 @@ impl Scanner {
             }
             let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
             let mut scan_node = self.scan_fragments(
-                true,
                 false,
+                true,
                 false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),

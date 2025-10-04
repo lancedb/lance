@@ -243,13 +243,13 @@ impl ProductQuantizationStorage {
 
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let transposed_codes = pq_code.values();
-            let mut new_row_ids = Vec::with_capacity(row_ids.len());
+            let mut new_row_addrs = Vec::with_capacity(row_ids.len());
             let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
 
-            let row_ids_values = row_ids.values();
-            for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    new_row_ids.push(mapped_value);
+            let row_addrs_values = row_ids.values();
+            for (i, row_addr) in row_addrs_values.iter().enumerate() {
+                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_addr(*row_addr) {
+                    new_row_addrs.push(mapped_value);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         num_bits,
@@ -259,19 +259,19 @@ impl ProductQuantizationStorage {
                 }
             }
 
-            let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+            let new_row_addrs = Arc::new(UInt64Array::from(new_row_addrs));
             let new_codes = UInt8Array::from(new_codes);
-            batch = if new_row_ids.is_empty() {
+            batch = if new_row_addrs.is_empty() {
                 RecordBatch::new_empty(batch.schema())
             } else {
-                let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+                let num_bytes_in_code = new_codes.len() / new_row_addrs.len();
                 let new_transposed_codes =
-                    transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+                    transpose(&new_codes, new_row_addrs.len(), num_bytes_in_code);
                 let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                     new_transposed_codes,
                     num_bytes_in_code as i32,
                 )?);
-                RecordBatch::try_new(batch.schema(), vec![new_row_ids, codes_fsl])?
+                RecordBatch::try_new(batch.schema(), vec![new_row_addrs, codes_fsl])?
             };
             pq_code = batch[PQ_CODE_COLUMN]
                 .as_fixed_size_list()

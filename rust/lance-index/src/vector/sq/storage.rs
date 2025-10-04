@@ -187,7 +187,7 @@ impl ScalarQuantizationStorage {
         offsets.push(0);
         for mut batch in batches.into_iter() {
             if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
+                batch = frag_reuse_index_ref.remap_row_addrs_record_batch(batch, 0)?
             }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;

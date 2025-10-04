@@ -10,7 +10,7 @@ use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
@@ -145,7 +145,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        debug_assert!(batch.column_by_name(ROW_ID).is_some());
+        debug_assert!(batch.column_by_name(ROW_ADDR).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
         Q::Storage::try_from_batch(

@@ -185,7 +185,7 @@ impl NGramPostingList {
                 location: location!(),
             })?;
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
+            bitmap = frag_reuse_index_ref.remap_row_addrs_roaring_tree_map(&bitmap);
         }
         Ok(Self { bitmap })
     }
@@ -538,7 +538,7 @@ impl ScalarIndex for NGramIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1266,7 +1266,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             });
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 

@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use roaring::RoaringBitmap;
 use snafu::location;
 
@@ -30,7 +30,7 @@ use crate::{Index, IndexType};
 /// A flat index is just a batch of value/row-id pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
-/// the values.  The second column "row_ids" contains the row ids
+/// the values.  The second column "row_addrs" contains the row ids
 ///
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
@@ -127,13 +127,13 @@ impl BTreeSubIndex for FlatIndexMetadata {
     }
 
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // The data source may not call the columns "values" and "row_ids" so we need to replace
+        // The data source may not call the columns "values" and "row_addrs" so we need to replace
         // the schema
         Ok(RecordBatch::try_new(
             self.schema.clone(),
             vec![
                 batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
-                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+                batch.column_by_name(ROW_ADDR).expect_ok()?.clone(),
             ],
         )?)
     }
