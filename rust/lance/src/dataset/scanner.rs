@@ -2125,7 +2125,7 @@ impl Scanner {
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
             self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
-                .with_row_id()
+                .with_row_addr()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
@@ -2652,8 +2652,8 @@ impl Scanner {
             }
             let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
             let mut scan_node = self.scan_fragments(
-                true,
                 false,
+                true,
                 false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),

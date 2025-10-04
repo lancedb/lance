@@ -19,7 +19,7 @@ use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
+use lance_core::{utils::tracing::StreamTracingExt, ROW_ADDR, ROW_ID};
 
 use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
@@ -1016,10 +1016,10 @@ impl ExecutionPlan for BooleanQueryExec {
             if let Some(mut must) = must {
                 while let Some(batch) = must.try_next().await? {
                     let _timer = elapsed_time.timer();
-                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                    let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>().values();
                     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
                     res.extend(std::iter::zip(
-                        row_ids.iter().copied(),
+                        row_addrs.iter().copied(),
                         scores.iter().copied(),
                     ));
                 }
