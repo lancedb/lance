@@ -1813,13 +1813,13 @@ mod tests {
     use arrow_array::{cast::AsArray, Array, UInt32Array};
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_index::{
         optimize::OptimizeOptions,
         scalar::{expression::PlannerIndexExt, ScalarIndexParams},
         DatasetIndexExt, IndexType,
     };
-    use tempfile::TempDir;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -1831,7 +1831,7 @@ mod tests {
     use super::*;
 
     struct TestFixture {
-        _tmp_path: TempDir,
+        _tmp_path: TempStrDir,
         dataset: Arc<Dataset>,
     }
 
@@ -1846,7 +1846,7 @@ mod tests {
     /// The fragment ids are 0 (values 0..100), 2 (values 250..300), 3 (values 300..400)
     impl TestFixture {
         async fn new() -> Self {
-            let tmp_path = tempfile::tempdir().unwrap();
+            let tmp_path = TempStrDir::default();
 
             let mut dataset = gen_batch()
                 .col("fully_indexed", array::step::<UInt32Type>())
@@ -1858,7 +1858,7 @@ mod tests {
                 )
                 .col("vector", array::rand_vec::<Float32Type>(Dimension::from(4)))
                 .into_dataset(
-                    tmp_path.path().to_str().unwrap(),
+                    tmp_path.as_str(),
                     FragmentCount::from(2),
                     FragmentRowCount::from(100),
                 )
@@ -2404,11 +2404,11 @@ mod tests {
     async fn test_limit_offset_with_deleted_rows() {
         // This test reproduces the issue from the Python test_limit_offset[stable] failure
         // Create a simple dataset with 10 rows (0-9)
-        let tmp_path = tempfile::tempdir().unwrap();
+        let tmp_path = TempStrDir::default();
         let mut dataset = gen_batch()
             .col("a", array::step::<UInt32Type>())
             .into_dataset(
-                tmp_path.path().to_str().unwrap(),
+                tmp_path.as_str(),
                 FragmentCount::from(1),
                 FragmentRowCount::from(10),
             )

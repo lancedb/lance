@@ -409,17 +409,12 @@ pub mod tests {
 
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
-        ArrayRef, StringArray, UInt8Array,
+        ArrayRef, DictionaryArray, StringArray, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::{
-        testing::{
-            check_basic_random, check_round_trip_encoding_of_data, check_specific_random, TestCases,
-        },
-        version::LanceFileVersion,
-    };
+    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
 
     use super::encode_dict_indices_and_items;
 
@@ -574,8 +569,22 @@ pub mod tests {
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             false,
         );
-        // TODO (https://github.com/lancedb/lance/issues/4782)
-        let test_cases = TestCases::default().with_max_file_version(LanceFileVersion::V2_0);
-        check_specific_random(dict_field, test_cases).await;
+        check_basic_random(dict_field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_already_dictionary() {
+        let values = StringArray::from_iter_values(["a", "bb", "ccc"]);
+        let indices = UInt8Array::from(vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
+        let dict_array = DictionaryArray::new(indices, Arc::new(values));
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_range(2..4)
+            .with_indices(vec![1])
+            .with_indices(vec![2]);
+        check_round_trip_encoding_of_data(vec![Arc::new(dict_array)], &test_cases, HashMap::new())
+            .await;
     }
 }

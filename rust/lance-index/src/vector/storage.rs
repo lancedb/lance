@@ -248,6 +248,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.reader.num_rows()
     }
 
+    pub fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
+    }
+
     pub fn quantizer(&self) -> Result<Quantizer> {
         let metadata = self.metadata();
         Q::from_metadata(metadata, self.distance_type)

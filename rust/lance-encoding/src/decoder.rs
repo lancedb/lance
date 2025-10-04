@@ -529,14 +529,36 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn is_primitive(data_type: &DataType) -> bool {
+    fn is_structural_primitive(data_type: &DataType) -> bool {
+        if data_type.is_primitive() {
+            true
+        } else {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Dictionary(_, value_type) => Self::is_structural_primitive(value_type),
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8 => true,
+                DataType::FixedSizeList(inner, _) => {
+                    Self::is_structural_primitive(inner.data_type())
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn is_primitive_legacy(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                DataType::FixedSizeList(inner, _) => Self::is_primitive_legacy(inner.data_type()),
                 _ => false,
             }
         }
@@ -673,12 +695,13 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
                 self.cache_repetition_index,
+                field,
             )?);
 
             // advance to the next top level column
@@ -689,11 +712,13 @@ impl CoreFieldDecoderStrategy {
         match &data_type {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() {
+                    // Packed struct
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
                         self.cache_repetition_index,
+                        field,
                     )?);
 
                     // advance to the next top level column
@@ -701,6 +726,29 @@ impl CoreFieldDecoderStrategy {
 
                     return Ok(scheduler);
                 }
+                // Maybe a blob descriptions struct?
+                if field.is_blob() {
+                    let column_info = column_infos.peek();
+                    if column_info.page_infos.iter().any(|page| {
+                        matches!(
+                            page.encoding,
+                            PageEncoding::Structural(pb21::PageLayout {
+                                layout: Some(pb21::page_layout::Layout::BlobLayout(_))
+                            })
+                        )
+                    }) {
+                        let column_info = column_infos.expect_next()?;
+                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                            column_info.as_ref(),
+                            self.decompressor_strategy.as_ref(),
+                            self.cache_repetition_index,
+                            field,
+                        )?);
+                        column_infos.next_top_level();
+                        return Ok(scheduler);
+                    }
+                }
+
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =
@@ -714,16 +762,6 @@ impl CoreFieldDecoderStrategy {
                         as Box<dyn StructuralFieldScheduler>,
                 )
             }
-            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
-                let column_info = column_infos.expect_next()?;
-                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                    column_info.as_ref(),
-                    self.decompressor_strategy.as_ref(),
-                    self.cache_repetition_index,
-                )?);
-                column_infos.next_top_level();
-                Ok(scheduler)
-            }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field
                     .children
@@ -734,7 +772,7 @@ impl CoreFieldDecoderStrategy {
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
-            _ => todo!(),
+            _ => todo!("create_structural_field_scheduler for {}", data_type),
         }
     }
 
@@ -745,7 +783,7 @@ impl CoreFieldDecoderStrategy {
         buffers: FileBuffers,
     ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_primitive_legacy(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
@@ -804,7 +842,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
-                if Self::is_primitive(inner.data_type()) {
+                if Self::is_primitive_legacy(inner.data_type()) {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -814,7 +852,7 @@ impl CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive(value_type) || value_type.is_binary_like() {
+                if Self::is_primitive_legacy(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -1516,7 +1554,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     /// Note that `scheduled_need` is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
     #[instrument(skip_all)]
-    fn wait_for_io(&mut self, scheduled_need: u64) -> Result<u64> {
+    fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
         while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
             self.rows_scheduled = message.scheduled_so_far;
@@ -1538,7 +1576,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self.rows_drained + self.rows_per_batch as u64 - 1;
+        let loaded_need = self.rows_drained + to_take.min(self.rows_per_batch as u64) - 1;
 
         self.root_decoder
             .wait(loaded_need, &self.wait_for_io_runtime)?;
@@ -1568,7 +1606,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 "Draining from scheduler (desire at least {} scheduled rows)",
                 desired_scheduled
             );
-            let actually_scheduled = self.wait_for_io(desired_scheduled)?;
+            let actually_scheduled = self.wait_for_io(desired_scheduled, to_take)?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
                 to_take -= under_scheduled;

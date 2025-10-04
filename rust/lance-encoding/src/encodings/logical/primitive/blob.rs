@@ -33,6 +33,176 @@ use crate::{
 /// This is probably a reasonable default for most cases.
 pub const TARGET_SHARD_SIZE: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(super) struct BlobDescriptionPageScheduler {
+    inner_scheduler: Box<dyn StructuralPageScheduler>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+}
+
+impl BlobDescriptionPageScheduler {
+    pub fn new(
+        inner_scheduler: Box<dyn StructuralPageScheduler>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> Self {
+        Self {
+            inner_scheduler,
+            def_meaning,
+        }
+    }
+
+    fn wrap_decoder_fut(
+        decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>> {
+        async move {
+            let decoder = decoder_fut.await?;
+            Ok(
+                Box::new(BlobDescriptionPageDecoder::new(decoder, def_meaning))
+                    as Box<dyn StructuralPageDecoder>,
+            )
+        }
+        .boxed()
+    }
+}
+
+impl StructuralPageScheduler for BlobDescriptionPageScheduler {
+    fn initialize<'a>(
+        &'a mut self,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        self.inner_scheduler.initialize(io)
+    }
+
+    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+        self.inner_scheduler.load(data);
+    }
+
+    fn schedule_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<Vec<PageLoadTask>> {
+        let tasks = self.inner_scheduler.schedule_ranges(ranges, io)?;
+        Ok(tasks
+            .into_iter()
+            .map(|task| PageLoadTask {
+                decoder_fut: Self::wrap_decoder_fut(task.decoder_fut, self.def_meaning.clone()),
+                num_rows: task.num_rows,
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug)]
+struct BlobDescriptionPageDecoder {
+    inner: Box<dyn StructuralPageDecoder>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+}
+
+impl BlobDescriptionPageDecoder {
+    fn new(
+        inner: Box<dyn StructuralPageDecoder>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> Self {
+        Self { inner, def_meaning }
+    }
+}
+
+impl StructuralPageDecoder for BlobDescriptionPageDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        Ok(Box::new(BlobDescriptionDecodePageTask::new(
+            self.inner.drain(num_rows)?,
+            self.def_meaning.clone(),
+        )))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.inner.num_rows()
+    }
+}
+
+#[derive(Debug)]
+struct BlobDescriptionDecodePageTask {
+    inner: Box<dyn DecodePageTask>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+}
+
+impl BlobDescriptionDecodePageTask {
+    fn new(inner: Box<dyn DecodePageTask>, def_meaning: Arc<[DefinitionInterpretation]>) -> Self {
+        Self { inner, def_meaning }
+    }
+}
+
+impl DecodePageTask for BlobDescriptionDecodePageTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let decoded = self.inner.decode()?;
+        let num_values = decoded.data.num_values();
+
+        // Need to extract out the repdef information
+        let DataBlock::Struct(descriptions) = &decoded.data else {
+            return Err(Error::Internal {
+                message: "Expected struct data block for descriptions".into(),
+                location: location!(),
+            });
+        };
+        let mut description_children = descriptions.children.iter();
+        let DataBlock::FixedWidth(positions) = description_children.next().expect_ok()? else {
+            return Err(Error::Internal {
+                message: "Expected fixed width data block for positions".into(),
+                location: location!(),
+            });
+        };
+        let DataBlock::FixedWidth(sizes) = description_children.next().expect_ok()? else {
+            return Err(Error::Internal {
+                message: "Expected fixed width data block for sizes".into(),
+                location: location!(),
+            });
+        };
+        let positions = positions.data.borrow_to_typed_slice::<u64>();
+        let sizes = sizes.data.borrow_to_typed_slice::<u64>();
+
+        let mut rep = Vec::with_capacity(num_values as usize);
+        let mut def = Vec::with_capacity(num_values as usize);
+
+        for (position, size) in positions.iter().copied().zip(sizes.iter().copied()) {
+            if size == 0 {
+                if position == 0 {
+                    rep.push(0);
+                    def.push(0);
+                } else {
+                    let repval = (position & 0xFFFF) as u16;
+                    let defval = ((position >> 16) & 0xFFFF) as u16;
+                    rep.push(repval);
+                    def.push(defval);
+                }
+            } else {
+                rep.push(0);
+                def.push(0);
+            }
+        }
+
+        let rep = if rep.iter().any(|r| *r != 0) {
+            Some(rep)
+        } else {
+            None
+        };
+        let def = if self.def_meaning.len() > 1
+            || self.def_meaning[0] != DefinitionInterpretation::AllValidItem
+        {
+            Some(def)
+        } else {
+            None
+        };
+
+        let repdef = RepDefUnraveler::new(rep, def, self.def_meaning.clone());
+
+        Ok(DecodedPage {
+            data: decoded.data,
+            repdef,
+        })
+    }
+}
+
 struct BlobCacheableState {
     positions: Arc<UInt64Array>,
     sizes: Arc<UInt64Array>,

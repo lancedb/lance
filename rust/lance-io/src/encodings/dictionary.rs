@@ -211,6 +211,7 @@ mod tests {
     use crate::local::LocalObjectReader;
     use arrow_array::StringArray;
     use arrow_buffer::ArrowNativeType;
+    use lance_core::utils::tempfile::TempStdFile;
     use tokio::io::AsyncWriteExt;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
@@ -235,8 +236,7 @@ mod tests {
         let keys2_ref = arr2.keys() as &dyn Array;
         let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
 
         let pos;
         {

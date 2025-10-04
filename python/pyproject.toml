@@ -34,6 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering",
 ]
@@ -56,13 +57,10 @@ tests = [
     "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
-    # Workardound for https://github.com/lancedb/lance/issues/4472
-    #
-    # tensorflow is broken on 2.20.0 with macOS ARM.
-    "tensorflow<=2.19.0",
+    # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
+    "tensorflow; sys_platform == 'linux'",
     "tqdm",
-    # Need to align with the datafusion version we use at lance rust
-    "datafusion==49.0.0",
+    "datafusion>=48.0.0",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
@@ -75,7 +73,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 "*.pyi" = ["E301", "E302"]
 
 [tool.pyright]
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 # TODO: expand this list as we fix more files.
 include = [
     "python/lance/util.py",

@@ -61,10 +61,15 @@ def test_schema_only(tmp_path):
 def test_write_with_max_page_bytes(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
-    with LanceFileWriter(str(path), schema, max_page_bytes=1) as writer:
-        writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    reader = LanceFileReader(str(path))
-    assert len(reader.metadata().columns[0].pages) == 3
+    for version in ["2.0", "2.1"]:
+        with LanceFileWriter(
+            str(path), schema, max_page_bytes=1, version=version
+        ) as writer:
+            writer.write_batch(pa.table({"a": [1, 2, 3]}))
+        reader = LanceFileReader(str(path))
+        # Only 2.0 splits large pages on write.   In 2.1+ we split on read.
+        expected_pages = 3 if version == "2.0" else 1
+        assert len(reader.metadata().columns[0].pages) == expected_pages
 
 
 def test_aborted_write(tmp_path):
@@ -89,7 +94,7 @@ def test_version(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
 
-    with LanceFileWriter(str(path), schema) as writer:
+    with LanceFileWriter(str(path), schema, version="2.0") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     reader = LanceFileReader(str(path))
     metadata = reader.metadata()
@@ -231,8 +236,7 @@ def test_metadata(tmp_path):
     assert metadata.num_rows == 3
     assert metadata.num_global_buffer_bytes > 0
     assert metadata.num_column_metadata_bytes > 0
-    # 64 and not 24 because we align/pad to 64 bytes
-    assert metadata.num_data_bytes == 64
+    assert metadata.num_data_bytes > 0
     assert len(metadata.columns) == 1
 
     column = metadata.columns[0]
@@ -269,10 +273,12 @@ def test_file_stat(tmp_path):
     assert len(file_stat.columns) == 2
 
     assert file_stat.columns[0].num_pages == 1
-    assert file_stat.columns[0].size_bytes == 8_000_000
+    assert file_stat.columns[0].size_bytes <= 8_000_000
 
-    assert file_stat.columns[1].num_pages == 2
-    assert file_stat.columns[1].size_bytes == 64_000_000
+    # 2 pages on 2.0, 1 page in 2.1+
+    assert file_stat.columns[1].num_pages <= 2
+    # Slightly larger than 64MiB because of padding, chunk overhead, etc.
+    assert file_stat.columns[1].size_bytes <= 64_200_000
 
 
 def test_round_trip_parquet(tmp_path):
@@ -501,7 +507,9 @@ def test_blob(tmp_path):
     # 100 1MiB values.  If we store as regular large_binary we end up
     # with several pages of values.  If we store as a blob we get a
     # single page
-    vals = pa.array([b"0" * (1024 * 1024) for _ in range(100)], pa.large_binary())
+    expected = pa.table(
+        {"val": pa.array([b"0" * (1024 * 1024)] * 100, pa.large_binary())}
+    )
     schema_no_blob = pa.schema([pa.field("val", pa.large_binary())])
     schema_blob = pa.schema(
         [pa.field("val", pa.large_binary(), metadata={"lance-encoding:blob": "true"})]
@@ -509,21 +517,24 @@ def test_blob(tmp_path):
 
     path = tmp_path / "no_blob.lance"
     with LanceFileWriter(str(path), schema_no_blob) as writer:
-        writer.write_batch(pa.table({"val": vals}))
+        for _ in range(100):
+            vals = pa.array([b"0" * (1024 * 1024)], pa.large_binary())
+            writer.write_batch(pa.table({"val": vals}))
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) > 1
-    assert reader.read_all().to_table() == pa.table({"val": vals})
+    assert reader.read_all().to_table() == expected
 
     path = tmp_path / "blob.lance"
     with LanceFileWriter(str(path), schema_blob) as writer:
-        writer.write_batch(pa.table({"val": vals}))
+        for _ in range(100):
+            vals = pa.array([b"0" * (1024 * 1024)], pa.large_binary())
+            writer.write_batch(pa.table({"val": vals}))
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
 
     actual = reader.read_all().to_table()
-    expected = pa.table({"val": vals})
 
     assert actual.num_rows == expected.num_rows
     for row_num in range(expected.num_rows):

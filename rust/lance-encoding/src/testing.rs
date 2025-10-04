@@ -323,7 +323,7 @@ pub async fn check_round_trip_encoding_generated(
     test_cases: TestCases,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for page_size in [4096, 1024 * 1024] {
+    for page_size in test_cases.page_sizes.iter().copied() {
         debug!("Testing random data with a page size of {}", page_size);
         let encoder_factory = |version: LanceFileVersion| {
             let encoding_strategy = default_encoding_strategy(version);

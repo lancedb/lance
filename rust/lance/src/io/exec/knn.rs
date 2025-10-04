@@ -1304,6 +1304,7 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
@@ -1313,7 +1314,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
@@ -1356,8 +1356,8 @@ mod tests {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
@@ -1525,13 +1525,13 @@ mod tests {
     struct NprobesTestFixture {
         dataset: Dataset,
         centroids: Arc<dyn Array>,
-        _tmp_dir: TempDir,
+        _tmp_dir: TempStrDir,
     }
 
     impl NprobesTestFixture {
         pub async fn new(num_centroids: usize, num_deltas: usize) -> Self {
-            let tempdir = tempdir().unwrap();
-            let tmppath = tempdir.path().to_str().unwrap();
+            let tempdir = TempStrDir::default();
+            let tmppath = tempdir.as_str();
 
             // We create 100 centroids
             // We generate 10,000 vectors evenly divided (100 vectors per centroid)

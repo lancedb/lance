@@ -533,6 +533,7 @@ mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field};
     use futures::{poll, StreamExt, TryStreamExt};
+    use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
 
     use super::*;
 
@@ -553,9 +554,8 @@ mod tests {
         ];
 
         // Create a stream
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), 0);
+        let path = TempStdFile::default();
+        let (mut spill, receiver) = create_replay_spill(path.to_owned(), schema.clone(), 0);
 
         // We can open a reader prior to writing any data. No batches will be ready.
         let mut stream_before = receiver.read();
@@ -618,9 +618,9 @@ mod tests {
     async fn test_spill_error() {
         // Create a spill
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), 0);
+        let path = TempStdFile::default();
+        let (mut spill, receiver) =
+            create_replay_spill(path.as_ref().to_owned(), schema.clone(), 0);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -680,8 +680,7 @@ mod tests {
     #[tokio::test]
     async fn test_spill_buffered() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("spill.arrows");
+        let path = TempStdPath::default();
         let memory_limit = 1024 * 1024; // 1 MiB
         let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), memory_limit);
 
@@ -712,8 +711,7 @@ mod tests {
     async fn test_spill_buffered_transition() {
         // Starts as buffered, then spills, then finished.
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("spill.arrows");
+        let path = TempStdPath::default();
         let memory_limit = 1024 * 1024; // 1 MiB
         let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), memory_limit);
 

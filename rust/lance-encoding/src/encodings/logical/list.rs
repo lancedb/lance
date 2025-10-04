@@ -531,9 +531,7 @@ mod tests {
             .with_range(1..3)
             .with_range(2..4)
             .with_indices(vec![1])
-            .with_indices(vec![2])
-            // TODO (https://github.com/lancedb/lance/issues/4782)
-            .with_max_file_version(LanceFileVersion::V2_0);
+            .with_indices(vec![2]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
             &test_cases,

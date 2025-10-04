@@ -14,7 +14,6 @@ use std::{
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
-use crate::scalar::inverted::builder::flatten_string_list;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
@@ -73,6 +72,7 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
@@ -152,7 +152,7 @@ impl DeepSizeOf for TokenSetFormat {
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
 }
@@ -212,7 +212,7 @@ impl InvertedIndex {
         }
     }
 
-    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+    pub fn tokenizer(&self) -> Box<dyn LanceTokenizer> {
         self.tokenizer.clone()
     }
 
@@ -348,7 +348,6 @@ impl InvertedIndex {
                 tokens,
                 inverted_list,
                 docs,
-                fragments: Default::default(),
                 token_set_format: TokenSetFormat::Arrow,
             })],
         }))
@@ -493,7 +492,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(text, &mut tokenizer, None);
+        let tokens = collect_query_tokens(text, &mut tokenizer, None);
 
         let (doc_ids, _) = self
             .bm25_search(
@@ -606,7 +605,6 @@ pub struct InvertedPartition {
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
-    pub(crate) fragments: HashSet<u32>,
     token_set_format: TokenSetFormat,
 }
 
@@ -650,7 +648,6 @@ impl InvertedPartition {
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
-        let fragments = docs.fragment_ids();
 
         Ok(Self {
             id,
@@ -658,7 +655,6 @@ impl InvertedPartition {
             tokens,
             inverted_list: Arc::new(inverted_list),
             docs,
-            fragments,
             token_set_format,
         })
     }
@@ -2102,13 +2098,6 @@ impl DocSet {
             }
         }
     }
-    pub fn fragment_ids(&self) -> HashSet<u32> {
-        self.row_ids
-            .iter()
-            .map(|row_id| (row_id >> 32) as u32)
-            .collect()
-    }
-
     pub fn total_tokens_num(&self) -> u64 {
         self.total_tokens
     }
@@ -2175,54 +2164,69 @@ impl DocSet {
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        let (row_ids, num_tokens, inv) = match is_legacy {
-            // for legacy format, the row id is doc id,
-            // in order to support efficient search, we need to sort the row ids,
-            // so that we can use binary search to get num_tokens
-            true => {
-                let (row_ids, num_tokens) = row_id_col
-                    .values()
-                    .iter()
-                    .filter_map(|id| {
-                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
-                        } else {
-                            Some(*id)
-                        }
-                    })
-                    .zip(num_tokens_col.values().iter())
-                    .sorted_unstable_by_key(|x| x.0)
-                    .unzip();
+        // for legacy format, the row id is doc id; sorting keeps binary search viable
+        if is_legacy {
+            let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
+                .values()
+                .iter()
+                .filter_map(|id| {
+                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                        frag_reuse_index_ref.remap_row_id(*id)
+                    } else {
+                        Some(*id)
+                    }
+                })
+                .zip(num_tokens_col.values().iter())
+                .sorted_unstable_by_key(|x| x.0)
+                .unzip();
 
-                // the legacy format doesn't need to store the inv
-                (row_ids, num_tokens, Vec::new())
+            let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
+            return Ok(Self {
+                row_ids,
+                num_tokens,
+                inv: Vec::new(),
+                total_tokens,
+            });
+        }
+
+        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
+        // remapped, we'll need resort to make sure binary_search works.
+        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            let mut row_ids = Vec::with_capacity(row_id_col.len());
+            let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
+            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
+                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
+                    row_ids.push(new_row_id);
+                    num_tokens.push(*num_token);
+                }
             }
-            false => {
-                let row_ids: Vec<u64> = row_id_col
-                    .values()
-                    .iter()
-                    .filter_map(|id| {
-                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
-                        } else {
-                            Some(*id)
-                        }
-                    })
-                    .collect();
-                let num_tokens = num_tokens_col.values().to_vec();
 
-                // build the inv
-                let inv = row_ids
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .sorted_unstable()
-                    .map(|(i, row_id)| (row_id, i as u32))
-                    .collect();
-                (row_ids, num_tokens, inv)
-            }
-        };
+            let mut inv: Vec<(u64, u32)> = row_ids
+                .iter()
+                .enumerate()
+                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+                .collect();
+            inv.sort_unstable_by_key(|entry| entry.0);
 
+            let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
+            return Ok(Self {
+                row_ids,
+                num_tokens,
+                inv,
+                total_tokens,
+            });
+        }
+
+        let row_ids = row_id_col.values().to_vec();
+        let num_tokens = num_tokens_col.values().to_vec();
+        let mut inv: Vec<(u64, u32)> = row_ids
+            .iter()
+            .enumerate()
+            .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+            .collect();
+        if !row_ids.is_sorted() {
+            inv.sort_unstable_by_key(|entry| entry.0);
+        }
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
             row_ids,
@@ -2286,7 +2290,7 @@ pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
+    tokenizer: Option<Box<dyn LanceTokenizer>>,
 ) -> Result<Vec<u64>> {
     if batches.is_empty() {
         return Ok(vec![]);
@@ -2313,12 +2317,12 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
+    tokenizer: Option<Box<dyn LanceTokenizer>>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_tokens(query, &mut tokenizer, None)
+    let query_tokens = collect_query_tokens(query, &mut tokenizer, None)
         .into_iter()
         .collect::<HashSet<_>>();
 
@@ -2327,7 +2331,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_tokens(doc, &mut tokenizer, Some(&query_tokens));
+            let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, Some(&query_tokens));
             if !doc_tokens.is_empty() {
                 results.push(row_id_array.value(i));
                 assert!(doc.contains(query));
@@ -2344,7 +2348,7 @@ pub fn flat_bm25_search(
     doc_col: &str,
     query_tokens: &HashSet<String>,
     nq: &HashMap<String, usize>,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
     avgdl: f32,
     num_docs: usize,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
@@ -2356,7 +2360,7 @@ pub fn flat_bm25_search(
             continue;
         };
 
-        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
+        let doc_tokens = collect_doc_tokens(doc, tokenizer, Some(query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
         let mut doc_token_count = HashMap::new();
         for token in doc_tokens {
@@ -2388,8 +2392,8 @@ pub fn flat_bm25_search_stream(
     query: String,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
-    let mut tokenizer = index.tokenizer.clone();
-    let tokens = collect_tokens(&query, &mut tokenizer, None)
+    let mut tokenizer = Box::new(index.tokenizer.clone());
+    let tokens = collect_query_tokens(&query, &mut tokenizer, None)
         .into_iter()
         .sorted_unstable()
         .collect::<HashSet<_>>();
@@ -2404,17 +2408,6 @@ pub fn flat_bm25_search_stream(
     }
     let stream = input.map(move |batch| {
         let batch = batch?;
-
-        // Flat if doc_col is a list
-        let batch = match batch[&doc_col].data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => batch,
-            DataType::List(_) => flatten_string_list::<i32>(&batch, &batch[&doc_col])?,
-            DataType::LargeList(_) => flatten_string_list::<i64>(&batch, &batch[&doc_col])?,
-            _ => panic!(
-                "Expecting Utf8, LargeUtf8, List(Utf8) or LargeList(Utf8), found {:?}",
-                batch[&doc_col].data_type()
-            ),
-        };
 
         let batch = flat_bm25_search(
             batch,
@@ -2447,10 +2440,9 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ::object_store::path::Path;
     use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
-    use tempfile::tempdir;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
@@ -2501,10 +2493,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_to_empty_posting_list() {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2564,10 +2556,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_posting_cache_conflict_across_partitions() {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

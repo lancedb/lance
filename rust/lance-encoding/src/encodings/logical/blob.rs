@@ -249,10 +249,7 @@ mod tests {
     async fn test_blob_encoding_simple() {
         let field = Field::try_from(
             ArrowField::new("blob_field", DataType::LargeBinary, true).with_metadata(
-                HashMap::from([(
-                    lance_core::datatypes::BLOB_META_KEY.to_string(),
-                    "true".to_string(),
-                )]),
+                HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]),
             ),
         )
         .unwrap();
@@ -298,10 +295,8 @@ mod tests {
     #[tokio::test]
     async fn test_blob_round_trip() {
         // Test round-trip encoding with blob metadata
-        let blob_metadata = HashMap::from([(
-            lance_core::datatypes::BLOB_META_KEY.to_string(),
-            "true".to_string(),
-        )]);
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
 
         // Create test data
         let val1: &[u8] = &vec![1u8; 1024]; // 1KB
