@@ -881,10 +881,10 @@ async fn recalc_versions_for_rewritten_fragments(
     old_fragments: &[Fragment],
 ) -> Result<()> {
     // Load old per-row last_updated_at version sequences
-    let mut old_last_updated_sequences: Vec<lance_table::format::DatasetVersionSequence> =
+    let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
         Vec::with_capacity(old_fragments.len());
     // Load old per-row created_at version sequences
-    let mut old_created_at_sequences: Vec<lance_table::format::DatasetVersionSequence> =
+    let mut old_created_at_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
         Vec::with_capacity(old_fragments.len());
 
     for frag in old_fragments.iter() {
@@ -905,7 +905,7 @@ async fn recalc_versions_for_rewritten_fragments(
             })?
         } else {
             let creation_version = infer_fragment_creation_version(dataset, frag).await?;
-            lance_table::format::DatasetVersionSequence::from_uniform_row_count(
+            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(
                 row_count,
                 creation_version,
             )
@@ -919,7 +919,7 @@ async fn recalc_versions_for_rewritten_fragments(
             })?
         } else {
             // Default: treat all rows as created at version 1
-            lance_table::format::DatasetVersionSequence::from_uniform_row_count(row_count, 1)
+            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
         };
 
         // Apply deletion mask if present (positions are local offsets)
@@ -966,10 +966,10 @@ async fn recalc_versions_for_rewritten_fragments(
         .zip(new_created_at_sequences.into_iter())
     {
         fragment.last_updated_at_version_meta = Some(
-            lance_table::format::DatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
+            lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
         );
         fragment.created_at_version_meta =
-            Some(lance_table::format::DatasetVersionMeta::from_sequence(&created_at_seq).unwrap());
+            Some(lance_table::format::RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap());
     }
 
     Ok(())

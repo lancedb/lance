@@ -24,12 +24,12 @@ use crate::rowids::{read_row_ids, RowIdSequence};
 /// not over row IDs. This keeps the encoding aligned with RowIdSequence order
 /// and enables zipped iteration without building a map.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
-pub struct DatasetVersionRun {
+pub struct RowDatasetVersionRun {
     pub span: U64Segment,
     pub version: u64,
 }
 
-impl DatasetVersionRun {
+impl RowDatasetVersionRun {
     /// Number of rows covered by this run.
     pub fn len(&self) -> usize {
         self.span.len()
@@ -52,11 +52,11 @@ impl DatasetVersionRun {
 /// Provides sequential iterators and optional lightweight indexing for
 /// efficient random access.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf, Default)]
-pub struct DatasetVersionSequence {
-    pub runs: Vec<DatasetVersionRun>,
+pub struct RowDatasetVersionSequence {
+    pub runs: Vec<RowDatasetVersionRun>,
 }
 
-impl DatasetVersionSequence {
+impl RowDatasetVersionSequence {
     /// Create a new empty version sequence
     pub fn new() -> Self {
         Self { runs: Vec::new() }
@@ -67,7 +67,7 @@ impl DatasetVersionSequence {
         if row_count == 0 {
             return Self::new();
         }
-        let run = DatasetVersionRun {
+        let run = RowDatasetVersionRun {
             span: U64Segment::Range(0..row_count),
             version,
         };
@@ -163,14 +163,14 @@ impl DatasetVersionSequence {
 
 /// Iterator over versions expanding runs lazily.
 pub struct VersionsIter<'a> {
-    runs: &'a [DatasetVersionRun],
+    runs: &'a [RowDatasetVersionRun],
     run_idx: usize,
     remaining_in_run: usize,
     current_version: u64,
 }
 
 impl<'a> VersionsIter<'a> {
-    fn new(runs: &'a [DatasetVersionRun]) -> Self {
+    fn new(runs: &'a [RowDatasetVersionRun]) -> Self {
         let mut it = Self {
             runs,
             run_idx: 0,
@@ -212,16 +212,16 @@ impl<'a> Iterator for VersionsIter<'a> {
 /// Metadata about the location of dataset version sequence data
 /// Following the same pattern as RowIdMeta
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub enum DatasetVersionMeta {
+pub enum RowDatasetVersionMeta {
     /// Small sequences stored inline in the fragment metadata
     Inline(Vec<u8>),
     /// Large sequences stored in external files
     External(ExternalFile),
 }
 
-impl DatasetVersionMeta {
+impl RowDatasetVersionMeta {
     /// Create inline metadata from a version sequence
-    pub fn from_sequence(sequence: &DatasetVersionSequence) -> lance_core::Result<Self> {
+    pub fn from_sequence(sequence: &RowDatasetVersionSequence) -> lance_core::Result<Self> {
         let bytes = write_dataset_versions(sequence);
         Ok(Self::Inline(bytes))
     }
@@ -232,7 +232,7 @@ impl DatasetVersionMeta {
     }
 
     /// Load the version sequence from this metadata
-    pub fn load_sequence(&self) -> lance_core::Result<DatasetVersionSequence> {
+    pub fn load_sequence(&self) -> lance_core::Result<RowDatasetVersionSequence> {
         match self {
             Self::Inline(data) => read_dataset_versions(data),
             Self::External(_file) => {
@@ -242,17 +242,17 @@ impl DatasetVersionMeta {
     }
 }
 
-/// Helper function to convert DatasetVersionMeta to protobuf format for last_updated_at
+/// Helper function to convert RowDatasetVersionMeta to protobuf format for last_updated_at
 pub fn last_updated_at_version_meta_to_pb(
-    meta: &Option<DatasetVersionMeta>,
+    meta: &Option<RowDatasetVersionMeta>,
 ) -> Option<pb::data_fragment::LastUpdatedAtVersionSequence> {
     meta.as_ref().map(|m| match m {
-        DatasetVersionMeta::Inline(data) => {
+        RowDatasetVersionMeta::Inline(data) => {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                 data.clone(),
             )
         }
-        DatasetVersionMeta::External(file) => {
+        RowDatasetVersionMeta::External(file) => {
             pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
                 pb::ExternalFile {
                     path: file.path.clone(),
@@ -264,15 +264,15 @@ pub fn last_updated_at_version_meta_to_pb(
     })
 }
 
-/// Helper function to convert DatasetVersionMeta to protobuf format for created_at
+/// Helper function to convert RowDatasetVersionMeta to protobuf format for created_at
 pub fn created_at_version_meta_to_pb(
-    meta: &Option<DatasetVersionMeta>,
+    meta: &Option<RowDatasetVersionMeta>,
 ) -> Option<pb::data_fragment::CreatedAtVersionSequence> {
     meta.as_ref().map(|m| match m {
-        DatasetVersionMeta::Inline(data) => {
+        RowDatasetVersionMeta::Inline(data) => {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.clone())
         }
-        DatasetVersionMeta::External(file) => {
+        RowDatasetVersionMeta::External(file) => {
             pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
                 pb::ExternalFile {
                     path: file.path.clone(),
@@ -285,13 +285,13 @@ pub fn created_at_version_meta_to_pb(
 }
 
 /// Serialize a dataset version sequence to a buffer (following RowIdSequence pattern)
-pub fn write_dataset_versions(sequence: &DatasetVersionSequence) -> Vec<u8> {
+pub fn write_dataset_versions(sequence: &RowDatasetVersionSequence) -> Vec<u8> {
     // Convert to protobuf sequence
-    let pb_sequence = pb::DatasetVersionSequence {
+    let pb_sequence = pb::RowDatasetVersionSequence {
         runs: sequence
             .runs
             .iter()
-            .map(|run| pb::DatasetVersionRun {
+            .map(|run| pb::RowDatasetVersionRun {
                 span: Some(pb::U64Segment::from(run.span.clone())),
                 version: run.version,
             })
@@ -302,9 +302,9 @@ pub fn write_dataset_versions(sequence: &DatasetVersionSequence) -> Vec<u8> {
 }
 
 /// Deserialize a dataset version sequence from bytes (following RowIdSequence pattern)
-pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<DatasetVersionSequence> {
-    let pb_sequence = pb::DatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
-        message: format!("Failed to decode DatasetVersionSequence: {}", e),
+pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<RowDatasetVersionSequence> {
+    let pb_sequence = pb::RowDatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
+        message: format!("Failed to decode RowDatasetVersionSequence: {}", e),
         location: location!(),
     })?;
 
@@ -313,29 +313,29 @@ pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<DatasetVersionSe
         .into_iter()
         .map(|pb_run| {
             let positions_pb = pb_run.span.ok_or_else(|| Error::Internal {
-                message: "Missing positions in DatasetVersionRun".to_string(),
+                message: "Missing positions in RowDatasetVersionRun".to_string(),
                 location: location!(),
             })?;
             let segment = U64Segment::try_from(positions_pb)?;
-            Ok(DatasetVersionRun {
+            Ok(RowDatasetVersionRun {
                 span: segment,
                 version: pb_run.version,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(DatasetVersionSequence { runs: segments })
+    Ok(RowDatasetVersionSequence { runs: segments })
 }
 
 /// Re-chunk a sequence of dataset version runs into new chunk sizes (aligned with RowIdSequence rechunking)
 pub fn rechunk_version_sequences(
-    sequences: impl IntoIterator<Item = DatasetVersionSequence>,
+    sequences: impl IntoIterator<Item = RowDatasetVersionSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
     allow_incomplete: bool,
-) -> Result<Vec<DatasetVersionSequence>> {
+) -> Result<Vec<RowDatasetVersionSequence>> {
     let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
     let total_chunks = chunk_sizes_vec.len();
-    let mut chunked_sequences: Vec<DatasetVersionSequence> = Vec::with_capacity(total_chunks);
+    let mut chunked_sequences: Vec<RowDatasetVersionSequence> = Vec::with_capacity(total_chunks);
 
     let mut run_iter = sequences
         .into_iter()
@@ -366,7 +366,7 @@ pub fn rechunk_version_sequences(
 
     for (chunk_index, chunk_size) in chunk_sizes_vec.iter().enumerate() {
         let chunk_size = *chunk_size;
-        let mut out_seq = DatasetVersionSequence::new();
+        let mut out_seq = RowDatasetVersionSequence::new();
         let mut remaining = chunk_size;
 
         while remaining > 0 {
@@ -389,7 +389,7 @@ pub fn rechunk_version_sequences(
                 std::cmp::Ordering::Greater => {
                     let run = run_iter.peek().unwrap();
                     let seg = run.span.slice(segment_offset as usize, remaining as usize);
-                    out_seq.runs.push(DatasetVersionRun {
+                    out_seq.runs.push(RowDatasetVersionRun {
                         span: seg,
                         version: run.version,
                     });
@@ -403,7 +403,7 @@ pub fn rechunk_version_sequences(
                     let seg = run
                         .span
                         .slice(segment_offset as usize, remaining_in_segment as usize);
-                    out_seq.runs.push(DatasetVersionRun {
+                    out_seq.runs.push(RowDatasetVersionRun {
                         span: seg,
                         version: run.version,
                     });
@@ -427,7 +427,7 @@ pub fn rechunk_version_sequences(
 }
 
 /// Build version metadata for a fragment if it has physical rows and no existing metadata.
-pub fn build_version_meta(fragment: &Fragment, current_version: u64) -> Option<DatasetVersionMeta> {
+pub fn build_version_meta(fragment: &Fragment, current_version: u64) -> Option<RowDatasetVersionMeta> {
     if let Some(physical_rows) = fragment.physical_rows {
         if physical_rows > 0 {
             // Verify row_id_meta exists (sanity check for stable row IDs)
@@ -438,12 +438,12 @@ pub fn build_version_meta(fragment: &Fragment, current_version: u64) -> Option<D
             // Use physical_rows directly as the authoritative row count
             // This is correct even for compacted fragments where row_id_meta might
             // have been partially copied
-            let version_sequence = DatasetVersionSequence::from_uniform_row_count(
+            let version_sequence = RowDatasetVersionSequence::from_uniform_row_count(
                 physical_rows as u64,
                 current_version,
             );
 
-            return Some(DatasetVersionMeta::from_sequence(&version_sequence).unwrap());
+            return Some(RowDatasetVersionMeta::from_sequence(&version_sequence).unwrap());
         }
     }
     None
@@ -473,8 +473,8 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
 
     if row_count > 0 {
         let version_seq =
-            DatasetVersionSequence::from_uniform_row_count(row_count, current_version);
-        let version_meta = DatasetVersionMeta::from_sequence(&version_seq)?;
+            RowDatasetVersionSequence::from_uniform_row_count(row_count, current_version);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq)?;
         fragment.last_updated_at_version_meta = Some(version_meta);
     }
 
@@ -533,13 +533,13 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
         }
 
         // Compress into runs
-        let mut runs: Vec<DatasetVersionRun> = Vec::new();
+        let mut runs: Vec<RowDatasetVersionRun> = Vec::new();
         if !base_versions.is_empty() {
             let mut start = 0usize;
             let mut curr_ver = base_versions[0];
             for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
                 if ver != curr_ver {
-                    runs.push(DatasetVersionRun {
+                    runs.push(RowDatasetVersionRun {
                         span: U64Segment::Range(start as u64..idx as u64),
                         version: curr_ver,
                     });
@@ -547,13 +547,13 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                     curr_ver = ver;
                 }
             }
-            runs.push(DatasetVersionRun {
+            runs.push(RowDatasetVersionRun {
                 span: U64Segment::Range(start as u64..base_versions.len() as u64),
                 version: curr_ver,
             });
         }
-        let new_seq = DatasetVersionSequence { runs };
-        let new_meta = DatasetVersionMeta::from_sequence(&new_seq)?;
+        let new_seq = RowDatasetVersionSequence { runs };
+        let new_meta = RowDatasetVersionMeta::from_sequence(&new_seq)?;
         fragment.last_updated_at_version_meta = Some(new_meta);
     }
 
@@ -561,7 +561,7 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
 }
 
 // Protobuf conversion implementations
-impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for DatasetVersionMeta {
+impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for RowDatasetVersionMeta {
     type Error = Error;
 
     fn try_from(value: pb::data_fragment::LastUpdatedAtVersionSequence) -> Result<Self> {
@@ -580,7 +580,7 @@ impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for DatasetVersion
     }
 }
 
-impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for DatasetVersionMeta {
+impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionMeta {
     type Error = Error;
 
     fn try_from(value: pb::data_fragment::CreatedAtVersionSequence) -> Result<Self> {
@@ -605,17 +605,17 @@ mod tests {
 
     #[test]
     fn test_version_random_access() {
-        let seq = DatasetVersionSequence {
+        let seq = RowDatasetVersionSequence {
             runs: vec![
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..3),
                     version: 1,
                 },
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..2),
                     version: 2,
                 },
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..1),
                     version: 3,
                 },
@@ -631,13 +631,13 @@ mod tests {
 
     #[test]
     fn test_serialization_round_trip() {
-        let seq = DatasetVersionSequence {
+        let seq = RowDatasetVersionSequence {
             runs: vec![
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..4),
                     version: 42,
                 },
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..3),
                     version: 99,
                 },
@@ -653,13 +653,13 @@ mod tests {
 
     #[test]
     fn test_get_version_for_row_id() {
-        let seq = DatasetVersionSequence {
+        let seq = RowDatasetVersionSequence {
             runs: vec![
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..2),
                     version: 8,
                 },
-                DatasetVersionRun {
+                RowDatasetVersionRun {
                     span: U64Segment::Range(0..2),
                     version: 9,
                 },

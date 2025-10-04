@@ -1893,10 +1893,10 @@ pub struct FragmentReader {
     fragment: Arc<Fragment>,
 
     /// The last_updated_at version sequence (loaded from fragment metadata)
-    last_updated_at_sequence: Option<Arc<lance_table::rowids::version::DatasetVersionSequence>>,
+    last_updated_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
 
     /// The created_at version sequence (loaded from fragment metadata)
-    created_at_sequence: Option<Arc<lance_table::rowids::version::DatasetVersionSequence>>,
+    created_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
 
     // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,

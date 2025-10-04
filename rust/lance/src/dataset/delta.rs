@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
-use lance_table::format::{DatasetVersionSequence, Fragment};
+use lance_table::format::{RowDatasetVersionSequence, Fragment};
 use lance_table::rowids::{read_row_ids, RowIdSequence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -296,7 +296,7 @@ impl FragmentDiffAnalyzer {
     async fn find_updated_and_inserted_records(
         &self,
         fragment: &Fragment,
-        version_sequence: &DatasetVersionSequence,
+        version_sequence: &RowDatasetVersionSequence,
     ) -> Result<Vec<RecordBatch>> {
         let row_ids_sequence = if let Some(row_id_meta) = &fragment.row_id_meta {
             match row_id_meta {
@@ -335,7 +335,7 @@ impl FragmentDiffAnalyzer {
         async fn process_rows(
             analyzer: Arc<FragmentDiffAnalyzer>,
             row_ids: Vec<u64>,
-            version_sequence: &DatasetVersionSequence,
+            version_sequence: &RowDatasetVersionSequence,
             row_ids_sequence: &RowIdSequence,
             op: DiffOperation,
             batch_size: usize,

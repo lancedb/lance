@@ -1711,7 +1711,7 @@ impl Transaction {
                                 {
                                     if version != current_version {
                                         // End current run, start new one
-                                        runs.push(lance_table::format::DatasetVersionRun {
+                                        runs.push(lance_table::format::RowDatasetVersionRun {
                                             span: lance_table::rowids::segment::U64Segment::Range(
                                                 run_start..i as u64,
                                             ),
@@ -1722,7 +1722,7 @@ impl Transaction {
                                     }
                                 }
                                 // Add final run
-                                runs.push(lance_table::format::DatasetVersionRun {
+                                runs.push(lance_table::format::RowDatasetVersionRun {
                                     span: lance_table::rowids::segment::U64Segment::Range(
                                         run_start..created_at_versions.len() as u64,
                                     ),
@@ -1731,9 +1731,9 @@ impl Transaction {
                             }
 
                             let created_at_seq =
-                                lance_table::format::DatasetVersionSequence { runs };
+                                lance_table::format::RowDatasetVersionSequence { runs };
                             fragment.created_at_version_meta = Some(
-                                lance_table::format::DatasetVersionMeta::from_sequence(
+                                lance_table::format::RowDatasetVersionMeta::from_sequence(
                                     &created_at_seq,
                                 )
                                 .map_err(|e| Error::Internal {

@@ -31,10 +31,7 @@ from .lance import (
     RowIdMeta as RowIdMeta,
 )
 from .lance import (
-    RowLastUpdatedAtVersionMeta as RowLastUpdatedAtVersionMeta,
-)
-from .lance import (
-    RowCreatedAtVersionMeta as RowCreatedAtVersionMeta,
+    RowDatasetVersionMeta as RowDatasetVersionMeta,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
@@ -73,9 +70,9 @@ class FragmentMetadata:
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
         The row id metadata, if any.
-    created_at_version_meta : Optional[RowCreatedAtVersionMeta]
+    created_at_version_meta : Optional[RowDatasetVersionMeta]
         The row created at version metadata, if any.
-    last_updated_at_version_meta : Optional[RowLastUpdatedAtVersionMeta]
+    last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
         The row last updated at version metadata, if any.
     """
 
@@ -84,8 +81,8 @@ class FragmentMetadata:
     physical_rows: int
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
-    created_at_version_meta: Optional[RowCreatedAtVersionMeta] = None
-    last_updated_at_version_meta: Optional[RowLastUpdatedAtVersionMeta] = None
+    created_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -123,12 +120,12 @@ class FragmentMetadata:
                 self.row_id_meta.asdict() if self.row_id_meta is not None else None
             ),
             created_at_version_meta=(
-                self.created_at_version_meta.asdict()
+                json.loads(self.created_at_version_meta.json())
                 if self.created_at_version_meta is not None
                 else None
             ),
             last_updated_at_version_meta=(
-                self.last_updated_at_version_meta.asdict()
+                json.loads(self.last_updated_at_version_meta.json())
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
@@ -148,14 +145,14 @@ class FragmentMetadata:
 
         created_at_version_meta = json_data.get("created_at_version_meta")
         if created_at_version_meta is not None:
-            created_at_version_meta = RowCreatedAtVersionMeta(
-                **created_at_version_meta
+            created_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(created_at_version_meta)
             )
 
         last_updated_at_version_meta = json_data.get("last_updated_at_version_meta")
         if last_updated_at_version_meta is not None:
-            last_updated_at_version_meta = RowLastUpdatedAtVersionMeta(
-                **last_updated_at_version_meta
+            last_updated_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(last_updated_at_version_meta)
             )
 
         return FragmentMetadata(

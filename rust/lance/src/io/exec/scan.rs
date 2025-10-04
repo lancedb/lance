@@ -170,7 +170,7 @@ impl LanceStream {
     ) -> Result<RecordBatch> {
         use arrow_array::{ArrayRef, UInt64Array};
         use datafusion::error::DataFusionError;
-        use lance_table::rowids::version::DatasetVersionSequence;
+        use lance_table::rowids::version::RowDatasetVersionSequence;
 
         let num_rows = batch.num_rows();
 
@@ -229,7 +229,7 @@ impl LanceStream {
                 })?
             } else {
                 // Default: treat all rows as created at version 1
-                DatasetVersionSequence::from_uniform_row_count(
+                RowDatasetVersionSequence::from_uniform_row_count(
                     fragment.physical_rows.unwrap_or(0) as u64,
                     1,
                 )

@@ -15,7 +15,7 @@ use snafu::location;
 use crate::format::pb;
 
 use crate::rowids::version::{
-    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, DatasetVersionMeta,
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
 };
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
@@ -287,11 +287,11 @@ pub struct Fragment {
 
     /// Last updated at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_updated_at_version_meta: Option<DatasetVersionMeta>,
+    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
 
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at_version_meta: Option<DatasetVersionMeta>,
+    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -463,11 +463,11 @@ impl TryFrom<pb::DataFragment> for Fragment {
             physical_rows,
             last_updated_at_version_meta: p
                 .last_updated_at_version_sequence
-                .map(DatasetVersionMeta::try_from)
+                .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
             created_at_version_meta: p
                 .created_at_version_sequence
-                .map(DatasetVersionMeta::try_from)
+                .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
         })
     }

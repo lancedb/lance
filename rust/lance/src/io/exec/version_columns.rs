@@ -15,7 +15,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::Statistics;
 use futures::StreamExt;
 use lance_core::{ROW_CREATED_AT_VERSION_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD};
-use lance_table::format::{DatasetVersionSequence, Fragment};
+use lance_table::format::{RowDatasetVersionSequence, Fragment};
 
 /// Add version metadata columns (`_row_last_updated_at_version` and `_row_created_at_version`)
 /// to a stream of record batches.
@@ -129,7 +129,7 @@ impl AddVersionColumnsExec {
             })?
         } else {
             // Default: treat all rows as created at version 1
-            DatasetVersionSequence::from_uniform_row_count(num_rows as u64, 1)
+            RowDatasetVersionSequence::from_uniform_row_count(num_rows as u64, 1)
         };
 
         // Expand RLE sequences into arrays

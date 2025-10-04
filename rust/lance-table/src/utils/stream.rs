@@ -181,9 +181,9 @@ pub struct RowIdAndDeletesConfig {
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
     /// The last_updated_at version sequence
-    pub last_updated_at_sequence: Option<Arc<crate::rowids::version::DatasetVersionSequence>>,
+    pub last_updated_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
     /// The created_at version sequence
-    pub created_at_sequence: Option<Arc<crate::rowids::version::DatasetVersionSequence>>,
+    pub created_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
