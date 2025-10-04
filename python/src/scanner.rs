@@ -87,18 +87,20 @@ impl ScanStatistics {
 impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let scanner = self_.scanner.clone();
-        RT.spawn(Some(self_.py()), async move { scanner.schema().await })?
+        let mut scanner = self_.scanner.clone();
+        RT.spawn(Some(self_.py()), async move {
+            Arc::make_mut(&mut scanner).schema().await
+        })?
             .map(|s| s.to_pyarrow(self_.py()))
             .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
 
     #[pyo3(signature = (*, verbose = false))]
     fn explain_plan(self_: PyRef<'_, Self>, verbose: bool) -> PyResult<String> {
-        let scanner = self_.scanner.clone();
+        let mut scanner = self_.scanner.clone();
         let res = RT
             .spawn(Some(self_.py()), async move {
-                scanner.explain_plan(verbose).await
+                Arc::make_mut(&mut scanner).explain_plan(verbose).await
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
@@ -107,11 +109,11 @@ impl Scanner {
 
     #[pyo3(signature = (*))]
     fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
-        let scanner = self_.scanner.clone();
+        let mut scanner = self_.scanner.clone();
         let res = RT
             .spawn(
                 Some(self_.py()),
-                async move { scanner.analyze_plan().await },
+                async move { Arc::make_mut(&mut scanner).analyze_plan().await },
             )?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
@@ -119,8 +121,10 @@ impl Scanner {
     }
 
     fn count_rows(self_: PyRef<'_, Self>) -> PyResult<u64> {
-        let scanner = self_.scanner.clone();
-        RT.spawn(Some(self_.py()), async move { scanner.count_rows().await })?
+        let mut scanner = self_.scanner.clone();
+        RT.spawn(Some(self_.py()), async move {
+            Arc::make_mut(&mut scanner).count_rows().await
+        })?
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 

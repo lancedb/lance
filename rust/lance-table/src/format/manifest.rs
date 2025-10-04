@@ -1033,6 +1033,8 @@ mod tests {
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
             Fragment {
                 id: 1,
@@ -1043,6 +1045,8 @@ mod tests {
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
         ];
 

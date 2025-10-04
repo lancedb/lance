@@ -53,6 +53,12 @@ impl ProjectionPlan {
             DataType::UInt64,
             true,
         )));
+        fields.push(Arc::new(
+            (*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone(),
+        ));
+        fields.push(Arc::new(
+            (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
+        ));
         ArrowSchema::new(fields)
     }
 
@@ -289,6 +295,36 @@ impl ProjectionPlan {
             self.requested_output_expr.push(OutputColumn {
                 expr: Expr::Column(Column::from_name(ROW_OFFSET)),
                 name: ROW_OFFSET.to_string(),
+            });
+        }
+    }
+
+    /// Include the row last updated at version in the output
+    pub fn include_row_last_updated_at_version(&mut self) {
+        self.physical_projection.with_row_last_updated_at_version = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(lance_core::ROW_LAST_UPDATED_AT_VERSION)),
+                name: lance_core::ROW_LAST_UPDATED_AT_VERSION.to_string(),
+            });
+        }
+    }
+
+    /// Include the row created at version in the output
+    pub fn include_row_created_at_version(&mut self) {
+        self.physical_projection.with_row_created_at_version = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == lance_core::ROW_CREATED_AT_VERSION)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(lance_core::ROW_CREATED_AT_VERSION)),
+                name: lance_core::ROW_CREATED_AT_VERSION.to_string(),
             });
         }
     }

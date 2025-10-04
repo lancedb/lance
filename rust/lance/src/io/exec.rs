@@ -19,6 +19,7 @@ mod take;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;
+mod version_columns;
 
 pub use filter::LanceFilterExec;
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
@@ -32,3 +33,4 @@ pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
 pub(crate) use utils::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
+pub use version_columns::AddVersionColumnsExec;
