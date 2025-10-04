@@ -2221,16 +2221,16 @@ impl Scanner {
                     .for_column(column)
                     .supports_fts(),
             )
-            .await?
-            .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
-                location!(),
-            ))?;
-        if let Some(fragmap) = &index.fragment_bitmap {
-            *accum |= fragmap;
-            Ok(true)
-        } else {
-            Ok(false)
+            .await?;
+        match index {
+            Some(index) => match &index.fragment_bitmap {
+                Some(fragmap) => {
+                    *accum |= fragmap;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            None => Ok(false),
         }
     }
 
@@ -2628,67 +2628,106 @@ impl Scanner {
                     .for_column(&column)
                     .supports_fts(),
             )
-            .await?
-            .ok_or(Error::invalid_input(
-                format!(
-                    "Column {} has no inverted index",
-                    query.column.as_ref().unwrap()
-                ),
-                location!(),
-            ))?;
+            .await?;
 
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        let mut match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+        let (match_plan, flat_match_plan) = match &index {
+            Some(index) => {
+                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                ));
+
+                let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+                if unindexed_fragments.is_empty() {
+                    (Some(match_plan), None)
+                } else {
+                    let flat_match_plan = self
+                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .await?;
+                    (Some(match_plan), Some(flat_match_plan))
+                }
+            }
+            None => {
+                let unindexed_fragments = self.dataset.fragments().iter().cloned().collect();
+                let flat_match_plan = self
+                    .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                    .await?;
+                (None, Some(flat_match_plan))
+            }
+        };
+
+        // Combine plans
+        let plan = match (match_plan, flat_match_plan) {
+            (Some(match_plan), Some(flat_match_plan)) => {
+                let match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
+                let match_plan = Arc::new(RepartitionExec::try_new(
+                    match_plan,
+                    Partitioning::RoundRobinBatch(1),
+                )?);
+                let sort_expr = PhysicalSortExpr {
+                    expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                };
+                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit))
+            }
+            (Some(match_plan), None) => match_plan,
+            (None, Some(flat_match_plan)) => flat_match_plan,
+            (None, None) => unreachable!(),
+        };
+
+        Ok(plan)
+    }
+
+    /// Plan match query on unindexed fragments
+    async fn plan_flat_match_query(
+        &self,
+        fragments: Vec<Fragment>,
+        query: &MatchQuery,
+        params: &FtsSearchParams,
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query
+            .column
+            .as_ref()
+            .ok_or(Error::invalid_input(
+                "the column must be specified in the query".to_string(),
+                location!(),
+            ))?
+            .clone();
+
+        let mut columns = vec![column];
+        if let Some(expr) = filter_plan.full_expr.as_ref() {
+            let filter_columns = Planner::column_names_in_expr(expr);
+            columns.extend(filter_columns);
+        }
+        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
+        let mut scan_node = self.scan_fragments(
+            true,
+            false,
+            false,
+            flat_fts_scan_schema,
+            Arc::new(fragments),
+            None,
+            false,
+        );
+
+        if let Some(expr) = filter_plan.full_expr.as_ref() {
+            // If there is a prefilter we need to manually apply it to the new data
+            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+        }
+
+        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            prefilter_source.clone(),
+            scan_node,
         ));
-        if !unindexed_fragments.is_empty() {
-            let mut columns = vec![column.clone()];
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(expr);
-                columns.extend(filter_columns);
-            }
-            let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                flat_fts_scan_schema,
-                Arc::new(unindexed_fragments),
-                None,
-                false,
-            );
-
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
-                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-            }
-
-            let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                scan_node,
-            ));
-
-            match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
-            match_plan = Arc::new(RepartitionExec::try_new(
-                match_plan,
-                Partitioning::RoundRobinBatch(1),
-            )?);
-            let sort_expr = PhysicalSortExpr {
-                expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: true,
-                    nulls_first: false,
-                },
-            };
-            match_plan =
-                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit));
-        }
-        Ok(match_plan)
+        Ok(flat_match_plan)
     }
 
     // ANN/KNN search execution node with optional prefilter
