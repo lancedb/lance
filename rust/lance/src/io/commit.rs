@@ -84,7 +84,7 @@ pub(crate) async fn read_transaction_file(
 }
 
 /// Write a transaction to a file and return the relative path.
-async fn write_transaction_file(
+pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
@@ -191,6 +191,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
+        Some(transaction),
     )
     .await;
 
@@ -673,6 +674,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
+            Some(transaction),
         )
         .await;
 
@@ -905,6 +907,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
+            Some(&transaction),
         )
         .await;
 
