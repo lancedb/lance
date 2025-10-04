@@ -696,6 +696,10 @@ impl ExecutionPlan for LanceScanExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -8331,6 +8331,239 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn test_limit_pushdown_in_physical_plan() -> Result<()> {
+        use tempfile::tempdir;
+        let temp_dir = tempdir()?;
+
+        let dataset_path = temp_dir.path().join("limit_pushdown_dataset");
+        let values: Vec<i32> = (0..1000).collect();
+        let array = Int32Array::from(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])?;
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            batch_reader,
+            dataset_path.to_str().unwrap(),
+            Some(write_params),
+        )
+        .await?;
+
+        let mut dataset = Dataset::open(dataset_path.to_str().unwrap()).await?;
+
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+
+        // Test 1: No filter with limit
+        {
+            let mut scanner = dataset.scan();
+            scanner.limit(Some(100), None)?;
+            let plan = scanner.explain_plan(true).await?;
+
+            assert!(plan.contains("range_before=Some(0..100)"));
+            assert!(plan.contains("range_after=None"));
+
+            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(100, total_rows);
+        }
+
+        // Test 2: Indexed filter with limit
+        {
+            let mut scanner = dataset.scan();
+            scanner.filter("value >= 500")?.limit(Some(50), None)?;
+            let plan = scanner.explain_plan(true).await?;
+
+            assert!(plan.contains("range_after=Some(0..50)"));
+            assert!(plan.contains("range_before=None"));
+
+            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(50, total_rows);
+        }
+
+        // Test 3: Offset + Limit
+        {
+            let mut scanner = dataset.scan();
+            scanner.filter("value < 500")?.limit(Some(30), Some(20))?;
+            let plan = scanner.explain_plan(true).await?;
+
+            assert!(plan.contains("GlobalLimitExec: skip=20, fetch=30"));
+            assert!(plan.contains("range_after=Some(0..50)"));
+
+            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(30, total_rows);
+
+            // Verify exact values (should be 20..50)
+            let all_values: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(all_values, (20..50).collect::<Vec<i32>>());
+        }
+
+        // Test 4: Large limit exceeding data
+        {
+            let mut scanner = dataset.scan();
+            scanner.limit(Some(5000), None)?;
+            let plan = scanner.explain_plan(true).await?;
+
+            assert!(plan.contains("range_before=Some(0..1000)"));
+
+            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(1000, total_rows);
+        }
+
+        // Test 5: Cross-fragment filter with limit
+        {
+            let mut scanner = dataset.scan();
+            scanner
+                .filter("value >= 95 AND value <= 205")?
+                .limit(Some(50), None)?;
+            let plan = scanner.explain_plan(true).await?;
+
+            assert!(plan.contains("range_after=Some(0..50)"));
+
+            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(50, total_rows);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_take_batch_size() -> Result<()> {
+        use tempfile::tempdir;
+        let temp_dir = tempdir()?;
+
+        let dataset_path = temp_dir.path().join("ints_dataset");
+        let values: Vec<i32> = (0..1024).collect();
+        let array = Int32Array::from(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "ints",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])?;
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            batch_reader,
+            dataset_path.to_str().unwrap(),
+            Some(write_params),
+        )
+        .await?;
+        let mut dataset = Dataset::open(dataset_path.to_str().unwrap()).await?;
+        dataset
+            .create_index(
+                &["ints"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+
+        let mut scanner = dataset.scan();
+        scanner.batch_size(50).filter("ints > 0")?.with_row_id();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(1023, total_rows);
+        assert_eq!(21, batches.len());
+
+        let mut scanner = dataset.scan();
+        scanner
+            .batch_size(50)
+            .filter("ints > 0")?
+            .limit(Some(1024), None)?
+            .with_row_id();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(1023, total_rows);
+        assert_eq!(21, batches.len());
+
+        let dataset_path2 = temp_dir.path().join("strings_dataset");
+        let strings: Vec<String> = (0..1024).map(|i| format!("string-{}", i)).collect();
+        let string_array = StringArray::from(strings);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "strings",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_array)])?;
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            batch_reader,
+            dataset_path2.to_str().unwrap(),
+            Some(write_params),
+        )
+        .await?;
+        let mut dataset2 = Dataset::open(dataset_path2.to_str().unwrap()).await?;
+        dataset2
+            .create_index(
+                &["strings"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+
+        let mut scanner = dataset2.scan();
+        scanner
+            .batch_size(50)
+            .filter("contains(strings, 'ing')")?
+            .limit(Some(1024), None)?
+            .with_row_id();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(1024, total_rows);
+        assert_eq!(21, batches.len());
+
+        Ok(())
+    }
+
     // This test covers
     // 1. Create branch from main, a branch and a global tag
     // 2. Write to each created branch and verify data
