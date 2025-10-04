@@ -43,7 +43,7 @@ async fn write_dataset(data_path: &str) {
 // Reads dataset from the given path and prints batch size, schema for all record batches. Also extracts and prints a slice from the first batch
 async fn read_dataset(data_path: &str) {
     let dataset = Dataset::open(data_path).await.unwrap();
-    let scanner = dataset.scan();
+    let mut scanner = dataset.scan();
 
     let mut batch_stream = scanner.try_into_stream().await.unwrap().map(|b| b.unwrap());
 
