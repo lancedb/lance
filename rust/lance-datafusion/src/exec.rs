@@ -780,4 +780,8 @@ impl ExecutionPlan for StrictBatchSizeExec {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
