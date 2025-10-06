@@ -1926,4 +1926,128 @@ mod tests {
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
     }
+
+    #[test]
+    fn test_merge_with_schema_with_nullable_struct_list_schema_mismatch() {
+        // left_list setup
+        let left_company_id = Arc::new(Int32Array::from(vec![None, None]));
+        let left_count = Arc::new(Int32Array::from(vec![None, None]));
+        let left_struct = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("company_id", DataType::Int32, true),
+                Field::new("count", DataType::Int32, true),
+            ]),
+            vec![left_company_id, left_count],
+            None,
+        ));
+        let left_list = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(left_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([2]),
+            left_struct,
+            None,
+        ));
+
+        // Right List Setup
+        let right_company_name = Arc::new(StringArray::from(vec!["Google", "Microsoft"]));
+        let right_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("company_name", DataType::Utf8, true)]),
+            vec![right_company_name],
+            None,
+        ));
+        let right_list = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(right_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([2]),
+            right_struct,
+            None,
+        ));
+
+        let target_fields = Fields::from(vec![Field::new(
+            "companies",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("company_id", DataType::Int32, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                    Field::new("count", DataType::Int32, true),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+
+        let left_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "companies",
+                left_list.data_type().clone(),
+                true,
+            )])),
+            vec![left_list as ArrayRef],
+        )
+        .unwrap();
+
+        let right_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "companies",
+                right_list.data_type().clone(),
+                true,
+            )])),
+            vec![right_list as ArrayRef],
+        )
+        .unwrap();
+
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &Schema::new(target_fields.to_vec()))
+            .unwrap();
+
+        // Verify the merged structure
+        let merged_list = merged
+            .column_by_name("companies")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let merged_struct = merged_list.values().as_struct();
+
+        // Should have all 3 fields
+        assert_eq!(merged_struct.num_columns(), 3);
+        assert!(merged_struct.column_by_name("company_id").is_some());
+        assert!(merged_struct.column_by_name("company_name").is_some());
+        assert!(merged_struct.column_by_name("count").is_some());
+
+        // Verify values
+        let company_id = merged_struct
+            .column_by_name("company_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(company_id.is_null(0));
+        assert!(company_id.is_null(1));
+
+        let company_name = merged_struct
+            .column_by_name("company_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(company_name.value(0), "Google");
+        assert_eq!(company_name.value(1), "Microsoft");
+
+        let count = merged_struct
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(count.is_null(0));
+        assert!(count.is_null(1));
+    }
 }
