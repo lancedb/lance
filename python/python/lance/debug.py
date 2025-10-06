@@ -9,3 +9,4 @@ from .lance import format_fragment as format_fragment
 from .lance import format_manifest as format_manifest
 from .lance import format_schema as format_schema
 from .lance import list_transactions as list_transactions
+from .lance import referenced_files as referenced_files

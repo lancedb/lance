@@ -241,6 +241,16 @@ pub struct ReadParams {
     pub file_reader_options: Option<FileReaderOptions>,
 }
 
+/// A file referenced by a dataset version, including both its absolute path
+/// and its relative path within the dataset structure.
+#[derive(Clone, Debug)]
+pub struct ReferencedFile {
+    /// Absolute path to the file
+    pub path: String,
+    /// Relative path within the dataset (e.g., "data/file.lance", "_versions/1.manifest")
+    pub relative_path: String,
+}
+
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     #[deprecated(
@@ -762,6 +772,285 @@ impl Dataset {
 
     pub fn manifest_location(&self) -> &ManifestLocation {
         &self.manifest_location
+    }
+
+    /// Get a list of all files referenced by the current version of the dataset.
+    ///
+    /// This returns information about all data files, deletion files, transaction files,
+    /// index directories, and the manifest file itself. Each file includes both its
+    /// absolute path (for reading) and relative path within the dataset (for copying
+    /// to a new location).
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`ReferencedFile`] structs, each containing:
+    /// - `path`: Absolute path to the file
+    /// - `relative_path`: Path relative to the dataset root (e.g., "data/file.lance")
+    ///
+    /// For data files and deletion files that have a `base_id`, the paths will be
+    /// resolved using the corresponding `BasePath` from the manifest.
+    pub async fn referenced_files(&self) -> Result<Vec<ReferencedFile>> {
+        use lance_table::io::deletion::deletion_file_path;
+
+        let mut files = Vec::new();
+        let manifest = &self.manifest;
+        let indices = self.load_indices().await?;
+
+        // Helper function to resolve base path
+        let resolve_base_path = |base_id: Option<u32>| -> Result<Path> {
+            if let Some(id) = base_id {
+                if let Some(base_path) = manifest.base_paths.get(&id) {
+                    Ok(Path::parse(&base_path.path)?)
+                } else {
+                    Err(Error::invalid_input(
+                        format!("base_id {} not found in manifest base_paths", id),
+                        location!(),
+                    ))
+                }
+            } else {
+                Ok(self.base.clone())
+            }
+        };
+
+        // Helper to convert Path to String, ensuring leading slash for absolute paths
+        let path_to_string = |path: &Path| -> String {
+            let s = path.to_string();
+            // If the path looks like an absolute path (starts with a drive/root indicator),
+            // ensure it has a leading slash
+            if !s.starts_with('/') && !s.starts_with("\\") && !s.contains("://") {
+                format!("/{}", s)
+            } else {
+                s
+            }
+        };
+
+        // Helper to remove prefix and get relative path
+        let remove_prefix = |path: &Path, prefix: &Path| -> Path {
+            let relative_parts = path.prefix_match(prefix);
+            if relative_parts.is_none() {
+                return path.clone();
+            }
+            Path::from_iter(relative_parts.unwrap())
+        };
+
+        // Add data files
+        for fragment in manifest.fragments.iter() {
+            for file in fragment.files.iter() {
+                let base = resolve_base_path(file.base_id)?;
+                let file_path = if let Some(base_path_entry) =
+                    file.base_id.and_then(|id| manifest.base_paths.get(&id))
+                {
+                    if base_path_entry.is_dataset_root {
+                        base.child(DATA_DIR).child(file.path.as_str())
+                    } else {
+                        base.child(file.path.as_str())
+                    }
+                } else {
+                    self.data_dir().child(file.path.as_str())
+                };
+                let relative_path = remove_prefix(&file_path, &self.base);
+                files.push(ReferencedFile {
+                    path: path_to_string(&file_path),
+                    relative_path: relative_path.to_string(),
+                });
+            }
+
+            // Add deletion files
+            if let Some(deletion_file) = &fragment.deletion_file {
+                let base = resolve_base_path(deletion_file.base_id)?;
+                let del_path = deletion_file_path(&base, fragment.id, deletion_file);
+                let relative_path = remove_prefix(&del_path, &self.base);
+                files.push(ReferencedFile {
+                    path: path_to_string(&del_path),
+                    relative_path: relative_path.to_string(),
+                });
+            }
+        }
+
+        // Add transaction file
+        if let Some(tx_path) = &manifest.transaction_file {
+            let tx_full_path = self.base.child("_transactions").child(tx_path.as_str());
+            let relative_path = remove_prefix(&tx_full_path, &self.base);
+            files.push(ReferencedFile {
+                path: path_to_string(&tx_full_path),
+                relative_path: relative_path.to_string(),
+            });
+        }
+
+        // Add index directories
+        for index in indices.iter() {
+            let base = resolve_base_path(index.base_id)?;
+            let index_dir = if let Some(base_path_entry) =
+                index.base_id.and_then(|id| manifest.base_paths.get(&id))
+            {
+                if base_path_entry.is_dataset_root {
+                    base.child(INDICES_DIR).child(index.uuid.to_string())
+                } else {
+                    base.child(index.uuid.to_string())
+                }
+            } else {
+                self.indices_dir().child(index.uuid.to_string())
+            };
+            let relative_path = remove_prefix(&index_dir, &self.base);
+            files.push(ReferencedFile {
+                path: path_to_string(&index_dir),
+                relative_path: relative_path.to_string(),
+            });
+        }
+
+        // Add the manifest file itself
+        let manifest_path = self.manifest_location.path.clone();
+        let relative_path = remove_prefix(&manifest_path, &self.base);
+        files.push(ReferencedFile {
+            path: path_to_string(&manifest_path),
+            relative_path: relative_path.to_string(),
+        });
+
+        Ok(files)
+    }
+
+    /// Copy all files referenced by the current dataset version to a new location.
+    ///
+    /// This method streams files from the source object store to the destination
+    /// without loading them entirely into memory. Files are copied in parallel
+    /// according to the IO parallelism configured on the source object store.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest` - The destination URI (e.g., "s3://bucket/path", "/local/path")
+    /// * `params` - Optional object store parameters for the destination
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use lance::Dataset;
+    /// # async fn example(dataset: &Dataset) -> lance::Result<()> {
+    /// // Copy to local filesystem
+    /// dataset.copy_dataset("/tmp/dataset_copy", None).await?;
+    ///
+    /// // Copy to S3 with custom params
+    /// let params = ObjectStoreParams { /* ... */ ..Default::default() };
+    /// dataset.copy_dataset("s3://my-bucket/dataset", Some(&params)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_dataset(&self, dest: &str, params: Option<&ObjectStoreParams>) -> Result<()> {
+        use futures::stream::{StreamExt, TryStreamExt};
+        use object_store::path::Path as OSPath;
+
+        // Parse destination and get object store
+        let dest_url = url::Url::parse(dest).map_err(|e| {
+            Error::invalid_input(
+                format!("Invalid destination URL '{}': {}", dest, e),
+                location!(),
+            )
+        })?;
+
+        let registry = self.session.store_registry();
+        let dest_store = registry
+            .get_store(dest_url, params.unwrap_or(&ObjectStoreParams::default()))
+            .await?;
+
+        // Get all referenced files
+        let files = self.referenced_files().await?;
+        let source_base = self.base.clone();
+
+        // Copy files in parallel with streaming
+        futures::stream::iter(files)
+            .map(move |file| {
+                let source_store = self.object_store.clone();
+                let dest_store = dest_store.clone();
+                let source_base = source_base.clone();
+
+                async move {
+                    // Build source path by appending relative path to source base
+                    let source_path = {
+                        let parts: Vec<&str> = file.relative_path.split('/').collect();
+                        parts
+                            .iter()
+                            .fold(source_base.clone(), |path, part| path.child(*part))
+                    };
+
+                    // Build destination path the same way
+                    let dest_path = {
+                        let parts: Vec<&str> = file.relative_path.split('/').collect();
+                        parts
+                            .iter()
+                            .fold(OSPath::from(""), |path, part| path.child(*part))
+                    };
+
+                    // Get streaming read from source
+                    let get_result =
+                        source_store
+                            .inner
+                            .get(&source_path)
+                            .await
+                            .map_err(|e| Error::IO {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Failed to read from source {}: {}",
+                                        file.relative_path, e
+                                    ),
+                                )),
+                                location: location!(),
+                            })?;
+
+                    // Start multipart upload to destination
+                    let mut upload =
+                        dest_store
+                            .inner
+                            .put_multipart(&dest_path)
+                            .await
+                            .map_err(|e| Error::IO {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Failed to start upload to {}: {}",
+                                        file.relative_path, e
+                                    ),
+                                )),
+                                location: location!(),
+                            })?;
+
+                    // Stream bytes from source to destination
+                    let mut stream = get_result.into_stream();
+
+                    while let Some(bytes_result) = stream.next().await {
+                        let bytes = bytes_result.map_err(|e| Error::IO {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to read bytes from {}: {}", file.path, e),
+                            )),
+                            location: location!(),
+                        })?;
+
+                        upload.put_part(bytes.into()).await.map_err(|e| Error::IO {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to write bytes to {}: {}", file.relative_path, e),
+                            )),
+                            location: location!(),
+                        })?;
+                    }
+
+                    // Complete the upload
+                    upload.complete().await.map_err(|e| Error::IO {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to complete upload to {}: {}", file.relative_path, e),
+                        )),
+                        location: location!(),
+                    })?;
+
+                    Ok::<(), Error>(())
+                }
+            })
+            .buffer_unordered(self.object_store.io_parallelism())
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
     }
 
     async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
@@ -8837,5 +9126,103 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_copy_dataset() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use futures::TryStreamExt;
+
+        // Create a source dataset with some data
+        let source_dir = tempdir().unwrap();
+        let source_uri = source_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let num_rows: usize = 100;
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..num_rows as i32).map(|x| x * 2),
+                )),
+            ],
+        )
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_file: 30,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+
+        let source_dataset = Dataset::write(batches, source_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Verify source dataset has expected data
+        assert_eq!(source_dataset.count_rows(None).await.unwrap(), num_rows);
+        assert_eq!(source_dataset.count_fragments(), 4); // 100 rows / 30 per file = 4 files
+
+        // Debug: Check what files are referenced
+        let files = source_dataset.referenced_files().await.unwrap();
+        println!("Referenced files:");
+        for file in &files {
+            println!("  path: {}", file.path);
+            println!("  relative_path: {}", file.relative_path);
+        }
+
+        // Copy dataset to a new location
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().to_str().unwrap();
+        // Convert path to file URL
+        let dest_uri = format!("file://{}", dest_path);
+
+        println!("Copying to: {}", dest_uri);
+        source_dataset.copy_dataset(&dest_uri, None).await.unwrap();
+
+        // Open the destination dataset
+        let dest_dataset = Dataset::open(&dest_uri).await.unwrap();
+
+        // Verify destination dataset has same row count
+        assert_eq!(dest_dataset.count_rows(None).await.unwrap(), num_rows);
+
+        // Verify destination dataset has same fragment count
+        assert_eq!(dest_dataset.count_fragments(), 4);
+
+        // Verify the data matches
+        let source_batches: Vec<RecordBatch> = source_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let dest_batches: Vec<RecordBatch> = dest_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(source_batches.len(), dest_batches.len());
+        for (source_batch, dest_batch) in source_batches.iter().zip(dest_batches.iter()) {
+            assert_eq!(source_batch.num_rows(), dest_batch.num_rows());
+            assert_eq!(source_batch.num_columns(), dest_batch.num_columns());
+            for i in 0..source_batch.num_columns() {
+                assert_eq!(source_batch.column(i), dest_batch.column(i));
+            }
+        }
     }
 }

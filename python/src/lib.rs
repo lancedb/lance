@@ -245,6 +245,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
+    m.add_wrapped(wrap_pyfunction!(debug::referenced_files))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     register_datagen(py, m)?;
