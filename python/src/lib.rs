@@ -25,6 +25,7 @@
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use std::ffi::CString;
@@ -60,6 +61,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
+use libc;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -113,7 +115,54 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // TODO: make this runtime configurable (e.g. num threads)
-static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
+static RT: atomic::AtomicPtr<BackgroundExecutor> = atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Get the current global executor object.
+pub fn global_executor() -> &'static mut BackgroundExecutor {
+    let ptr = RT.load(Ordering::SeqCst);
+    if !ptr.is_null() {
+        return unsafe { &mut *ptr }
+    }
+    let new_ptr = Box::into_raw(Box::new(BackgroundExecutor::new()));
+    match RT.compare_exchange(
+        std::ptr::null_mut(),
+        new_ptr,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => {
+            unsafe { &mut *new_ptr }
+        },
+        Err(racing_ptr) => unsafe {
+            // Another thread already installed an executor object. Drop our new executor, which
+            // is no longer needed.
+            drop(Box::from_raw(new_ptr));
+            &mut *racing_ptr
+        },
+    }
+}
+
+/// Handle the process forking.
+///
+/// After a fork() operation, threads from the parent process do not carry over to the child.
+/// The child process needs to re-create its BackgroundExecutor object.
+///
+/// atfork handlers run in "async-signal context" which means that we can't (safely) do much here.
+/// Therefore, we just set the global executor pointer to null, and let the next thread that wants
+/// to use the global executor re-create it.
+///
+/// Note also that this function does leak memory, because it doesn't clean up the old executor
+/// pointer. This is intentional.
+extern "C" fn atfork_child() {
+    RT.store(std::ptr::null_mut(), Ordering::SeqCst);
+}
+
+fn install_atfork() {
+    let result = unsafe {
+        libc::pthread_atfork(None, None, Some(atfork_child))
+    };
+    assert_eq!(result, 0, "pthread_atfork failed");
+}
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
@@ -191,6 +240,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let mut log_builder = env_logger::Builder::from_env(env);
     set_timestamp_precision(&mut log_builder);
     set_log_file_target(&mut log_builder);
+    install_atfork();
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
@@ -335,7 +385,7 @@ fn infer_tfrecord_schema(
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<_>>();
-    let schema = RT
+    let schema = global_executor()
         .runtime
         .block_on(::lance::utils::tfrecord::infer_tfrecord_schema(
             uri,
@@ -380,7 +430,7 @@ fn read_tfrecord(
         std::sync::mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>();
 
     let schema_ref = schema.clone();
-    RT.spawn_background(None, async move {
+    global_executor().spawn_background(None, async move {
         let mut stream =
             match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await
             {
@@ -422,10 +472,10 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
-    let indices = RT
+    let indices = global_executor()
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let (manifest, _) = RT
+    let (manifest, _) = global_executor()
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(
@@ -450,7 +500,7 @@ impl FFILanceTableProvider {
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
         // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
-        let _ = RT.block_on(Some(py), dataset_ref.load_indices())?;
+        let _ = global_executor().block_on(Some(py), dataset_ref.load_indices())?;
         Ok(Self {
             dataset: dataset_ref.clone(),
             with_row_id,
@@ -470,7 +520,7 @@ impl FFILanceTableProvider {
         ));
 
         let ffi_provider =
-            FFI_TableProvider::new(a_lance_table_provider, true, RT.get_runtime_handle());
+            FFI_TableProvider::new(a_lance_table_provider, true, global_executor().get_runtime_handle());
         let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
         capsule
     }

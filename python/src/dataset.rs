@@ -91,7 +91,7 @@ use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
 use crate::utils::PyLance;
-use crate::RT;
+use crate::global_executor;
 use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
@@ -110,7 +110,7 @@ fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader +
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         Ok(Box::new(
-            RT.spawn(Some(py), async move { scanner.to_reader().await })?
+            global_executor().spawn(Some(py), async move { scanner.to_reader().await })?
                 .map_err(|err| PyValueError::new_err(err.to_string()))?,
         ))
     } else {
@@ -228,7 +228,7 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let (new_dataset, stats) = RT
+        let (new_dataset, stats) = global_executor()
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
@@ -253,7 +253,7 @@ impl MergeInsertBuilder {
 
         let UncommittedMergeInsert {
             transaction, stats, ..
-        } = RT
+        } = global_executor()
             .spawn(Some(py), job.execute_uncommitted(new_data))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
@@ -276,7 +276,7 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let schema_ref = schema.as_ref().map(|s| &s.0);
-        RT.block_on(None, job.explain_plan(schema_ref, verbose))?
+        global_executor().block_on(None, job.explain_plan(schema_ref, verbose))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -289,7 +289,7 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(None, job.analyze_plan(new_data_stream))?
+        global_executor().block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
@@ -493,7 +493,7 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        let dataset = RT.block_on(Some(py), builder.load())?;
+        let dataset = global_executor().block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
@@ -528,7 +528,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let metadata_options: HashMap<String, Option<String>> =
             metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
-        RT.block_on(None, async {
+        global_executor().block_on(None, async {
             new_self
                 .update_schema_metadata(metadata_options)
                 .replace()
@@ -553,7 +553,7 @@ impl Dataset {
             Ok(new_self)
         };
 
-        let new_self = RT
+        let new_self = global_executor()
             .block_on(None, future)?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
@@ -567,7 +567,7 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        RT.block_on(None, self.ds.index_statistics(&index_name))?
+        global_executor().block_on(None, self.ds.index_statistics(&index_name))?
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
                     PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
@@ -588,7 +588,7 @@ impl Dataset {
     ///
     /// This call will open the index and return its concrete index type.
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
-        let index_metadata = RT
+        let index_metadata = global_executor()
             .block_on(Some(self_.py()), self_.ds.load_indices())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let py = self_.py();
@@ -601,7 +601,7 @@ impl Dataset {
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
                 let ds = self_.ds.clone();
-                let idx_type = match RT.block_on(Some(self_.py()), async {
+                let idx_type = match global_executor().block_on(Some(self_.py()), async {
                     if let Some(system_index_type) = infer_system_index_type(idx) {
                         Ok::<_, lance::Error>(system_index_type.to_string())
                     } else {
@@ -1014,7 +1014,7 @@ impl Dataset {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        RT.block_on(None, self.ds.count_rows(filter))?
+        global_executor().block_on(None, self.ds.count_rows(filter))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1038,7 +1038,7 @@ impl Dataset {
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }
         .infer_error()?;
-        let batch = RT
+        let batch = global_executor()
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
@@ -1066,7 +1066,7 @@ impl Dataset {
         }
         .infer_error()?;
 
-        let batch = RT
+        let batch = global_executor()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_rows(&row_indices, projection),
@@ -1081,7 +1081,7 @@ impl Dataset {
         row_indices: Vec<u64>,
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
-        let blobs = RT
+        let blobs = global_executor()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs(&row_indices, blob_column),
@@ -1095,7 +1095,7 @@ impl Dataset {
         row_indices: Vec<u64>,
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
-        let blobs = RT
+        let blobs = global_executor()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs_by_indices(&row_indices, blob_column),
@@ -1196,7 +1196,7 @@ impl Dataset {
             .collect::<PyResult<Vec<_>>>()?;
 
         let mut new_self = self.ds.as_ref().clone();
-        new_self = RT
+        new_self = global_executor()
             .spawn(None, async move {
                 new_self.alter_columns(&alterations).await.map(|_| new_self)
             })?
@@ -1212,7 +1212,7 @@ impl Dataset {
         right_on: String,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .spawn(None, async move {
                 new_self
                     .merge(reader.0, &left_on, &right_on)
@@ -1241,7 +1241,7 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        let new_dataset = RT
+        let new_dataset = global_executor()
             .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = new_dataset;
@@ -1284,7 +1284,7 @@ impl Dataset {
             .build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let new_self = RT
+        let new_self = global_executor()
             .block_on(None, operation.execute())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
@@ -1296,7 +1296,7 @@ impl Dataset {
     }
 
     fn count_deleted_rows(&self) -> PyResult<usize> {
-        RT.block_on(None, self.ds.count_deleted_rows())?
+        global_executor().block_on(None, self.ds.count_deleted_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1328,7 +1328,7 @@ impl Dataset {
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
-        RT.block_on(Some(self_.py()), self_.ds.latest_version_id())?
+        global_executor().block_on(Some(self_.py()), self_.ds.latest_version_id())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1349,7 +1349,7 @@ impl Dataset {
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.restore())?
+        global_executor().block_on(None, new_self.restore())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1364,7 +1364,7 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
     ) -> PyResult<CleanupStats> {
         let older_than = Duration::microseconds(older_than_micros);
-        let cleanup_stats = RT
+        let cleanup_stats = global_executor()
             .block_on(
                 None,
                 self.ds.cleanup_old_versions(
@@ -1414,7 +1414,7 @@ impl Dataset {
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
-        let inner_result = RT.block_on(None, self_.ds.tags().get_version(&tag))?;
+        let inner_result = global_executor().block_on(None, self_.ds.tags().get_version(&tag))?;
 
         inner_result.map_err(|err: lance::Error| match err {
             lance::Error::NotFound { .. } => {
@@ -1429,7 +1429,7 @@ impl Dataset {
 
     fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
         let new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags().create(tag.as_str(), version))?
+        global_executor().block_on(None, new_self.tags().create(tag.as_str(), version))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
@@ -1442,7 +1442,7 @@ impl Dataset {
 
     fn delete_tag(&mut self, tag: String) -> PyResult<()> {
         let new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags().delete(tag.as_str()))?
+        global_executor().block_on(None, new_self.tags().delete(tag.as_str()))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -1454,7 +1454,7 @@ impl Dataset {
 
     fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
         let new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags().update(tag.as_str(), version))?
+        global_executor().block_on(None, new_self.tags().update(tag.as_str(), version))?
             .infer_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1476,7 +1476,7 @@ impl Dataset {
                 );
             }
         }
-        RT.block_on(
+        global_executor().block_on(
             None,
             new_self
                 .optimize_indices(&options)
@@ -1664,13 +1664,13 @@ impl Dataset {
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
         if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
-            let _index_metadata = RT
+            let _index_metadata = global_executor()
                 .block_on(None, builder.execute_uncommitted())?
                 .infer_error()?;
             // Note: We don't update self.ds here as the index is not committed
         } else {
             // For regular indexing, use the standard execute path
-            RT.block_on(None, builder.into_future())?.infer_error()?;
+            global_executor().block_on(None, builder.into_future())?.infer_error()?;
             self.ds = Arc::new(new_self);
         }
 
@@ -1679,7 +1679,7 @@ impl Dataset {
 
     fn drop_index(&mut self, name: &str) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.drop_index(name))?
+        global_executor().block_on(None, new_self.drop_index(name))?
             .infer_error()?;
         self.ds = Arc::new(new_self);
 
@@ -1687,7 +1687,7 @@ impl Dataset {
     }
 
     fn prewarm_index(&self, name: &str) -> PyResult<()> {
-        RT.block_on(None, self.ds.prewarm_index(name))?
+        global_executor().block_on(None, self.ds.prewarm_index(name))?
             .infer_error()
     }
 
@@ -1698,7 +1698,7 @@ impl Dataset {
         index_type: &str,
         batch_readhead: Option<usize>,
     ) -> PyResult<()> {
-        RT.block_on(None, async {
+        global_executor().block_on(None, async {
             let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
             let index_dir = self.ds.indices_dir().child(index_uuid);
             match index_type.to_uppercase().as_str() {
@@ -1735,12 +1735,12 @@ impl Dataset {
     }
 
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
-        RT.block_on(None, self.ds.num_small_files(max_rows_per_group))
+        global_executor().block_on(None, self.ds.num_small_files(max_rows_per_group))
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn data_stats(&self) -> PyResult<PyLance<DataStatistics>> {
-        RT.block_on(None, self.ds.calculate_data_stats())?
+        global_executor().block_on(None, self.ds.calculate_data_stats())?
             .infer_error()
             .map(PyLance)
     }
@@ -1766,11 +1766,11 @@ impl Dataset {
     }
 
     fn index_cache_entry_count(&self) -> PyResult<usize> {
-        RT.block_on(None, self.ds.index_cache_entry_count())
+        global_executor().block_on(None, self.ds.index_cache_entry_count())
     }
 
     fn index_cache_hit_rate(&self) -> PyResult<f32> {
-        RT.block_on(None, self.ds.index_cache_hit_rate())
+        global_executor().block_on(None, self.ds.index_cache_hit_rate())
     }
 
     fn session(&self) -> Session {
@@ -1784,7 +1784,7 @@ impl Dataset {
         storage_options: Option<HashMap<String, String>>,
         ignore_not_found: Option<bool>,
     ) -> PyResult<()> {
-        RT.spawn(None, async move {
+        global_executor().spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
             let result = object_store.remove_dir_all(path).await;
@@ -1882,7 +1882,7 @@ impl Dataset {
             builder = builder.with_commit_handler(commit_handler);
         }
 
-        let ds = RT
+        let ds = global_executor()
             .block_on(
                 commit_lock.map(|cl| cl.py()),
                 builder.execute(transaction.0),
@@ -1941,7 +1941,7 @@ impl Dataset {
             .map(|transaction| transaction.0)
             .collect();
 
-        let res = RT
+        let res = global_executor()
             .block_on(None, builder.execute_batch(transactions))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         let uri = res.dataset.uri().to_string();
@@ -1954,13 +1954,13 @@ impl Dataset {
     }
 
     fn validate(&self) -> PyResult<()> {
-        RT.block_on(None, self.ds.validate())?
+        global_executor().block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.migrate_manifest_paths_v2())?
+        global_executor().block_on(None, new_self.migrate_manifest_paths_v2())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1969,7 +1969,7 @@ impl Dataset {
     fn drop_columns(&mut self, columns: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let columns: Vec<_> = columns.iter().map(|s| s.as_str()).collect();
-        RT.block_on(None, new_self.drop_columns(&columns))?
+        global_executor().block_on(None, new_self.drop_columns(&columns))?
             .map_err(|err| match err {
                 lance::Error::InvalidInput { source, .. } => {
                     PyValueError::new_err(source.to_string())
@@ -1991,7 +1991,7 @@ impl Dataset {
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .spawn(None, async move {
                 new_self.add_columns(transforms, None, batch_size).await?;
                 Ok(new_self)
@@ -2012,7 +2012,7 @@ impl Dataset {
         let transforms = transforms_from_python(transforms)?;
 
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .spawn(None, async move {
                 new_self
                     .add_columns(transforms, read_columns, batch_size)
@@ -2032,7 +2032,7 @@ impl Dataset {
         let transform = NewColumnTransform::AllNulls(Arc::new(arrow_schema.clone()));
 
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .spawn(None, async move {
                 new_self.add_columns(transform, None, None).await?;
                 Ok(new_self)
@@ -2049,7 +2049,7 @@ impl Dataset {
         partition_id: usize,
         with_vector: bool,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        let stream = RT
+        let stream = global_executor()
             .block_on(
                 None,
                 self.ds
@@ -2068,7 +2068,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let delete_updates: HashMap<String, Option<String>> =
             keys.into_iter().map(|k| (k, None)).collect();
-        RT.block_on(None, async { new_self.update_config(delete_updates).await })?
+        global_executor().block_on(None, async { new_self.update_config(delete_updates).await })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -2111,11 +2111,11 @@ impl Dataset {
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
         let result = if replace {
-            RT.block_on(None, async {
+            global_executor().block_on(None, async {
                 new_self.update_metadata(values).replace().await
             })?
         } else {
-            RT.block_on(None, async { new_self.update_metadata(values).await })?
+            global_executor().block_on(None, async { new_self.update_metadata(values).await })?
         }
         .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
@@ -2130,11 +2130,11 @@ impl Dataset {
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
         let new_config = if replace {
-            RT.block_on(None, async {
+            global_executor().block_on(None, async {
                 new_self.update_config(values).replace().await
             })?
         } else {
-            RT.block_on(None, async { new_self.update_config(values).await })?
+            global_executor().block_on(None, async { new_self.update_config(values).await })?
         }
         .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
@@ -2149,11 +2149,11 @@ impl Dataset {
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
         let result = if replace {
-            RT.block_on(None, async {
+            global_executor().block_on(None, async {
                 new_self.update_schema_metadata(values).replace().await
             })?
         } else {
-            RT.block_on(None, async {
+            global_executor().block_on(None, async {
                 new_self.update_schema_metadata(values).await
             })?
         }
@@ -2173,7 +2173,7 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<()> {
         let ds_clone = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .block_on(None, async move {
                 let mut new_self = ds_clone;
                 let mut builder = new_self.update_field_metadata();
@@ -2201,7 +2201,7 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<()> {
         let ds_clone = self.ds.as_ref().clone();
-        let new_self = RT
+        let new_self = global_executor()
             .block_on(None, async move {
                 let mut new_self = ds_clone;
                 let mut builder = new_self.update_field_metadata();
@@ -2229,7 +2229,7 @@ impl Dataset {
         index_name: &str,
     ) -> PyResult<Py<crate::indices::PyIvfModel>> {
         use crate::indices::PyIvfModel;
-        let ivf_model = crate::RT.block_on(Some(py), async {
+        let ivf_model = crate::global_executor().block_on(Some(py), async {
             use lance::index::DatasetIndexInternalExt;
             use lance_index::metrics::NoOpMetricsCollector;
 
@@ -2276,7 +2276,7 @@ impl Dataset {
     #[pyo3(signature = (version))]
     fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyLance<Transaction>>> {
         let new_self = self.ds.as_ref().clone();
-        let transaction = RT
+        let transaction = global_executor()
             .block_on(None, new_self.read_transaction_by_version(version))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(transaction.map(PyLance))
@@ -2288,7 +2288,7 @@ impl Dataset {
         recent_transactions: usize,
     ) -> PyResult<Vec<Option<PyLance<Transaction>>>> {
         let new_self = self.ds.as_ref().clone();
-        let transactions = RT
+        let transactions = global_executor()
             .block_on(None, new_self.get_transactions(recent_transactions))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -2305,7 +2305,7 @@ impl Dataset {
     #[pyo3(signature=(compared_version))]
     fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
         let new_self = self.ds.as_ref().clone();
-        let transactions = RT
+        let transactions = global_executor()
             .block_on(None, new_self.diff_meta(compared_version))?
             .map_err(|err: Error| match err {
                 Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
@@ -2335,7 +2335,7 @@ impl SqlQuery {
         use arrow::pyarrow::ToPyArrow;
 
         let builder = self.builder.clone();
-        let batches = RT
+        let batches = global_executor()
             .block_on(None, async move {
                 let query = builder.build().await?;
                 query.into_batch_records().await
@@ -2369,7 +2369,7 @@ impl SqlQuery {
             )
         });
 
-        let stream = RT
+        let stream = global_executor()
             .block_on(None, fut)
             .map_err(|e| PyValueError::new_err(e.to_string()))?
             .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
@@ -2435,7 +2435,7 @@ impl PyWriteDest {
 
 impl Dataset {
     fn _checkout_version(&self, version: impl Into<Ref> + std::marker::Send) -> PyResult<Self> {
-        let ds = RT
+        let ds = global_executor()
             .block_on(None, self.ds.checkout_version(version))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -2449,11 +2449,11 @@ impl Dataset {
     }
 
     fn list_versions(&self) -> PyResult<Vec<Version>> {
-        RT.block_on(None, self.ds.versions())?.infer_error()
+        global_executor().block_on(None, self.ds.versions())?.infer_error()
     }
 
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
-        RT.block_on(None, self.ds.tags().list())?.infer_error()
+        global_executor().block_on(None, self.ds.tags().list())?.infer_error()
     }
 
     fn list_tags_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, TagContents)>> {
@@ -2468,7 +2468,7 @@ impl Dataset {
             }
             None => None,
         };
-        RT.block_on(None, async {
+        global_executor().block_on(None, async {
             self.ds.tags().list_tags_ordered(ordering).await
         })?
         .infer_error()
@@ -2506,18 +2506,18 @@ pub fn write_dataset(
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
-        let batches = RT
+        let batches = global_executor()
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(
+        global_executor().block_on(
             Some(py),
             LanceDataset::write(batches, dest.as_dest(), params),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        RT.block_on(
+        global_executor().block_on(
             Some(py),
             LanceDataset::write(batches, dest.as_dest(), params),
         )?

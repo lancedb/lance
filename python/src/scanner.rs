@@ -27,7 +27,7 @@ use ::lance::dataset::scanner::Scanner as LanceScanner;
 use pyo3::exceptions::PyValueError;
 
 use crate::reader::LanceReader;
-use crate::RT;
+use crate::global_executor;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
@@ -88,7 +88,7 @@ impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let scanner = self_.scanner.clone();
-        RT.spawn(Some(self_.py()), async move { scanner.schema().await })?
+        global_executor().spawn(Some(self_.py()), async move { scanner.schema().await })?
             .map(|s| s.to_pyarrow(self_.py()))
             .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
@@ -96,7 +96,7 @@ impl Scanner {
     #[pyo3(signature = (*, verbose = false))]
     fn explain_plan(self_: PyRef<'_, Self>, verbose: bool) -> PyResult<String> {
         let scanner = self_.scanner.clone();
-        let res = RT
+        let res = global_executor()
             .spawn(Some(self_.py()), async move {
                 scanner.explain_plan(verbose).await
             })?
@@ -108,7 +108,7 @@ impl Scanner {
     #[pyo3(signature = (*))]
     fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
         let scanner = self_.scanner.clone();
-        let res = RT
+        let res = global_executor()
             .spawn(
                 Some(self_.py()),
                 async move { scanner.analyze_plan().await },
@@ -120,7 +120,7 @@ impl Scanner {
 
     fn count_rows(self_: PyRef<'_, Self>) -> PyResult<u64> {
         let scanner = self_.scanner.clone();
-        RT.spawn(Some(self_.py()), async move { scanner.count_rows().await })?
+        global_executor().spawn(Some(self_.py()), async move { scanner.count_rows().await })?
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
@@ -128,7 +128,7 @@ impl Scanner {
         self_: PyRef<'_, Self>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let scanner = self_.scanner.clone();
-        let reader = RT
+        let reader = global_executor()
             .spawn(Some(self_.py()), async move {
                 LanceReader::try_new(scanner).await
             })?
