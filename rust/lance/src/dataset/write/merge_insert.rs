@@ -2059,7 +2059,8 @@ mod tests {
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
-    use lance_arrow::FixedSizeListArrayExt;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::{FixedSizeListArrayExt, ARROW_EXT_NAME_KEY};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
@@ -4787,5 +4788,80 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert_eq!(value_bitmap.len(), 2);
         assert!(value_bitmap.contains(0));
         assert!(value_bitmap.contains(1));
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_json() {
+        // JSON columns are special in that they rely on the preservation of the
+        // field metadata.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Utf8, true),
+            Field::new("meta", DataType::Utf8, true).with_metadata(
+                [(
+                    ARROW_EXT_NAME_KEY.to_string(),
+                    ARROW_JSON_EXT_NAME.to_string(),
+                )]
+                .into(),
+            ),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let ds = InsertBuilder::new("memory://")
+            .execute(vec![empty_batch])
+            .await
+            .unwrap();
+
+        let new_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"key1": "value1"}"#,
+                    r#"{"key2": 2}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let ds = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::once(async { Ok(new_data) }).boxed(),
+            )))
+            .await
+            .unwrap()
+            .0;
+
+        // Upsert omitting x
+        let new_data = RecordBatch::try_new(
+            Arc::new(schema.project(&[0, 2]).unwrap()),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 3])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"key2": "updated"}"#,
+                    r#"{"key3": 3}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let ds = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(Box::pin(RecordBatchStreamAdapter::new(
+                new_data.schema(),
+                futures::stream::once(async { Ok(new_data) }).boxed(),
+            )))
+            .await
+            .unwrap()
+            .0;
     }
 }
