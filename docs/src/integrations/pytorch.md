@@ -25,7 +25,7 @@ Note:
 
 1. The PyTorch dataset automatically convert data into `torch.Tensor`.
 
-2. If you are using multiprocessing, it is preferrable to use spawn rather than fork.
+2. If you are using multiprocessing, it is preferrable to use forkserver or spawn rather than fork.
    The safe dataloader uses the spawning method.
 
 ## Fork-based Dataloader
