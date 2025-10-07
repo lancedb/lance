@@ -1,0 +1,35 @@
+[package]
+name = "lance-namespace-impls"
+version = "0.38.1"
+edition = "2021"
+authors = ["Lance Namespace Contributors"]
+description = "Lance Namespace implementations"
+license = "Apache-2.0"
+repository = "https://github.com/lancedb/lance"
+documentation = "https://docs.rs/lance-namespace-impls"
+keywords = ["lance", "namespace", "directory", "filesystem"]
+categories = ["database"]
+
+[features]
+default = []
+dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
+
+[dependencies]
+lance-namespace = { workspace = true }
+
+# Directory implementation dependencies (optional, enabled by "dir" feature)
+lance = { workspace = true, optional = true }
+opendal = { workspace = true, optional = true, features = ["services-fs", "services-s3", "services-gcs", "services-azblob"] }
+arrow = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+# Common dependencies
+async-trait = { workspace = true }
+bytes = { workspace = true }
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
