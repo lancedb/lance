@@ -16,9 +16,8 @@ const BLOB_FILE_CLASS: &str = "com/lancedb/lance/BlobFile";
 const BLOB_FILE_CTOR_SIG: &str = "()V";
 const NATIVE_BLOB: &str = "nativeBlobHandle";
 
-#[derive(Clone)]
 pub struct BlockingBlobFile {
-    pub(crate) inner: Arc<BlobFile>,
+    pub(crate) inner: BlobFile,
 }
 
 impl IntoJava for BlockingBlobFile {
@@ -31,7 +30,7 @@ impl IntoJava for BlockingBlobFile {
 
 impl From<BlobFile> for BlockingBlobFile {
     fn from(b: BlobFile) -> Self {
-        Self { inner: Arc::new(b) }
+        Self { inner: b }
     }
 }
 
