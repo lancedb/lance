@@ -23,12 +23,12 @@ Then, you can use the Lance dataset in PyTorch training and inference loops.
 
 Note:
 
-1. The PyTorch dataset automatically convert data into `torch.Tensor`.
+1. the PyTorch dataset automatically convert data into `torch.Tensor`
 
-2. If you are using multiprocessing, it is preferrable to use forkserver or spawn rather than fork.
-   The safe dataloader uses the spawning method.
+2. lance is not fork-safe. If you are using multiprocessing, use spawn instead.
+The safe dataloader uses the spawning method.
 
-## Fork-based Dataloader
+## UnSafe Dataloader
 
 ```python
 import torch
@@ -101,6 +101,6 @@ Available samplers:
 
 !!! warning
 
-    For multiprocessing it is best not to use fork as lance is
+    For multiprocessing you should probably not use fork as lance is
     multi-threaded internally and fork and multi-thread do not work well.
-    Refer to [this discussion](https://discuss.python.org/t/concerns-regarding-deprecation-of-fork-with-alive-threads/33555).
+    Refer to [this discussion](https://discuss.python.org/t/concerns-regarding-deprecation-of-fork-with-alive-threads/33555). 

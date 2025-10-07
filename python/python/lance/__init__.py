@@ -190,3 +190,13 @@ def set_logger(
     log_handler=None,
 ):
     log.set_logger(file_path, name, level, format_string, log_handler)
+
+
+def __warn_on_fork():
+    warnings.warn(
+        "lance is not fork-safe. If you are using multiprocessing, use spawn or forkserver instead."
+    )
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=__warn_on_fork)

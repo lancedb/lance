@@ -52,6 +52,7 @@ pub static IO_CORE_RESERVATION: LazyLock<usize> = LazyLock::new(|| {
 });
 
 fn create_runtime() -> Runtime {
+    // TODO: make this runtime configurable (e.g. num threads)
     Builder::new_multi_thread()
         .thread_name("lance-cpu")
         .max_blocking_threads(get_num_compute_intensive_cpus())
@@ -62,52 +63,44 @@ fn create_runtime() -> Runtime {
         .unwrap()
 }
 
-// TODO: make this runtime configurable (e.g. num threads)
 static CPU_RUNTIME: atomic::AtomicPtr<Runtime> = atomic::AtomicPtr::new(std::ptr::null_mut());
+
+static RUNTIME_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-/// Get the current global executor object.
-pub fn global_cpu_runtime() -> &'static mut Runtime {
-    let ptr = CPU_RUNTIME.load(Ordering::SeqCst);
-    if !ptr.is_null() {
-        return unsafe { &mut *ptr };
+fn global_cpu_runtime() -> &'static mut Runtime {
+    loop {
+        let ptr = CPU_RUNTIME.load(Ordering::SeqCst);
+        if !ptr.is_null() {
+            return unsafe { &mut *ptr };
+        }
+        if !RUNTIME_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+            break;
+        }
     }
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();
     }
     let new_ptr = Box::into_raw(Box::new(create_runtime()));
-    match CPU_RUNTIME.compare_exchange(
-        std::ptr::null_mut(),
-        new_ptr,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    ) {
-        Ok(_) => unsafe { &mut *new_ptr },
-        Err(racing_ptr) => unsafe {
-            // Another thread already installed a Runtime object. Drop our new Runtime, which
-            // is no longer needed.
-            drop(Box::from_raw(new_ptr));
-            &mut *racing_ptr
-        },
-    }
+    CPU_RUNTIME.store(new_ptr, Ordering::SeqCst);
+    return unsafe { &mut *new_ptr };
 }
 
-/// Handle the process forking.
+/// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
+/// runs in "async-signal context" which means that we can't (safely) do much here.
 extern "C" fn atfork_tokio_child() {
     CPU_RUNTIME.store(std::ptr::null_mut(), Ordering::SeqCst);
+    RUNTIME_INSTALLED.store(false, Ordering::SeqCst);
 }
 
 #[cfg(not(windows))]
 fn install_atfork() {
-    let result = unsafe { libc::pthread_atfork(None, None, Some(atfork_tokio_child)) };
-    assert_eq!(result, 0, "pthread_atfork failed");
+    unsafe { libc::pthread_atfork(None, None, Some(atfork_tokio_child)) };
 }
 
 #[cfg(windows)]
-fn install_atfork() {
-    // Do nothing on Windows.
-}
+fn install_atfork() { }
 
 /// Spawn a CPU intensive task
 ///

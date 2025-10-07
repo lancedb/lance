@@ -114,61 +114,48 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-// TODO: make this runtime configurable (e.g. num threads)
-static RT: atomic::AtomicPtr<BackgroundExecutor> = atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Get the current global executor object.
-pub fn global_executor() -> &'static mut BackgroundExecutor {
-    let ptr = RT.load(Ordering::SeqCst);
-    if !ptr.is_null() {
-        return unsafe { &mut *ptr }
-    }
-    let new_ptr = Box::into_raw(Box::new(BackgroundExecutor::new()));
-    match RT.compare_exchange(
-        std::ptr::null_mut(),
-        new_ptr,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    ) {
-        Ok(_) => {
-            unsafe { &mut *new_ptr }
-        },
-        Err(racing_ptr) => unsafe {
-            // Another thread already installed an executor object. Drop our new executor, which
-            // is no longer needed.
-            drop(Box::from_raw(new_ptr));
-            &mut *racing_ptr
-        },
-    }
+fn create_background_executor() {
+    // TODO: make this runtime configurable (e.g. num threads)
+    BackgroundExecutor::new()
 }
 
-/// Handle the process forking.
-///
-/// After a fork() operation, threads from the parent process do not carry over to the child.
-/// The child process needs to re-create its BackgroundExecutor object.
-///
-/// atfork handlers run in "async-signal context" which means that we can't (safely) do much here.
-/// Therefore, we just set the global executor pointer to null, and let the next thread that wants
-/// to use the global executor re-create it.
-///
-/// Note also that this function does leak memory, because it doesn't clean up the old executor
-/// pointer. This is intentional.
+static BACKGROUND_EXECUTOR: atomic::AtomicPtr<BackgroundExecutor> = atomic::AtomicPtr::new(std::ptr::null_mut());
+
+static RUNTIME_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+pub fn global_executor() -> &'static mut BackgroundExecutor {
+    loop {
+        let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
+        if !ptr.is_null() {
+            return unsafe { &mut *ptr }
+        }
+        if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+            break;
+        }
+    }
+    if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+        install_atfork();
+    }
+    let new_ptr = Box::into_raw(Box::new(create_background_executor())));
+    BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
+    return unsafe { &mut *new_ptr };
+}
+
+/// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
+/// runs in "async-signal context" which means that we can't (safely) do much here.
 extern "C" fn atfork_child() {
-    RT.store(std::ptr::null_mut(), Ordering::SeqCst);
+    BACKGROUND_EXECUTOR.store(std::ptr::null_mut(), Ordering::SeqCst);
 }
 
 #[cfg(not(windows))]
 fn install_atfork() {
-    let result = unsafe {
-        libc::pthread_atfork(None, None, Some(atfork_child))
-    };
-    assert_eq!(result, 0, "pthread_atfork failed");
+    unsafe { libc::pthread_atfork(None, None, Some(atfork_child)) };
 }
 
 #[cfg(windows)]
-fn install_atfork() {
-    // Do nothing on Windows.
-}
+fn install_atfork() { }
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
@@ -246,7 +233,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let mut log_builder = env_logger::Builder::from_env(env);
     set_timestamp_precision(&mut log_builder);
     set_log_file_target(&mut log_builder);
-    install_atfork();
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
