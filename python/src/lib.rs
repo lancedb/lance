@@ -125,7 +125,7 @@ static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-pub fn global_executor() -> &'static mut BackgroundExecutor {
+pub fn RT() -> &'static mut BackgroundExecutor {
     loop {
         let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
         if !ptr.is_null() {
@@ -140,7 +140,7 @@ pub fn global_executor() -> &'static mut BackgroundExecutor {
     }
     let new_ptr = Box::into_raw(Box::new(create_background_executor()));
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
-    return unsafe { &mut *new_ptr };
+    unsafe { &mut *new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
@@ -377,7 +377,7 @@ fn infer_tfrecord_schema(
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<_>>();
-    let schema = global_executor()
+    let schema = RT()
         .runtime
         .block_on(::lance::utils::tfrecord::infer_tfrecord_schema(
             uri,
@@ -422,7 +422,7 @@ fn read_tfrecord(
         std::sync::mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>();
 
     let schema_ref = schema.clone();
-    global_executor().spawn_background(None, async move {
+    RT().spawn_background(None, async move {
         let mut stream =
             match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await
             {
@@ -464,10 +464,10 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
-    let indices = global_executor()
+    let indices = RT()
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let (manifest, _) = global_executor()
+    let (manifest, _) = RT()
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(
@@ -492,7 +492,7 @@ impl FFILanceTableProvider {
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
         // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
-        let _ = global_executor().block_on(Some(py), dataset_ref.load_indices())?;
+        let _ = RT().block_on(Some(py), dataset_ref.load_indices())?;
         Ok(Self {
             dataset: dataset_ref.clone(),
             with_row_id,
@@ -512,7 +512,7 @@ impl FFILanceTableProvider {
         ));
 
         let ffi_provider =
-            FFI_TableProvider::new(a_lance_table_provider, true, global_executor().get_runtime_handle());
+            FFI_TableProvider::new(a_lance_table_provider, true, RT().get_runtime_handle());
         let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
         capsule
     }

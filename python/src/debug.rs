@@ -7,7 +7,7 @@ use lance::{datatypes::Schema, Error};
 use lance_table::format::{DeletionFile, Fragment};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{utils::PyLance, Dataset, global_executor};
+use crate::{utils::PyLance, Dataset, RT};
 
 /// Format the Lance schema of a dataset as a string.
 ///
@@ -111,7 +111,7 @@ pub fn list_transactions(
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let mut dataset = dataset.bind(py).borrow().ds.clone();
 
-    global_executor().block_on(Some(py), async move {
+    RT().block_on(Some(py), async move {
         let mut transactions = vec![];
 
         loop {

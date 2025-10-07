@@ -39,7 +39,7 @@ use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{Dataset, Scanner, global_executor};
+use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -87,7 +87,7 @@ impl FileFragment {
         dataset: &Dataset,
         fragment_id: usize,
     ) -> PyResult<PyLance<Fragment>> {
-        let metadata = global_executor().block_on(None, async {
+        let metadata = RT().block_on(None, async {
             LanceFragment::create_from_file(filename, dataset.ds.as_ref(), fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
@@ -112,7 +112,7 @@ impl FileFragment {
         let batches = convert_reader(reader)?;
 
         reader.py().allow_threads(|| {
-            global_executor().runtime.block_on(async move {
+            RT().runtime.block_on(async move {
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
                         .await
@@ -133,7 +133,7 @@ impl FileFragment {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        global_executor().runtime.block_on(async {
+        RT().runtime.block_on(async {
             self.fragment
                 .count_rows(filter)
                 .await
@@ -157,7 +157,7 @@ impl FileFragment {
         };
 
         let fragment = self_.fragment.clone();
-        let session = global_executor()
+        let session = RT()
             .spawn(Some(self_.py()), async move {
                 fragment
                     .open_session(&projection, with_row_address.unwrap_or(false))
@@ -186,7 +186,7 @@ impl FileFragment {
 
         let indices = row_indices.iter().map(|v| *v as u32).collect::<Vec<_>>();
         let fragment = self_.fragment.clone();
-        let batch = global_executor()
+        let batch = RT()
             .spawn(Some(self_.py()), async move {
                 fragment.take(&indices, &projection).await
             })?
@@ -273,7 +273,7 @@ impl FileFragment {
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
         let fragment = self.fragment.clone();
-        let (fragment, schema) = global_executor()
+        let (fragment, schema) = RT()
             .spawn(None, async move {
                 fragment.add_columns(transforms, None, batch_size).await
             })?
@@ -292,7 +292,7 @@ impl FileFragment {
         let transforms = transforms_from_python(transforms)?;
 
         let fragment = self.fragment.clone();
-        let (fragment, schema) = global_executor()
+        let (fragment, schema) = RT()
             .spawn(None, async move {
                 fragment
                     .add_columns(transforms, read_columns, batch_size)
@@ -311,7 +311,7 @@ impl FileFragment {
         max_field_id: i32,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let mut fragment = self.fragment.clone();
-        let (fragment, schema) = global_executor()
+        let (fragment, schema) = RT()
             .spawn(None, async move {
                 fragment
                     .merge_columns(reader.0, &left_on, &right_on, max_field_id)
@@ -324,7 +324,7 @@ impl FileFragment {
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
-        let updated_fragment = global_executor()
+        let updated_fragment = RT()
             .block_on(None, async { old_fragment.delete(predicate).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -360,13 +360,13 @@ impl FileFragment {
 
     #[getter]
     fn num_deletions(&self) -> PyResult<usize> {
-        global_executor().block_on(None, self.fragment.count_deletions())?
+        RT().block_on(None, self.fragment.count_deletions())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     #[getter]
     fn physical_rows(&self) -> PyResult<usize> {
-        global_executor().block_on(None, self.fragment.physical_rows())?
+        RT().block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
@@ -389,7 +389,7 @@ fn do_write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    global_executor().block_on(
+    RT().block_on(
         Some(reader.py()),
         InsertBuilder::new(dest.as_dest())
             .with_params(&params)
@@ -441,7 +441,7 @@ pub fn write_fragments_transaction<'py>(
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
-        let reader = global_executor().block_on(
+        let reader = RT().block_on(
             Some(reader.py()),
             scanner
                 .to_reader()
@@ -650,7 +650,7 @@ impl FragmentSession {
     #[pyo3(signature=(indices))]
     pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
         let session = self_.session.clone();
-        let batch = global_executor()
+        let batch = RT()
             .spawn(
                 Some(self_.py()),
                 async move { session.take(&indices).await },

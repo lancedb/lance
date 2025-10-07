@@ -8,7 +8,7 @@ use pyo3::{pyclass, pymethods};
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 
-use crate::global_executor;
+use crate::RT;
 
 /// The Session holds stateful information for a dataset.
 ///
@@ -44,7 +44,7 @@ impl Session {
     }
 
     fn __repr__(&self) -> String {
-        let (index_cache_size, meta_cache_size) = global_executor()
+        let (index_cache_size, meta_cache_size) = RT()
             .block_on(None, async move {
                 (
                     self.inner.index_cache_stats().await.size_bytes,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::PythonErrorExt, global_executor};
+use crate::{error::PythonErrorExt, RT};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
@@ -305,7 +305,7 @@ impl LanceFileWriter {
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        global_executor().block_on(
+        RT().block_on(
             None,
             Self::open(
                 path,
@@ -320,19 +320,19 @@ impl LanceFileWriter {
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        global_executor().block_on(None, async {
+        RT().block_on(None, async {
             self.inner.lock().await.write_batch(&batch.0).await
         })?
         .infer_error()
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        global_executor().block_on(None, async { self.inner.lock().await.finish().await })?
+        RT().block_on(None, async { self.inner.lock().await.finish().await })?
             .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
-        global_executor().block_on(None, async {
+        RT().block_on(None, async {
             self.inner
                 .lock()
                 .await
@@ -343,7 +343,7 @@ impl LanceFileWriter {
     }
 
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
-        global_executor().block_on(None, async {
+        RT().block_on(None, async {
             self.inner.lock().await.add_schema_metadata(key, value)
         })?;
         Ok(())
@@ -352,7 +352,7 @@ impl LanceFileWriter {
 
 impl Drop for LanceFileWriter {
     fn drop(&mut self) {
-        global_executor().runtime.block_on(async {
+        RT().runtime.block_on(async {
             let mut inner = self.inner.lock().await;
             inner.abort().await;
         });
@@ -458,7 +458,7 @@ impl LanceFileSession {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        global_executor().block_on(None, Self::try_new(uri_or_path, storage_options))?
+        RT().block_on(None, Self::try_new(uri_or_path, storage_options))?
     }
 
     #[pyo3(signature=(path, columns=None))]
@@ -468,7 +468,7 @@ impl LanceFileSession {
         columns: Option<Vec<String>>,
     ) -> PyResult<LanceFileReader> {
         let path = self.base_path.child(path);
-        global_executor().block_on(
+        RT().block_on(
             None,
             LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
         )?
@@ -492,7 +492,7 @@ impl LanceFileSession {
         max_page_bytes: Option<u64>,
     ) -> PyResult<LanceFileWriter> {
         let path = self.base_path.child(path);
-        global_executor().block_on(
+        RT().block_on(
             None,
             LanceFileWriter::open_with_store(
                 self.object_store.clone(),
@@ -577,7 +577,7 @@ impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = global_executor().block_on(None, self.0.next()).ok()?;
+        let batch = RT().block_on(None, self.0.next()).ok()?;
         batch.map(|b| b.map_err(|e| e.into()))
     }
 }
@@ -598,7 +598,7 @@ impl LanceFileReader {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
         let inner = self.inner.clone();
-        let stream = global_executor().block_on(None, async move {
+        let stream = RT().block_on(None, async move {
             inner
                 .read_stream(
                     params,
@@ -621,7 +621,7 @@ impl LanceFileReader {
         storage_options: Option<HashMap<String, String>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        global_executor().block_on(None, Self::open(path, storage_options, columns))?
+        RT().block_on(None, Self::open(path, storage_options, columns))?
     }
 
     pub fn read_all(
@@ -679,7 +679,7 @@ impl LanceFileReader {
     }
 
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
-        let buffer_bytes = global_executor()
+        let buffer_bytes = RT()
             .runtime
             .block_on(self.inner.read_global_buffer(index))
             .infer_error()?;
