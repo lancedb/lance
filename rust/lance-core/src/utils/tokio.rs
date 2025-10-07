@@ -100,7 +100,7 @@ fn install_atfork() {
 }
 
 #[cfg(windows)]
-fn install_atfork() { }
+fn install_atfork() {}
 
 /// Spawn a CPU intensive task
 ///
