@@ -105,7 +105,9 @@ def write_dataset_fts_index():
     data = pa.table(
         {
             "idx": pa.array(range(1000)),
-            "text": pa.array([f"document with words {i} and more text" for i in range(1000)]),
+            "text": pa.array(
+                [f"document with words {i} and more text" for i in range(1000)]
+            ),
         }
     )
 

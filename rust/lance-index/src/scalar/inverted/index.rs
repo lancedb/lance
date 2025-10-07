@@ -81,7 +81,9 @@ use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
-pub const INVERTED_INDEX_VERSION: u32 = 0;
+// Version 0: Arrow TokenSetFormat (legacy)
+// Version 1: Fst TokenSetFormat (new default, incompatible with old clients)
+pub const INVERTED_INDEX_VERSION: u32 = 1;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -552,9 +554,15 @@ impl ScalarIndex for InvertedIndex {
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
+        // Use version 0 for Arrow format (legacy), version 1 for Fst format (new)
+        let index_version = match self.token_set_format {
+            TokenSetFormat::Arrow => 0,
+            TokenSetFormat::Fst => INVERTED_INDEX_VERSION,
+        };
+
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: INVERTED_INDEX_VERSION,
+            index_version,
         })
     }
 
@@ -567,9 +575,15 @@ impl ScalarIndex for InvertedIndex {
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
+        // Use version 0 for Arrow format (legacy), version 1 for Fst format (new)
+        let index_version = match self.token_set_format {
+            TokenSetFormat::Arrow => 0,
+            TokenSetFormat::Fst => INVERTED_INDEX_VERSION,
+        };
+
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: INVERTED_INDEX_VERSION,
+            index_version,
         })
     }
 
