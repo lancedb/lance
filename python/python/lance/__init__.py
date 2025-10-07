@@ -194,7 +194,8 @@ def set_logger(
 
 def __warn_on_fork():
     warnings.warn(
-        "lance is not fork-safe. If you are using multiprocessing, use spawn or forkserver instead."
+        "lance is not fork-safe. If you are using multiprocessing, use spawn or \
+forkserver instead."
     )
 
 

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from pathlib import Path
-import lance
 import os
+import sys
+from pathlib import Path
+
+import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
