@@ -110,6 +110,22 @@ impl BlobFile {
         }
     }
 
+    /// Read the entire blob file from the current cursor position
+    /// to the end of the file
+    ///
+    /// After this call the cursor will be pointing to the end of
+    /// the file.
+    pub async fn read(&self) -> Result<bytes::Bytes> {
+        let position = self.position;
+        let size = self.size;
+        self.do_with_reader(|cursor, reader| async move {
+            let start = position as usize + cursor as usize;
+            let end = (position + size) as usize;
+            Ok((end as u64, reader.get_range(start..end).await?))
+        })
+        .await
+    }
+
     /// Read up to `len` bytes from the current cursor position
     ///
     /// After this call the cursor will be pointing to the end of
@@ -123,22 +139,6 @@ impl BlobFile {
             let end = start + read_size;
             let data = reader.get_range(start..end).await?;
             Ok((end as u64 - position, data))
-        })
-        .await
-    }
-
-    /// Read the entire blob file from the current cursor position
-    /// to the end of the file
-    ///
-    /// After this call the cursor will be pointing to the end of
-    /// the file.
-    pub async fn read(&self) -> Result<bytes::Bytes> {
-        let position = self.position;
-        let size = self.size;
-        self.do_with_reader(|cursor, reader| async move {
-            let start = position as usize + cursor as usize;
-            let end = (position + size) as usize;
-            Ok((end as u64, reader.get_range(start..end).await?))
         })
         .await
     }
