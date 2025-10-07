@@ -111,6 +111,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+
+    // number of indices merged
+    merged_num: usize,
 }
 
 type BuildStream<S, Q> =
@@ -149,6 +152,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
+            merged_num: 0,
         })
     }
 
@@ -208,11 +212,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
+            merged_num: 0,
         })
     }
 
     // build the index with the all data in the dataset,
-    pub async fn build(&mut self) -> Result<()> {
+    // return the number of indices merged
+    pub async fn build(&mut self) -> Result<usize> {
         // step 1. train IVF & quantizer
         self.with_ivf(self.load_or_build_ivf().await?);
 
@@ -229,7 +235,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
 
-        Ok(())
+        Ok(self.merged_num)
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -642,6 +648,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         ));
                     };
                     ivf.centroids = Some(split_results.new_centroids);
+                    self.merged_num = self.existing_indices.len();
 
                     (
                         split_results.assign_batches,

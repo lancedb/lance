@@ -384,15 +384,21 @@ pub(crate) async fn optimize_vector_indices_v2(
     } else {
         0
     };
+
+    // Only pass indices that will actually be merged
+    let indices_to_merge = if num_indices_to_merge > 0 {
+        let start_pos = existing_indices.len() - num_indices_to_merge;
+        existing_indices[start_pos..].to_vec()
+    } else {
+        Vec::new()
+    };
+
     let temp_dir = tempfile::tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
-    let start_pos = existing_indices.len() - num_indices_to_merge;
-    let indices_to_merge = existing_indices[start_pos..].to_vec();
-    let merged_num = indices_to_merge.len();
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
-    match index_type {
+    let merged_num = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -407,11 +413,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(indices_to_merge.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                     dataset.clone(),
@@ -424,11 +430,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(indices_to_merge.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             }
         }
         // IVF_PQ
@@ -444,11 +450,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
@@ -463,11 +469,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
@@ -481,11 +487,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
@@ -503,11 +509,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
@@ -525,11 +531,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
@@ -547,11 +553,11 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(indices_to_merge.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (sub_index_type, quantization_type) => {
             unimplemented!(
@@ -560,7 +566,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 quantization_type
             )
         }
-    }
+    };
 
     Ok((new_uuid, merged_num))
 }

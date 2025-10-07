@@ -153,6 +153,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .len()
                 .saturating_sub(options.num_indices_to_merge);
             let indices_to_merge = &old_indices[start_pos..];
+
+            // If there's nothing to do (no unindexed fragments and at most 1 index to "merge"),
+            // we can skip creating a new index. Merging a single index without new data is pointless.
+            if unindexed.is_empty() && indices_to_merge.len() <= 1 {
+                return Ok(None);
+            }
+
             indices_to_merge.iter().for_each(|idx| {
                 frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
             });
