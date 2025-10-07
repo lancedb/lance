@@ -101,3 +101,25 @@ def test_pq_buffer():
             "column": "vec",
         }
     )
+
+
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.36.0"),
+    reason="FTS index was introduced in 0.36.0",
+)
+def test_fts_index_list_indices():
+    # Test that list_indices() doesn't panic when reading FTS index created by newer version
+    # This is a regression test for forward compatibility issue where Lance 0.36 would panic
+    # when calling list_indices() on datasets with FTS indices created by Lance 0.38+
+    ds = lance.dataset(get_path("fts_index"))
+
+    # This should not panic
+    indices = ds.list_indices()
+
+    # Should have at least one index
+    assert len(indices) > 0
+
+    # Should be able to find the FTS index
+    fts_indices = [idx for idx in indices if idx["type"] == "FTS" or idx["type"] == "Inverted"]
+    assert len(fts_indices) > 0

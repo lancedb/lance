@@ -99,9 +99,24 @@ def write_dataset_scalar_index():
     dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
 
 
+def write_dataset_fts_index():
+    shutil.rmtree(get_path("fts_index"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "text": pa.array([f"document with words {i} and more text" for i in range(1000)]),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("fts_index"))
+    dataset.create_scalar_index("text", "INVERTED")
+
+
 if __name__ == "__main__":
     write_basic_types()
     write_large()
     write_dataset_pq_buffer()
     write_dataset_scalar_index()
     write_dataset_json()
+    write_dataset_fts_index()
