@@ -138,7 +138,7 @@ pub fn global_executor() -> &'static mut BackgroundExecutor {
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();
     }
-    let new_ptr = Box::into_raw(Box::new(create_background_executor())));
+    let new_ptr = Box::into_raw(Box::new(create_background_executor()));
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
     return unsafe { &mut *new_ptr };
 }
