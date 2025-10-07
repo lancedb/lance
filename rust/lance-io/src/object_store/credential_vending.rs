@@ -32,12 +32,17 @@ pub struct CredentialVendingParams {
     /// How early to refresh credentials before expiration (in milliseconds)
     /// Default: 300,000 (5 minutes)
     pub refresh_lead_time_ms: u64,
+
+    /// Initial storage options to use (avoids initial describe_table call)
+    /// If provided, the wrapper will use these credentials immediately
+    pub initial_storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for CredentialVendingParams {
     fn default() -> Self {
         Self {
             refresh_lead_time_ms: 300_000, // 5 minutes
+            initial_storage_options: None,
         }
     }
 }
@@ -53,13 +58,19 @@ impl CredentialVendingParams {
         self.refresh_lead_time_ms = ms;
         self
     }
+
+    /// Set initial storage options to avoid first describe_table call
+    pub fn with_initial_storage_options(mut self, options: HashMap<String, String>) -> Self {
+        self.initial_storage_options = Some(options);
+        self
+    }
 }
 
 /// Cache for credentials with expiration tracking
 #[derive(Debug, Clone)]
 struct CredentialsCache {
     storage_options: HashMap<String, String>,
-    expires_at_millis: Option<u64>,
+    expires_at_millis: u64,
     last_refresh: Instant,
     initialized: bool,
 }
@@ -68,7 +79,7 @@ impl CredentialsCache {
     fn new() -> Self {
         Self {
             storage_options: HashMap::new(),
-            expires_at_millis: None,
+            expires_at_millis: 0,
             last_refresh: Instant::now(),
             initialized: false,
         }
@@ -109,11 +120,28 @@ impl CredentialVendingObjectStoreWrapper {
         table_id: Vec<String>,
         params: CredentialVendingParams,
     ) -> Self {
+        let credentials = if let Some(initial_options) = &params.initial_storage_options {
+            // Initialize with provided credentials - expires_at_millis is required
+            let expires_at_millis = initial_options
+                .get("expires_at_millis")
+                .and_then(|s| s.parse::<u64>().ok())
+                .expect("expires_at_millis is required in storage_options");
+
+            Arc::new(RwLock::new(CredentialsCache {
+                storage_options: initial_options.clone(),
+                expires_at_millis,
+                last_refresh: Instant::now(),
+                initialized: true,
+            }))
+        } else {
+            Arc::new(RwLock::new(CredentialsCache::new()))
+        };
+
         Self {
             namespace,
             table_id,
             params,
-            credentials: Arc::new(RwLock::new(CredentialsCache::new())),
+            credentials,
             refresh_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -139,17 +167,30 @@ impl CredentialVendingObjectStoreWrapper {
                 location: location!(),
             })?;
 
-        if let Some(storage_options) = response.storage_options {
-            let expires_at_millis = storage_options
-                .get("expires_at_millis")
-                .and_then(|s| s.parse::<u64>().ok());
+        let storage_options = response.storage_options.ok_or_else(|| Error::IO {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "storage_options not found in describe_table response",
+            )),
+            location: location!(),
+        })?;
 
-            let mut cache = self.credentials.write().unwrap();
-            cache.storage_options = storage_options;
-            cache.expires_at_millis = expires_at_millis;
-            cache.last_refresh = Instant::now();
-            cache.initialized = true;
-        }
+        let expires_at_millis = storage_options
+            .get("expires_at_millis")
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| Error::IO {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "expires_at_millis is required in storage_options",
+                )),
+                location: location!(),
+            })?;
+
+        let mut cache = self.credentials.write().unwrap();
+        cache.storage_options = storage_options;
+        cache.expires_at_millis = expires_at_millis;
+        cache.last_refresh = Instant::now();
+        cache.initialized = true;
 
         Ok(())
     }
@@ -169,18 +210,13 @@ impl CredentialVendingObjectStoreWrapper {
                     return Ok(());
                 }
 
-                if let Some(expires_at) = cache.expires_at_millis {
-                    let now_millis = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or(Duration::from_secs(0))
-                        .as_millis() as u64;
+                let now_millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_millis() as u64;
 
-                    // No need to refresh
-                    if now_millis + self.params.refresh_lead_time_ms < expires_at {
-                        return Ok(());
-                    }
-                } else {
-                    // No expiration, use cached credentials
+                // No need to refresh if not within lead time of expiration
+                if now_millis + self.params.refresh_lead_time_ms < cache.expires_at_millis {
                     return Ok(());
                 }
             }
@@ -199,18 +235,13 @@ impl CredentialVendingObjectStoreWrapper {
                     return Ok(());
                 }
 
-                if let Some(expires_at) = cache.expires_at_millis {
-                    let now_millis = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or(Duration::from_secs(0))
-                        .as_millis() as u64;
+                let now_millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_millis() as u64;
 
-                    // No need to refresh
-                    if now_millis + self.params.refresh_lead_time_ms < expires_at {
-                        return Ok(());
-                    }
-                } else {
-                    // No expiration, use cached credentials
+                // No need to refresh if not within lead time of expiration
+                if now_millis + self.params.refresh_lead_time_ms < cache.expires_at_millis {
                     return Ok(());
                 }
             }
@@ -690,5 +721,36 @@ mod tests {
 
         // Should only call once for initial load
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_initial_storage_options() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let namespace = Arc::new(MockNamespace {
+            call_count: call_count.clone(),
+            expires_at_millis: 0,
+        });
+
+        // Create initial storage options
+        let mut initial_options = HashMap::new();
+        initial_options.insert("aws_access_key_id".to_string(), "initial_key".to_string());
+        initial_options.insert("expires_at_millis".to_string(), "9999999999999".to_string());
+
+        let params =
+            CredentialVendingParams::default().with_initial_storage_options(initial_options);
+
+        let wrapper = CredentialVendingObjectStoreWrapper::new(
+            namespace,
+            vec!["test_table".to_string()],
+            params,
+        );
+
+        // Should not call describe_table since we have initial credentials
+        wrapper.ensure_fresh_credentials().await.unwrap();
+        wrapper.ensure_fresh_credentials().await.unwrap();
+        wrapper.ensure_fresh_credentials().await.unwrap();
+
+        // Should never call describe_table
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 }

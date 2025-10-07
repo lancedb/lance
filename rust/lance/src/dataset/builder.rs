@@ -121,7 +121,16 @@ impl DatasetBuilder {
         // Create builder with location from namespace
         let mut builder = Self::from_uri(table_uri);
 
-        // Set up credential vending
+        // Set up credential vending with initial storage options from describe_table
+        let params = if let Some(storage_options) = response.storage_options {
+            // Use provided params or create new ones, then add initial storage options
+            let mut params = params.unwrap_or_default();
+            params.initial_storage_options = Some(storage_options);
+            Some(params)
+        } else {
+            params
+        };
+
         builder = builder.with_credential_vending(namespace, table_id, params);
 
         Ok(builder)
