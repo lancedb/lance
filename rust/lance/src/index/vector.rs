@@ -18,6 +18,7 @@ mod fixture_test;
 use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_file::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -51,7 +52,6 @@ use lance_table::format::IndexMetadata;
 use object_store::path::Path;
 use serde::Serialize;
 use snafu::location;
-use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
@@ -344,8 +344,8 @@ pub(crate) async fn build_vector_index(
     let mut ivf_params = ivf_params.clone();
     ivf_params.num_partitions = Some(num_partitions);
 
-    let temp_dir = tempdir()?;
-    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let temp_dir = TempStdDir::default();
+    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = IvfShuffler::new(temp_dir_path, num_partitions);
     match index_type {
         IndexType::IvfFlat => match element_type {
@@ -611,8 +611,8 @@ pub(crate) async fn build_vector_index_incremental(
         });
     }
 
-    let temp_dir = tempdir()?;
-    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let temp_dir = TempStdDir::default();
+    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()));
 
     let index_dir = dataset.indices_dir().child(uuid);
@@ -858,7 +858,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -943,7 +943,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
     // Load the index metadata to get the correct index directory
     let index_meta = dataset
         .load_index(uuid)
@@ -1294,17 +1294,17 @@ mod tests {
     use crate::dataset::Dataset;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::Array;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::DatasetIndexExt;
     use lance_linalg::distance::MetricType;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_pq() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -1517,9 +1517,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_flat() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column
         let source_reader = lance_datagen::gen_batch()
@@ -1713,9 +1713,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_vector_index_empty_dataset() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column
         let source_reader = lance_datagen::gen_batch()
@@ -1942,9 +1942,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_sq() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column
         let source_reader = lance_datagen::gen_batch()
@@ -2156,9 +2156,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_hnsw_pq() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -2415,9 +2415,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_hnsw_sq() {
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with vector column
         let source_reader = lance_datagen::gen_batch()

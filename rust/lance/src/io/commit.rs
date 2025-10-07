@@ -116,6 +116,7 @@ async fn do_commit_new_dataset(
         ref_name,
         ref_version,
         ref_path,
+        branch_name,
         ..
     } = &transaction.operation
     {
@@ -144,6 +145,7 @@ async fn do_commit_new_dataset(
             ref_name.clone(),
             ref_path.clone(),
             new_base_id,
+            branch_name.clone(),
             transaction_file,
         );
 
@@ -993,6 +995,7 @@ mod tests {
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1165,8 +1168,8 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_create_index() {
         // Create a table with two vector columns
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let dimension = 16;
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1297,8 +1300,8 @@ mod tests {
     async fn test_concurrent_writes() {
         for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
             // Create an empty table
-            let test_dir = tempfile::tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = test_dir.as_str();
 
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
@@ -1365,9 +1368,9 @@ mod tests {
         }
     }
 
-    async fn get_empty_dataset() -> (tempfile::TempDir, Dataset) {
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+    async fn get_empty_dataset() -> (TempStrDir, Dataset) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",

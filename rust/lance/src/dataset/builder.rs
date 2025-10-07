@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use super::refs::{Ref, Tags};
+use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::dataset::branch_location::BranchLocation;
 use crate::{
     error::{Error, Result},
     session::Session,
@@ -26,6 +27,7 @@ use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
+
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
@@ -107,6 +109,13 @@ impl DatasetBuilder {
     /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
         self.version = Some(Ref::from(version));
+        self
+    }
+
+    /// Sets `version` for the builder using a branch and optional version number
+    /// If version_number is null, checkout the latest version
+    pub fn with_branch(mut self, branch: &str, version_number: Option<u64>) -> Self {
+        self.version = Some(Ref::from((branch, version_number)));
         self
     }
 
@@ -300,31 +309,96 @@ impl DatasetBuilder {
             )),
         };
 
-        let mut version: Option<u64> = None;
-        let cloned_ref = self.version.clone();
+        let target_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
 
         // How do we detect which version scheme is in use?
-
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
-        if let Some(r) = cloned_ref {
-            version = match r {
-                Ref::Version(v) => Some(v),
-                Ref::Tag(t) => {
-                    let tags = Tags::new(
-                        object_store.clone(),
-                        commit_handler.clone(),
-                        base_path.clone(),
-                    );
-                    Some(tags.get_version(t.as_str()).await?)
+        // Two cases that need to check out after loading the manifest:
+        // 1. If the target is configured as a branch, we need to check the branch field in the manifest
+        // and reload the right branch in case the uri is not the right one.
+        // 2. If the target is configured as a tag, and we don't find the tag under the table_uri,
+        // we need to get the root_location after loading the manifest and get the right version.
+        // In practice, we should try best to use the right uri and avoid double loading.
+        let mut need_delay_checkout = false;
+        let (mut branch, mut version_number) = match target_ref.clone() {
+            Some(Ref::Version(branch, version_number)) => {
+                if branch.is_some() {
+                    need_delay_checkout = true;
+                }
+                (branch, version_number)
+            }
+            // Here we assume the uri and path is the root.
+            // If tag not found, we need to delay checkout after loading by uri
+            Some(Ref::Tag(tag_name)) => {
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    BranchLocation {
+                        path: base_path.clone(),
+                        uri: table_uri.clone(),
+                        branch: None,
+                    },
+                );
+                let tag_content = refs.tags().get(&tag_name).await;
+                if let Ok(tag_content) = tag_content {
+                    (tag_content.branch.clone(), Some(tag_content.version))
+                } else {
+                    need_delay_checkout = true;
+                    (None, None)
                 }
             }
-        }
+            None => (None, None),
+        };
 
+        let dataset = Self::load_by_uri(
+            session,
+            manifest,
+            file_reader_options,
+            table_uri,
+            version_number,
+            object_store,
+            base_path,
+            commit_handler,
+        )
+        .await?;
+
+        if need_delay_checkout {
+            if let Some(Ref::Tag(tag_name)) = target_ref {
+                let tag_content = dataset.tags().get(tag_name.as_str()).await?;
+                branch = tag_content.branch.clone();
+                version_number = Some(tag_content.version);
+            }
+
+            if branch.as_deref() != dataset.manifest.branch.as_deref() {
+                return dataset.checkout_version((branch, version_number)).await;
+            }
+        }
+        if let Some(version_number) = version_number {
+            if version_number != dataset.manifest.version {
+                return Err(Error::VersionNotFound {
+                    message: format!("version {} not found", version_number),
+                });
+            }
+        }
+        Ok(dataset)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_by_uri(
+        session: Arc<Session>,
+        manifest: Option<Manifest>,
+        file_reader_options: Option<FileReaderOptions>,
+        table_uri: String,
+        version_number: Option<u64>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        commit_handler: Arc<dyn CommitHandler>,
+    ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
@@ -335,11 +409,26 @@ impl DatasetBuilder {
             }
             (manifest, location)
         } else {
-            let manifest_location = match version {
+            let manifest_location = match version_number {
                 Some(version) => {
-                    commit_handler
+                    let target_manifest_result = commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
-                        .await?
+                        .await;
+                    // This may fail due to the uri is not the right branch
+                    // In this case we should try to load the latest version and checkout the right branch and version_number
+                    match target_manifest_result {
+                        Ok(manifest_location) => manifest_location,
+                        Err(e) => {
+                            if let Error::VersionNotFound { message: _ } = e {
+                                // If the version is not found, we need to try to load the latest version.
+                                commit_handler
+                                    .resolve_latest_location(&base_path, &object_store)
+                                    .await?
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
@@ -350,7 +439,6 @@ impl DatasetBuilder {
                         location: location!(),
                     })?,
             };
-
             let manifest = Dataset::load_manifest(
                 &object_store,
                 &manifest_location,

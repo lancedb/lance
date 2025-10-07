@@ -229,6 +229,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -241,7 +242,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-    use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
@@ -254,8 +254,8 @@ mod tests {
         const DIM: usize = 64;
         const IVF_PARTITIONS: usize = 2;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(1000 * DIM);
 
@@ -387,8 +387,8 @@ mod tests {
         const DIM: usize = 64;
         const TOTAL: usize = 1000;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(TOTAL * DIM);
 
@@ -476,8 +476,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_indices_after_merge_insert() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         // Create initial dataset using lance_datagen
         let mut dataset = lance_datagen::gen_batch()

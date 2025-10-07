@@ -120,14 +120,15 @@ use snafu::location;
 
 use crate::buffer::LanceBuffer;
 
-// We assume 16 bits is good enough for rep-def levels.  This _would_ give
-// us 65536 levels of struct nesting and list nesting.  However, we cut that
-// in half for SPECIAL_THRESHOLD because we use the top bit to indicate if an
-// item is a special value (null list / empty list) during construction.
 pub type LevelBuffer = Vec<u16>;
 
 // As we build def levels we add this to special values to indicate that they
 // are special so that we can skip over them when processing lower levels.
+//
+// We assume 16 bits is good enough for rep-def levels.  This _would_ give
+// us 65536 levels of struct nesting and list nesting.  However, we cut that
+// in half for SPECIAL_THRESHOLD because we use the top bit to indicate if an
+// item is a special value (null list / empty list) during construction.
 //
 // We subtract this off at the end of construction to get the actual definition
 // levels.
@@ -799,7 +800,7 @@ impl RepDefBuilder {
 
     /// The builder is "empty" if there is no repetition and no nulls.  In this case we don't need
     /// to store anything to disk (except the description)
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.repdefs
             .iter()
             .all(|r| matches!(r, RawRepDef::Validity(ValidityDesc { validity: None, .. })))

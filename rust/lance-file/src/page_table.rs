@@ -173,6 +173,7 @@ impl PageTable {
 mod tests {
 
     use super::*;
+    use lance_core::utils::tempfile::TempStdFile;
     use pretty_assertions::assert_eq;
 
     use lance_io::local::LocalObjectReader;
@@ -201,8 +202,7 @@ mod tests {
         page_table.set(13, 2, page_info.clone());
         page_table.set(13, 3, page_info.clone());
 
-        let test_dir = tempfile::tempdir().unwrap();
-        let path = test_dir.path().join("test");
+        let path = TempStdFile::default();
 
         // The first field_id with entries is 10, but if it's inside of a struct
         // the struct itself needs to be included in the page table. We use 9
@@ -259,8 +259,7 @@ mod tests {
     async fn test_error_handling() {
         let mut page_table = PageTable::default();
 
-        let test_dir = tempfile::tempdir().unwrap();
-        let path = test_dir.path().join("test");
+        let path = TempStdFile::default();
 
         // Returns an error if the page table is empty
         let mut writer = tokio::fs::File::create(&path).await.unwrap();

@@ -18,7 +18,7 @@ use crate::{
         STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
-    encodings::logical::primitive::blob::BlobPageScheduler,
+    encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
         pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
         ProtobufUtils21,
@@ -2894,6 +2894,7 @@ impl StructuralPrimitiveFieldScheduler {
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -2905,6 +2906,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     decompressors,
                     cache_repetition_index,
+                    target_field,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2919,6 +2921,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_layout: &PageLayout,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -2963,19 +2966,28 @@ impl StructuralPrimitiveFieldScheduler {
                     blob.inner_layout.as_ref().expect_ok()?.as_ref(),
                     decompressors,
                     cache_repetition_index,
+                    target_field,
                 )?;
                 let def_meaning = blob
                     .layers
                     .iter()
                     .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
-                let def_meaning = def_meaning.into();
-                Box::new(BlobPageScheduler::new(
-                    inner_scheduler,
-                    page_info.priority,
-                    page_info.num_rows,
-                    def_meaning,
-                ))
+                if matches!(target_field.data_type(), DataType::Struct(_)) {
+                    // User wants to decode blob into struct
+                    Box::new(BlobDescriptionPageScheduler::new(
+                        inner_scheduler,
+                        def_meaning.into(),
+                    ))
+                } else {
+                    // User wants to decode blob into binary data
+                    Box::new(BlobPageScheduler::new(
+                        inner_scheduler,
+                        page_info.priority,
+                        page_info.num_rows,
+                        def_meaning.into(),
+                    ))
+                }
             }
         })
     }
@@ -2985,6 +2997,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -2992,6 +3005,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_layout,
             decompressors,
             cache_repetition_index,
+            target_field,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -3856,21 +3870,35 @@ impl PrimitiveStructuralEncoder {
         );
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
-
-        let mut data_iter = fixed.data.chunks_exact(bytes_per_value);
         let mut offset = 0;
-        while let Some(control) = repdef.append_next(&mut zipped_data) {
-            if control.is_new_row {
-                // We have finished a row
-                debug_assert!(offset <= len);
-                // SAFETY: We know that `start <= len`
-                unsafe { rep_index_builder.append(offset as u64) };
+
+        if bytes_per_value == 0 {
+            // No data, just dump the repdef into the buffer
+            while let Some(control) = repdef.append_next(&mut zipped_data) {
+                if control.is_new_row {
+                    // We have finished a row
+                    debug_assert!(offset <= len);
+                    // SAFETY: We know that `start <= len`
+                    unsafe { rep_index_builder.append(offset as u64) };
+                }
+                offset = zipped_data.len();
             }
-            if control.is_visible {
-                let value = data_iter.next().unwrap();
-                zipped_data.extend_from_slice(value);
+        } else {
+            // We have data, zip it with the repdef
+            let mut data_iter = fixed.data.chunks_exact(bytes_per_value);
+            while let Some(control) = repdef.append_next(&mut zipped_data) {
+                if control.is_new_row {
+                    // We have finished a row
+                    debug_assert!(offset <= len);
+                    // SAFETY: We know that `start <= len`
+                    unsafe { rep_index_builder.append(offset as u64) };
+                }
+                if control.is_visible {
+                    let value = data_iter.next().unwrap();
+                    zipped_data.extend_from_slice(value);
+                }
+                offset = zipped_data.len();
             }
-            offset = zipped_data.len();
         }
 
         debug_assert_eq!(zipped_data.len(), len);
@@ -4177,6 +4205,17 @@ impl PrimitiveStructuralEncoder {
                     // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
                 };
+            }
+
+            if let DataType::Struct(fields) = &field.data_type() {
+                if fields.is_empty() {
+                    if repdefs.iter().any(|rd| !rd.is_empty()) {
+                        return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
+                    }
+                    // This is maybe a little confusing but the reader should never look at this anyways and it
+                    // seems like overkill to invent a new layout just for "empty structs".
+                    return Self::encode_simple_all_null(column_idx, num_values, row_number);
+                }
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);

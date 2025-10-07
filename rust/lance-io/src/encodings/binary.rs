@@ -473,6 +473,7 @@ mod tests {
         types::GenericStringType, BinaryArray, GenericStringArray, LargeStringArray, StringArray,
     };
     use arrow_select::concat::concat;
+    use lance_core::utils::tempfile::TempStdFile;
 
     use crate::local::LocalObjectReader;
 
@@ -492,8 +493,7 @@ mod tests {
     }
 
     async fn test_round_trips<O: OffsetSizeTrait>(arrs: &[&GenericStringArray<O>]) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
 
         let pos = write_test_data(&path, arrs).await.unwrap();
 
@@ -555,8 +555,7 @@ mod tests {
     async fn test_range_query() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
         let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
 
         // Write some garbage to reset "tell()".
@@ -604,8 +603,7 @@ mod tests {
     async fn test_take() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
 
         let pos = write_test_data(&path, &[&data]).await.unwrap();
         let reader = LocalObjectReader::open_local_path(&path, 1024, None)
@@ -627,8 +625,7 @@ mod tests {
     async fn test_take_sparse_indices() {
         let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
         let pos = write_test_data(&path, &[&data]).await.unwrap();
         let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
@@ -657,8 +654,7 @@ mod tests {
     async fn test_take_dense_indices() {
         let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("foo");
+        let path = TempStdFile::default();
         let pos = write_test_data(&path, &[&data]).await.unwrap();
 
         let reader = LocalObjectReader::open_local_path(&path, 1024, None)
@@ -704,8 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_slice() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("slices");
+        let path = TempStdFile::default();
         let data = StringArray::from_iter_values((0..100).map(|v| format!("abcdef-{v:#03}")));
 
         let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
@@ -725,8 +720,7 @@ mod tests {
                 None
             }
         }));
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("nulls");
+        let path = TempStdFile::default();
 
         let pos = {
             let mut object_writer = tokio::fs::File::create(&path).await.unwrap();

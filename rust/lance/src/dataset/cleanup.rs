@@ -124,7 +124,7 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list().await?;
+        let tags = self.dataset.tags().list().await?;
         let tagged_versions: HashSet<u64> = tags
             .values()
             .map(|tag_content| tag_content.version)
@@ -615,7 +615,7 @@ fn tagged_old_versions_cleanup_error(
 ) -> Error {
     let unreferenced_tags: HashMap<String, u64> = tags
         .iter()
-        .filter_map(|(k, &v)| {
+        .filter_map(|(k, v)| {
             if tagged_old_versions.contains(&v.version) {
                 Some((k.clone(), v.version))
             } else {
@@ -655,7 +655,7 @@ mod tests {
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
-    use tempfile::{tempdir, TempDir};
+    use lance_core::utils::tempfile::TempStrDir;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -721,7 +721,7 @@ mod tests {
     struct MockDatasetFixture<'a> {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempDir,
+        _tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
         pub clock: MockClock<'a>,
@@ -729,12 +729,12 @@ mod tests {
 
     impl MockDatasetFixture<'_> {
         fn try_new() -> Result<Self> {
-            let tmpdir = tempdir()?;
-            // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
-            let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
+            let tmpdir = TempStrDir::default();
+            let tmpdir_path = tmpdir.as_str();
+            let dataset_path = format!("{}/my_db", tmpdir_path);
             Ok(Self {
                 _tmpdir: tmpdir,
-                dataset_path: format!("{}/my_db", tmpdir_path),
+                dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
                 clock: MockClock::new(),
             })
@@ -1029,10 +1029,10 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
 
         fixture
             .clock
@@ -1051,7 +1051,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         cleanup_error = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         let removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1080,11 +1080,11 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
-        dataset.tags.create("tag-latest", 3).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("tag-latest", 3).await.unwrap();
 
         fixture
             .clock
@@ -1101,7 +1101,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1113,7 +1113,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed.old_versions, 1);
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(

@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "0.37.0"
+version = "0.38.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.80"
@@ -21,8 +21,8 @@ lance-index = { path = "../../rust/lance-index" }
 lance-io = { path = "../../rust/lance-io" }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
-arrow = { version = "55.1", features = ["ffi"] }
-arrow-schema = "55.1"
+arrow = { version = "56.1", features = ["ffi"] }
+arrow-schema = "56.1"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
