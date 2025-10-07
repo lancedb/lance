@@ -181,3 +181,12 @@ message VectorIndex {
   // Vector distance metrics type
   VectorMetricType metric_type = 4;
 }
+
+// Scalar index details (for forward compatibility with 9-22 release)
+// These are duplicates of lance.table.* definitions but in lance.index.pb package
+// so we can decode indices created by newer releases
+message BTreeIndexDetails {}
+message BitmapIndexDetails {}
+message LabelListIndexDetails {}
+message InvertedIndexDetails {}
+message NGramIndexDetails {}

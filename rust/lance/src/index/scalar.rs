@@ -215,25 +215,48 @@ fn get_scalar_index_details(
     details: &prost_types::Any,
 ) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
     if details.type_url.ends_with("BitmapIndexDetails") {
-        Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::BitmapIndexDetails>()?,
-        )))
+        // Try old format first (lance.table.BitmapIndexDetails)
+        if let Ok(old_details) = details.to_msg::<lance_table::format::pb::BitmapIndexDetails>() {
+            return Ok(Some(Box::new(old_details)));
+        }
+        // Try new format (lance.index.pb.BitmapIndexDetails)
+        if let Ok(_new_details) = details.to_msg::<lance_index::pb::BitmapIndexDetails>() {
+            // Convert to old format for compatibility
+            return Ok(Some(Box::new(lance_table::format::pb::BitmapIndexDetails{})));
+        }
+        Ok(None)
     } else if details.type_url.ends_with("BTreeIndexDetails") {
-        Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::BTreeIndexDetails>()?,
-        )))
+        if let Ok(old_details) = details.to_msg::<lance_table::format::pb::BTreeIndexDetails>() {
+            return Ok(Some(Box::new(old_details)));
+        }
+        if let Ok(_new_details) = details.to_msg::<lance_index::pb::BTreeIndexDetails>() {
+            return Ok(Some(Box::new(lance_table::format::pb::BTreeIndexDetails{})));
+        }
+        Ok(None)
     } else if details.type_url.ends_with("LabelListIndexDetails") {
-        Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::LabelListIndexDetails>()?,
-        )))
+        if let Ok(old_details) = details.to_msg::<lance_table::format::pb::LabelListIndexDetails>() {
+            return Ok(Some(Box::new(old_details)));
+        }
+        if let Ok(_new_details) = details.to_msg::<lance_index::pb::LabelListIndexDetails>() {
+            return Ok(Some(Box::new(lance_table::format::pb::LabelListIndexDetails{})));
+        }
+        Ok(None)
     } else if details.type_url.ends_with("InvertedIndexDetails") {
-        Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::InvertedIndexDetails>()?,
-        )))
+        if let Ok(old_details) = details.to_msg::<lance_table::format::pb::InvertedIndexDetails>() {
+            return Ok(Some(Box::new(old_details)));
+        }
+        if let Ok(_new_details) = details.to_msg::<lance_index::pb::InvertedIndexDetails>() {
+            return Ok(Some(Box::new(lance_table::format::pb::InvertedIndexDetails::default())));
+        }
+        Ok(None)
     } else if details.type_url.ends_with("NGramIndexDetails") {
-        Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
-        )))
+        if let Ok(old_details) = details.to_msg::<lance_table::format::pb::NGramIndexDetails>() {
+            return Ok(Some(Box::new(old_details)));
+        }
+        if let Ok(_new_details) = details.to_msg::<lance_index::pb::NGramIndexDetails>() {
+            return Ok(Some(Box::new(lance_table::format::pb::NGramIndexDetails{})));
+        }
+        Ok(None)
     } else {
         Ok(None)
     }
