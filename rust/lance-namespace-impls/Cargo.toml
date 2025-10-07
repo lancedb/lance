@@ -1,14 +1,15 @@
 [package]
 name = "lance-namespace-impls"
-version = "0.38.1"
-edition = "2021"
-authors = ["Lance Namespace Contributors"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 description = "Lance Namespace implementations"
-license = "Apache-2.0"
-repository = "https://github.com/lancedb/lance"
-documentation = "https://docs.rs/lance-namespace-impls"
-keywords = ["lance", "namespace", "directory", "filesystem"]
-categories = ["database"]
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 
 [features]
 default = []
@@ -33,3 +34,6 @@ thiserror = "1.0"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

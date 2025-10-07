@@ -1,14 +1,15 @@
 [package]
 name = "lance-namespace"
-version = "0.38.1"
-edition = "2021"
-authors = ["Lance Namespace Contributors"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 description = "Lance Namespace Rust Client - A unified interface for managing namespaces and tables"
-license = "Apache-2.0"
-repository = "https://github.com/lancedb/lance"
-documentation = "https://docs.rs/lance-namespace"
-keywords = ["lance", "namespace", "table", "database"]
-categories = ["database"]
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
@@ -27,9 +28,12 @@ url = { workspace = true }
 arrow = { workspace = true }
 
 # Use models from the reqwest client
-lance-namespace-reqwest-client = { path = "../../../lance-namespace/rust/lance-namespace-reqwest-client", version = "0.0.17" }
+lance-namespace-reqwest-client = "0.0.16"
 
 [dev-dependencies]
 tokio = { workspace = true }
 wiremock = "0.6"
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

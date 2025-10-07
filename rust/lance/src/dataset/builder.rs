@@ -312,11 +312,7 @@ impl DatasetBuilder {
         };
 
         let params = params.unwrap_or_default();
-        let wrapper = CredentialVendingObjectStoreWrapper::new(
-            namespace,
-            table_id,
-            params,
-        );
+        let wrapper = CredentialVendingObjectStoreWrapper::new(namespace, table_id, params);
 
         // Chain with existing wrappers if any
         if let Some(existing) = self.options.object_store_wrapper {

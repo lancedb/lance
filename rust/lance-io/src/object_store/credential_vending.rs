@@ -15,7 +15,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_namespace::LanceNamespace;
-use object_store::{path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult};
+use object_store::{
+    path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult,
+};
 use snafu::location;
 
 use crate::{Error, Result};
@@ -69,7 +73,6 @@ impl CredentialsCache {
             initialized: false,
         }
     }
-
 }
 
 /// Wrapper that provides credential vending for ObjectStore
@@ -128,14 +131,12 @@ impl CredentialVendingObjectStoreWrapper {
             .namespace
             .describe_table(request)
             .await
-            .map_err(|e| {
-                Error::IO {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to refresh credentials: {}", e),
-                    )),
-                    location: location!(),
-                }
+            .map_err(|e| Error::IO {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to refresh credentials: {}", e),
+                )),
+                location: location!(),
             })?;
 
         if let Some(storage_options) = response.storage_options {
@@ -257,13 +258,12 @@ impl fmt::Display for DelegatingObjectStore {
 #[async_trait]
 impl OSObjectStore for DelegatingObjectStore {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.put(location, payload).await
     }
 
@@ -273,24 +273,22 @@ impl OSObjectStore for DelegatingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.put_multipart(location).await
     }
 
@@ -299,46 +297,42 @@ impl OSObjectStore for DelegatingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.get(location).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.get_opts(location, options).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.get_range(location, range).await
     }
 
@@ -347,35 +341,32 @@ impl OSObjectStore for DelegatingObjectStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.get_ranges(location, ranges).await
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.delete(location).await
     }
 
@@ -394,57 +385,52 @@ impl OSObjectStore for DelegatingObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.rename(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.copy_if_not_exists(from, to).await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.wrapper
-            .ensure_fresh_credentials()
-            .await
-            .map_err(|e| object_store::Error::Generic {
+        self.wrapper.ensure_fresh_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
                 store: "CredentialVending",
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         self.inner.rename_if_not_exists(from, to).await
     }
 }
@@ -517,10 +503,7 @@ mod tests {
                 "expires_at_millis".to_string(),
                 self.expires_at_millis.to_string(),
             );
-            storage_options.insert(
-                "aws_access_key_id".to_string(),
-                "test_key".to_string(),
-            );
+            storage_options.insert("aws_access_key_id".to_string(), "test_key".to_string());
 
             Ok(DescribeTableResponse {
                 version: None,
