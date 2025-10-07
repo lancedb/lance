@@ -47,7 +47,7 @@ lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
-libc.workspace = true
+libc = "0.2.176"
 log = "0.4"
 prost = "0.13"
 prost-types = "0.13"
