@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Lance Namespace Rust Client
 //!
 //! A Rust client for the Lance Namespace API that provides a unified interface

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Directory-based Lance Namespace implementation.
 //!
 //! This module provides a directory-based implementation of the Lance namespace

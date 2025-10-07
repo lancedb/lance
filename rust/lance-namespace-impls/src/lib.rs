@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Lance Namespace implementations.
 //!
 //! This crate provides various implementations of the Lance Namespace trait.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Lance Namespace base interface and implementations.
 
 use async_trait::async_trait;

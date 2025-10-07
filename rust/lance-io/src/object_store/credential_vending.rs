@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Credential vending object store wrapper
 //!
 //! This module provides an ObjectStore wrapper that automatically refreshes
@@ -160,16 +163,15 @@ impl CredentialVendingObjectStoreWrapper {
             .describe_table(request)
             .await
             .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to refresh credentials: {}", e),
-                )),
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to refresh credentials: {}",
+                    e
+                ))),
                 location: location!(),
             })?;
 
         let storage_options = response.storage_options.ok_or_else(|| Error::IO {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            source: Box::new(std::io::Error::other(
                 "storage_options not found in describe_table response",
             )),
             location: location!(),
@@ -179,8 +181,7 @@ impl CredentialVendingObjectStoreWrapper {
             .get("expires_at_millis")
             .and_then(|s| s.parse::<u64>().ok())
             .ok_or_else(|| Error::IO {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                source: Box::new(std::io::Error::other(
                     "expires_at_millis is required in storage_options",
                 )),
                 location: location!(),

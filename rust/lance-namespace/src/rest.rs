@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! REST implementation of Lance Namespace
 
 use std::collections::HashMap;
@@ -53,8 +56,7 @@ impl RestNamespaceConfig {
 
         let mut additional_headers = HashMap::new();
         for (key, value) in &properties {
-            if key.starts_with(Self::HEADER_PREFIX) {
-                let header_name = &key[Self::HEADER_PREFIX.len()..];
+            if let Some(header_name) = key.strip_prefix(Self::HEADER_PREFIX) {
                 additional_headers.insert(header_name.to_string(), value.clone());
             }
         }
@@ -95,10 +97,7 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
 fn convert_api_error<T: std::fmt::Debug>(err: crate::apis::Error<T>) -> NamespaceError {
     use crate::apis::Error;
     match err {
-        Error::Reqwest(e) => NamespaceError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        )),
+        Error::Reqwest(e) => NamespaceError::Io(std::io::Error::other(e.to_string())),
         Error::Serde(e) => NamespaceError::Other(format!("Serialization error: {}", e)),
         Error::Io(e) => NamespaceError::Io(e),
         Error::ResponseError(e) => NamespaceError::Other(format!("Response error: {:?}", e)),
@@ -477,12 +476,10 @@ impl LanceNamespace for RestNamespace {
         .map_err(convert_api_error)?;
 
         // Convert response to bytes
-        let bytes = response.bytes().await.map_err(|e| {
-            NamespaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| NamespaceError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(bytes)
     }
@@ -602,8 +599,7 @@ mod tests {
 
         let _namespace = RestNamespace::new(properties);
 
-        // Successfully created the namespace
-        assert!(true);
+        // Successfully created the namespace - test passes if no panic
     }
 
     #[tokio::test]
@@ -659,8 +655,7 @@ mod tests {
         let properties = HashMap::new();
         let _namespace = RestNamespace::new(properties);
 
-        // The default delimiter should be "." as per the Java implementation
-        assert!(true);
+        // The default delimiter should be "." - test passes if no panic
     }
 
     #[test]
@@ -669,7 +664,7 @@ mod tests {
         properties.insert("uri".to_string(), "https://api.example.com/v1".to_string());
 
         let _namespace = RestNamespace::new(properties);
-        assert!(true);
+        // Test passes if no panic
     }
 
     #[tokio::test]

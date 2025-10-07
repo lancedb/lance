@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "Lance Namespace implementations"
 keywords.workspace = true
 categories.workspace = true

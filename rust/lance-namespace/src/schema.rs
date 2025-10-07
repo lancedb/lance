@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Schema conversion utilities for Lance Namespace.
 //!
 //! This module provides functions to convert between JsonArrow schema representations
@@ -13,13 +16,13 @@ pub fn convert_json_arrow_schema(json_schema: &JsonArrowSchema) -> Result<ArrowS
     let fields: Result<Vec<Field>> = json_schema
         .fields
         .iter()
-        .map(|f| convert_json_arrow_field(f))
+        .map(convert_json_arrow_field)
         .collect();
 
     let metadata = json_schema
         .metadata
         .as_ref()
-        .map(|m| m.clone())
+        .cloned()
         .unwrap_or_default();
 
     Ok(ArrowSchema::new_with_metadata(fields?, metadata))

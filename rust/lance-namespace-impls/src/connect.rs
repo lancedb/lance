@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Connect functionality for Lance Namespace implementations.
 
 use std::collections::HashMap;
