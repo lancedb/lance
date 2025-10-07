@@ -45,6 +45,7 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
+libc = "0.2.176"
 lance = { version = "=0.38.1", path = "./rust/lance" }
 lance-arrow = { version = "=0.38.1", path = "./rust/lance-arrow" }
 lance-core = { version = "=0.38.1", path = "./rust/lance-core" }

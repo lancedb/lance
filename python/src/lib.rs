@@ -157,11 +157,17 @@ extern "C" fn atfork_child() {
     RT.store(std::ptr::null_mut(), Ordering::SeqCst);
 }
 
+#[cfg(not(windows))]
 fn install_atfork() {
     let result = unsafe {
         libc::pthread_atfork(None, None, Some(atfork_child))
     };
     assert_eq!(result, 0, "pthread_atfork failed");
+}
+
+#[cfg(windows)]
+fn install_atfork() {
+    // Do nothing on Windows.
 }
 
 pub fn init_logging(mut log_builder: Builder) {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::LazyLock;
+use std::sync::atomic::Ordering;
+use std::sync::{atomic, LazyLock};
 use std::time::Duration;
 
 use crate::Result;
@@ -50,7 +51,7 @@ pub static IO_CORE_RESERVATION: LazyLock<usize> = LazyLock::new(|| {
         .unwrap()
 });
 
-pub static CPU_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+fn create_runtime() -> Runtime {
     Builder::new_multi_thread()
         .thread_name("lance-cpu")
         .max_blocking_threads(get_num_compute_intensive_cpus())
@@ -59,7 +60,58 @@ pub static CPU_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .thread_keep_alive(Duration::from_secs(u64::MAX))
         .build()
         .unwrap()
-});
+}
+
+// TODO: make this runtime configurable (e.g. num threads)
+static CPU_RUNTIME: atomic::AtomicPtr<Runtime> = atomic::AtomicPtr::new(std::ptr::null_mut());
+
+static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+/// Get the current global executor object.
+pub fn global_cpu_runtime() -> &'static mut Runtime {
+    let ptr = CPU_RUNTIME.load(Ordering::SeqCst);
+    if !ptr.is_null() {
+        return unsafe { &mut *ptr }
+    }
+    if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+        install_atfork();
+    }
+    let new_ptr = Box::into_raw(Box::new(create_runtime()));
+    match CPU_RUNTIME.compare_exchange(
+        std::ptr::null_mut(),
+        new_ptr,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => {
+            unsafe { &mut *new_ptr }
+        },
+        Err(racing_ptr) => unsafe {
+            // Another thread already installed a Runtime object. Drop our new Runtime, which
+            // is no longer needed.
+            drop(Box::from_raw(new_ptr));
+            &mut *racing_ptr
+        },
+    }
+}
+
+/// Handle the process forking.
+extern "C" fn atfork_tokio_child() {
+    CPU_RUNTIME.store(std::ptr::null_mut(), Ordering::SeqCst);
+}
+
+#[cfg(not(windows))]
+fn install_atfork() {
+    let result = unsafe {
+        libc::pthread_atfork(None, None, Some(atfork_tokio_child))
+    };
+    assert_eq!(result, 0, "pthread_atfork failed");
+}
+
+#[cfg(windows)]
+fn install_atfork() {
+    // Do nothing on Windows.
+}
 
 /// Spawn a CPU intensive task
 ///
@@ -75,7 +127,7 @@ pub fn spawn_cpu<F: FnOnce() -> Result<R> + Send + 'static, R: Send + 'static>(
     let (send, recv) = tokio::sync::oneshot::channel();
     // Propagate the current span into the task
     let span = Span::current();
-    CPU_RUNTIME.spawn_blocking(move || {
+    global_cpu_runtime().spawn_blocking(move || {
         let _span_guard = span.enter();
         let result = func();
         let _ = send.send(result);
