@@ -119,6 +119,8 @@ impl ScopedFragmentRead {
         FragReadConfig::default()
             .with_row_id(self.with_deleted_rows || self.projection.with_row_id)
             .with_row_address(self.projection.with_row_addr)
+            .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
+            .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
             .with_reader_priority(self.priority)
     }

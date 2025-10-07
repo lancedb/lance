@@ -9,6 +9,7 @@ mod fragment;
 mod index;
 mod manifest;
 
+pub use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence};
 pub use fragment::*;
 pub use index::IndexMetadata;
 
