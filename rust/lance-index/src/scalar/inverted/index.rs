@@ -82,7 +82,7 @@ use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
-// Version 1: Fst TokenSetFormat (new default, incompatible with old clients)
+// Version 1: Fst TokenSetFormat (new default, incompatible clients < 0.38)
 pub const INVERTED_INDEX_VERSION: u32 = 1;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
