@@ -71,7 +71,7 @@ static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 pub fn global_cpu_runtime() -> &'static mut Runtime {
     let ptr = CPU_RUNTIME.load(Ordering::SeqCst);
     if !ptr.is_null() {
-        return unsafe { &mut *ptr }
+        return unsafe { &mut *ptr };
     }
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();
@@ -83,9 +83,7 @@ pub fn global_cpu_runtime() -> &'static mut Runtime {
         Ordering::SeqCst,
         Ordering::SeqCst,
     ) {
-        Ok(_) => {
-            unsafe { &mut *new_ptr }
-        },
+        Ok(_) => unsafe { &mut *new_ptr },
         Err(racing_ptr) => unsafe {
             // Another thread already installed a Runtime object. Drop our new Runtime, which
             // is no longer needed.
@@ -102,9 +100,7 @@ extern "C" fn atfork_tokio_child() {
 
 #[cfg(not(windows))]
 fn install_atfork() {
-    let result = unsafe {
-        libc::pthread_atfork(None, None, Some(atfork_tokio_child))
-    };
+    let result = unsafe { libc::pthread_atfork(None, None, Some(atfork_tokio_child)) };
     assert_eq!(result, 0, "pthread_atfork failed");
 }
 
