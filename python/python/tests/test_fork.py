@@ -6,6 +6,7 @@ import lance
 import os
 import pyarrow as pa
 import pyarrow.compute as pc
+import pytest
 
 N_DIMS = 768
 NUM_ROWS = 100_000
