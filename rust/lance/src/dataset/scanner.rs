@@ -3739,10 +3739,10 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, Int64Array, LargeStringArray,
-        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
+        RecordBatchIterator, StringArray, StructArray,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::Fields;
     use arrow_select::take;
