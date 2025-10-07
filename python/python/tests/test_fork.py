@@ -12,6 +12,7 @@ N_DIMS = 768
 NUM_ROWS = 100_000
 NEW_ROWS = 10_000
 
+
 def create_table(num_rows) -> pa.Table:
     return pa.table(
         {
@@ -19,6 +20,7 @@ def create_table(num_rows) -> pa.Table:
             "b": pa.array(range(0, num_rows)),
         }
     )
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Test not applicable on Windows")
 def test_table_roundtrip(tmp_path: Path):
