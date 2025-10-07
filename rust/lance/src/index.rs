@@ -889,7 +889,7 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
-fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
     indices.retain(|idx| {
         let max_supported_version = idx
             .index_details

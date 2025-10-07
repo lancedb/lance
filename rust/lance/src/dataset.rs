@@ -122,6 +122,7 @@ pub use write::{
     write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder,
     WriteDestination, WriteMode, WriteParams,
 };
+use crate::index::retain_supported_indices;
 
 const INDICES_DIR: &str = "_indices";
 

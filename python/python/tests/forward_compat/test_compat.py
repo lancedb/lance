@@ -109,6 +109,8 @@ def test_pq_buffer():
     reason="FTS token set format was introduced in 0.36.0",
 )
 def test_list_indices_ignores_new_fts_index_version():
+    # Dataset::load_manifest does not do retain_supported_indices
+    # so this can only work with no cache
     session = lance.Session(index_cache_size_bytes=0, metadata_cache_size_bytes=0)
     ds = lance.dataset(get_path("fts_index"), session=session)
     indices = ds.list_indices()
