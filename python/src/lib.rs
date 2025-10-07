@@ -26,7 +26,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{self, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use std::ffi::CString;
 
@@ -114,14 +114,14 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn create_background_executor() {
+fn create_background_executor() -> BackgroundExecutor {
     // TODO: make this runtime configurable (e.g. num threads)
     BackgroundExecutor::new()
 }
 
 static BACKGROUND_EXECUTOR: atomic::AtomicPtr<BackgroundExecutor> = atomic::AtomicPtr::new(std::ptr::null_mut());
 
-static RUNTIME_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
