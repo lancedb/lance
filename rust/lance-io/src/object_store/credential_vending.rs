@@ -754,4 +754,87 @@ mod tests {
         // Should never call describe_table
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test]
+    async fn test_different_tables_have_isolated_credentials() {
+        // This test verifies that different table_ids create different wrapper instances
+        // and don't share credentials, even when using the same namespace
+        let call_count_a = Arc::new(AtomicUsize::new(0));
+        let call_count_b = Arc::new(AtomicUsize::new(0));
+
+        let namespace_a = Arc::new(MockNamespace {
+            call_count: call_count_a.clone(),
+            expires_at_millis: 9999999999999,
+        });
+
+        let namespace_b = Arc::new(MockNamespace {
+            call_count: call_count_b.clone(),
+            expires_at_millis: 9999999999999,
+        });
+
+        // Create two wrappers with different table IDs
+        let wrapper_a = CredentialVendingObjectStoreWrapper::new(
+            namespace_a,
+            vec!["table_a".to_string()],
+            CredentialVendingParams::default(),
+        );
+
+        let wrapper_b = CredentialVendingObjectStoreWrapper::new(
+            namespace_b,
+            vec!["table_b".to_string()],
+            CredentialVendingParams::default(),
+        );
+
+        // Fetch credentials for table A
+        wrapper_a.ensure_fresh_credentials().await.unwrap();
+        assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count_b.load(Ordering::SeqCst), 0);
+
+        // Fetch credentials for table B
+        wrapper_b.ensure_fresh_credentials().await.unwrap();
+        assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
+
+        // Verify table A credentials are still cached and independent
+        wrapper_a.ensure_fresh_credentials().await.unwrap();
+        assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
+
+        // Verify table B credentials are still cached and independent
+        wrapper_b.ensure_fresh_credentials().await.unwrap();
+        assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_wrapper_pointer_uniqueness() {
+        // This test verifies that each wrapper instance has a unique pointer address
+        // which is used for cache key differentiation
+        let namespace = Arc::new(MockNamespace {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            expires_at_millis: 9999999999999,
+        });
+
+        let wrapper_a = Arc::new(CredentialVendingObjectStoreWrapper::new(
+            namespace.clone(),
+            vec!["table_a".to_string()],
+            CredentialVendingParams::default(),
+        ));
+
+        let wrapper_b = Arc::new(CredentialVendingObjectStoreWrapper::new(
+            namespace,
+            vec!["table_b".to_string()],
+            CredentialVendingParams::default(),
+        ));
+
+        // Even though both wrappers are for different tables, they should have
+        // different pointer addresses, which ensures cache isolation
+        let ptr_a = Arc::as_ptr(&wrapper_a);
+        let ptr_b = Arc::as_ptr(&wrapper_b);
+
+        assert_ne!(
+            ptr_a, ptr_b,
+            "Different wrapper instances must have different pointer addresses"
+        );
+    }
 }

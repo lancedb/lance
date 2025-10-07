@@ -102,17 +102,13 @@ impl DatasetBuilder {
         let response = namespace
             .describe_table(request)
             .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to describe table from namespace: {}", e),
-                )),
+            .map_err(|e| Error::Namespace {
+                source: Box::new(e),
                 location: location!(),
             })?;
 
-        let table_uri = response.location.ok_or_else(|| Error::IO {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
+        let table_uri = response.location.ok_or_else(|| Error::Namespace {
+            source: Box::new(std::io::Error::other(
                 "Table location not found in namespace response",
             )),
             location: location!(),
