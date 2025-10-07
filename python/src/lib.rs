@@ -55,13 +55,13 @@ use file::{
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
+use libc;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-use libc;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -119,7 +119,8 @@ fn create_background_executor() -> BackgroundExecutor {
     BackgroundExecutor::new()
 }
 
-static BACKGROUND_EXECUTOR: atomic::AtomicPtr<BackgroundExecutor> = atomic::AtomicPtr::new(std::ptr::null_mut());
+static BACKGROUND_EXECUTOR: atomic::AtomicPtr<BackgroundExecutor> =
+    atomic::AtomicPtr::new(std::ptr::null_mut());
 
 static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
@@ -129,7 +130,7 @@ pub fn RT() -> &'static mut BackgroundExecutor {
     loop {
         let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            return unsafe { &mut *ptr }
+            return unsafe { &mut *ptr };
         }
         if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
@@ -155,7 +156,7 @@ fn install_atfork() {
 }
 
 #[cfg(windows)]
-fn install_atfork() { }
+fn install_atfork() {}
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();

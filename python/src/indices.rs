@@ -26,7 +26,7 @@ use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
 use crate::{
-    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT
+    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
