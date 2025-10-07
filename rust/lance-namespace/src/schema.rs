@@ -19,11 +19,7 @@ pub fn convert_json_arrow_schema(json_schema: &JsonArrowSchema) -> Result<ArrowS
         .map(convert_json_arrow_field)
         .collect();
 
-    let metadata = json_schema
-        .metadata
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
+    let metadata = json_schema.metadata.as_ref().cloned().unwrap_or_default();
 
     Ok(ArrowSchema::new_with_metadata(fields?, metadata))
 }
