@@ -19,6 +19,7 @@ def create_table(num_rows) -> pa.Table:
         }
     )
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Test not applicable on Windows")
 def test_table_roundtrip(tmp_path: Path):
     uri = tmp_path
 
@@ -36,3 +37,4 @@ def test_table_roundtrip(tmp_path: Path):
 
     table = dataset.to_table(columns=["a"], limit=20)
     assert len(table) == 20
+
