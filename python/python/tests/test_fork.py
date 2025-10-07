@@ -38,4 +38,3 @@ def test_table_roundtrip(tmp_path: Path):
 
     table = dataset.to_table(columns=["a"], limit=20)
     assert len(table) == 20
-
