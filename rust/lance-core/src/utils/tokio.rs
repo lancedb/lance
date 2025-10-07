@@ -84,7 +84,7 @@ fn global_cpu_runtime() -> &'static mut Runtime {
     }
     let new_ptr = Box::into_raw(Box::new(create_runtime()));
     CPU_RUNTIME.store(new_ptr, Ordering::SeqCst);
-    unsafe { &mut *new_ptr };
+    unsafe { &mut *new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
