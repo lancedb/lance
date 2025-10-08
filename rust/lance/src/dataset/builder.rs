@@ -127,7 +127,12 @@ impl DatasetBuilder {
             params
         };
 
-        builder = builder.with_credential_vending(namespace, table_id, params);
+        // Create LanceNamespaceCredentialVendor and add to builder
+        let vendor = lance_io::object_store::LanceNamespaceCredentialVendor::new(
+            namespace,
+            table_id,
+        );
+        builder = builder.with_credential_vending(Arc::new(vendor), params);
 
         Ok(builder)
     }
@@ -279,37 +284,35 @@ impl DatasetBuilder {
     ///
     /// # Example
     /// ```ignore
+    /// use std::sync::Arc;
     /// use lance_namespace_impls::connect;
-    /// use lance_io::object_store::CredentialVendingParams;
+    /// use lance_io::object_store::{CredentialVendor, LanceNamespaceCredentialVendor, CredentialVendingParams};
     ///
     /// let namespace = connect("rest", properties).await?;
+    ///
+    /// // Create a credential vendor from namespace
+    /// let vendor = Arc::new(LanceNamespaceCredentialVendor::new(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    /// ));
     ///
     /// // With custom params
     /// let params = CredentialVendingParams::new()
     ///     .with_refresh_lead_time_ms(300_000); // 5 minutes
     /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
-    ///     .with_credential_vending(
-    ///         namespace.clone(),
-    ///         vec!["my_table".to_string()],
-    ///         Some(params),
-    ///     )
+    ///     .with_credential_vending(vendor.clone(), Some(params))
     ///     .load()
     ///     .await?;
     ///
     /// // With default params
     /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
-    ///     .with_credential_vending(
-    ///         namespace,
-    ///         vec!["my_table".to_string()],
-    ///         None,
-    ///     )
+    ///     .with_credential_vending(vendor, None)
     ///     .load()
     ///     .await?;
     /// ```
     pub fn with_credential_vending(
         mut self,
-        namespace: Arc<dyn lance_namespace::LanceNamespace>,
-        table_id: Vec<String>,
+        vendor: Arc<dyn lance_io::object_store::CredentialVendor>,
         params: Option<lance_io::object_store::CredentialVendingParams>,
     ) -> Self {
         use lance_io::object_store::{
@@ -317,7 +320,7 @@ impl DatasetBuilder {
         };
 
         let params = params.unwrap_or_default();
-        let wrapper = CredentialVendingObjectStoreWrapper::new(namespace, table_id, params);
+        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
 
         // Chain with existing wrappers if any
         if let Some(existing) = self.options.object_store_wrapper {

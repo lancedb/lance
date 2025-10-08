@@ -68,6 +68,7 @@ pub(crate) mod datagen;
 pub(crate) mod dataset;
 pub(crate) mod debug;
 pub(crate) mod error;
+pub(crate) mod credential_vending;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
@@ -81,6 +82,7 @@ pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
+use crate::credential_vending::PyCredentialVendor;
 use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
@@ -256,6 +258,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<PyCredentialVendor>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;

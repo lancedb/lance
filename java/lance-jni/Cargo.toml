@@ -30,6 +30,8 @@ tokio = { version = "1.23", features = [
     "fs",
     "sync",
 ] }
+async-trait = "0.1"
+snafu = "0.8"
 jni = "0.21.1"
 serde_json = { version = "1" }
 log = "0.4"

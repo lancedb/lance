@@ -29,6 +29,83 @@ use crate::{Error, Result};
 
 use super::WrappingObjectStore;
 
+/// Trait for providing credentials with expiration tracking
+///
+/// Implementations can fetch credentials from various sources (namespace servers,
+/// credential vending machines, etc.) and are usable from Python/Java via FFI.
+#[async_trait]
+pub trait CredentialVendor: Send + Sync {
+    /// Fetch fresh credentials
+    ///
+    /// Returns a tuple of (storage_options, expires_at_millis)
+    /// where storage_options is a map of credential key-value pairs
+    /// and expires_at_millis is the epoch time in milliseconds when credentials expire
+    async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)>;
+}
+
+/// CredentialVendor implementation that fetches credentials from a LanceNamespace
+pub struct LanceNamespaceCredentialVendor {
+    namespace: Arc<dyn LanceNamespace>,
+    table_id: Vec<String>,
+}
+
+impl LanceNamespaceCredentialVendor {
+    /// Create a new LanceNamespaceCredentialVendor
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace implementation to fetch credentials from
+    /// * `table_id` - The table identifier
+    pub fn new(namespace: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
+        Self {
+            namespace,
+            table_id,
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialVendor for LanceNamespaceCredentialVendor {
+    async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)> {
+        use lance_namespace::models::DescribeTableRequest;
+
+        let request = DescribeTableRequest {
+            id: Some(self.table_id.clone()),
+            version: None,
+        };
+
+        let response = self
+            .namespace
+            .describe_table(request)
+            .await
+            .map_err(|e| Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to fetch credentials: {}",
+                    e
+                ))),
+                location: location!(),
+            })?;
+
+        let storage_options = response.storage_options.ok_or_else(|| Error::IO {
+            source: Box::new(std::io::Error::other(
+                "storage_options not found in describe_table response",
+            )),
+            location: location!(),
+        })?;
+
+        let expires_at_millis = storage_options
+            .get("expires_at_millis")
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| Error::IO {
+                source: Box::new(std::io::Error::other(
+                    "expires_at_millis is required in storage_options",
+                )),
+                location: location!(),
+            })?;
+
+        Ok((storage_options, expires_at_millis))
+    }
+}
+
 /// Configuration parameters for credential vending
 #[derive(Debug, Clone)]
 pub struct CredentialVendingParams {
@@ -91,12 +168,11 @@ impl CredentialsCache {
 
 /// Wrapper that provides credential vending for ObjectStore
 ///
-/// This wrapper automatically refreshes credentials from a LanceNamespace
+/// This wrapper automatically refreshes credentials from a CredentialVendor
 /// implementation before they expire.
 #[derive(Clone)]
 pub struct CredentialVendingObjectStoreWrapper {
-    namespace: Arc<dyn LanceNamespace>,
-    table_id: Vec<String>,
+    vendor: Arc<dyn CredentialVendor>,
     params: CredentialVendingParams,
     credentials: Arc<RwLock<CredentialsCache>>,
     refresh_lock: Arc<Mutex<()>>,
@@ -105,7 +181,6 @@ pub struct CredentialVendingObjectStoreWrapper {
 impl fmt::Debug for CredentialVendingObjectStoreWrapper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CredentialVendingObjectStoreWrapper")
-            .field("table_id", &self.table_id)
             .field("params", &self.params)
             .finish()
     }
@@ -115,14 +190,9 @@ impl CredentialVendingObjectStoreWrapper {
     /// Create a new credential vending wrapper
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch credentials from
-    /// * `table_id` - The table identifier
+    /// * `vendor` - The credential vendor implementation to fetch credentials from
     /// * `params` - Configuration parameters for credential vending
-    pub fn new(
-        namespace: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-        params: CredentialVendingParams,
-    ) -> Self {
+    pub fn new(vendor: Arc<dyn CredentialVendor>, params: CredentialVendingParams) -> Self {
         let credentials = if let Some(initial_options) = &params.initial_storage_options {
             // Initialize with provided credentials - expires_at_millis is required
             let expires_at_millis = initial_options
@@ -141,51 +211,16 @@ impl CredentialVendingObjectStoreWrapper {
         };
 
         Self {
-            namespace,
-            table_id,
+            vendor,
             params,
             credentials,
             refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Refresh credentials from the namespace
+    /// Refresh credentials from the vendor
     async fn refresh_credentials(&self) -> Result<()> {
-        use lance_namespace::models::DescribeTableRequest;
-
-        let request = DescribeTableRequest {
-            id: Some(self.table_id.clone()),
-            version: None,
-        };
-
-        let response = self
-            .namespace
-            .describe_table(request)
-            .await
-            .map_err(|e| Error::IO {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to refresh credentials: {}",
-                    e
-                ))),
-                location: location!(),
-            })?;
-
-        let storage_options = response.storage_options.ok_or_else(|| Error::IO {
-            source: Box::new(std::io::Error::other(
-                "storage_options not found in describe_table response",
-            )),
-            location: location!(),
-        })?;
-
-        let expires_at_millis = storage_options
-            .get("expires_at_millis")
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| Error::IO {
-                source: Box::new(std::io::Error::other(
-                    "expires_at_millis is required in storage_options",
-                )),
-                location: location!(),
-            })?;
+        let (storage_options, expires_at_millis) = self.vendor.get_credentials().await?;
 
         let mut cache = self.credentials.write().unwrap();
         cache.storage_options = storage_options;
@@ -283,7 +318,7 @@ impl fmt::Debug for DelegatingObjectStore {
 
 impl fmt::Display for DelegatingObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DelegatingObjectStore({:?})", self.wrapper.table_id)
+        write!(f, "DelegatingObjectStore(CredentialVending)")
     }
 }
 
@@ -474,7 +509,30 @@ mod tests {
     use lance_namespace::NamespaceError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Mock namespace for testing
+    // Mock credential vendor for testing
+    struct MockCredentialVendor {
+        call_count: Arc<AtomicUsize>,
+        expires_at_millis: u64,
+    }
+
+    #[async_trait]
+    impl CredentialVendor for MockCredentialVendor {
+        async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+
+            let mut storage_options = HashMap::new();
+            storage_options.insert(
+                "expires_at_millis".to_string(),
+                self.expires_at_millis.to_string(),
+            );
+            storage_options.insert("aws_access_key_id".to_string(), "test_key".to_string());
+
+            Ok((storage_options, self.expires_at_millis))
+        }
+    }
+
+    // Mock namespace for LanceNamespaceCredentialVendor integration tests
+    #[allow(dead_code)]
     struct MockNamespace {
         call_count: Arc<AtomicUsize>,
         expires_at_millis: u64,
@@ -677,17 +735,13 @@ mod tests {
             .as_millis() as u64;
 
         let call_count = Arc::new(AtomicUsize::new(0));
-        let namespace = Arc::new(MockNamespace {
+        let vendor = Arc::new(MockCredentialVendor {
             call_count: call_count.clone(),
             expires_at_millis: now_millis + 1000, // Expires in 1 second
         });
 
         let params = CredentialVendingParams::new().with_refresh_lead_time_ms(2000);
-        let wrapper = CredentialVendingObjectStoreWrapper::new(
-            namespace,
-            vec!["test_table".to_string()],
-            params,
-        );
+        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
 
         // Should trigger refresh since we're within lead time
         wrapper.ensure_fresh_credentials().await.unwrap();
@@ -701,17 +755,13 @@ mod tests {
     #[tokio::test]
     async fn test_no_expiration() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let namespace = Arc::new(MockNamespace {
+        let vendor = Arc::new(MockCredentialVendor {
             call_count: call_count.clone(),
             expires_at_millis: 0, // Invalid, will be ignored
         });
 
         let params = CredentialVendingParams::default();
-        let wrapper = CredentialVendingObjectStoreWrapper::new(
-            namespace,
-            vec!["test_table".to_string()],
-            params,
-        );
+        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
 
         // First call should still refresh to get initial credentials
         wrapper.ensure_fresh_credentials().await.unwrap();
@@ -727,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn test_initial_storage_options() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let namespace = Arc::new(MockNamespace {
+        let vendor = Arc::new(MockCredentialVendor {
             call_count: call_count.clone(),
             expires_at_millis: 0,
         });
@@ -740,67 +790,57 @@ mod tests {
         let params =
             CredentialVendingParams::default().with_initial_storage_options(initial_options);
 
-        let wrapper = CredentialVendingObjectStoreWrapper::new(
-            namespace,
-            vec!["test_table".to_string()],
-            params,
-        );
+        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
 
-        // Should not call describe_table since we have initial credentials
+        // Should not call get_credentials since we have initial credentials
         wrapper.ensure_fresh_credentials().await.unwrap();
         wrapper.ensure_fresh_credentials().await.unwrap();
         wrapper.ensure_fresh_credentials().await.unwrap();
 
-        // Should never call describe_table
+        // Should never call get_credentials
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn test_different_tables_have_isolated_credentials() {
-        // This test verifies that different table_ids create different wrapper instances
-        // and don't share credentials, even when using the same namespace
+        // This test verifies that different vendors create different wrapper instances
+        // and don't share credentials
         let call_count_a = Arc::new(AtomicUsize::new(0));
         let call_count_b = Arc::new(AtomicUsize::new(0));
 
-        let namespace_a = Arc::new(MockNamespace {
+        let vendor_a = Arc::new(MockCredentialVendor {
             call_count: call_count_a.clone(),
             expires_at_millis: 9999999999999,
         });
 
-        let namespace_b = Arc::new(MockNamespace {
+        let vendor_b = Arc::new(MockCredentialVendor {
             call_count: call_count_b.clone(),
             expires_at_millis: 9999999999999,
         });
 
-        // Create two wrappers with different table IDs
-        let wrapper_a = CredentialVendingObjectStoreWrapper::new(
-            namespace_a,
-            vec!["table_a".to_string()],
-            CredentialVendingParams::default(),
-        );
+        // Create two wrappers with different vendors
+        let wrapper_a =
+            CredentialVendingObjectStoreWrapper::new(vendor_a, CredentialVendingParams::default());
 
-        let wrapper_b = CredentialVendingObjectStoreWrapper::new(
-            namespace_b,
-            vec!["table_b".to_string()],
-            CredentialVendingParams::default(),
-        );
+        let wrapper_b =
+            CredentialVendingObjectStoreWrapper::new(vendor_b, CredentialVendingParams::default());
 
-        // Fetch credentials for table A
+        // Fetch credentials for wrapper A
         wrapper_a.ensure_fresh_credentials().await.unwrap();
         assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
         assert_eq!(call_count_b.load(Ordering::SeqCst), 0);
 
-        // Fetch credentials for table B
+        // Fetch credentials for wrapper B
         wrapper_b.ensure_fresh_credentials().await.unwrap();
         assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
         assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
 
-        // Verify table A credentials are still cached and independent
+        // Verify wrapper A credentials are still cached and independent
         wrapper_a.ensure_fresh_credentials().await.unwrap();
         assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
         assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
 
-        // Verify table B credentials are still cached and independent
+        // Verify wrapper B credentials are still cached and independent
         wrapper_b.ensure_fresh_credentials().await.unwrap();
         assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
         assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
@@ -810,24 +850,22 @@ mod tests {
     fn test_wrapper_pointer_uniqueness() {
         // This test verifies that each wrapper instance has a unique pointer address
         // which is used for cache key differentiation
-        let namespace = Arc::new(MockNamespace {
+        let vendor = Arc::new(MockCredentialVendor {
             call_count: Arc::new(AtomicUsize::new(0)),
             expires_at_millis: 9999999999999,
         });
 
         let wrapper_a = Arc::new(CredentialVendingObjectStoreWrapper::new(
-            namespace.clone(),
-            vec!["table_a".to_string()],
+            vendor.clone(),
             CredentialVendingParams::default(),
         ));
 
         let wrapper_b = Arc::new(CredentialVendingObjectStoreWrapper::new(
-            namespace,
-            vec!["table_b".to_string()],
+            vendor,
             CredentialVendingParams::default(),
         ));
 
-        // Even though both wrappers are for different tables, they should have
+        // Even though both wrappers use the same vendor, they should have
         // different pointer addresses, which ensures cache isolation
         let ptr_a = Arc::as_ptr(&wrapper_a);
         let ptr_b = Arc::as_ptr(&wrapper_b);

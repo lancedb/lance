@@ -61,7 +61,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
-pub use credential_vending::{CredentialVendingObjectStoreWrapper, CredentialVendingParams};
+pub use credential_vending::{
+    CredentialVendingObjectStoreWrapper, CredentialVendingParams, CredentialVendor,
+    LanceNamespaceCredentialVendor,
+};
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 
 #[async_trait]

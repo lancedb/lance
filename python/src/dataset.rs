@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::credential_vending::PyCredentialVendor;
 use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
@@ -449,7 +450,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, credential_vendor=None))]
     fn new(
         py: Python,
         uri: String,
@@ -464,6 +465,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
+        credential_vendor: Option<PyCredentialVendor>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -550,7 +552,13 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        let dataset = rt().block_on(Some(py), builder.load())?;
+        if let Some(credential_vendor) = credential_vendor {
+            use crate::credential_vending::py_credential_vendor_to_arc;
+            let vendor_arc = py_credential_vendor_to_arc(credential_vendor);
+            builder = builder.with_credential_vending(vendor_arc, None);
+        }
+
+        let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
