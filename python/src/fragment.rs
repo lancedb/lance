@@ -39,7 +39,7 @@ use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{Dataset, Scanner, rt};
+use crate::{rt, Dataset, Scanner};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]

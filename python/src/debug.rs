@@ -7,7 +7,7 @@ use lance::{datatypes::Schema, Error};
 use lance_table::format::{DeletionFile, Fragment};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{utils::PyLance, Dataset, rt};
+use crate::{rt, utils::PyLance, Dataset};
 
 /// Format the Lance schema of a dataset as a string.
 ///

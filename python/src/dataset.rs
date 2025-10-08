@@ -87,11 +87,11 @@ use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::PyIndexConfig;
+use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
 use crate::utils::PyLance;
-use crate::rt;
 use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
