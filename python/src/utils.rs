@@ -41,7 +41,7 @@ use pyo3::{
 };
 
 use crate::file::object_store_from_uri_or_path;
-use crate::RT;
+use crate::rt;
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -209,7 +209,7 @@ impl Hnsw {
         let dt = DistanceType::try_from(distance_type)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        let hnsw = RT()
+        let hnsw = rt()
             .runtime
             .block_on(params.build(vectors.clone(), dt))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -219,8 +219,8 @@ impl Hnsw {
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
         let (object_store, path) =
-            RT().block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
-        let mut writer = RT()
+            rt().block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
+        let mut writer = rt()
             .block_on(
                 Some(py),
                 FileWriter::<ManifestDescribing>::try_new(
@@ -232,7 +232,7 @@ impl Hnsw {
                 ),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        RT().block_on(Some(py), async {
+        rt().block_on(Some(py), async {
             let batch = self.hnsw.to_batch()?;
             let metadata = batch.schema_ref().metadata().clone();
             writer.write_record_batch(batch).await?;
