@@ -149,21 +149,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             Ok((new_uuid, 1, created_index))
         }
         it if it.is_vector() => {
-            let start_pos = old_indices
-                .len()
-                .saturating_sub(options.num_indices_to_merge);
-            let indices_to_merge = &old_indices[start_pos..];
-
-            // If there's nothing to do (no unindexed fragments and at most 1 index to "merge"),
-            // we can skip creating a new index. Merging a single index without new data is pointless.
-            // if unindexed.is_empty() && indices_to_merge.len() <= 1 {
-            //     return Ok(None);
-            // }
-
-            indices_to_merge.iter().for_each(|idx| {
-                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-            });
-
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -187,6 +172,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             )
             .boxed()
             .await?;
+
+            old_indices[old_indices.len() - indices_merged..]
+                .iter()
+                .for_each(|idx| {
+                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+                });
+
             Ok((
                 new_uuid,
                 indices_merged,
