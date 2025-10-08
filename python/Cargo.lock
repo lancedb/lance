@@ -5802,6 +5802,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
+ "libc",
  "log",
  "object_store",
  "once_cell",
