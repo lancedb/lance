@@ -15,11 +15,11 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Fields};
-use futures::stream;
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
     Stream,
 };
+use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
@@ -112,6 +112,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 
+    // whether force to retrain the index
+    retrain: bool,
     // number of indices merged
     merged_num: usize,
 }
@@ -152,6 +154,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
+            retrain: false,
             merged_num: 0,
         })
     }
@@ -212,8 +215,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
+            retrain: false,
             merged_num: 0,
         })
+    }
+
+    pub fn with_retrain(&mut self, retrain: bool) -> &mut Self {
+        self.retrain = retrain;
+        self
     }
 
     // build the index with the all data in the dataset,
@@ -230,7 +239,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         // step 3. build partitions
-        let build_idx_stream = self.build_partitions().await?;
+        let build_idx_stream = self.build_partitions().boxed().await?;
 
         // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
@@ -648,15 +657,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         ));
                     };
                     ivf.centroids = Some(split_results.new_centroids);
-                    self.merged_num = self.existing_indices.len();
-
                     (
                         split_results.assign_batches,
                         Arc::new(self.existing_indices.clone()),
                     )
                 }
-                None => (vec![None; ivf.num_partitions()], Arc::new(Vec::new())),
+                None => {
+                    if self.retrain {
+                        (
+                            vec![None; ivf.num_partitions()],
+                            Arc::new(self.existing_indices.clone()),
+                        )
+                    } else {
+                        (vec![None; ivf.num_partitions()], Arc::new(Vec::new()))
+                    }
+                }
             };
+        self.merged_num = merge_indices.len();
 
         let distance_type = self.distance_type;
         let column = self.column.clone();

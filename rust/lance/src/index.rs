@@ -2067,10 +2067,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
 
@@ -2083,10 +2080,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 2);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats: serde_json::Value =
