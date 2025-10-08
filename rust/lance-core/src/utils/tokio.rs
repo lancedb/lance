@@ -52,7 +52,6 @@ pub static IO_CORE_RESERVATION: LazyLock<usize> = LazyLock::new(|| {
 });
 
 fn create_runtime() -> Runtime {
-    // TODO: make this runtime configurable (e.g. num threads)
     Builder::new_multi_thread()
         .thread_name("lance-cpu")
         .max_blocking_threads(get_num_compute_intensive_cpus())
@@ -78,6 +77,7 @@ fn global_cpu_runtime() -> &'static mut Runtime {
         if !RUNTIME_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
         }
+        std::thread::yield_now();
     }
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();

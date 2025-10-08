@@ -134,6 +134,7 @@ pub fn rt() -> &'static mut BackgroundExecutor {
         if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
         }
+        std::thread::yield_now();
     }
     if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
         install_atfork();
@@ -147,6 +148,7 @@ pub fn rt() -> &'static mut BackgroundExecutor {
 /// runs in "async-signal context" which means that we can't (safely) do much here.
 extern "C" fn atfork_child() {
     BACKGROUND_EXECUTOR.store(std::ptr::null_mut(), Ordering::SeqCst);
+    EXECUTOR_INSTALLED.store(false, Ordering::SeqCst);
 }
 
 #[cfg(not(windows))]
