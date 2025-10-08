@@ -282,7 +282,7 @@ impl ShuffleReader for IvfShufflerReader {
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
-        Ok(self.partition_sizes[partition_id])
+        Ok(*self.partition_sizes.get(partition_id).unwrap_or(&0))
     }
 
     fn total_loss(&self) -> Option<f64> {

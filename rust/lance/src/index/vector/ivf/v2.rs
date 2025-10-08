@@ -2033,4 +2033,66 @@ mod tests {
             .await
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn test_partition_split_on_append() {
+        // This test verifies that when we append enough data to a partition
+        // such that it exceeds MAX_PARTITION_SIZE_FACTOR * target_partition_size,
+        // the partition will be split into 2 partitions.
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Create initial dataset with just enough rows for 2 partitions
+        // Using a small initial dataset to avoid long test times
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        // Create an IVF-PQ index with 2 partitions
+        // For IvfPq, target_partition_size = 8192
+        // Split triggers when partition_size > 4 * 8192 = 32,768
+        let nlist = 2;
+        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify we start with 2 partitions using index statistics
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(initial_num_partitions, 2);
+
+        // Append enough data to trigger a split
+        // We need to add more than 32,768 rows to one partition
+        // To ensure they mostly go to one partition, we'll generate vectors
+        // that are very similar to each other (tight range) to cluster together
+        let append_rows = 50000;
+        append_dataset::<Float32Type>(&mut dataset, append_rows, 0.0..0.05).await;
+
+        // Optimize indices - this should trigger the split check and perform the split
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        // Reload the dataset to get the latest index information
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Verify that we now have 3 partitions (one partition was split)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions, 3,
+            "Expected partition split to increase partitions from 2 to 3, got stats: {}",
+            stats_json
+        );
+    }
 }

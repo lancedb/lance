@@ -714,6 +714,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             }
 
                             if assign_batch.num_rows() > 0 {
+                                // Drop PART_ID column from assign_batch to match schema of existing batches
+                                let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
                                 batches.push(assign_batch);
                             }
                         }
@@ -772,6 +774,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     location!(),
                 ))?;
 
+            // Skip if this partition doesn't exist in the existing index
+            // This can happen after a split creates a new partition
+            if part_id >= existing_index.ivf_model().num_partitions() {
+                continue;
+            }
+
             let part_storage = existing_index.load_partition_storage(part_id).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
@@ -824,7 +832,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         let mut loss = 0.0;
-        if reader.partition_size(part_id)? > 0 {
+        // Skip if this partition doesn't exist in the reader
+        // This can happen after a split creates a new partition
+        let partition_size = reader.partition_size(part_id).unwrap_or(0);
+        if partition_size > 0 {
             let mut partition_data = reader.read_partition(part_id).await?.ok_or(Error::io(
                 format!("partition {} is empty", part_id).as_str(),
                 location!(),
@@ -1167,14 +1178,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             &mut assign_ops,
         )?;
         // assign the vectors in the reassigned partitions
-        for idx in reassign_part_ids.values() {
+        for (i, idx) in reassign_part_ids.values().iter().enumerate() {
             let part_idx = *idx as usize;
             let (row_ids, vectors) = self.load_partition_vectors(part_idx).await?;
 
-            let d0 = self.distance_type.arrow_batch_func()(
-                &reassign_part_centroids.value(part_idx),
-                &vectors,
-            )?;
+            let d0 =
+                self.distance_type.arrow_batch_func()(&reassign_part_centroids.value(i), &vectors)?;
             let d1 = self.distance_type.arrow_batch_func()(&c1, &vectors)?;
             let d2 = self.distance_type.arrow_batch_func()(&c2, &vectors)?;
             let d0 = d0.values();
