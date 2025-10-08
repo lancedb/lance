@@ -35,11 +35,11 @@ LOGGER.setLevel(get_log_level())
 
 def set_logger(
     file_path: Optional[str] = "pylance.log",
-    name="pylance",
-    level=logging.INFO,
-    format_string=None,
-    log_handler=None,
-):
+    name: str = "pylance",
+    level: int = logging.INFO,
+    format_string: Optional[str] = None,
+    log_handler: Optional[logging.Handler] = None,
+) -> None:
     global LOGGER
     if not format_string:
         format_string = "%(asctime)s %(name)s [%(levelname)s] %(filename)s:%(lineno)d %(funcName)s : %(message)s"  # noqa E501
@@ -47,7 +47,9 @@ def set_logger(
     LOGGER.setLevel(level)
     lh = log_handler
     if lh is None:
-        lh = logging.FileHandler(file_path)
+        # Use default file path if None
+        actual_file_path = file_path if file_path is not None else "pylance.log"
+        lh = logging.FileHandler(actual_file_path)
     lh.setLevel(level)
     formatter = logging.Formatter(format_string)
     lh.setFormatter(formatter)
