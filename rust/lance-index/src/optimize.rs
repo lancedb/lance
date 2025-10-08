@@ -67,7 +67,6 @@ impl OptimizeOptions {
             num_indices_to_merge: 0,
             index_names: None,
             retrain: true,
-            ..Default::default()
         }
     }
 
