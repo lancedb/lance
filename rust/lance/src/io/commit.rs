@@ -552,7 +552,8 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     };
     for index in indices {
-        // Skip recalculation for newer indices (index_version >= 1)
+        // Skip recalculation for newer indices (index_version >= 1) since they already have
+        // correct fragment bitmaps set during creation and don't implement calculate_included_frags
         let should_recalculate = if index.index_version >= 1 {
             false
         } else {

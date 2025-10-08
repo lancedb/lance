@@ -382,7 +382,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let num_indices_to_merge = if options.retrain {
         existing_indices.len()
     } else {
-        0
+        options.num_indices_to_merge
     };
 
     // Only pass indices that will actually be merged
