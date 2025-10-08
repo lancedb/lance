@@ -38,7 +38,7 @@ impl Session {
             metadata_cache_size_bytes.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             Default::default(),
         );
-        Session {
+        Self {
             inner: Arc::new(session),
         }
     }
@@ -64,7 +64,7 @@ impl Session {
     }
 
     /// Return whether the other session is the same as this one.
-    pub fn is_same_as(&self, other: &Session) -> bool {
+    pub fn is_same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
