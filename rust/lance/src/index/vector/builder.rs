@@ -655,15 +655,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         Arc::new(self.existing_indices.clone()),
                     )
                 }
-                None => {
-                    // When no splitting is needed, use existing_indices as-is
-                    // They've already been filtered by the caller based on num_indices_to_merge
-                    self.merged_num = self.existing_indices.len();
-                    (
-                        vec![None; ivf.num_partitions()],
-                        Arc::new(self.existing_indices.clone()),
-                    )
-                }
+                None => (vec![None; ivf.num_partitions()], Arc::new(Vec::new())),
             };
 
         let distance_type = self.distance_type;

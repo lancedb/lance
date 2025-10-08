@@ -379,20 +379,6 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = if options.retrain {
-        existing_indices.len()
-    } else {
-        options.num_indices_to_merge
-    };
-
-    // Only pass indices that will actually be merged
-    let indices_to_merge = if num_indices_to_merge > 0 {
-        let start_pos = existing_indices.len() - num_indices_to_merge;
-        existing_indices[start_pos..].to_vec()
-    } else {
-        Vec::new()
-    };
-
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
@@ -413,7 +399,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge.clone())
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -430,7 +416,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge.clone())
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -450,7 +436,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -469,7 +455,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -487,7 +473,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -509,7 +495,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -531,7 +517,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -553,7 +539,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge.clone())
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()

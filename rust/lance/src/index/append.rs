@@ -156,9 +156,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             // If there's nothing to do (no unindexed fragments and at most 1 index to "merge"),
             // we can skip creating a new index. Merging a single index without new data is pointless.
-            if unindexed.is_empty() && indices_to_merge.len() <= 1 {
-                return Ok(None);
-            }
+            // if unindexed.is_empty() && indices_to_merge.len() <= 1 {
+            //     return Ok(None);
+            // }
 
             indices_to_merge.iter().for_each(|idx| {
                 frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
