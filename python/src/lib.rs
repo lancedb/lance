@@ -55,8 +55,6 @@ use file::{
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
-#[cfg(not(windows))]
-use libc;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
