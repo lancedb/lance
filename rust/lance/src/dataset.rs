@@ -97,6 +97,7 @@ use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
+use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, read_transaction_file,
@@ -122,7 +123,6 @@ pub use write::{
     write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder,
     WriteDestination, WriteMode, WriteParams,
 };
-use crate::index::retain_supported_indices;
 
 const INDICES_DIR: &str = "_indices";
 
