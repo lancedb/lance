@@ -1400,10 +1400,10 @@ public class DatasetTest {
     try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
       List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(0L), "blobs");
       assertEquals(1, blobs.size());
-      BlobFile b = blobs.get(0);
-      assertEquals(0L, b.size());
-      assertArrayEquals(new byte[0], b.read());
-      b.close();
+      BlobFile blobFile = blobs.get(0);
+      assertEquals(0L, blobFile.size());
+      assertArrayEquals(new byte[0], blobFile.read());
+      blobFile.close();
     }
   }
 
@@ -1412,22 +1412,22 @@ public class DatasetTest {
     String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
     try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
       List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs");
-      BlobFile b = blobs.get(0);
-      long size = b.size();
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
       assertTrue(size >= 1_000_000, "expected large blob size");
-      byte[] p0 = b.readUpTo(256);
-      assertEquals(256, p0.length);
-      assertEquals(256L, b.tell());
-      b.seek(512);
-      byte[] range = b.readUpTo(256);
+      byte[] data1 = blobFile.readUpTo(256);
+      assertEquals(256, data1.length);
+      assertEquals(256L, blobFile.tell());
+      blobFile.seek(512);
+      byte[] range = blobFile.readUpTo(256);
       assertEquals(256, range.length);
-      assertEquals(768L, b.tell());
-      b.seek(0);
-      byte[] all = b.read();
+      assertEquals(768L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
       assertEquals(size, all.length);
-      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), p0);
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), data1);
       assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
-      b.close();
+      blobFile.close();
     }
   }
 
@@ -1436,23 +1436,23 @@ public class DatasetTest {
     String base = tempDir.resolve("testReadSmallBlobSequentialIntegrity").toString();
     try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
       List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs");
-      BlobFile b = blobs.get(0);
-      long size = b.size();
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
       assertTrue(size >= 128, "expected small blob size");
 
-      b.seek(0);
-      byte[] c1 = b.readUpTo(64);
-      byte[] c2 = b.readUpTo(64);
-      byte[] rest = b.read();
-      byte[] combined = new byte[c1.length + c2.length + rest.length];
-      System.arraycopy(c1, 0, combined, 0, c1.length);
-      System.arraycopy(c2, 0, combined, c1.length, c2.length);
-      System.arraycopy(rest, 0, combined, c1.length + c2.length, rest.length);
+      blobFile.seek(0);
+      byte[] data1 = blobFile.readUpTo(64);
+      byte[] data2 = blobFile.readUpTo(64);
+      byte[] restData = blobFile.read();
+      byte[] combined = new byte[data1.length + data2.length + restData.length];
+      System.arraycopy(data1, 0, combined, 0, data1.length);
+      System.arraycopy(data2, 0, combined, data2.length, data2.length);
+      System.arraycopy(restData, 0, combined, data1.length + data2.length, restData.length);
 
-      b.seek(0);
-      byte[] all = b.read();
-      assertArrayEquals(all, combined);
-      b.close();
+      blobFile.seek(0);
+      byte[] allData = blobFile.read();
+      assertArrayEquals(allData, combined);
+      blobFile.close();
     }
   }
 }
