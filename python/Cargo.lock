@@ -4228,6 +4228,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace-impls"
+version = "0.38.1"
+dependencies = [
+ "arrow",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "lance",
+ "lance-namespace",
+ "opendal",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "lance-namespace-reqwest-client"
 version = "0.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5846,6 +5862,8 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
+ "lance-namespace-impls",
  "lance-table",
  "libc",
  "log",

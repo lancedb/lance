@@ -3510,6 +3510,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "log",
  "object_store",
  "prost",
