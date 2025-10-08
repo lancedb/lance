@@ -22,11 +22,6 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Construct a format-layer Transaction from a protobuf Transaction.
-    pub fn from_pb(pb_tx: pb::Transaction) -> Self {
-        Self { inner: pb_tx }
-    }
-
     /// Accessor for testing or internal inspection if needed.
     pub fn as_pb(&self) -> &pb::Transaction {
         &self.inner
@@ -37,5 +32,11 @@ impl Transaction {
 impl From<Transaction> for pb::Transaction {
     fn from(tx: Transaction) -> Self {
         tx.inner
+    }
+}
+
+impl From<pb::Transaction> for Transaction {
+    fn from(pb_tx: pb::Transaction) -> Self {
+        Self { inner: pb_tx }
     }
 }

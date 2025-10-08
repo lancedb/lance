@@ -1967,7 +1967,11 @@ impl Transaction {
             manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file = if transaction_file_path.is_empty() {
+            None
+        } else {
+            Some(transaction_file_path.to_string())
+        };
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
