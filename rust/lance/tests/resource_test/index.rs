@@ -73,7 +73,8 @@ async fn test_label_list_lifecycle() {
         400 * 1024 * 1024,
         "Total memory allocation too high"
     );
-    assert_eq!(mem_stats.net_bytes_allocated(), 0, "memory leak");
+    // We do leak some memory for one-time initialization of DataFusion session.
+    assert_le!(mem_stats.net_bytes_allocated(), 300_000, "memory leak");
 
     // Drop everything, assert no leak
 
