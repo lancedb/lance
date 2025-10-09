@@ -2710,18 +2710,16 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         p.commit_handler = get_commit_handler(options)?;
 
-        if let Some(target_bases_list) = get_dict_opt::<Vec<Bound<PyAny>>>(options, "target_bases")? {
+        // Handle initial_bases parameter (list of DatasetBasePath objects)
+        if let Some(initial_bases_list) = get_dict_opt::<Vec<Bound<PyAny>>>(options, "initial_bases")? {
             let mut new_bases = Vec::new();
-            let mut target_base_refs = Vec::new();
 
-            for item in target_bases_list.iter() {
+            for item in initial_bases_list.iter() {
                 if let Ok(dataset_base_path) = item.extract::<DatasetBasePath>() {
                     new_bases.push(BasePath::from(dataset_base_path));
-                } else if let Ok(s) = item.extract::<String>() {
-                    target_base_refs.push(s);
                 } else {
                     return Err(PyValueError::new_err(
-                        "target_bases must contain DatasetBasePath objects or strings"
+                        "initial_bases must contain DatasetBasePath objects only"
                     ));
                 }
             }
@@ -2729,9 +2727,12 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             if !new_bases.is_empty() {
                 p = p.with_initial_bases(new_bases);
             }
+        }
 
-            if !target_base_refs.is_empty() {
-                p = p.with_target_base_names_or_paths(target_base_refs);
+        // Handle target_bases parameter (list of strings - base names or paths)
+        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")? {
+            if !target_bases_list.is_empty() {
+                p = p.with_target_base_names_or_paths(target_bases_list);
             }
         }
 

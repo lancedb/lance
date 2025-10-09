@@ -1715,14 +1715,12 @@ mod tests {
             &format!("{}/test_validation", test_uri),
             Some(WriteParams {
                 mode: WriteMode::Create,
-                initial_bases: Some(vec![
-                    BasePath {
-                        id: 1,
-                        name: Some("base1".to_string()),
-                        path: base1_uri.clone(),
-                        is_dataset_root: true,
-                    },
-                ]),
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("base1".to_string()),
+                    path: base1_uri.clone(),
+                    is_dataset_root: true,
+                }]),
                 target_bases: Some(vec![1]),
                 target_base_names_or_paths: Some(vec!["base1".to_string()]),
                 ..Default::default()
@@ -1968,5 +1966,149 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Cannot register new bases in Append mode"));
+    }
+
+    #[tokio::test]
+    async fn test_is_dataset_root_flag() {
+        use lance_core::utils::tempfile::TempDir;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create dataset with different is_dataset_root settings using tempdir
+        let test_dir = TempDir::default();
+        let primary_uri = test_dir.path_str();
+        let base1_dir = test_dir.std_path().join("base1");
+        let base2_dir = test_dir.std_path().join("base2");
+
+        std::fs::create_dir_all(&base1_dir).unwrap();
+        std::fs::create_dir_all(&base2_dir).unwrap();
+
+        let base1_uri = format!("file://{}", base1_dir.display());
+        let base2_uri = format!("file://{}", base2_dir.display());
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(10),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 5, // Create multiple fragments
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true, // Files will go to base1/data/
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: false, // Files will go directly to base2/
+                    },
+                ]),
+                target_bases: Some(vec![1, 2]), // Write to both bases
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+
+        // Verify base_paths configuration
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+
+        let base1 = dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("base1".to_string()))
+            .expect("base1 not found");
+        let base2 = dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("base2".to_string()))
+            .expect("base2 not found");
+
+        // Verify is_dataset_root flags are persisted correctly in manifest
+        assert!(
+            base1.is_dataset_root,
+            "base1 should have is_dataset_root=true"
+        );
+        assert!(
+            !base2.is_dataset_root,
+            "base2 should have is_dataset_root=false"
+        );
+
+        // Verify data was written to both bases
+        let fragments = dataset.get_fragments();
+        assert!(!fragments.is_empty());
+
+        let has_base1_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
+        let has_base2_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+
+        assert!(has_base1_data, "Should have data in base1");
+        assert!(has_base2_data, "Should have data in base2");
+
+        // Verify actual file paths on disk
+        // For base1 (is_dataset_root=true), files should be in base1/data/
+        let base1_data_dir = base1_dir.join("data");
+        assert!(base1_data_dir.exists(), "base1/data directory should exist");
+        let base1_files: Vec<_> = std::fs::read_dir(&base1_data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "lance")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !base1_files.is_empty(),
+            "base1/data should contain .lance files"
+        );
+
+        // For base2 (is_dataset_root=false), files should be directly in base2/
+        let base2_files: Vec<_> = std::fs::read_dir(&base2_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "lance")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !base2_files.is_empty(),
+            "base2 should contain .lance files directly"
+        );
+
+        // Verify base2 does NOT have a data subdirectory with lance files
+        let base2_data_dir = base2_dir.join("data");
+        if base2_data_dir.exists() {
+            let base2_data_files: Vec<_> = std::fs::read_dir(&base2_data_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "lance")
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                base2_data_files.is_empty(),
+                "base2/data should NOT contain .lance files"
+            );
+        }
     }
 }

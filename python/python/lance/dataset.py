@@ -4898,7 +4898,8 @@ def write_dataset(
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
-    target_bases: Optional[List[Union[str, DatasetBasePath]]] = None,
+    initial_bases: Optional[List[DatasetBasePath]] = None,
+    target_bases: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4977,32 +4978,27 @@ def write_dataset(
         and can be retrieved using read_transaction().
         If both `commit_message` and `properties` are provided, `commit_message` will
         override any "lance.commit.message" key in `properties`.
-    target_bases: list of str or DatasetBasePath, optional
-        Specifies which base paths to use for writing data. Can contain:
+    initial_bases: list of DatasetBasePath, optional
+        New base paths to register in the manifest. Only used in **CREATE mode**.
+        Cannot be specified in APPEND or OVERWRITE modes.
 
-        - :class:`DatasetBasePath` objects: Register new base paths (**CREATE mode only**)
-        - Strings: Reference existing bases by name or path (for all modes)
+        Each :class:`DatasetBasePath` defines a storage location with an optional name:
 
-        **Important**: OVERWRITE mode **always inherits** existing base_paths and cannot
-        register new ones. Only CREATE mode can register new bases.
+        >>> from lance import DatasetBasePath
+        >>> bases = [
+        ...     DatasetBasePath("s3://bucket1/data", name="primary"),
+        ...     DatasetBasePath("s3://bucket2/data", name="archive")
+        ... ]
 
-        When a string is provided, it will be resolved by trying to match:
-        1. Base name (e.g., "primary", "archive")
-        2. Base path URI (e.g., "s3://bucket/path")
+    target_bases: list of str, optional
+        References to base paths where data should be written. Can be specified in all modes.
 
-        For CREATE mode, you can define new bases and write to them in one call:
+        Each string is resolved by trying to match:
+        1. Base name (e.g., "primary", "archive") from registered bases
+        2. Base path URI (e.g., "s3://bucket1/data")
 
-        >>> bases = [DatasetBasePath("s3://bucket1/data", name="primary"),
-        ...          DatasetBasePath("s3://bucket2/data", name="archive")]
-        >>> ds = write_dataset(data, "s3://bucket1/dataset", mode="create",
-        ...                    target_bases=bases)
-
-        For OVERWRITE and APPEND modes, reference existing bases by name or path:
-
-        >>> # OVERWRITE always inherits existing base_paths
-        >>> write_dataset(data, ds, mode="overwrite", target_bases=["primary"])
-        >>> write_dataset(data, ds, mode="append", target_bases=["primary"])
-        >>> write_dataset(data, ds, mode="append", target_bases=["s3://bucket1/data"])
+        **CREATE mode**: References must match bases in `initial_bases`
+        **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
 
     Examples
     --------
@@ -5010,12 +5006,16 @@ def write_dataset(
 
     >>> import lance
     >>> from lance import DatasetBasePath
-    >>> bases = [
+    >>> initial_bases = [
     ...     DatasetBasePath("s3://fast-storage/data", name="hot"),
     ...     DatasetBasePath("s3://archive-storage/data", name="cold")
     ... ]
-    >>> ds = lance.write_dataset(data, "s3://fast-storage/mydataset",
-    ...                          mode="create", target_bases=bases)
+    >>> ds = lance.write_dataset(
+    ...     data, "s3://fast-storage/mydataset",
+    ...     mode="create",
+    ...     initial_bases=initial_bases,
+    ...     target_bases=["hot"]
+    ... )
 
     Append data to a specific base by name:
 
@@ -5065,6 +5065,7 @@ def write_dataset(
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
+        "initial_bases": initial_bases,
         "target_bases": target_bases,
     }
 

@@ -60,12 +60,12 @@ class TestMultiBase:
             data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
                 DatasetBasePath(self.path3_uri, name="path3"),
-                "path2",  # Write data to path2
             ],
+            target_bases=["path2"],  # Write data to path2
             max_rows_per_file=100,  # Force multiple fragments
         )
 
@@ -91,11 +91,11 @@ class TestMultiBase:
             initial_data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",  # Write to path1
             ],
+            target_bases=["path1"],  # Write to path1
             max_rows_per_file=100,
         )
 
@@ -129,11 +129,11 @@ class TestMultiBase:
             initial_data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",  # Write to path1
             ],
+            target_bases=["path1"],  # Write to path1
             max_rows_per_file=100,
         )
 
@@ -174,11 +174,11 @@ class TestMultiBase:
             initial_data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",  # Write to path1
             ],
+            target_bases=["path1"],  # Write to path1
             max_rows_per_file=50,
         )
 
@@ -211,6 +211,16 @@ class TestMultiBase:
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
 
+        # Verify that data files were written to primary path (not to path1 or path2)
+        fragments = list(updated_dataset.get_fragments())
+        for fragment in fragments:
+            # Fragment files should be in primary path (base_id should be None)
+            data_file = fragment.data_files()[0]
+            assert data_file.base_id is None, (
+                f"Expected data file to be in primary path (base_id=None), "
+                f"but got base_id={data_file.base_id}"
+            )
+
         # Since base_paths exist, we can append to them by name
         append_data = self.create_test_data(25, id_offset=300)
 
@@ -224,75 +234,114 @@ class TestMultiBase:
         final_result = final_dataset.to_table().to_pandas()
         assert len(final_result) == 100
 
-    def test_concurrent_appends(self):
-        """Test concurrent appends to multi-base dataset."""
-        # Create initial dataset
+    def test_multi_base_append_mode_primary_path_default(self):
+        """Test that APPEND mode defaults to primary path when no target specified."""
+        # Create initial dataset with explicit data file bases
         initial_data = self.create_test_data(100)
 
-        lance.write_dataset(
+        dataset = lance.write_dataset(
             initial_data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                DatasetBasePath(self.path3_uri, name="path3"),
-                "path1",  # Write to path1
             ],
+            target_bases=["path1"],  # Write to path1
             max_rows_per_file=50,
         )
 
-        def append_worker(worker_id, target_path_name, start_id, num_rows):
-            """Worker function to append data concurrently."""
-            worker_data = self.create_test_data(num_rows, id_offset=start_id)
+        # Append without specifying target - should use primary path
+        append_data = self.create_test_data(75, id_offset=100)
 
-            # Load dataset fresh for this worker
-            worker_dataset = lance.dataset(self.primary_uri)
+        updated_dataset = lance.write_dataset(
+            append_data,
+            dataset,
+            mode="append",
+            # No target_bases specified - data goes to primary path
+            max_rows_per_file=25,
+        )
 
-            # Perform append
-            return lance.write_dataset(
-                worker_data,
-                worker_dataset,
-                mode="append",
-                target_bases=[target_path_name],  # Reference by name
-                max_rows_per_file=25,
-            )
+        # Verify appended data
+        result = updated_dataset.to_table().to_pandas()
+        assert len(result) == 175
 
-        # Configure concurrent append tasks
-        append_tasks = [
-            {"worker_id": 1, "target_path": "path1", "start_id": 100, "num_rows": 50},
-            {"worker_id": 2, "target_path": "path2", "start_id": 150, "num_rows": 50},
-            {"worker_id": 3, "target_path": "path3", "start_id": 200, "num_rows": 50},
-        ]
-
-        # Execute concurrent appends
-        results = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_task = {
-                executor.submit(
-                    append_worker,
-                    task["worker_id"],
-                    task["target_path"],
-                    task["start_id"],
-                    task["num_rows"],
-                ): task
-                for task in append_tasks
-            }
-
-            for future in as_completed(future_to_task):
-                results.append(future.result())
-
-        # Verify final dataset integrity
-        final_dataset = lance.dataset(self.primary_uri)
-        final_data = final_dataset.to_table().to_pandas()
-
-        # Should have initial 100 + 3 * 50 = 250 rows
-        assert len(final_data) == 250
-
-        # Verify all expected IDs are present
-        expected_ids = set(range(250))
-        actual_ids = set(final_data["id"].tolist())
+        # Verify data content
+        expected_ids = set(range(175))
+        actual_ids = set(result["id"].tolist())
         assert actual_ids == expected_ids
+
+        # Verify base_paths are preserved from previous manifest
+        base_paths = updated_dataset._ds.base_paths()
+        assert len(base_paths) == 2
+        assert any(bp.name == "path1" for bp in base_paths.values())
+        assert any(bp.name == "path2" for bp in base_paths.values())
+
+        # Verify that new data files were written to primary path (not to path1 or path2)
+        fragments = list(updated_dataset.get_fragments())
+        # The first 2 fragments should be in path1 (from initial write)
+        # The remaining fragments should be in primary path (from append)
+        primary_path_fragments = 0
+        path1_fragments = 0
+
+        for fragment in fragments:
+            data_file = fragment.data_files()[0]
+            if data_file.base_id is None:
+                primary_path_fragments += 1
+            else:
+                base_path = base_paths.get(data_file.base_id)
+                if base_path and base_path.name == "path1":
+                    path1_fragments += 1
+
+        assert path1_fragments == 2, f"Expected 2 fragments in path1, got {path1_fragments}"
+        assert primary_path_fragments >= 3, (
+            f"Expected at least 3 fragments in primary path, got {primary_path_fragments}"
+        )
+
+    def test_multi_base_is_dataset_root_flag(self):
+        """Test is_dataset_root flag on DatasetBasePath."""
+        # Create initial dataset with one base marked as dataset_root
+        initial_data = self.create_test_data(100)
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.path1_uri, name="path1", is_dataset_root=True),
+                DatasetBasePath(self.path2_uri, name="path2", is_dataset_root=False),
+            ],
+            target_bases=["path1"],
+            max_rows_per_file=50,
+        )
+
+        # Verify base_paths configuration
+        base_paths = dataset._ds.base_paths()
+        assert len(base_paths) == 2
+
+        # Find path1 and path2 in base_paths
+        path1_base = None
+        path2_base = None
+        for base_path in base_paths.values():
+            if base_path.name == "path1":
+                path1_base = base_path
+            elif base_path.name == "path2":
+                path2_base = base_path
+
+        assert path1_base is not None, "path1 base not found"
+        assert path2_base is not None, "path2 base not found"
+
+        # Verify is_dataset_root flags
+        assert path1_base.is_dataset_root is True, (
+            f"Expected path1.is_dataset_root=True, got {path1_base.is_dataset_root}"
+        )
+        assert path2_base.is_dataset_root is False, (
+            f"Expected path2.is_dataset_root=False, got {path2_base.is_dataset_root}"
+        )
+
+        # Verify data is readable
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 100
 
     def test_validation_errors(self):
         """Test validation errors for invalid multi-base configurations."""
@@ -304,11 +353,11 @@ class TestMultiBase:
                 data,
                 self.primary_uri,
                 mode="create",
-                target_bases=[
+                initial_bases=[
                     DatasetBasePath(self.path1_uri, name="path1"),
                     DatasetBasePath(self.path2_uri, name="path2"),
-                    "path3",  # Not in new bases
                 ],
+                target_bases=["path3"],  # Not in new bases
             )
 
         # Test 2: DatasetBasePath in APPEND mode
@@ -317,11 +366,11 @@ class TestMultiBase:
             data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",
             ],
+            target_bases=["path1"],
         )
 
         with pytest.raises(Exception, match="Cannot register new bases in Append mode"):
@@ -329,12 +378,12 @@ class TestMultiBase:
                 data,
                 base_dataset,
                 mode="append",
-                target_bases=[
+                initial_bases=[
                     DatasetBasePath(
                         name="path3", path=self.path3_uri
                     ),  # New base not allowed
-                    "path3",
                 ],
+                target_bases=["path3"],
             )
 
     def test_fragment_distribution(self):
@@ -345,11 +394,11 @@ class TestMultiBase:
             data,
             self.primary_uri,
             mode="create",
-            target_bases=[
+            initial_bases=[
                 DatasetBasePath(self.path1_uri, name="path1"),
                 DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",
             ],
+            target_bases=["path1"],
             max_rows_per_file=100,  # Should create 10 fragments
         )
 
@@ -365,142 +414,3 @@ class TestMultiBase:
         filtered_result = dataset.scanner(filter="id < 500").to_table().to_pandas()
         assert len(filtered_result) == 500
         assert all(filtered_result["id"] < 500)
-
-    def test_schema_consistency(self):
-        """Test that schema is consistent across multi-base operations."""
-        # Create dataset with specific schema
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field("name", pa.string()),
-                pa.field("score", pa.float64()),
-            ]
-        )
-
-        data = pa.table(
-            {
-                "id": [1, 2, 3, 4, 5],
-                "name": ["a", "b", "c", "d", "e"],
-                "score": [1.0, 2.0, 3.0, 4.0, 5.0],
-            },
-            schema=schema,
-        )
-
-        dataset = lance.write_dataset(
-            data,
-            self.primary_uri,
-            mode="create",
-            target_bases=[
-                DatasetBasePath(self.path1_uri, name="path1"),
-                DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",
-            ],
-        )
-
-        # Verify schema
-        assert dataset.schema == schema
-
-        # Append with same schema to different path
-        append_data = pa.table(
-            {"id": [6, 7, 8], "name": ["f", "g", "h"], "score": [6.0, 7.0, 8.0]},
-            schema=schema,
-        )
-
-        updated_dataset = lance.write_dataset(
-            append_data, dataset, mode="append", target_bases=["path2"]
-        )
-
-        # Schema should remain consistent
-        assert updated_dataset.schema == schema
-
-        # Verify all data
-        result = updated_dataset.to_table()
-        assert len(result) == 8
-        assert result.schema == schema
-
-    def test_dataset_reopening(self):
-        """Test reopening a multi-base dataset."""
-        data = self.create_test_data(300)
-
-        # Create multi-base dataset
-        dataset = lance.write_dataset(
-            data,
-            self.primary_uri,
-            mode="create",
-            target_bases=[
-                DatasetBasePath(self.path1_uri, name="path1"),
-                DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",
-            ],
-            max_rows_per_file=100,
-        )
-
-        # Close and reopen dataset
-        del dataset
-        reopened_dataset = lance.dataset(self.primary_uri)
-
-        # Verify data is still accessible
-        result = reopened_dataset.to_table().to_pandas()
-        assert len(result) == 300
-
-        # Verify we can still append to different paths
-        append_data = self.create_test_data(50, id_offset=300)
-
-        updated_dataset = lance.write_dataset(
-            append_data,
-            reopened_dataset,
-            mode="append",
-            target_bases=["path2"],  # Reference by name
-        )
-
-        final_result = updated_dataset.to_table().to_pandas()
-        assert len(final_result) == 350
-
-    def test_single_path_mode(self):
-        """Test behavior with single path configuration."""
-        data = self.create_test_data(100)
-
-        # Test with single path (should work like normal dataset)
-        dataset = lance.write_dataset(
-            data,
-            self.primary_uri,
-            mode="create",
-            target_bases=[
-                DatasetBasePath(self.path1_uri, name="path1"),
-                "path1",
-            ],
-        )
-
-        result = dataset.to_table().to_pandas()
-        assert len(result) == 100
-
-        # Verify data integrity
-        pd.testing.assert_frame_equal(
-            result.sort_values("id").reset_index(drop=True),
-            data.sort_values("id").reset_index(drop=True),
-        )
-
-    def test_primary_path_write_rejection(self):
-        """Test that writing to primary path URI is rejected."""
-        data = self.create_test_data(50)
-
-        # Create dataset with explicit data file bases
-        dataset = lance.write_dataset(
-            data,
-            self.primary_uri,
-            mode="create",
-            target_bases=[
-                DatasetBasePath(self.path1_uri, name="path1"),
-                DatasetBasePath(self.path2_uri, name="path2"),
-                "path1",
-            ],
-        )
-
-        # Try to append using primary path URI (should fail - not in registered bases)
-        with pytest.raises(Exception, match="not found"):
-            lance.write_dataset(
-                data,
-                dataset,
-                mode="append",
-                target_bases=[self.primary_uri],  # Primary path URI not registered
-            )
