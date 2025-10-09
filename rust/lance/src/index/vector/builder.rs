@@ -30,6 +30,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -112,8 +113,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 
-    // whether force to retrain the index
-    retrain: bool,
+    // optimize options for only incremental build
+    optimize_options: Option<OptimizeOptions>,
     // number of indices merged
     merged_num: usize,
 }
@@ -154,7 +155,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
-            retrain: false,
+            optimize_options: None,
             merged_num: 0,
         })
     }
@@ -167,8 +168,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        optimize_options: OptimizeOptions,
     ) -> Result<Self> {
-        Self::new(
+        let mut builder = Self::new(
             dataset,
             column,
             index_dir,
@@ -179,6 +181,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             sub_index_params,
             frag_reuse_index,
         )
+        .unwrap();
+        builder.optimize_options = Some(optimize_options);
+        Ok(builder)
     }
 
     pub fn new_remapper(
@@ -215,14 +220,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
-            retrain: false,
+            optimize_options: None,
             merged_num: 0,
         })
-    }
-
-    pub fn with_retrain(&mut self, retrain: bool) -> &mut Self {
-        self.retrain = retrain;
-        self
     }
 
     // build the index with the all data in the dataset,
@@ -663,14 +663,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )
                 }
                 None => {
-                    if self.retrain {
-                        (
-                            vec![None; ivf.num_partitions()],
-                            Arc::new(self.existing_indices.clone()),
-                        )
-                    } else {
-                        (vec![None; ivf.num_partitions()], Arc::new(Vec::new()))
-                    }
+                    let is_retrain = self
+                        .optimize_options
+                        .as_ref()
+                        .map(|opt| opt.retrain)
+                        .unwrap_or(false);
+                    let num_to_merge = match is_retrain {
+                        true => self.existing_indices.len(), // retrain, merge all indices
+                        false => self
+                            .optimize_options
+                            .as_ref()
+                            .and_then(|opt| opt.num_indices_to_merge)
+                            .unwrap_or(0),
+                    };
+
+                    let indices_to_merge = self.existing_indices
+                        [self.existing_indices.len().saturating_sub(num_to_merge)..]
+                        .to_vec();
+
+                    (vec![None; ivf.num_partitions()], Arc::new(indices_to_merge))
                 }
             };
         self.merged_num = merge_indices.len();

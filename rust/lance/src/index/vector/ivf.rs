@@ -396,11 +396,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .with_retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -414,11 +414,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .with_retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -435,11 +435,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -455,11 +455,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -474,11 +474,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -501,7 +501,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -524,7 +523,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -547,7 +545,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .with_retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -609,7 +606,7 @@ async fn optimize_ivf_pq_indices(
 
     let start_pos = existing_indices
         .len()
-        .saturating_sub(options.num_indices_to_merge);
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
 
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
@@ -683,10 +680,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    let start_pos = if num_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_to_merge
     };
 
     let indices_to_merge = existing_indices[start_pos..]

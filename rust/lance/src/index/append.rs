@@ -219,14 +219,13 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::storage::VectorStore;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
@@ -237,7 +236,6 @@ mod tests {
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
-    use crate::index::vector::ivf::v2;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -305,9 +303,12 @@ mod tests {
             .unwrap();
         assert_eq!(results[0].num_rows(), 10); // Flat search.
 
-        dataset.optimize_indices(&Default::default()).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let index = &dataset.load_indices().await.unwrap()[0];
+        let indices = dataset.load_indices().await.unwrap();
 
         assert!(dataset
             .unindexed_fragments(&index.name)
@@ -340,26 +341,19 @@ mod tests {
         assert!(contained);
 
         // Check that the index has all 2000 rows.
-        let binding = dataset
-            .open_vector_index(
-                "vector",
-                index.uuid.to_string().as_str(),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let ivf_index = binding.as_any().downcast_ref::<v2::IvfPq>().unwrap();
-        let row_in_index = stream::iter(0..IVF_PARTITIONS)
-            .map(|part_id| async move {
-                let part = ivf_index.load_partition_storage(part_id).await.unwrap();
-                part.len()
-            })
-            .buffered(2)
-            .collect::<Vec<usize>>()
-            .await
-            .iter()
-            .sum::<usize>();
-        assert_eq!(row_in_index, 2000);
+        let mut num_rows = 0;
+        for index in indices.iter() {
+            let index = dataset
+                .open_vector_index(
+                    "vector",
+                    index.uuid.to_string().as_str(),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            num_rows += index.num_rows();
+        }
+        assert_eq!(num_rows, 2000);
     }
 
     #[rstest]
@@ -437,10 +431,7 @@ mod tests {
         assert_eq!(stats["num_unindexed_fragments"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
@@ -560,7 +551,7 @@ mod tests {
             updated_dataset.clone(),
             &old_indices_refs,
             &unindexed_fragments,
-            &OptimizeOptions::default(),
+            &OptimizeOptions::merge(old_indices.len()),
         )
         .await
         .unwrap();

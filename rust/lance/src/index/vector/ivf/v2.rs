@@ -1946,7 +1946,10 @@ mod tests {
             .execute(vec![new_data])
             .await
             .unwrap();
-        dataset.optimize_indices(&Default::default()).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
 
         let pq_meta: ProductQuantizationMetadata =
             get_pq_metadata(&dataset, scheduler.clone()).await;

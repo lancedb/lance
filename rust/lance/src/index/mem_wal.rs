@@ -1619,11 +1619,10 @@ mod tests {
         assert_eq!(mem_wal.state, lance_index::mem_wal::State::Merged);
 
         // Now use optimize_indices to create delta index (this is how delta indices are actually created)
-        let optimize_options = OptimizeOptions {
-            num_indices_to_merge: 0,
-            ..OptimizeOptions::default()
-        };
-        dataset.optimize_indices(&optimize_options).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
 
         // Verify we now have multiple indices with the same name (delta indices)
         let indices = dataset.load_indices().await.unwrap();
