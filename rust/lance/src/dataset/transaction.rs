@@ -1695,12 +1695,23 @@ impl Transaction {
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 final_indices.retain(|existing_index| {
-                    !new_indices
+                    // if it's new index replacing the old index, remove the old index, new index's bitmap should contain all the fragments in the old index
+                    // if it's a new delta index, remove indices in ``removed_indices``
+                    !new_indices.iter().any(|new_index| {
+                        let Some(new_index_bitmap) = new_index.fragment_bitmap.as_ref() else {
+                            return new_index.name == existing_index.name;
+                        };
+                        let Some(existing_index_bitmap) = existing_index.fragment_bitmap.as_ref()
+                        else {
+                            return new_index.name == existing_index.name;
+                        };
+
+                        new_index.name == existing_index.name
+                            && new_index_bitmap.intersection_len(existing_index_bitmap)
+                                == existing_index_bitmap.len()
+                    }) && !removed_indices
                         .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                        .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }

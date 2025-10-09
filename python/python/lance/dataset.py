@@ -4683,7 +4683,7 @@ class DatasetOptimizer:
 
         Parameters
         ----------
-        num_indices_to_merge: int, default 1
+        num_indices_to_merge: optional, int, default None
             The number of indices to merge.
             If set to 0, new delta index will be created.
         index_names: List[str], default None

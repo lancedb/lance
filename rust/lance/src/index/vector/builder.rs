@@ -649,6 +649,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
                 Some(partition) => {
                     // Perform split and record the fact for downstream build/merge
+                    log::info!(
+                        "split partition {}, will merge all {} delta indices",
+                        partition,
+                        self.existing_indices.len()
+                    );
                     let split_results = self.split_partition(partition, ivf).await?;
                     let Some(ivf) = self.ivf.as_mut() else {
                         return Err(Error::invalid_input(
@@ -685,6 +690,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
             };
         self.merged_num = merge_indices.len();
+        log::info!(
+            "merge {}/{} delta indices",
+            self.merged_num,
+            self.existing_indices.len()
+        );
 
         let distance_type = self.distance_type;
         let column = self.column.clone();
@@ -845,8 +855,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut loss = 0.0;
         // Skip if this partition doesn't exist in the reader
         // This can happen after a split creates a new partition
-        let partition_size = reader.partition_size(part_id).unwrap_or(0);
-        if partition_size > 0 {
+        if reader.partition_size(part_id)? > 0 {
             let mut partition_data = reader.read_partition(part_id).await?.ok_or(Error::io(
                 format!("partition {} is empty", part_id).as_str(),
                 location!(),
