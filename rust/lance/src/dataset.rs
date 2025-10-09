@@ -2544,6 +2544,8 @@ mod tests {
     };
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+    use lance_io::assert_io_eq;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2798,7 +2800,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_manifest_iops() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
+        let io_tracker = Arc::new(IOTracker::default());
 
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
@@ -2813,13 +2815,12 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let _original_ds = Dataset::write(
             batches,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -2829,12 +2830,10 @@ mod tests {
         .await
         .unwrap();
 
-        io_stats.lock().unwrap().read_iops = 0;
-
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session),
@@ -2844,13 +2843,12 @@ mod tests {
             .await
             .unwrap();
 
-        let get_iops = || io_stats.lock().unwrap().read_iops;
-
         // There should be only two IOPS:
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        assert_eq!(get_iops(), 2);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 2);
     }
 
     #[rstest]
