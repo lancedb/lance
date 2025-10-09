@@ -34,6 +34,7 @@ public class WriteParams {
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
+  private final Optional<String> fileFormatVersion;
   private Map<String, String> storageOptions = new HashMap<>();
 
   private WriteParams(
@@ -42,12 +43,14 @@ public class WriteParams {
       Optional<Long> maxBytesPerFile,
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
+      Optional<String> fileFormatVersion,
       Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
     this.enableStableRowIds = enableStableRowIds;
+    this.fileFormatVersion = fileFormatVersion;
     this.storageOptions = storageOptions;
   }
 
@@ -76,6 +79,10 @@ public class WriteParams {
     return enableStableRowIds;
   }
 
+  public Optional<String> getFileFormatVersion() {
+    return fileFormatVersion;
+  }
+
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
@@ -97,6 +104,7 @@ public class WriteParams {
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
+    private Optional<String> fileFormatVersion = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
@@ -129,6 +137,11 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withFileFormatVersion(String fileFormatVersion) {
+      this.fileFormatVersion = Optional.of(fileFormatVersion);
+      return this;
+    }
+
     public WriteParams build() {
       return new WriteParams(
           maxRowsPerFile,
@@ -136,6 +149,7 @@ public class WriteParams {
           maxBytesPerFile,
           mode,
           enableStableRowIds,
+          fileFormatVersion,
           storageOptions);
     }
   }
