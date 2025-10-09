@@ -160,6 +160,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_incremental(
         dataset: Dataset,
         column: String,
