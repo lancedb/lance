@@ -5644,7 +5644,7 @@ mod test {
             // UPDATE
 
             dataset
-                .optimize_indices(&OptimizeOptions::append())
+                .optimize_indices(&OptimizeOptions::merge(1))
                 .await
                 .unwrap();
             let updated_version = dataset.version().version;
