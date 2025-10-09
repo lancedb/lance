@@ -1051,6 +1051,7 @@ impl MergeInsertJob {
                     write_schema,
                     stream,
                     Default::default(), // TODO: support write params.
+                    None,               // Merge insert doesn't use target_bases
                 )
                 .await?;
 
@@ -1435,6 +1436,7 @@ impl MergeInsertJob {
                 self.dataset.schema().clone(),
                 Box::pin(stream),
                 WriteParams::default(),
+                None, // Merge insert doesn't use target_bases
             )
             .await?;
 

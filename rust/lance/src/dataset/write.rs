@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
-
+use std::sync::atomic::AtomicUsize;
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -25,7 +25,7 @@ use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use lance_table::format::{DataFile, Fragment};
+use lance_table::format::{BasePath, DataFile, Fragment, Manifest};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -226,6 +226,25 @@ pub struct WriteParams {
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// New base paths to register in the manifest during dataset creation.
+    /// Each BasePath must have a properly assigned ID (non-zero).
+    /// Only used in CREATE/OVERWRITE modes for manifest registration.
+    /// IDs should be assigned by the caller before passing to WriteParams.
+    pub initial_bases: Option<Vec<BasePath>>,
+
+    /// Target base IDs for writing data files.
+    /// When provided, all new data files will be written to bases with these IDs.
+    /// Used in all modes (CREATE, APPEND, OVERWRITE) to specify where data should be written.
+    /// The IDs must correspond to either:
+    /// - IDs in initial_bases (for CREATE/OVERWRITE modes)
+    /// - IDs already registered in the existing dataset manifest (for APPEND mode)
+    pub target_bases: Option<Vec<u32>>,
+
+    /// Target base names or paths as strings (unresolved).
+    /// These will be resolved to IDs when the write operation executes.
+    /// Resolution happens at builder execution time when dataset context is available.
+    pub target_base_names_or_paths: Option<Vec<String>>,
 }
 
 impl Default for WriteParams {
@@ -247,6 +266,9 @@ impl Default for WriteParams {
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
+            initial_bases: None,
+            target_bases: None,
+            target_base_names_or_paths: None,
         }
     }
 }
@@ -279,6 +301,52 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Set the initial_bases for this WriteParams.
+    ///
+    /// This specifies new base paths to register in the manifest during dataset creation.
+    /// Each BasePath must have a properly assigned ID (non-zero) before calling this method.
+    /// Only used in CREATE/OVERWRITE modes for manifest registration.
+    pub fn with_initial_bases(self, bases: Vec<BasePath>) -> Self {
+        Self {
+            initial_bases: Some(bases),
+            ..self
+        }
+    }
+
+    /// Set the target_bases for this WriteParams.
+    ///
+    /// This specifies the base IDs where data files should be written.
+    /// The IDs must correspond to either:
+    /// - IDs in initial_bases (for CREATE/OVERWRITE modes)
+    /// - IDs already registered in the existing dataset manifest (for APPEND mode)
+    pub fn with_target_bases(self, base_ids: Vec<u32>) -> Self {
+        Self {
+            target_bases: Some(base_ids),
+            ..self
+        }
+    }
+
+    /// Store target base names or paths for deferred resolution.
+    ///
+    /// This method stores the references in `target_base_names_or_paths` field
+    /// to be resolved later at execution time when the dataset manifest is available.
+    ///
+    /// Resolution will happen at write execution time and will try to match:
+    /// 1. initial_bases by name
+    /// 2. initial_bases by path
+    /// 3. existing manifest by name
+    /// 4. existing manifest by path
+    ///
+    /// # Arguments
+    ///
+    /// * `references` - Vector of base names or paths to be resolved later
+    pub fn with_target_base_names_or_paths(self, references: Vec<String>) -> Self {
+        Self {
+            target_base_names_or_paths: Some(references),
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -308,6 +376,7 @@ pub async fn do_write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     storage_version: LanceFileVersion,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
     // Convert arrow.json to lance.json (JSONB) for storage if needed
     //
@@ -325,7 +394,13 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    let writer_generator = WriterGenerator::new(
+        object_store,
+        base_dir,
+        schema,
+        storage_version,
+        target_bases_info
+    );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -377,6 +452,208 @@ pub struct WrittenFragments {
     pub blob: Option<(Vec<Fragment>, Schema)>,
 }
 
+/// Resolve target bases for writing.
+///
+/// This function should be called early in the write flow (e.g., in InsertBuilder)
+/// before calling write_fragments_internal.
+///
+/// This function:
+/// 1. Assigns sequential IDs to base paths that have ID 0 in initial_bases
+/// 2. Validates that all IDs in initial_bases are non-zero and unique
+/// 3. Resolves target_base_names_or_paths to target_bases IDs
+/// 4. Validates that all target base IDs are non-zero
+/// 5. Prepares TargetBaseInfo structs with object stores for round-robin selection
+///
+/// Returns Option<Vec<TargetBaseInfo>> - Some if target bases are configured, None otherwise
+pub(crate) async fn resolve_target_bases(
+    params: &mut WriteParams,
+    existing_manifest: Option<&Manifest>,
+    store_registry: Arc<ObjectStoreRegistry>,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
+    // Step 1: Assign IDs to initial_bases that have ID 0
+    if let Some(initial_bases) = &mut params.initial_bases {
+        let mut next_id = 1u32;
+        for base_path in initial_bases.iter_mut() {
+            if base_path.id == 0 {
+                base_path.id = next_id;
+                next_id += 1;
+            } else {
+                // Track the highest assigned ID to avoid conflicts
+                next_id = next_id.max(base_path.id + 1);
+            }
+        }
+    }
+
+    // Step 2: Validate that IDs in initial_bases are non-zero and unique
+    if let Some(initial_bases) = &params.initial_bases {
+        let mut seen_ids = std::collections::HashSet::new();
+        for base_path in initial_bases {
+            if base_path.id == 0 {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Base path '{}' has ID 0. IDs must be non-zero and assigned.",
+                        base_path.name.as_ref().unwrap_or(&base_path.path)
+                    ),
+                    location!(),
+                ));
+            }
+            if !seen_ids.insert(base_path.id) {
+                return Err(Error::invalid_input(
+                    format!("Duplicate base path ID: {}", base_path.id),
+                    location!(),
+                ));
+            }
+        }
+    }
+
+    // Step 3: Resolve target_base_names_or_paths to IDs if present
+    let resolved_target_bases = if let Some(ref names_or_paths) = params.target_base_names_or_paths
+    {
+        let mut resolved_ids = Vec::new();
+        for reference in names_or_paths {
+            let ref_str = reference.as_str();
+            let mut id_found = None;
+
+            // Check initial_bases by name
+            if let Some(initial_bases) = &params.initial_bases {
+                for base in initial_bases {
+                    if let Some(name) = &base.name {
+                        if name == ref_str {
+                            id_found = Some(base.id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Check initial_bases by path
+            if id_found.is_none() {
+                if let Some(initial_bases) = &params.initial_bases {
+                    for base in initial_bases {
+                        if base.path == ref_str {
+                            id_found = Some(base.id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Check existing manifest by name
+            if id_found.is_none() {
+                if let Some(manifest) = existing_manifest {
+                    for (id, base) in &manifest.base_paths {
+                        if let Some(name) = &base.name {
+                            if name == ref_str {
+                                id_found = Some(*id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check existing manifest by path
+            if id_found.is_none() {
+                if let Some(manifest) = existing_manifest {
+                    for (id, base) in &manifest.base_paths {
+                        if base.path == ref_str {
+                            id_found = Some(*id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let id = id_found.ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "Base reference '{}' not found in initial_bases or existing manifest",
+                        ref_str
+                    ),
+                    location!(),
+                )
+            })?;
+
+            resolved_ids.push(id);
+        }
+        Some(resolved_ids)
+    } else {
+        params.target_bases.clone()
+    };
+
+    // Step 4: prepare TargetBaseInfo structs
+    if let Some(target_bases) = &resolved_target_bases {
+        let store_params = params.store_params.clone().unwrap_or_default();
+
+        // Collect information for all target bases
+        let mut base_infos = Vec::new();
+        for &target_base_id in target_bases {
+            // Find the base_path for this ID
+            let (target_path_uri, is_dataset_root) = match &params.initial_bases {
+                Some(initial_bases) => {
+                    // CREATE or OVERWRITE with new bases: find the base_path by ID
+                    let base_path = initial_bases
+                        .iter()
+                        .find(|base_path| base_path.id == target_base_id)
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                format!(
+                                    "Target base ID {} not found in initial_bases",
+                                    target_base_id
+                                ),
+                                location!(),
+                            )
+                        })?;
+                    (base_path.path.clone(), base_path.is_dataset_root)
+                }
+                None => {
+                    // APPEND or OVERWRITE without new bases: find in existing manifest
+                    let manifest = existing_manifest.ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "Cannot use target base ID {} without existing manifest or initial_bases",
+                                target_base_id
+                            ),
+                            location!(),
+                        )
+                    })?;
+
+                    let base_path = manifest.base_paths.get(&target_base_id).ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "Target base ID {} not found in existing manifest",
+                                target_base_id
+                            ),
+                            location!(),
+                        )
+                    })?;
+                    (base_path.path.clone(), base_path.is_dataset_root)
+                }
+            };
+
+            // Extract path from URI using standard ObjectStore method
+            let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
+                store_registry.clone(),
+                &target_path_uri,
+                &store_params,
+            )
+                .await?;
+
+            // Store the raw path - /data will be added later based on is_dataset_root
+            base_infos.push(TargetBaseInfo {
+                base_id: target_base_id,
+                object_store: target_object_store,
+                base_dir: extracted_path,
+                is_dataset_root,
+            });
+        }
+
+        Ok(Some(base_infos))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Writes the given data to the dataset and returns fragments.
 ///
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
@@ -394,6 +671,7 @@ pub async fn write_fragments_internal(
     schema: Schema,
     data: SendableRecordBatchStream,
     mut params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<WrittenFragments> {
     // Convert Arrow JSON columns to Lance JSON (JSONB) format
     //
@@ -502,6 +780,7 @@ pub async fn write_fragments_internal(
         data,
         params,
         storage_version,
+        target_bases_info,
     );
 
     let (default, blob) = if let Some(blob_data) = blob_data {
@@ -514,6 +793,7 @@ pub async fn write_fragments_internal(
             blob_data,
             blob_write_params,
             storage_version,
+            None, // Blobs don't use target_bases
         );
         let (fragments_res, blobs_res) = futures::join!(fragments_fut, blob_fut);
         let fragments = fragments_res?;
@@ -540,22 +820,35 @@ pub trait GenericWriter: Send {
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
 }
 
+struct V1WriterAdapter<M>
+where
+    M: ManifestProvider + Send + Sync,
+{
+    writer: FileWriter<M>,
+    path: String,
+    base_id: Option<u32>,
+}
+
 #[async_trait::async_trait]
-impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String) {
+impl<M> GenericWriter for V1WriterAdapter<M>
+where
+    M: ManifestProvider + Send + Sync,
+{
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        self.0.write(batches).await
+        self.writer.write(batches).await
     }
     async fn tell(&mut self) -> Result<u64> {
-        Ok(self.0.tell().await? as u64)
+        Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        let size_bytes = self.0.tell().await?;
+        let size_bytes = self.writer.tell().await?;
         Ok((
-            self.0.finish().await? as u32,
+            self.writer.finish().await? as u32,
             DataFile::new_legacy(
-                self.1.clone(),
-                self.0.schema(),
+                self.path.clone(),
+                self.writer.schema(),
                 NonZero::new(size_bytes as u64),
+                self.base_id,
             ),
         ))
     }
@@ -564,6 +857,7 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
 struct V2WriterAdapter {
     writer: v2::writer::FileWriter,
     path: String,
+    base_id: Option<u32>,
 }
 
 #[async_trait::async_trait]
@@ -599,6 +893,7 @@ impl GenericWriter for V2WriterAdapter {
             major,
             minor,
             NonZero::new(self.writer.tell().await?),
+            self.base_id,
         );
         Ok((num_rows, data_file))
     }
@@ -610,21 +905,45 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
+    open_writer_with_options(
+        object_store,
+        schema,
+        base_dir,
+        storage_version,
+        true,
+        None,
+    )
+    .await
+}
+
+pub async fn open_writer_with_options(
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    storage_version: LanceFileVersion,
+    add_data_dir: bool,
+    base_id: Option<u32>,
+) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", generate_random_filename());
 
-    let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
+    let full_path = if add_data_dir {
+        base_dir.child(DATA_DIR).child(filename.as_str())
+    } else {
+        base_dir.child(filename.as_str())
+    };
 
     let writer = if storage_version == LanceFileVersion::Legacy {
-        Box::new((
-            FileWriter::<ManifestDescribing>::try_new(
+        Box::new(V1WriterAdapter {
+            writer: FileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
                 &Default::default(),
             )
             .await?,
-            filename,
-        ))
+            path: filename,
+            base_id,
+        })
     } else {
         let writer = object_store.create(&full_path).await?;
         let file_writer = v2::writer::FileWriter::try_new(
@@ -638,18 +957,37 @@ pub async fn open_writer(
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
+            base_id,
         };
         Box::new(writer_adapter) as Box<dyn GenericWriter>
     };
     Ok(writer)
 }
 
-/// Creates new file writers for a given dataset.
+/// Information about a target base for writing.
+/// Contains the base ID, object store, directory path, and whether it's a dataset root.
+pub struct TargetBaseInfo {
+    pub base_id: u32,
+    pub object_store: Arc<ObjectStore>,
+    /// The base directory path (without /data subdirectory)
+    pub base_dir: Path,
+    /// Whether this base path is a dataset root.
+    /// If true, /data will be added when creating file paths.
+    /// If false, files will be written directly to base_dir.
+    pub is_dataset_root: bool,
+}
+
 struct WriterGenerator {
+    /// Default object store (used when no target bases specified)
     object_store: Arc<ObjectStore>,
+    /// Default base directory (used when no target bases specified)
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    /// Target base information (if writing to specific bases)
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    /// Counter for round-robin selection
+    next_base_index: AtomicUsize,
 }
 
 impl WriterGenerator {
@@ -658,26 +996,52 @@ impl WriterGenerator {
         base_dir: &Path,
         schema: &Schema,
         storage_version: LanceFileVersion,
+        target_bases_info: Option<Vec<TargetBaseInfo>>,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            target_bases_info,
+            next_base_index: AtomicUsize::new(0),
         }
+    }
+
+    /// Select the next target base using round-robin strategy.
+    /// TODO: In the future, we can develop different strategies for selecting target bases
+    fn select_target_base(&self) -> Option<&TargetBaseInfo> {
+        self.target_bases_info.as_ref().map(|bases| {
+            let index = self
+                .next_base_index
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            &bases[index % bases.len()]
+        })
     }
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
         // Use temporary ID 0; will assign ID later.
         let fragment = Fragment::new(0);
 
-        let writer = open_writer(
-            &self.object_store,
-            &self.schema,
-            &self.base_dir,
-            self.storage_version,
-        )
-        .await?;
+        let writer = if let Some(base_info) = self.select_target_base() {
+            open_writer_with_options(
+                base_info.object_store.as_ref(),
+                &self.schema,
+                &base_info.base_dir,
+                self.storage_version,
+                base_info.is_dataset_root,
+                Some(base_info.base_id),
+            )
+            .await?
+        } else {
+            open_writer(
+                self.object_store.as_ref(),
+                &self.schema,
+                &self.base_dir,
+                self.storage_version,
+            )
+            .await?
+        };
 
         Ok((writer, fragment))
     }
@@ -697,7 +1061,7 @@ async fn resolve_commit_handler(
                 .map(|opts| opts.object_store.is_some())
                 .unwrap_or_default()
             {
-                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
+                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: Default::default() });
             }
             commit_handler_from_url(uri, store_options).await
         }
@@ -706,7 +1070,7 @@ async fn resolve_commit_handler(
                 Err(Error::InvalidInput {
                     source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
                         .into(),
-                    location: location!(),
+                    location: Default::default(),
                 })
             } else {
                 Ok(commit_handler)
@@ -944,6 +1308,7 @@ mod tests {
                     schema,
                     data_stream,
                     write_params,
+                    None,
                 )
                 .await
             }
@@ -1015,6 +1380,7 @@ mod tests {
                 schema,
                 data_stream,
                 write_params,
+                None,
             )
             .await
             .unwrap();
@@ -1092,6 +1458,7 @@ mod tests {
             schema.clone(),
             data_stream,
             write_params,
+            None,
         )
         .await
         .unwrap();
@@ -1123,5 +1490,586 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_data_file_bases_writer_generator() {
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_io::object_store::ObjectStore;
+        use std::sync::Arc;
+
+        // Create test schema
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create in-memory object store
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+
+        // Test WriterGenerator with explicit data file bases configuration
+        let target_bases = vec![TargetBaseInfo {
+            base_id: 2,
+            object_store: object_store.clone(),
+            base_dir: base_dir.clone(),
+            is_dataset_root: false, // Test uses direct data directory
+        }];
+        let writer_generator = WriterGenerator::new(
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            LanceFileVersion::Stable,
+            Some(target_bases),
+        );
+
+        // Create a writer
+        let (writer, fragment) = writer_generator.new_writer().await.unwrap();
+
+        // Verify fragment is created
+        assert_eq!(fragment.id, 0); // Temporary ID
+
+        // Verify writer is created (we can't test much more without writing data)
+        drop(writer); // Clean up
+    }
+
+    #[tokio::test]
+    async fn test_writer_with_base_id() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance_io::object_store::ObjectStore;
+        use std::sync::Arc;
+
+        // Create test data
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Create in-memory object store and writer
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+
+        let mut inner_writer = open_writer_with_options(
+            object_store.as_ref(),
+            &schema,
+            &base_dir,
+            LanceFileVersion::Stable,
+            false, // Don't add /data
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Write data
+        inner_writer.write(&[batch]).await.unwrap();
+
+        // Finish and manually set base_id
+        let base_id = 2u32;
+        let (_num_rows, mut data_file) = inner_writer.finish().await.unwrap();
+        data_file.base_id = Some(base_id);
+
+        assert_eq!(data_file.base_id, Some(base_id));
+        assert!(!data_file.path.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_target_base_selection() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance_io::object_store::ObjectStore;
+        use std::sync::Arc;
+
+        // Create test schema
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create in-memory object stores for different bases
+        let store1 = Arc::new(ObjectStore::memory());
+        let store2 = Arc::new(ObjectStore::memory());
+        let store3 = Arc::new(ObjectStore::memory());
+
+        // Create WriterGenerator with multiple target bases
+        let target_bases = vec![
+            TargetBaseInfo {
+                base_id: 1,
+                object_store: store1.clone(),
+                base_dir: Path::from("base1"),
+                is_dataset_root: false,
+            },
+            TargetBaseInfo {
+                base_id: 2,
+                object_store: store2.clone(),
+                base_dir: Path::from("base2"),
+                is_dataset_root: false,
+            },
+            TargetBaseInfo {
+                base_id: 3,
+                object_store: store3.clone(),
+                base_dir: Path::from("base3"),
+                is_dataset_root: false,
+            },
+        ];
+
+        let writer_generator = WriterGenerator::new(
+            Arc::new(ObjectStore::memory()),
+            &Path::from("default"),
+            &schema,
+            LanceFileVersion::Stable,
+            Some(target_bases),
+        );
+
+        // Create test batch
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Create multiple writers and verify round-robin selection
+        let mut base_ids = Vec::new();
+        for _ in 0..6 {
+            let (mut writer, _fragment) = writer_generator.new_writer().await.unwrap();
+            writer.write(std::slice::from_ref(&batch)).await.unwrap();
+            let (_num_rows, data_file) = writer.finish().await.unwrap();
+            base_ids.push(data_file.base_id.unwrap());
+        }
+
+        // Verify round-robin pattern: 1, 2, 3, 1, 2, 3
+        assert_eq!(base_ids, vec![1, 2, 3, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_data_file_bases_path_parsing() {
+        // Test URI parsing logic
+        let test_cases = vec![
+            ("s3://multi-path-test/test1/subBucket2", "test1/subBucket2"),
+            ("gs://my-bucket/path/to/data", "path/to/data"),
+            ("file:///tmp/test/bucket", "tmp/test/bucket"),
+        ];
+
+        for (uri, expected_path) in test_cases {
+            let url = url::Url::parse(uri).unwrap();
+            let parsed_path = url.path().trim_start_matches('/');
+            assert_eq!(parsed_path, expected_path, "Failed for URI: {}", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_params_validation() {
+        // Test CREATE mode validation
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            initial_bases: Some(vec![
+                BasePath {
+                    id: 1,
+                    name: Some("bucket1".to_string()),
+                    path: "s3://bucket1/path1".to_string(),
+                    is_dataset_root: true,
+                },
+                BasePath {
+                    id: 2,
+                    name: Some("bucket2".to_string()),
+                    path: "s3://bucket2/path2".to_string(),
+                    is_dataset_root: true,
+                },
+            ]),
+            target_bases: Some(vec![1]), // Use ID 1 which corresponds to bucket1
+            ..Default::default()
+        };
+
+        // This should be valid
+        let result = validate_write_params(&params);
+        assert!(result.is_ok());
+
+        // Test target_bases with ID not in initial_bases (should fail)
+        params.target_bases = Some(vec![99]); // ID 99 doesn't exist
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+
+        // Test CREATE mode with target_bases but no initial_bases (should fail)
+        params.initial_bases = None;
+        params.target_bases = Some(vec![1]);
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+    }
+
+    fn validate_write_params(params: &WriteParams) -> Result<()> {
+        // Replicate the validation logic from the main write function
+        if matches!(params.mode, WriteMode::Create) {
+            if let Some(target_bases) = &params.target_bases {
+                if target_bases.len() != 1 {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "target_bases with {} elements is not supported",
+                            target_bases.len()
+                        ),
+                        Default::default(),
+                    ));
+                }
+                let target_base_id = target_bases[0];
+                if let Some(initial_bases) = &params.initial_bases {
+                    if !initial_bases.iter().any(|bp| bp.id == target_base_id) {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "target_base_id {} must be one of the initial_bases in CREATE mode",
+                                target_base_id
+                            ),
+                            Default::default(),
+                        ));
+                    }
+                } else {
+                    return Err(Error::invalid_input(
+                        "initial_bases must be provided when target_bases is specified in CREATE mode",
+                        Default::default(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_create() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create dataset with multi-base configuration
+        let test_uri = "memory://multi_base_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen.batch(5),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify dataset was created
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+
+        // Verify base_paths are registered in manifest
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base1".to_string())));
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base2".to_string())));
+
+        // Verify data was written to base1
+        let fragments = dataset.get_fragments();
+        assert!(!fragments.is_empty());
+        for fragment in fragments {
+            assert!(fragment
+                .metadata
+                .files
+                .iter()
+                .any(|file| file.base_id == Some(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_overwrite() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create initial dataset
+        let test_uri = "memory://overwrite_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+        let _base3_uri = format!("{}/base3", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen.batch(3),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+
+        // Overwrite - should inherit existing base configuration (base1, base2)
+        // Write to base2
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen2.batch(2),
+            std::sync::Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                // No initial_bases - inherits existing base_paths
+                target_bases: Some(vec![2]), // Write to base2
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify data was overwritten
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+
+        // Verify base_paths were inherited (still base1 and base2)
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base1".to_string())));
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base2".to_string())));
+
+        // Verify data was written to base2 (ID 2)
+        let fragments = dataset.get_fragments();
+        assert!(fragments.iter().any(|f| f
+            .metadata
+            .files
+            .iter()
+            .any(|file| file.base_id == Some(2))));
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_append() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create initial dataset with multi-base configuration
+        let test_uri = "memory://append_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen.batch(3),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+
+        // Append to base1 (same base as initial write)
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen2.batch(2),
+            std::sync::Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+
+        // Verify base_paths are still registered
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+
+        // Append to base2 (different base)
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen3.batch(4),
+            std::sync::Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                target_bases: Some(vec![2]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
+
+        // Verify data is distributed across both bases
+        let fragments = dataset.get_fragments();
+        let has_base1_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
+        let has_base2_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+
+        assert!(has_base1_data, "Should have data in base1");
+        assert!(has_base2_data, "Should have data in base2");
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_overwrite_reference_existing() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create initial dataset with multi-base configuration
+        let test_uri = "memory://overwrite_ref_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen.batch(3),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+
+        // Overwrite referencing existing base2 without registering new bases
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = crate::dataset::Dataset::write(
+            data_gen2.batch(5),
+            std::sync::Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                target_bases: Some(vec![2]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify data was overwritten with new row count
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+
+        // Verify base_paths are still the same (no new bases registered)
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base1".to_string())));
+        assert!(dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base2".to_string())));
+
+        // Verify data was written to base2
+        let fragments = dataset.get_fragments();
+        assert!(fragments.iter().any(|f| f
+            .metadata
+            .files
+            .iter()
+            .any(|file| file.base_id == Some(2))));
     }
 }

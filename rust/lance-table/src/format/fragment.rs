@@ -54,6 +54,7 @@ impl DataFile {
         file_major_version: u32,
         file_minor_version: u32,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -62,7 +63,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
-            base_id: None,
+            base_id,
         }
     }
 
@@ -83,7 +84,11 @@ impl DataFile {
         }
     }
 
-    pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
+    pub fn new_legacy_from_fields(
+        path: impl Into<String>,
+        fields: Vec<i32>,
+        base_id: Option<u32>,
+    ) -> Self {
         Self::new(
             path,
             fields,
@@ -91,6 +96,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             None,
+            base_id,
         )
     }
 
@@ -98,6 +104,7 @@ impl DataFile {
         path: impl Into<String>,
         schema: &Schema,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
@@ -108,6 +115,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             file_size_bytes,
+            base_id,
         )
     }
 
@@ -324,7 +332,7 @@ impl Fragment {
     ) -> Self {
         Self {
             id,
-            files: vec![DataFile::new_legacy(path, schema, None)],
+            files: vec![DataFile::new_legacy(path, schema, None, None)],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
@@ -347,6 +355,7 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         );
         self.files.push(data_file);
         self
@@ -373,12 +382,14 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         ));
     }
 
     /// Add a new [`DataFile`] to this fragment.
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
-        self.files.push(DataFile::new_legacy(path, schema, None));
+        self.files
+            .push(DataFile::new_legacy(path, schema, None, None));
     }
 
     // True if this fragment is made up of legacy v1 files, false otherwise
@@ -519,6 +530,7 @@ mod tests {
             vec![DataFile::new_legacy_from_fields(
                 path.to_string(),
                 vec![0, 1, 2, 3],
+                None,
             )]
         )
     }

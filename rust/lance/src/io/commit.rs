@@ -1520,8 +1520,8 @@ mod tests {
             Fragment {
                 id: 0,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("unused", vec![9]),
+                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("unused", vec![9], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
@@ -1530,8 +1530,8 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
@@ -1564,7 +1564,11 @@ mod tests {
         let expected_fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 10])],
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    vec![0, 1, 10],
+                    None,
+                )],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1572,8 +1576,8 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("path3", vec![10]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("path3", vec![10], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,

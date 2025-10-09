@@ -80,7 +80,7 @@ use lance_index::{
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use lance_table::format::Fragment;
+use lance_table::format::{BasePath, Fragment};
 use lance_table::io::commit::CommitHandler;
 
 use crate::error::PythonErrorExt;
@@ -379,6 +379,63 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
     }
 }
 
+/// Python binding for BasePath
+#[pyclass(name = "DatasetBasePath", module = "lance")]
+#[derive(Clone)]
+pub struct DatasetBasePath {
+    #[pyo3(get)]
+    pub id: u32,
+    #[pyo3(get)]
+    pub name: Option<String>,
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub is_dataset_root: bool,
+}
+
+#[pymethods]
+impl DatasetBasePath {
+    #[new]
+    #[pyo3(signature = (path, name = None, is_dataset_root = false, id = None))]
+    fn new(path: String, name: Option<String>, is_dataset_root: bool, id: Option<u32>) -> Self {
+        Self {
+            id: id.unwrap_or(0),
+            name,
+            path,
+            is_dataset_root,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DatasetBasePath(id={}, name={:?}, path={}, is_dataset_root={})",
+            self.id, self.name, self.path, self.is_dataset_root
+        )
+    }
+}
+
+impl From<BasePath> for DatasetBasePath {
+    fn from(base_path: BasePath) -> Self {
+        Self {
+            id: base_path.id,
+            name: base_path.name,
+            path: base_path.path,
+            is_dataset_root: base_path.is_dataset_root,
+        }
+    }
+}
+
+impl From<DatasetBasePath> for BasePath {
+    fn from(py_base_path: DatasetBasePath) -> Self {
+        BasePath::new(
+            py_base_path.id,
+            py_base_path.path.clone(),
+            py_base_path.name,
+            py_base_path.is_dataset_root,
+        )
+    }
+}
+
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
 #[derive(Clone)]
@@ -582,6 +639,21 @@ impl Dataset {
     fn serialized_manifest(&self, py: Python) -> PyObject {
         let manifest_bytes = self.ds.manifest().serialized();
         PyBytes::new(py, &manifest_bytes).into()
+    }
+
+    /// Get base paths from the manifest.
+    ///
+    /// Returns a dictionary mapping base_id to DatasetBasePath objects.
+    fn base_paths(&self, py: Python) -> PyResult<PyObject> {
+        let manifest = self.ds.manifest();
+        let dict = pyo3::types::PyDict::new(py);
+
+        for (base_id, base_path) in manifest.base_paths.iter() {
+            let py_base_path = DatasetBasePath::from(base_path.clone());
+            dict.set_item(base_id, py_base_path.into_py_any(py)?)?;
+        }
+
+        Ok(dict.into())
     }
 
     /// Load index metadata.
@@ -2637,6 +2709,31 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         p.commit_handler = get_commit_handler(options)?;
+
+        if let Some(target_bases_list) = get_dict_opt::<Vec<Bound<PyAny>>>(options, "target_bases")? {
+            let mut new_bases = Vec::new();
+            let mut target_base_refs = Vec::new();
+
+            for item in target_bases_list.iter() {
+                if let Ok(dataset_base_path) = item.extract::<DatasetBasePath>() {
+                    new_bases.push(BasePath::from(dataset_base_path));
+                } else if let Ok(s) = item.extract::<String>() {
+                    target_base_refs.push(s);
+                } else {
+                    return Err(PyValueError::new_err(
+                        "target_bases must contain DatasetBasePath objects or strings"
+                    ));
+                }
+            }
+
+            if !new_bases.is_empty() {
+                p = p.with_initial_bases(new_bases);
+            }
+
+            if !target_base_refs.is_empty() {
+                p = p.with_target_base_names_or_paths(target_base_refs);
+            }
+        }
 
         // Handle properties
         if let Some(props) =
