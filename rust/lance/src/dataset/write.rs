@@ -47,6 +47,7 @@ use lance_arrow::json::is_arrow_json_field;
 mod commit;
 pub mod delete;
 mod insert;
+pub mod lsm;
 pub mod merge_insert;
 mod retry;
 pub mod update;
@@ -54,6 +55,7 @@ pub mod update;
 pub use commit::CommitBuilder;
 pub use delete::DeleteBuilder;
 pub use insert::InsertBuilder;
+pub use lsm::{LogStructuredMergeJob, LogStructuredMergeJobBuilder};
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]
