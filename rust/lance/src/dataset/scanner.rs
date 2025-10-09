@@ -3770,7 +3770,6 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
     use std::vec;
 
     use arrow::array::as_primitive_array;

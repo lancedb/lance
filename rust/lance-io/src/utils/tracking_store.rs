@@ -58,7 +58,17 @@ pub struct IoStats {
 /// assert_io_eq!(io_stats, num_hops, 1, "should be just {}", "one hop");
 #[macro_export]
 macro_rules! assert_io_eq {
-    ($io_stats:expr, $field:ident, $expected:expr $(, $($arg:tt)+)?) => {
+    ($io_stats:expr, $field:ident, $expected:expr) => {
+        assert_eq!(
+            $io_stats.$field, $expected,
+            "Expected {} to be {}, got {}. Requests: {:#?}",
+            stringify!($field),
+            $expected,
+            $io_stats.$field,
+            $io_stats.requests
+        );
+    };
+    ($io_stats:expr, $field:ident, $expected:expr, $($arg:tt)+) => {
         assert_eq!(
             $io_stats.$field, $expected,
             "Expected {} to be {}, got {}. Requests: {:#?} {}",
@@ -66,14 +76,24 @@ macro_rules! assert_io_eq {
             $expected,
             $io_stats.$field,
             $io_stats.requests,
-            format_args!($($($arg)+)?)
+            format_args!($($arg)+)
         );
     };
 }
 
 #[macro_export]
 macro_rules! assert_io_gt {
-    ($io_stats:expr, $field:ident, $expected:expr $(, $($arg:tt)+)?) => {
+    ($io_stats:expr, $field:ident, $expected:expr) => {
+        assert!(
+            $io_stats.$field > $expected,
+            "Expected {} to be > {}, got {}. Requests: {:#?}",
+            stringify!($field),
+            $expected,
+            $io_stats.$field,
+            $io_stats.requests
+        );
+    };
+    ($io_stats:expr, $field:ident, $expected:expr, $($arg:tt)+) => {
         assert!(
             $io_stats.$field > $expected,
             "Expected {} to be > {}, got {}. Requests: {:#?} {}",
@@ -81,14 +101,24 @@ macro_rules! assert_io_gt {
             $expected,
             $io_stats.$field,
             $io_stats.requests,
-            format_args!($($($arg)+)?)
+            format_args!($($arg)+)
         );
     };
 }
 
 #[macro_export]
 macro_rules! assert_io_lt {
-    ($io_stats:expr, $field:ident, $expected:expr $(, $($arg:tt)+)?) => {
+    ($io_stats:expr, $field:ident, $expected:expr) => {
+        assert!(
+            $io_stats.$field < $expected,
+            "Expected {} to be < {}, got {}. Requests: {:#?}",
+            stringify!($field),
+            $expected,
+            $io_stats.$field,
+            $io_stats.requests
+        );
+    };
+    ($io_stats:expr, $field:ident, $expected:expr, $($arg:tt)+) => {
         assert!(
             $io_stats.$field < $expected,
             "Expected {} to be < {}, got {}. Requests: {:#?} {}",
@@ -96,7 +126,7 @@ macro_rules! assert_io_lt {
             $expected,
             $io_stats.$field,
             $io_stats.requests,
-            format_args!($($($arg)+)?)
+            format_args!($($arg)+)
         );
     };
 }

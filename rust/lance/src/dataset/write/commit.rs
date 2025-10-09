@@ -482,11 +482,8 @@ pub struct BatchCommitResult {
 
 #[cfg(test)]
 mod tests {
-    use all_asserts::assert_gt;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use datafusion_expr::sqlparser::keywords::IO;
-    use futures::io;
     use lance_io::utils::tracking_store::IOTracker;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_io::{object_store::ChainedWrappingObjectStore, utils::CachedFileSize};
