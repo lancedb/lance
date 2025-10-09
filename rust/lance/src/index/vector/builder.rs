@@ -180,8 +180,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None,
             sub_index_params,
             frag_reuse_index,
-        )
-        .unwrap();
+        )?;
         builder.optimize_options = Some(optimize_options);
         Ok(builder)
     }

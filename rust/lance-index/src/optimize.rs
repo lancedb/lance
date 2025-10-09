@@ -3,7 +3,7 @@
 
 /// Options for optimizing all indices.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OptimizeOptions {
     /// Number of delta indices to merge for one column. Default: 1.
     ///
@@ -33,16 +33,6 @@ pub struct OptimizeOptions {
     ///
     /// NOTE: this option is only supported for v3 vector indices.
     pub retrain: bool,
-}
-
-impl Default for OptimizeOptions {
-    fn default() -> Self {
-        Self {
-            num_indices_to_merge: None,
-            index_names: None,
-            retrain: false,
-        }
-    }
 }
 
 impl OptimizeOptions {

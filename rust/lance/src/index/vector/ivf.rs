@@ -486,17 +486,15 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -508,17 +506,15 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -530,17 +526,15 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
