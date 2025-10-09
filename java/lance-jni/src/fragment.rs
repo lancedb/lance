@@ -11,12 +11,13 @@ use jni::{
     sys::{jint, jlong},
     JNIEnv,
 };
+use lance::dataset::transaction::Operation;
+use lance::dataset::{InsertBuilder, WriteDestination};
 use lance::datatypes::Schema;
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_io::utils::CachedFileSize;
 use std::iter::once;
 
-use lance::dataset::fragment::FileFragment;
 use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
@@ -227,11 +228,27 @@ fn create_fragment<'a>(
         &enable_stable_row_ids,
         &storage_options_obj,
     )?;
-    let fragments = RT.block_on(FileFragment::create_fragments(
-        &path_str,
-        source,
-        Some(write_params),
-    ))?;
+
+    let transaction = RT.block_on(
+        InsertBuilder::new(WriteDestination::from(&path_str))
+            .with_params(&write_params)
+            .execute_uncommitted_stream(source),
+    )?;
+
+    assert!(
+        transaction.blobs_op.is_none(),
+        "Blob writing is not yet supported by the java _write_fragments API"
+    );
+
+    let get_fragments = |operation| match operation {
+        Operation::Overwrite { fragments, .. } => Ok(fragments),
+        Operation::Append { fragments, .. } => Ok(fragments),
+        _ => Err(Error::unsupported_error("Unexpected operation".into())),
+    };
+
+    let fragments = get_fragments(transaction.operation)
+        .map_err(|err| Error::runtime_error(err.to_string()))?;
+
     export_vec(env, &fragments)
 }
 

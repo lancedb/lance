@@ -69,7 +69,11 @@ public class DataReplacementTest extends OperationTestBase {
         idRoot.setRowCount(rowCount);
 
         List<FragmentMetadata> fragmentMetas =
-            Fragment.create(datasetPath, allocator, idRoot, new WriteParams.Builder().build());
+            Fragment.create(
+                datasetPath,
+                allocator,
+                idRoot,
+                new WriteParams.Builder().withMode(WriteParams.WriteMode.APPEND).build());
 
         Transaction appendTxn =
             dataset
