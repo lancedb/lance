@@ -23,7 +23,7 @@ use pyo3::{
 
 use lance::dataset::BlobFile as InnerBlobFile;
 
-use crate::{error::PythonErrorExt, RT};
+use crate::{error::PythonErrorExt, rt};
 
 #[pyclass]
 pub struct LanceBlobFile {
@@ -34,22 +34,22 @@ pub struct LanceBlobFile {
 impl LanceBlobFile {
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
-        RT.block_on(Some(py), inner.close())?.infer_error()
+        rt().block_on(Some(py), inner.close())?.infer_error()
     }
 
     pub fn is_closed(&self, py: Python<'_>) -> PyResult<bool> {
         let inner = self.inner.clone();
-        RT.block_on(Some(py), inner.is_closed())
+        rt().block_on(Some(py), inner.is_closed())
     }
 
     pub fn seek(&self, py: Python<'_>, position: u64) -> PyResult<()> {
         let inner = self.inner.clone();
-        RT.block_on(Some(py), inner.seek(position))?.infer_error()
+        rt().block_on(Some(py), inner.seek(position))?.infer_error()
     }
 
     pub fn tell(&self, py: Python<'_>) -> PyResult<u64> {
         let inner = self.inner.clone();
-        RT.block_on(Some(py), inner.tell())?.infer_error()
+        rt().block_on(Some(py), inner.tell())?.infer_error()
     }
 
     pub fn size(&self) -> u64 {
@@ -58,14 +58,14 @@ impl LanceBlobFile {
 
     pub fn readall<'a>(&'a self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
         let inner = self.inner.clone();
-        let data = RT.block_on(Some(py), inner.read())?.infer_error()?;
+        let data = rt().block_on(Some(py), inner.read())?.infer_error()?;
         Ok(PyBytes::new(py, &data))
     }
 
     pub fn read_into(&self, dst: Bound<'_, PyByteArray>) -> PyResult<usize> {
         let inner = self.inner.clone();
 
-        let data = RT
+        let data = rt()
             .block_on(Some(dst.py()), inner.read_up_to(dst.len()))?
             .infer_error()?;
 

@@ -170,3 +170,9 @@ impl BackgroundExecutor {
         }
     }
 }
+
+impl Default for BackgroundExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}

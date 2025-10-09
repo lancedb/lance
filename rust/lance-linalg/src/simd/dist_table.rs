@@ -32,7 +32,7 @@ pub fn sum_4bit_dist_table(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
-    debug_assert!(n % BATCH_SIZE == 0);
+    debug_assert!(n.is_multiple_of(BATCH_SIZE));
 
     match *SIMD_SUPPORT {
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]

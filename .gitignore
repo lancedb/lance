@@ -1,6 +1,13 @@
 # Prerequisites
 *.d
 
+# vim swap files
+*.swp
+
+# cargo config files
+.cargo/config
+python/.cargo/config
+
 # Compiled Object files
 *.slo
 *.lo

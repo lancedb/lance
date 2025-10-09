@@ -249,7 +249,7 @@ impl PyCompactionTask {
     pub fn execute(&self, dataset: PyObject) -> PyResult<PyRewriteResult> {
         let dataset = unwrap_dataset(dataset)?;
         let dataset = Python::with_gil(|py| dataset.borrow(py).clone());
-        let result = RT
+        let result = rt()
             .block_on(
                 None,
                 async move { self.0.execute(dataset.ds.as_ref()).await },
@@ -475,7 +475,7 @@ impl PyCompaction {
         })?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
-        let metrics = RT.block_on(None, async move {
+        let metrics = rt().block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
         Python::with_gil(|py| {
@@ -510,7 +510,7 @@ impl PyCompaction {
             let options = options.downcast_bound::<PyDict>(py)?;
             parse_compaction_options(options)
         })?;
-        let plan = RT
+        let plan = rt()
             .block_on(None, async move {
                 plan_compaction(dataset.ds.as_ref(), &opts).await
             })?
@@ -553,7 +553,7 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
             &options,
         );
-        let metrics = RT
+        let metrics = rt()
             .block_on(None, fut)?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Python::with_gil(|py| {

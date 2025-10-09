@@ -2010,7 +2010,7 @@ impl BatchGeneratorBuilder {
             )
             .sum::<Result<u64, ArrowError>>()?;
         let mut num_rows = RowCount::from(batch_size_bytes.0 / bytes_per_row);
-        if batch_size_bytes.0 % bytes_per_row != 0 {
+        if !batch_size_bytes.0.is_multiple_of(bytes_per_row) {
             match rounding {
                 RoundingBehavior::ExactOrErr => {
                     return Err(ArrowError::NotYetImplemented(

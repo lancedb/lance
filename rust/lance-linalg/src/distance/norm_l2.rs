@@ -177,7 +177,7 @@ mod tests {
 
     /// Reference implementation of L2 norm.
     fn norm_l2_reference(data: &[f64]) -> f32 {
-        data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
+        data.iter().map(|v| *v * *v).sum::<f64>().sqrt() as f32
     }
 
     fn do_norm_l2_test<T: Normalize + ToPrimitive>(

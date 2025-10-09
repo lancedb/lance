@@ -8,7 +8,7 @@ use pyo3::{pyclass, pymethods};
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 
-use crate::RT;
+use crate::rt;
 
 /// The Session holds stateful information for a dataset.
 ///
@@ -38,13 +38,13 @@ impl Session {
             metadata_cache_size_bytes.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             Default::default(),
         );
-        Session {
+        Self {
             inner: Arc::new(session),
         }
     }
 
     fn __repr__(&self) -> String {
-        let (index_cache_size, meta_cache_size) = RT
+        let (index_cache_size, meta_cache_size) = rt()
             .block_on(None, async move {
                 (
                     self.inner.index_cache_stats().await.size_bytes,
@@ -64,7 +64,7 @@ impl Session {
     }
 
     /// Return whether the other session is the same as this one.
-    pub fn is_same_as(&self, other: &Session) -> bool {
+    pub fn is_same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
