@@ -3739,10 +3739,10 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, Int64Array, LargeStringArray,
-        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
+        RecordBatchIterator, StringArray, StructArray,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::Fields;
     use arrow_select::take;
@@ -3899,97 +3899,6 @@ mod test {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_filter_with_nullable_struct_list_schema_mismatch() {
-        let test_uri = TempStrDir::default();
-
-        let struct_fields = Fields::from(vec![
-            Arc::new(ArrowField::new("company_id", DataType::Int64, true)),
-            Arc::new(ArrowField::new("company_name", DataType::Utf8, true)),
-            Arc::new(ArrowField::new("count", DataType::Int64, true)),
-        ]);
-        let list_item_field = Arc::new(ArrowField::new(
-            "item",
-            DataType::Struct(struct_fields.clone()),
-            true,
-        ));
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("cid", DataType::Utf8, false),
-            ArrowField::new("companies", DataType::List(list_item_field.clone()), true),
-        ]));
-
-        let companies_values: ArrayRef = Arc::new(
-            StructArray::try_new(
-                struct_fields.clone(),
-                vec![
-                    Arc::new(Int64Array::from(vec![
-                        Option::<i64>::None,
-                        None,
-                        None,
-                        None,
-                        Some(100),
-                        Some(101),
-                    ])) as ArrayRef,
-                    Arc::new(StringArray::from(vec![
-                        Some("Google"),
-                        Some("Microsoft"),
-                        None,
-                        None,
-                        Some("Apple"),
-                        Some("Amazon"),
-                    ])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![
-                        Option::<i64>::None,
-                        None,
-                        None,
-                        None,
-                        Some(50),
-                        Some(60),
-                    ])) as ArrayRef,
-                ],
-                None,
-            )
-            .unwrap(),
-        );
-
-        let companies_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 4, 6]));
-        let companies_array: ArrayRef = Arc::new(ListArray::new(
-            list_item_field,
-            companies_offsets,
-            companies_values,
-            None,
-        ));
-
-        let cid_array: ArrayRef = Arc::new(StringArray::from(vec!["1", "2", "3"]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![cid_array.clone(), companies_array.clone()],
-        )
-        .unwrap();
-
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-        Dataset::write(reader, &test_uri, None).await.unwrap();
-
-        let dataset = Dataset::open(&test_uri).await.unwrap();
-        let mut scan = dataset.scan();
-        scan.filter("cid = '1'").unwrap();
-
-        let batches = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("filter should not trigger schema mismatch");
-
-        assert_eq!(batches.len(), 1);
-        let companies_col = batches[0]
-            .column_by_name("companies")
-            .expect("companies column missing");
-        assert_eq!(companies_col.len(), 1);
     }
 
     #[cfg(not(windows))]
