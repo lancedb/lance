@@ -9,6 +9,8 @@ use futures::StreamExt;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use std::sync::Arc;
+use lance::io::ObjectStore;
+
 // Writes sample dataset to the given path
 async fn write_dataset(data_path: &str) {
     // Define new schema
@@ -55,10 +57,16 @@ async fn read_dataset(data_path: &str) {
     }
 } // End read dataset
 
+async fn clean_resources(data_path: &str) {
+    let (store, base) = ObjectStore::from_uri(data_path).await.unwrap();
+    store.remove_dir_all(base).await.unwrap();
+}
+
 #[tokio::main]
 async fn main() {
     let data_path: &str = "./temp_data.lance";
 
     write_dataset(data_path).await;
     read_dataset(data_path).await;
+    clean_resources(data_path).await;
 }
