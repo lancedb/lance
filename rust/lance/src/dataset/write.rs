@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::num::NonZero;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -25,11 +21,15 @@ use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use lance_table::format::{BasePath, DataFile, Fragment, Manifest};
+use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::location;
+use std::collections::HashMap;
+use std::num::NonZero;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::session::Session;
@@ -399,7 +399,7 @@ pub async fn do_write_fragments(
         base_dir,
         schema,
         storage_version,
-        target_bases_info
+        target_bases_info,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -452,127 +452,60 @@ pub struct WrittenFragments {
     pub blob: Option<(Vec<Fragment>, Schema)>,
 }
 
-/// Resolve target bases for writing.
-///
-/// This function should be called early in the write flow (e.g., in InsertBuilder)
-/// before calling write_fragments_internal.
-///
-/// This function:
-/// 1. Assigns sequential IDs to base paths that have ID 0 in initial_bases
-/// 2. Validates that all IDs in initial_bases are non-zero and unique
-/// 3. Resolves target_base_names_or_paths to target_bases IDs
-/// 4. Validates that all target base IDs are non-zero
-/// 5. Prepares TargetBaseInfo structs with object stores for round-robin selection
-///
-/// Returns Option<Vec<TargetBaseInfo>> - Some if target bases are configured, None otherwise
-pub(crate) async fn resolve_target_bases(
+pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
-    existing_manifest: Option<&Manifest>,
-    store_registry: Arc<ObjectStoreRegistry>,
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
-    // Step 1: Assign IDs to initial_bases that have ID 0
+    // Step 1: Validations
+    if !matches!(params.mode, WriteMode::Create) && params.initial_bases.is_some() {
+        return Err(Error::invalid_input(
+            format!(
+                "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
+                params.mode
+            ),
+            location!(),
+        ));
+    }
+
+    if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
+        return Err(Error::invalid_input(
+            "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+            location!(),
+        ));
+    }
+
+    // Step 2: Assign IDs to initial_bases and add them to all_bases
+    let mut all_bases: HashMap<u32, BasePath> = existing_base_paths.cloned().unwrap_or_default();
     if let Some(initial_bases) = &mut params.initial_bases {
-        let mut next_id = 1u32;
+        let mut next_id = all_bases.keys().max().map(|&id| id + 1).unwrap_or(1);
+
         for base_path in initial_bases.iter_mut() {
             if base_path.id == 0 {
                 base_path.id = next_id;
                 next_id += 1;
-            } else {
-                // Track the highest assigned ID to avoid conflicts
-                next_id = next_id.max(base_path.id + 1);
             }
+            all_bases.insert(base_path.id, base_path.clone());
         }
     }
 
-    // Step 2: Validate that IDs in initial_bases are non-zero and unique
-    if let Some(initial_bases) = &params.initial_bases {
-        let mut seen_ids = std::collections::HashSet::new();
-        for base_path in initial_bases {
-            if base_path.id == 0 {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Base path '{}' has ID 0. IDs must be non-zero and assigned.",
-                        base_path.name.as_ref().unwrap_or(&base_path.path)
-                    ),
-                    location!(),
-                ));
-            }
-            if !seen_ids.insert(base_path.id) {
-                return Err(Error::invalid_input(
-                    format!("Duplicate base path ID: {}", base_path.id),
-                    location!(),
-                ));
-            }
-        }
-    }
-
-    // Step 3: Resolve target_base_names_or_paths to IDs if present
-    let resolved_target_bases = if let Some(ref names_or_paths) = params.target_base_names_or_paths
-    {
+    // Step 3: Resolve target_base_names_or_paths to IDs
+    let target_base_ids = if let Some(ref names_or_paths) = params.target_base_names_or_paths {
         let mut resolved_ids = Vec::new();
         for reference in names_or_paths {
             let ref_str = reference.as_str();
-            let mut id_found = None;
-
-            // Check initial_bases by name
-            if let Some(initial_bases) = &params.initial_bases {
-                for base in initial_bases {
-                    if let Some(name) = &base.name {
-                        if name == ref_str {
-                            id_found = Some(base.id);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Check initial_bases by path
-            if id_found.is_none() {
-                if let Some(initial_bases) = &params.initial_bases {
-                    for base in initial_bases {
-                        if base.path == ref_str {
-                            id_found = Some(base.id);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Check existing manifest by name
-            if id_found.is_none() {
-                if let Some(manifest) = existing_manifest {
-                    for (id, base) in &manifest.base_paths {
-                        if let Some(name) = &base.name {
-                            if name == ref_str {
-                                id_found = Some(*id);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check existing manifest by path
-            if id_found.is_none() {
-                if let Some(manifest) = existing_manifest {
-                    for (id, base) in &manifest.base_paths {
-                        if base.path == ref_str {
-                            id_found = Some(*id);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let id = id_found.ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Base reference '{}' not found in initial_bases or existing manifest",
-                        ref_str
-                    ),
-                    location!(),
-                )
-            })?;
+            let id = all_bases
+                .iter()
+                .find(|(_, base)| {
+                    base.name.as_ref().map(|n| n == ref_str).unwrap_or(false)
+                        || base.path == ref_str
+                })
+                .map(|(&id, _)| id)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        format!("Base reference '{}' not found in available bases", ref_str),
+                        location!(),
+                    )
+                })?;
 
             resolved_ids.push(id);
         }
@@ -581,74 +514,44 @@ pub(crate) async fn resolve_target_bases(
         params.target_bases.clone()
     };
 
-    // Step 4: prepare TargetBaseInfo structs
-    if let Some(target_bases) = &resolved_target_bases {
+    // Step 4: Prepare TargetBaseInfo structs
+    let store_registry = params
+        .session
+        .as_ref()
+        .map(|s| s.store_registry())
+        .unwrap_or_default();
+
+    if let Some(target_bases) = &target_base_ids {
         let store_params = params.store_params.clone().unwrap_or_default();
+        let mut bases_info = Vec::new();
 
-        // Collect information for all target bases
-        let mut base_infos = Vec::new();
         for &target_base_id in target_bases {
-            // Find the base_path for this ID
-            let (target_path_uri, is_dataset_root) = match &params.initial_bases {
-                Some(initial_bases) => {
-                    // CREATE or OVERWRITE with new bases: find the base_path by ID
-                    let base_path = initial_bases
-                        .iter()
-                        .find(|base_path| base_path.id == target_base_id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(
-                                format!(
-                                    "Target base ID {} not found in initial_bases",
-                                    target_base_id
-                                ),
-                                location!(),
-                            )
-                        })?;
-                    (base_path.path.clone(), base_path.is_dataset_root)
-                }
-                None => {
-                    // APPEND or OVERWRITE without new bases: find in existing manifest
-                    let manifest = existing_manifest.ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "Cannot use target base ID {} without existing manifest or initial_bases",
-                                target_base_id
-                            ),
-                            location!(),
-                        )
-                    })?;
+            let base_path = all_bases.get(&target_base_id).ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "Target base ID {} not found in available bases",
+                        target_base_id
+                    ),
+                    location!(),
+                )
+            })?;
 
-                    let base_path = manifest.base_paths.get(&target_base_id).ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "Target base ID {} not found in existing manifest",
-                                target_base_id
-                            ),
-                            location!(),
-                        )
-                    })?;
-                    (base_path.path.clone(), base_path.is_dataset_root)
-                }
-            };
-
-            // Extract path from URI using standard ObjectStore method
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
-                &target_path_uri,
+                &base_path.path,
                 &store_params,
             )
-                .await?;
+            .await?;
 
-            // Store the raw path - /data will be added later based on is_dataset_root
-            base_infos.push(TargetBaseInfo {
+            bases_info.push(TargetBaseInfo {
                 base_id: target_base_id,
                 object_store: target_object_store,
                 base_dir: extracted_path,
-                is_dataset_root,
+                is_dataset_root: base_path.is_dataset_root,
             });
         }
 
-        Ok(Some(base_infos))
+        Ok(Some(bases_info))
     } else {
         Ok(None)
     }
@@ -905,15 +808,7 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
-    open_writer_with_options(
-        object_store,
-        schema,
-        base_dir,
-        storage_version,
-        true,
-        None,
-    )
-    .await
+    open_writer_with_options(object_store, schema, base_dir, storage_version, true, None).await
 }
 
 pub async fn open_writer_with_options(
@@ -1810,6 +1705,36 @@ mod tests {
                 .iter()
                 .any(|file| file.base_id == Some(1)));
         }
+
+        // Test validation: cannot specify both target_bases and target_base_names_or_paths
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let result = Dataset::write(
+            data_gen2.batch(5),
+            &format!("{}/test_validation", test_uri),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_bases: Some(vec![1]),
+                target_base_names_or_paths: Some(vec!["base1".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot specify both target_base_names_or_paths and target_bases"));
     }
 
     #[tokio::test]
@@ -1826,7 +1751,7 @@ mod tests {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
-        let dataset = crate::dataset::Dataset::write(
+        let dataset = Dataset::write(
             data_gen.batch(3),
             &primary_uri,
             Some(WriteParams {
@@ -1859,7 +1784,7 @@ mod tests {
         let mut data_gen2 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
-        let dataset = crate::dataset::Dataset::write(
+        let dataset = Dataset::write(
             data_gen2.batch(2),
             std::sync::Arc::new(dataset),
             Some(WriteParams {
@@ -1890,11 +1815,38 @@ mod tests {
 
         // Verify data was written to base2 (ID 2)
         let fragments = dataset.get_fragments();
-        assert!(fragments.iter().any(|f| f
+        assert!(fragments.iter().all(|f| f
             .metadata
             .files
             .iter()
-            .any(|file| file.base_id == Some(2))));
+            .all(|file| file.base_id == Some(2))));
+
+        // Test validation: cannot specify initial_bases in OVERWRITE mode
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let result = Dataset::write(
+            data_gen3.batch(2),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                initial_bases: Some(vec![BasePath {
+                    id: 3,
+                    name: Some("base3".to_string()),
+                    path: _base3_uri.clone(),
+                    is_dataset_root: true,
+                }]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot register new bases in Overwrite mode"));
     }
 
     #[tokio::test]
@@ -1910,7 +1862,7 @@ mod tests {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
-        let dataset = crate::dataset::Dataset::write(
+        let dataset = Dataset::write(
             data_gen.batch(3),
             &primary_uri,
             Some(WriteParams {
@@ -1942,7 +1894,7 @@ mod tests {
         let mut data_gen2 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
-        let dataset = crate::dataset::Dataset::write(
+        let dataset = Dataset::write(
             data_gen2.batch(2),
             std::sync::Arc::new(dataset),
             Some(WriteParams {
@@ -1963,9 +1915,9 @@ mod tests {
         let mut data_gen3 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
-        let dataset = crate::dataset::Dataset::write(
+        let dataset = Dataset::write(
             data_gen3.batch(4),
-            std::sync::Arc::new(dataset),
+            Arc::new(dataset),
             Some(WriteParams {
                 mode: WriteMode::Append,
                 target_bases: Some(vec![2]),
@@ -1988,88 +1940,33 @@ mod tests {
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
-    }
 
-    #[tokio::test]
-    async fn test_multi_base_overwrite_reference_existing() {
-        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-
-        // Create initial dataset with multi-base configuration
-        let test_uri = "memory://overwrite_ref_test";
-        let primary_uri = format!("{}/primary", test_uri);
-        let base1_uri = format!("{}/base1", test_uri);
-        let base2_uri = format!("{}/base2", test_uri);
-
-        let mut data_gen =
+        // Test validation: cannot specify initial_bases in APPEND mode
+        let mut data_gen4 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let base3_uri = format!("{}/base3", test_uri);
 
-        let dataset = crate::dataset::Dataset::write(
-            data_gen.batch(3),
-            &primary_uri,
+        let result = Dataset::write(
+            data_gen4.batch(2),
+            Arc::new(dataset),
             Some(WriteParams {
-                mode: WriteMode::Create,
-                initial_bases: Some(vec![
-                    BasePath {
-                        id: 1,
-                        name: Some("base1".to_string()),
-                        path: base1_uri.clone(),
-                        is_dataset_root: true,
-                    },
-                    BasePath {
-                        id: 2,
-                        name: Some("base2".to_string()),
-                        path: base2_uri.clone(),
-                        is_dataset_root: true,
-                    },
-                ]),
+                mode: WriteMode::Append,
+                initial_bases: Some(vec![BasePath {
+                    id: 3,
+                    name: Some("base3".to_string()),
+                    path: base3_uri,
+                    is_dataset_root: true,
+                }]),
                 target_bases: Some(vec![1]),
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
-        assert_eq!(dataset.manifest.base_paths.len(), 2);
-
-        // Overwrite referencing existing base2 without registering new bases
-        let mut data_gen2 =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
-
-        let dataset = crate::dataset::Dataset::write(
-            data_gen2.batch(5),
-            std::sync::Arc::new(dataset),
-            Some(WriteParams {
-                mode: WriteMode::Overwrite,
-                target_bases: Some(vec![2]),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Verify data was overwritten with new row count
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
-
-        // Verify base_paths are still the same (no new bases registered)
-        assert_eq!(dataset.manifest.base_paths.len(), 2);
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base1".to_string())));
-        assert!(dataset
-            .manifest
-            .base_paths
-            .values()
-            .any(|bp| bp.name == Some("base2".to_string())));
-
-        // Verify data was written to base2
-        let fragments = dataset.get_fragments();
-        assert!(fragments.iter().any(|f| f
-            .metadata
-            .files
-            .iter()
-            .any(|file| file.base_id == Some(2))));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot register new bases in Append mode"));
     }
 }

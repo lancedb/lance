@@ -25,7 +25,7 @@ use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::{write_fragments_internal, TargetBaseInfo};
+use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
@@ -195,7 +195,9 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
-        let target_base_info = self.validate_and_resolve_multi_base(&mut context).await?;
+        let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
+        let target_base_info =
+            validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
         let written_frags = write_fragments_internal(
             context.dest.dataset(),
@@ -211,39 +213,6 @@ impl<'a> InsertBuilder<'a> {
         let transaction = Self::build_transaction(schema, written_frags, &context)?;
 
         Ok((transaction, context))
-    }
-
-    async fn validate_and_resolve_multi_base(
-        &self,
-        context: &mut WriteContext<'_>,
-    ) -> Result<Option<Vec<TargetBaseInfo>>> {
-
-        if !matches!(context.params.mode, WriteMode::Create)
-            && context.params.initial_bases.is_some()
-        {
-            return Err(Error::invalid_input(
-                format!(
-                    "Cannot register new bases in {:?} mode. Only CREATE mode can register new bases.",
-                    context.params.mode
-                ),
-                location!(),
-            ));
-        }
-        
-        let existing_manifest = context.dest.dataset().map(|ds| ds.manifest.as_ref());
-        let store_registry = context
-            .params
-            .session
-            .as_ref()
-            .map(|s| s.store_registry())
-            .unwrap_or_default();
-
-        crate::dataset::write::resolve_target_bases(
-            &mut context.params,
-            existing_manifest,
-            store_registry,
-        )
-            .await
     }
 
     fn build_transaction(

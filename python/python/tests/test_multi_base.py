@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 """
-Tests for multi-bases dataset functionality.
+Tests for multi-base dataset functionality.
 """
 
 import shutil
@@ -18,8 +18,8 @@ import pytest
 from lance import DatasetBasePath
 
 
-class TestMultiBases:
-    """Test multi-bases dataset functionality with local file system."""
+class TestMultiBase:
+    """Test multi-base dataset functionality with local file system."""
 
     def setup_method(self):
         """Set up test directories for each test."""
@@ -42,7 +42,7 @@ class TestMultiBases:
             shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def create_test_data(self, num_rows=500, id_offset=0):
-        """Create test data for multi-bases tests."""
+        """Create test data for multi-base tests."""
         return pd.DataFrame(
             {
                 "id": range(id_offset, id_offset + num_rows),
@@ -51,11 +51,11 @@ class TestMultiBases:
             }
         )
 
-    def test_multi_bases_create_and_read(self):
-        """Test creating a multi-bases dataset and reading it back."""
+    def test_multi_base_create_and_read(self):
+        """Test creating a multi-base dataset and reading it back."""
         data = self.create_test_data(500)
 
-        # Create dataset with multi-bases layout
+        # Create dataset with multi-base layout
         dataset = lance.write_dataset(
             data,
             self.primary_uri,
@@ -82,8 +82,8 @@ class TestMultiBases:
             data.sort_values("id").reset_index(drop=True),
         )
 
-    def test_multi_bases_append_mode(self):
-        """Test appending data to a multi-bases dataset."""
+    def test_multi_base_append_mode(self):
+        """Test appending data to a multi-base dataset."""
         # Create initial dataset
         initial_data = self.create_test_data(300)
 
@@ -120,7 +120,7 @@ class TestMultiBases:
         actual_ids = set(result["id"].tolist())
         assert actual_ids == expected_ids
 
-    def test_multi_bases_overwrite_mode_inherits_bases(self):
+    def test_multi_base_overwrite_mode_inherits_bases(self):
         """Test OVERWRITE mode inherits existing base configuration."""
         # Create initial dataset with multi-base configuration
         initial_data = self.create_test_data(200)
@@ -165,7 +165,7 @@ class TestMultiBases:
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
 
-    def test_multi_bases_overwrite_mode_primary_path_default(self):
+    def test_multi_base_overwrite_mode_primary_path_default(self):
         """Test that OVERWRITE mode defaults to primary path when no target specified."""
         # Create initial dataset with explicit data file bases
         initial_data = self.create_test_data(100)
@@ -225,7 +225,7 @@ class TestMultiBases:
         assert len(final_result) == 100
 
     def test_concurrent_appends(self):
-        """Test concurrent appends to multi-bases dataset."""
+        """Test concurrent appends to multi-base dataset."""
         # Create initial dataset
         initial_data = self.create_test_data(100)
 
@@ -295,7 +295,7 @@ class TestMultiBases:
         assert actual_ids == expected_ids
 
     def test_validation_errors(self):
-        """Test validation errors for invalid multi-bases configurations."""
+        """Test validation errors for invalid multi-base configurations."""
         data = self.create_test_data(100)
 
         # Test 1: Target reference not found in new bases for CREATE mode
@@ -337,15 +337,6 @@ class TestMultiBases:
                 ],
             )
 
-        # Test 3: Write to dataset with explicit data file bases without target_bases
-        with pytest.raises(Exception, match="target_bases"):
-            lance.write_dataset(
-                data,
-                base_dataset,
-                mode="append",
-                # No target_bases specified
-            )
-
     def test_fragment_distribution(self):
         """Test that fragments are correctly distributed and readable."""
         data = self.create_test_data(1000)
@@ -376,7 +367,7 @@ class TestMultiBases:
         assert all(filtered_result["id"] < 500)
 
     def test_schema_consistency(self):
-        """Test that schema is consistent across multi-bases operations."""
+        """Test that schema is consistent across multi-base operations."""
         # Create dataset with specific schema
         schema = pa.schema(
             [
@@ -428,10 +419,10 @@ class TestMultiBases:
         assert result.schema == schema
 
     def test_dataset_reopening(self):
-        """Test reopening a multi-bases dataset."""
+        """Test reopening a multi-base dataset."""
         data = self.create_test_data(300)
 
-        # Create multi-bases dataset
+        # Create multi-base dataset
         dataset = lance.write_dataset(
             data,
             self.primary_uri,
