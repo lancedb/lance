@@ -10,6 +10,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use std::sync::Arc;
 use lance::io::ObjectStore;
+use lance_core::utils::tempfile::TempStrDir;
 
 // Writes sample dataset to the given path
 async fn write_dataset(data_path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -59,12 +60,14 @@ async fn read_dataset(data_path: &str) -> Result<(), Box<dyn std::error::Error>>
 async fn clean_resources(data_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (store, base) = ObjectStore::from_uri(data_path).await?;
     store.remove_dir_all(base).await?;
+    println!("Cleaned up resources at: {}", data_path);
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data_path: &str = "./temp_data.lance";
+    let tempdir = TempStrDir::default();
+    let data_path = tempdir.as_str();
 
     let result = async {
         write_dataset(data_path).await?;
