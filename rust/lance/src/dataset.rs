@@ -1397,11 +1397,7 @@ impl Dataset {
         let (store, _) = ObjectStore::from_uri_and_params(
             self.session.store_registry(),
             &base_path.path,
-            &self
-                .store_params
-                .as_deref()
-                .cloned()
-                .unwrap_or_default(),
+            &self.store_params.as_deref().cloned().unwrap_or_default(),
         )
         .await?;
 
