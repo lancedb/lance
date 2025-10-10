@@ -66,7 +66,7 @@ impl ScanPlanner {
                 (row_id_sequence, num_logical_rows)
             } else {
                 // Create synthetic row ID sequence from row addresses
-                let row_ids_start = (fragment.id as u64) << 32;
+                let row_ids_start = fragment.id << 32;
                 let row_ids_end = row_ids_start + num_physical_rows;
                 let num_logical_rows = file_fragment.count_rows(None).await? as u64;
                 let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
@@ -76,12 +76,11 @@ impl ScanPlanner {
             let deletion_vector = file_fragment.get_deletion_vector().await?;
 
             // Adjust num_logical_rows if there's a deletion vector and we're not using stable row IDs
-            let num_logical_rows =
-                if deletion_vector.is_some() && !dataset.manifest.uses_stable_row_ids() {
-                    num_physical_rows - deletion_vector.as_ref().unwrap().len() as u64
-                } else {
-                    num_logical_rows
-                };
+            let num_logical_rows = match (&deletion_vector, dataset.manifest.uses_stable_row_ids())
+            {
+                (Some(dv), false) => num_physical_rows - dv.len() as u64,
+                _ => num_logical_rows,
+            };
 
             Result::Ok(LoadedFragment {
                 row_id_sequence,
@@ -142,7 +141,7 @@ impl ScanPlanner {
             }
 
             let mut to_read: Vec<Range<u64>> =
-                Self::full_frag_range(*num_physical_rows, &deletion_vector);
+                Self::full_frag_range(*num_physical_rows, deletion_vector);
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
