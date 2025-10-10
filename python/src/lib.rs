@@ -83,7 +83,6 @@ pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
-use crate::credential_vending::PyCredentialVendor;
 use crate::file::LanceFileSession;
 use crate::namespace::{connect_namespace, PyNamespace};
 use crate::fragment::{write_fragments, write_fragments_transaction};
@@ -260,7 +259,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
-    m.add_class::<PyCredentialVendor>()?;
     m.add_class::<PyNamespace>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;

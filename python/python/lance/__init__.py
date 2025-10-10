@@ -8,7 +8,7 @@ import os
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
-from . import log
+from . import io, log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
@@ -25,6 +25,8 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
+from .io import CredentialVendor, StaticCredentialVendor
+from .namespace import LanceNamespaceCredentialVendor
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "CredentialVendor",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -55,20 +58,23 @@ __all__ = [
     "Index",
     "LanceDataset",
     "LanceFragment",
+    "LanceNamespaceCredentialVendor",
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
     "ScanStatistics",
+    "StaticCredentialVendor",
     "Transaction",
     "__version__",
-    "bytes_read_counter",
-    "iops_counter",
-    "write_dataset",
-    "schema_to_json",
-    "json_to_schema",
-    "dataset",
     "batch_udf",
+    "bytes_read_counter",
+    "dataset",
+    "io",
+    "iops_counter",
+    "json_to_schema",
+    "schema_to_json",
     "set_logger",
+    "write_dataset",
     "FFILanceTableProvider",
 ]
 

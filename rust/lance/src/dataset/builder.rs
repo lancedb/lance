@@ -128,10 +128,8 @@ impl DatasetBuilder {
         };
 
         // Create LanceNamespaceCredentialVendor and add to builder
-        let vendor = lance_io::object_store::LanceNamespaceCredentialVendor::new(
-            namespace,
-            table_id,
-        );
+        let vendor =
+            lance_io::object_store::LanceNamespaceCredentialVendor::new(namespace, table_id);
         builder = builder.with_credential_vending(Arc::new(vendor), params);
 
         Ok(builder)

@@ -8,9 +8,10 @@ Tests for custom CredentialVendor implementations.
 import time
 
 import lance
+from lance import CredentialVendor
 
 
-class CustomCredentialVendor:
+class CustomCredentialVendor(CredentialVendor):
     """
     Custom credential vendor that provides mock credentials.
 
@@ -60,17 +61,18 @@ def test_custom_credential_vendor():
     assert creds["storage_options"]["aws_access_key_id"] == "my_custom_key_1"
     assert vendor.call_count == 1
 
-    # Test that it can be wrapped by Lance
-    py_vendor = lance._lib._CredentialVendor(vendor)
-    assert py_vendor is not None
+    # Test that second call increments counter
+    creds2 = vendor.get_credentials()
+    assert creds2["storage_options"]["aws_access_key_id"] == "my_custom_key_2"
+    assert vendor.call_count == 2
 
 
 def test_credential_vendor_with_dataset(tmp_path):
     """
     Test that a credential vendor can be passed to a Dataset.
 
-    Note: This test will fail to actually load a dataset because we're using
-    mock credentials, but it verifies the Python->Rust FFI integration works.
+    Note: Credential vending is used with cloud storage. With local files,
+    the vendor is accepted but not actually used.
     """
     import pyarrow as pa
 
@@ -81,12 +83,11 @@ def test_credential_vendor_with_dataset(tmp_path):
 
     # Create a custom credential vendor
     vendor = CustomCredentialVendor()
-    py_vendor = lance._lib._CredentialVendor(vendor)
 
-    # Note: We can't actually use credential vending with a local file path
-    # This just tests that the parameter is accepted
+    # Pass the vendor directly - no wrapping needed!
+    # Note: With local files, the vendor is accepted but not used
     # In a real scenario, you would use this with an S3 or cloud path
-    ds = lance.dataset(str(dataset_path))
+    ds = lance.dataset(str(dataset_path), credential_vendor=vendor)
     assert ds is not None
 
     # Verify we can read the data
@@ -98,31 +99,128 @@ def test_credential_vendor_error_handling():
     Test that errors in get_credentials are handled properly.
     """
 
-    class FailingVendor:
+    class FailingVendor(CredentialVendor):
         def get_credentials(self):
             raise ValueError("Intentional error for testing")
 
     vendor = FailingVendor()
-    py_vendor = lance._lib._CredentialVendor(vendor)
 
     # The vendor was created successfully
-    assert py_vendor is not None
+    assert vendor is not None
 
     # Error would occur when actually calling get_credentials during dataset operations
 
 
-def test_credential_vendor_validation():
+def test_credential_vendor_validation(tmp_path):
     """
     Test that invalid credential vendors are rejected.
     """
     import pytest
+    import pyarrow as pa
 
     # Object without get_credentials method
     class InvalidVendor:
         pass
 
+    # Create a test dataset
+    table = pa.table({"a": [1, 2, 3]})
+    dataset_path = tmp_path / "test.lance"
+    lance.write_dataset(table, str(dataset_path))
+
+    # Should fail when trying to open dataset with invalid vendor
     with pytest.raises(TypeError, match="must implement get_credentials"):
-        lance._lib._CredentialVendor(InvalidVendor())
+        lance.dataset(str(dataset_path), credential_vendor=InvalidVendor())
+
+
+def test_namespace_credential_vendor(tmp_path):
+    """
+    Test LanceNamespaceCredentialVendor with directory namespace.
+    """
+    import time
+    from lance import LanceNamespaceCredentialVendor
+
+    # Connect to directory namespace
+    namespace = lance._lib.connect_namespace("dir", {"path": str(tmp_path)})
+
+    # Note: In a real scenario, the namespace would have tables registered
+    # For this test, we create a mock vendor to show the pattern
+
+    # Create a custom mock namespace that returns credentials
+    class MockNamespace:
+        def describe_table(self, table_id, version):
+            return {
+                "location": "s3://test-bucket/table.lance",
+                "storage_options": {
+                    "aws_access_key_id": "ASIA_TEST",
+                    "aws_secret_access_key": "test_secret",
+                    "aws_session_token": "test_token",
+                    "expires_at_millis": str(int((time.time() + 3600) * 1000)),
+                },
+                "version": 1,
+            }
+
+    mock_ns = MockNamespace()
+    vendor = LanceNamespaceCredentialVendor(
+        namespace=mock_ns,
+        table_id=["workspace", "table"]
+    )
+
+    # Get credentials
+    creds = vendor.get_credentials()
+
+    # Verify structure
+    assert "storage_options" in creds
+    assert "expires_at_millis" in creds
+    assert creds["storage_options"]["aws_access_key_id"] == "ASIA_TEST"
+    assert isinstance(creds["expires_at_millis"], int)
+
+
+def test_namespace_vendor_missing_credentials():
+    """
+    Test that LanceNamespaceCredentialVendor raises error when namespace
+    doesn't return credentials.
+    """
+    import pytest
+    from lance import LanceNamespaceCredentialVendor
+
+    class BadNamespace:
+        def describe_table(self, table_id, version):
+            return {"location": "s3://bucket/table.lance"}  # Missing storage_options
+
+    vendor = LanceNamespaceCredentialVendor(
+        namespace=BadNamespace(),
+        table_id=["workspace", "table"]
+    )
+
+    with pytest.raises(RuntimeError, match="did not return storage_options"):
+        vendor.get_credentials()
+
+
+def test_namespace_vendor_missing_expiration():
+    """
+    Test that LanceNamespaceCredentialVendor raises error when credentials
+    don't have expiration time.
+    """
+    import pytest
+    from lance import LanceNamespaceCredentialVendor
+
+    class BadNamespace:
+        def describe_table(self, table_id, version):
+            return {
+                "location": "s3://bucket/table.lance",
+                "storage_options": {
+                    "aws_access_key_id": "ASIA_TEST",
+                    # Missing expires_at_millis
+                }
+            }
+
+    vendor = LanceNamespaceCredentialVendor(
+        namespace=BadNamespace(),
+        table_id=["workspace", "table"]
+    )
+
+    with pytest.raises(RuntimeError, match="missing 'expires_at_millis'"):
+        vendor.get_credentials()
 
 
 if __name__ == "__main__":

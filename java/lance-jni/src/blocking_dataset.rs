@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::credential_vending::JavaCredentialVendor;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
@@ -9,6 +10,7 @@ use crate::utils::{
     get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
 use crate::{traits::IntoJava, RT};
+use lance_io::object_store::CredentialVendor;
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
@@ -85,6 +87,7 @@ impl BlockingDataset {
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
+        credential_vendor: Option<Arc<dyn CredentialVendor>>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
@@ -105,6 +108,10 @@ impl BlockingDataset {
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
+
+        if let Some(vendor) = credential_vendor {
+            builder = builder.with_credential_vending(vendor, None);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -687,6 +694,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
     serialized_manifest: JObject, // Optional<ByteBuffer>
+    credential_vendor_obj: JObject, // Optional<CredentialVendor>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -698,7 +706,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj,
-            serialized_manifest
+            serialized_manifest,
+            credential_vendor_obj
         )
     )
 }
@@ -713,13 +722,36 @@ fn inner_open_native<'local>(
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
     serialized_manifest: JObject, // Optional<ByteBuffer>
+    credential_vendor_obj: JObject, // Optional<CredentialVendor>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+
+    // Extract credential vendor first (before get_bytes_opt which borrows env)
+    let credential_vendor = if !credential_vendor_obj.is_null() {
+        // Check if it's an Optional.empty()
+        let is_present = env.call_method(&credential_vendor_obj, "isPresent", "()Z", &[])?
+            .z()?;
+        if is_present {
+            // Get the value from Optional
+            let vendor_obj = env.call_method(&credential_vendor_obj, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            Some(JavaCredentialVendor::new(env, vendor_obj)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let credential_vendor_arc = credential_vendor.map(|v| Arc::new(v) as Arc<dyn CredentialVendor>);
+
+    // Get serialized manifest after credential vendor (to avoid borrow conflicts)
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
+
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -727,7 +759,8 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
-        serialized_manifest,
+        serialized_manifest.as_deref(),
+        credential_vendor_arc,
     )?;
     dataset.into_java(env)
 }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::credential_vending::PyCredentialVendor;
 use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
@@ -465,7 +464,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        credential_vendor: Option<PyCredentialVendor>,
+        credential_vendor: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -553,8 +552,8 @@ impl Dataset {
         }
 
         if let Some(credential_vendor) = credential_vendor {
-            use crate::credential_vending::py_credential_vendor_to_arc;
-            let vendor_arc = py_credential_vendor_to_arc(credential_vendor);
+            use crate::credential_vending::py_object_to_credential_vendor;
+            let vendor_arc = py_object_to_credential_vendor(credential_vendor.into())?;
             builder = builder.with_credential_vending(vendor_arc, None);
         }
 

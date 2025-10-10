@@ -11,22 +11,18 @@ use pyo3::types::PyDict;
 
 use crate::rt;
 
-/// Python-implemented credential vendor
+/// Internal wrapper for Python credential vendors
 ///
-/// This allows Python code to provide credentials to Lance datasets.
-/// The Python class must implement a `get_credentials()` method that returns
-/// a dict with 'storage_options' and 'expires_at_millis' keys.
-#[pyclass(name = "_CredentialVendor", module = "_lib")]
+/// This is not exposed to Python. Users pass their Python objects directly
+/// to dataset functions, and we wrap them internally with this struct.
 #[derive(Clone)]
 pub struct PyCredentialVendor {
     /// The Python object implementing get_credentials()
     inner: PyObject,
 }
 
-#[pymethods]
 impl PyCredentialVendor {
-    #[new]
-    fn new(obj: PyObject) -> PyResult<Self> {
+    pub fn new(obj: PyObject) -> PyResult<Self> {
         Python::with_gil(|py| {
             // Verify the object has a get_credentials method
             if !obj.bind(py).hasattr("get_credentials")? {
@@ -36,10 +32,6 @@ impl PyCredentialVendor {
             }
             Ok(Self { inner: obj })
         })
-    }
-
-    fn __repr__(&self) -> String {
-        "PyCredentialVendor".to_string()
     }
 }
 
@@ -150,9 +142,11 @@ impl CredentialVendor for PyCredentialVendorWrapper {
     }
 }
 
-/// Convert a PyCredentialVendor to an Arc<dyn CredentialVendor>
-pub fn py_credential_vendor_to_arc(
-    py_vendor: PyCredentialVendor,
-) -> Arc<dyn CredentialVendor> {
-    Arc::new(PyCredentialVendorWrapper::new(py_vendor))
+/// Convert a Python object to an Arc<dyn CredentialVendor>
+/// This is the main entry point for converting Python credential vendors to Rust
+pub fn py_object_to_credential_vendor(
+    py_obj: PyObject,
+) -> PyResult<Arc<dyn CredentialVendor>> {
+    let py_vendor = PyCredentialVendor::new(py_obj)?;
+    Ok(Arc::new(PyCredentialVendorWrapper::new(py_vendor)))
 }
