@@ -4,7 +4,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -16,8 +15,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::Statistics;
-use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
+use futures::TryStreamExt;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -54,6 +52,7 @@ impl PlannedFilterReadExec {
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
 
         Self {
@@ -80,6 +79,7 @@ impl PlannedFilterReadExec {
     }
 
     /// Convert PlannedFragmentRead to ScopedFragmentRead for execution
+    #[allow(dead_code)]
     fn to_scoped_fragments(&self, scan_scheduler: Arc<ScanScheduler>) -> Vec<ScopedFragmentRead> {
         self.planned_fragments
             .iter()
@@ -189,8 +189,8 @@ impl ExecutionPlan for PlannedFilterReadExec {
             } else {
                 // Create ScanScheduler only when actually executing (not during planning)
                 let scan_scheduler = ScanScheduler::new(
-                    dataset.object_store().clone(),
-                    SchedulerConfig::new(),
+                    Arc::new(dataset.object_store().clone()),
+                    SchedulerConfig::max_bandwidth(dataset.object_store()),
                 );
 
                 let fragment_readahead = fragment_readahead.unwrap_or(4).max(1);

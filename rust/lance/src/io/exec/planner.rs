@@ -55,16 +55,31 @@ impl ScanPlanner {
         fragments: Vec<lance_table::format::Fragment>,
     ) -> Result<Vec<LoadedFragment>> {
         let loaded_fragments = fragments.into_iter().map(|fragment| async move {
-            let file_fragment = FileFragment::new(fragment);
-            let row_id_sequence =
-                Arc::new(load_row_id_sequence(dataset.object_store(), &file_fragment).await?);
-            let deletion_vector = file_fragment.get_deletion_vector().await?;
-
-            let num_physical_rows = file_fragment.physical_rows() as u64;
-            let num_logical_rows = if let Some(deletion_vector) = &deletion_vector {
-                num_physical_rows - deletion_vector.len() as u64
+            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
+            
+            let num_physical_rows = file_fragment.physical_rows().await? as u64;
+            
+            // Check if dataset uses stable row IDs
+            let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
+                let row_id_sequence = load_row_id_sequence(dataset, &fragment).await?;
+                let num_logical_rows = row_id_sequence.len();
+                (row_id_sequence, num_logical_rows)
             } else {
-                num_physical_rows
+                // Create synthetic row ID sequence from row addresses
+                let row_ids_start = (fragment.id as u64) << 32;
+                let row_ids_end = row_ids_start + num_physical_rows;
+                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
+                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+                (addrs_as_ids, num_logical_rows)
+            };
+            
+            let deletion_vector = file_fragment.get_deletion_vector().await?;
+            
+            // Adjust num_logical_rows if there's a deletion vector and we're not using stable row IDs
+            let num_logical_rows = if deletion_vector.is_some() && !dataset.manifest.uses_stable_row_ids() {
+                num_physical_rows - deletion_vector.as_ref().unwrap().len() as u64
+            } else {
+                num_logical_rows
             };
 
             Result::Ok(LoadedFragment {

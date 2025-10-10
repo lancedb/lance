@@ -351,9 +351,10 @@ impl FilteredReadStream {
         limit: Option<usize>,
     ) -> Self {
         let soft_limit = limit.map(|l| l as u64).unwrap_or(u64::MAX);
+        let metrics_clone = metrics.clone();
         let task_stream = futures::stream::iter(scoped_fragments)
             .map(move |fragment| {
-                let metrics = metrics.clone();
+                let metrics = metrics_clone.clone();
                 Self::read_fragment(fragment, metrics, Some(soft_limit))
             })
             .buffer_unordered(fragment_readahead);
