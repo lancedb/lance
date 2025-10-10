@@ -56,9 +56,9 @@ impl ScanPlanner {
     ) -> Result<Vec<LoadedFragment>> {
         let loaded_fragments = fragments.into_iter().map(|fragment| async move {
             let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
-            
+
             let num_physical_rows = file_fragment.physical_rows().await? as u64;
-            
+
             // Check if dataset uses stable row IDs
             let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
                 let row_id_sequence = load_row_id_sequence(dataset, &fragment).await?;
@@ -72,15 +72,16 @@ impl ScanPlanner {
                 let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
                 (addrs_as_ids, num_logical_rows)
             };
-            
+
             let deletion_vector = file_fragment.get_deletion_vector().await?;
-            
+
             // Adjust num_logical_rows if there's a deletion vector and we're not using stable row IDs
-            let num_logical_rows = if deletion_vector.is_some() && !dataset.manifest.uses_stable_row_ids() {
-                num_physical_rows - deletion_vector.as_ref().unwrap().len() as u64
-            } else {
-                num_logical_rows
-            };
+            let num_logical_rows =
+                if deletion_vector.is_some() && !dataset.manifest.uses_stable_row_ids() {
+                    num_physical_rows - deletion_vector.as_ref().unwrap().len() as u64
+                } else {
+                    num_logical_rows
+                };
 
             Result::Ok(LoadedFragment {
                 row_id_sequence,
