@@ -21,13 +21,12 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 /// Dataset is a shallow clone with external base paths
 pub const FLAG_SHALLOW_CLONE: u64 = 16;
 /// Disable external transaction file
-/// TODO: Add this flag in the future to disable write transaction file.
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 64;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
+pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool, disable_transaction_file: bool) -> Result<()> {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -73,6 +72,9 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
         manifest.writer_feature_flags |= FLAG_SHALLOW_CLONE;
     }
 
+    if disable_transaction_file {
+        manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
+    }
     Ok(())
 }
 
@@ -88,10 +90,6 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
     writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
 }
 
-pub fn can_read_transaction_file(writer_flags: u64) -> bool {
-    writer_flags & FLAG_DISABLE_TRANSACTION_FILE != 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +103,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_SHALLOW_CLONE));
+        assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -121,6 +120,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_SHALLOW_CLONE));
+        assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -174,7 +174,7 @@ mod tests {
             None,
             base_paths,
         );
-        apply_feature_flags(&mut cloned_manifest, false).unwrap();
+        apply_feature_flags(&mut cloned_manifest, false, false).unwrap();
         assert_ne!(cloned_manifest.reader_feature_flags & FLAG_SHALLOW_CLONE, 0);
         assert_ne!(cloned_manifest.writer_feature_flags & FLAG_SHALLOW_CLONE, 0);
     }

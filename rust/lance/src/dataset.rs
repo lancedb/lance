@@ -2476,6 +2476,7 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    disable_transaction_file: bool,            // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -2484,9 +2485,17 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_stable_row_ids: false,
+            disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
         }
+    }
+}
+
+impl ManifestWriteConfig {
+
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
     }
 }
 
@@ -2503,7 +2512,7 @@ pub(crate) async fn write_manifest_file(
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_stable_row_ids)?;
+        apply_feature_flags(manifest, config.use_stable_row_ids, config.disable_transaction_file)?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
