@@ -357,6 +357,7 @@ impl<'a> CommitBuilder<'a> {
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
+                session.store_registry(),
             )
             .await?
         };
@@ -391,6 +392,7 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+
                 Ok(Dataset {
                     object_store,
                     base: base_path,
@@ -404,6 +406,7 @@ impl<'a> CommitBuilder<'a> {
                     fragment_bitmap,
                     metadata_cache,
                     file_reader_options: None,
+                    store_params: self.store_params.clone().map(Box::new),
                 })
             }
         }

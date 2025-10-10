@@ -26,6 +26,7 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    DatasetBasePath,
     FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",

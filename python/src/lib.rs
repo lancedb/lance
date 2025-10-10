@@ -47,7 +47,7 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{MergeInsertBuilder, PyFullTextQuery};
+use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery};
 use env_logger::{Builder, Env};
 use file::{
     stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -240,6 +240,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;

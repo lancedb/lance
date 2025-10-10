@@ -734,6 +734,7 @@ async fn rewrite_files(
         dataset.schema().clone(),
         reader,
         params,
+        None, // Compaction doesn't use target_bases
     )
     .await?;
 

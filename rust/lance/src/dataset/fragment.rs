@@ -935,21 +935,29 @@ impl FileFragment {
                 .dataset
                 .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
-            let (store_scheduler, reader_priority) =
-                if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
-                } else {
-                    (
-                        ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                        ),
-                        0,
-                    )
-                };
+            let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
+                // TODO: make object stores for non-default bases reuse the same scan scheduler
+                //  currently we always create a new one
+                let object_store = self.dataset.object_store_for_base(base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&object_store);
+                (
+                    ScanScheduler::new(object_store, config),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+                (
+                    scan_scheduler.clone(),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else {
+                (
+                    ScanScheduler::new(
+                        self.dataset.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    ),
+                    0,
+                )
+            };
             let file_scheduler = store_scheduler
                 .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
                 .await?;
@@ -3168,6 +3176,7 @@ mod tests {
             schema: schema.clone(),
             fragments,
             config_upsert_values: None,
+            initial_bases: None,
         };
 
         let new_dataset =
@@ -3277,6 +3286,7 @@ mod tests {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
                 config_upsert_values: None,
+                initial_bases: None,
             };
 
             let dataset =
