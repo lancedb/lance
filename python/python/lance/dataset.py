@@ -4981,15 +4981,6 @@ def write_dataset(
     initial_bases: list of DatasetBasePath, optional
         New base paths to register in the manifest. Only used in **CREATE mode**.
         Cannot be specified in APPEND or OVERWRITE modes.
-
-        Each :class:`DatasetBasePath` defines a storage location with an optional name:
-
-        >>> from lance import DatasetBasePath
-        >>> bases = [
-        ...     DatasetBasePath("s3://bucket1/data", name="primary"),
-        ...     DatasetBasePath("s3://bucket2/data", name="archive")
-        ... ]
-
     target_bases: list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
@@ -5000,31 +4991,6 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
-
-    Examples
-    --------
-    Create a dataset with multiple base paths:
-
-    >>> import lance
-    >>> from lance import DatasetBasePath
-    >>> initial_bases = [
-    ...     DatasetBasePath("s3://fast-storage/data", name="hot"),
-    ...     DatasetBasePath("s3://archive-storage/data", name="cold")
-    ... ]
-    >>> ds = lance.write_dataset(
-    ...     data, "s3://fast-storage/mydataset",
-    ...     mode="create",
-    ...     initial_bases=initial_bases,
-    ...     target_bases=["hot"]
-    ... )
-
-    Append data to a specific base by name:
-
-    >>> lance.write_dataset(new_data, ds, mode="append", target_bases=["hot"])
-
-    Overwrite data (inherits existing base_paths):
-
-    >>> lance.write_dataset(new_data, ds, mode="overwrite", target_bases=["cold"])
     """
     if use_legacy_format is not None:
         warnings.warn(
