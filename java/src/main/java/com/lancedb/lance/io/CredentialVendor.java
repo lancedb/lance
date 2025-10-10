@@ -29,7 +29,6 @@ import java.util.Map;
  *
  * <pre>{@code
  * public class MyCredentialVendor implements CredentialVendor {
- *   @Override
  *   public Map<String, Object> getCredentials() {
  *     // Fetch from your credential service
  *     Map<String, String> storageOptions = new HashMap<>();

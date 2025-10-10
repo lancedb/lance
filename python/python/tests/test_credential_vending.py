@@ -128,7 +128,7 @@ def test_credential_vendor_validation(tmp_path):
     lance.write_dataset(table, str(dataset_path))
 
     # Should fail when trying to open dataset with invalid vendor
-    with pytest.raises(TypeError, match="must implement get_credentials"):
+    with pytest.raises(TypeError, match="CredentialVendor must implement get_credentials"):
         lance.dataset(str(dataset_path), credential_vendor=InvalidVendor())
 
 

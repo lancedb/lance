@@ -92,6 +92,7 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
+    credential_vendor: Optional[CredentialVendor] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -149,6 +150,10 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
+    credential_vendor : optional, lance.CredentialVendor
+        A credential vendor to use for this dataset. This is used to provide
+        dynamic credentials for cloud storage access. If not specified, static
+        credentials from storage_options will be used.
     """
     ds = LanceDataset(
         uri,
@@ -162,6 +167,7 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
+        credential_vendor=credential_vendor,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -185,6 +191,7 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
+                credential_vendor=credential_vendor,
             )
     else:
         return ds
