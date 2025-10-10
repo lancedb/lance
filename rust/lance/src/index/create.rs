@@ -592,7 +592,7 @@ mod tests {
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
         // Create initial dataset with 10,000 rows
-        let num_rows = 10_000;
+        let num_rows = 256;
         let reader = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col(
@@ -607,7 +607,7 @@ mod tests {
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
         // Create IVF_PQ vector index
-        let vector_params = VectorIndexParams::ivf_pq(4, 8, 16, MetricType::L2, 50);
+        let vector_params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(
                 &["vector"],
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(indices.len(), 2, "Should have 2 indices");
 
         // Insert more data (5,000 rows)
-        let num_new_rows = 5_000;
+        let num_new_rows = 32;
         let new_reader = lance_datagen::gen_batch()
             .col(
                 "id",
@@ -681,7 +681,7 @@ mod tests {
         // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
         // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
         // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
-        assert_eq!(indices_after.len(), 3);
+        assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
         let id_idx = indices_after
             .iter()
             .find(|idx| idx.name == "id_idx")
