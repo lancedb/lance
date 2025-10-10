@@ -134,11 +134,27 @@ macro_rules! assert_io_lt {
 // These fields are "dead code" because we just use them right now to display
 // in test failure messages through Debug. (The lint ignores Debug impls.)
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IoRequestRecord {
     pub method: &'static str,
     pub path: Path,
     pub range: Option<Range<u64>>,
+}
+
+impl std::fmt::Debug for IoRequestRecord {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // For example: "put /path/to/file range: 0-100"
+        write!(
+            f,
+            "IORequest(method={}, path=\"{}\"",
+            self.method, self.path
+        )?;
+        if let Some(range) = &self.range {
+            write!(f, ", range={:?}", range)?;
+        }
+        write!(f, ")")?;
+        Ok(())
+    }
 }
 
 impl Display for IoStats {
