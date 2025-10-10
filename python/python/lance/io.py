@@ -28,12 +28,10 @@ class CredentialVendor(ABC):
     ...     def get_credentials(self):
     ...         # Fetch from your credential service
     ...         return {
-    ...             "storage_options": {
-    ...                 "aws_access_key_id": "ASIA...",
-    ...                 "aws_secret_access_key": "secret",
-    ...                 "aws_session_token": "token",
-    ...             },
-    ...             "expires_at_millis": 1234567890000,
+    ...             "aws_access_key_id": "ASIA...",
+    ...             "aws_secret_access_key": "secret",
+    ...             "aws_session_token": "token",
+    ...             "expires_at_millis": "1234567890000",
     ...         }
     ...
     >>> vendor = MyCredentialVendor()
@@ -47,7 +45,7 @@ class CredentialVendor(ABC):
     """
 
     @abstractmethod
-    def get_credentials(self) -> Dict:
+    def get_credentials(self) -> Dict[str, str]:
         """Get fresh storage credentials.
 
         This method is called automatically before each request and before existing
@@ -55,27 +53,29 @@ class CredentialVendor(ABC):
 
         Returns
         -------
-        dict
-            Dictionary with two required keys:
+        Dict[str, str]
+            Dictionary of string key-value pairs containing cloud storage credentials
+            and expiration time. Required keys:
 
-            - "storage_options" (dict): Cloud storage credentials. Keys vary by provider:
+            - "expires_at_millis" (str): Unix timestamp in milliseconds (as string) when
+              credentials expire. Lance will automatically call get_credentials() again
+              before this time.
 
-              AWS S3:
-                - "aws_access_key_id" (str): AWS access key
-                - "aws_secret_access_key" (str): AWS secret key
-                - "aws_session_token" (str, optional): Session token for temporary credentials
+            Plus provider-specific credential keys:
 
-              Azure Blob Storage:
-                - "account_name" (str): Storage account name
-                - "account_key" (str): Storage account key
-                - Or "sas_token" (str): SAS token
+            AWS S3:
+              - "aws_access_key_id" (str): AWS access key
+              - "aws_secret_access_key" (str): AWS secret key
+              - "aws_session_token" (str, optional): Session token for temporary credentials
 
-              Google Cloud Storage:
-                - "service_account_key" (str): Service account JSON key
-                - Or "token" (str): OAuth token
+            Azure Blob Storage:
+              - "account_name" (str): Storage account name
+              - "account_key" (str): Storage account key
+              - Or "sas_token" (str): SAS token
 
-            - "expires_at_millis" (int): Unix timestamp in milliseconds when credentials expire.
-              Lance will automatically call get_credentials() again before this time.
+            Google Cloud Storage:
+              - "service_account_key" (str): Service account JSON key
+              - Or "token" (str): OAuth token
 
         Raises
         ------
@@ -92,13 +92,12 @@ class CredentialVendor(ABC):
         ...         RoleSessionName='lance-session'
         ...     )
         ...     creds = response['Credentials']
+        ...     expires_at_millis = int(creds['Expiration'].timestamp() * 1000)
         ...     return {
-        ...         "storage_options": {
-        ...             "aws_access_key_id": creds['AccessKeyId'],
-        ...             "aws_secret_access_key": creds['SecretAccessKey'],
-        ...             "aws_session_token": creds['SessionToken'],
-        ...         },
-        ...         "expires_at_millis": int(creds['Expiration'].timestamp() * 1000),
+        ...         "aws_access_key_id": creds['AccessKeyId'],
+        ...         "aws_secret_access_key": creds['SecretAccessKey'],
+        ...         "aws_session_token": creds['SessionToken'],
+        ...         "expires_at_millis": str(expires_at_millis),
         ...     }
         """
         pass
@@ -113,46 +112,36 @@ class StaticCredentialVendor(CredentialVendor):
 
     Parameters
     ----------
-    storage_options : dict
-        Storage credentials to return (e.g., AWS keys, Azure account info)
-    expires_at_millis : int
-        Unix timestamp in milliseconds when credentials expire
+    credentials : Dict[str, str]
+        Dictionary containing storage credentials and expires_at_millis as strings
 
     Example
     -------
-    >>> vendor = StaticCredentialVendor(
-    ...     storage_options={
-    ...         "aws_access_key_id": "ASIA...",
-    ...         "aws_secret_access_key": "secret",
-    ...         "aws_session_token": "token",
-    ...     },
-    ...     expires_at_millis=1234567890000,
-    ... )
+    >>> vendor = StaticCredentialVendor({
+    ...     "aws_access_key_id": "ASIA...",
+    ...     "aws_secret_access_key": "secret",
+    ...     "aws_session_token": "token",
+    ...     "expires_at_millis": "1234567890000",
+    ... })
     >>> dataset = lance.dataset("s3://bucket/table.lance", credential_vendor=vendor)
     """
 
-    def __init__(self, storage_options: Dict[str, str], expires_at_millis: int):
+    def __init__(self, credentials: Dict[str, str]):
         """Initialize with static credentials.
 
         Parameters
         ----------
-        storage_options : dict
-            Storage credentials
-        expires_at_millis : int
-            Expiration time in milliseconds since epoch
+        credentials : Dict[str, str]
+            Credential dictionary with all keys as strings, including expires_at_millis
         """
-        self._storage_options = storage_options.copy()
-        self._expires_at_millis = expires_at_millis
+        self._credentials = credentials.copy()
 
-    def get_credentials(self) -> Dict:
+    def get_credentials(self) -> Dict[str, str]:
         """Return the static credentials.
 
         Returns
         -------
-        dict
-            Credentials dictionary with "storage_options" and "expires_at_millis"
+        Dict[str, str]
+            Credentials dictionary with string keys and values
         """
-        return {
-            "storage_options": self._storage_options.copy(),
-            "expires_at_millis": self._expires_at_millis,
-        }
+        return self._credentials.copy()

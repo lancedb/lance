@@ -64,7 +64,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
         self._namespace = namespace
         self._table_id = table_id
 
-    def get_credentials(self) -> Dict:
+    def get_credentials(self) -> Dict[str, str]:
         """Fetch credentials from the namespace.
 
         This calls namespace.describe_table() to get the latest credentials
@@ -72,8 +72,9 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
 
         Returns
         -------
-        dict
-            Credentials dictionary with "storage_options" and "expires_at_millis"
+        Dict[str, str]
+            Flat dictionary of string key-value pairs containing credentials
+            and expires_at_millis
 
         Raises
         ------
@@ -85,7 +86,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
             table_id=self._table_id, version=None
         )
 
-        # Extract storage options
+        # Extract storage options - should already be a flat dict of strings
         storage_options = table_info.get("storage_options")
         if storage_options is None:
             raise RuntimeError(
@@ -93,18 +94,12 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
                 "Ensure the namespace supports credential vending."
             )
 
-        # Extract expiration time from storage_options
-        # The expires_at_millis is included in storage_options by the namespace
-        expires_at_millis_str = storage_options.get("expires_at_millis")
-        if expires_at_millis_str is None:
+        # Verify expires_at_millis is present
+        if "expires_at_millis" not in storage_options:
             raise RuntimeError(
                 "Namespace storage_options missing 'expires_at_millis'. "
                 "Credential refresh will not work properly."
             )
 
-        expires_at_millis = int(expires_at_millis_str)
-
-        return {
-            "storage_options": storage_options,
-            "expires_at_millis": expires_at_millis,
-        }
+        # Return the storage_options directly - it's already a flat Map<String, String>
+        return storage_options

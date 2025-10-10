@@ -69,66 +69,47 @@ impl CredentialVendor for PyCredentialVendorWrapper {
                         location: snafu::location!(),
                     })?;
 
-                // Extract the result dict
+                // Extract the result dict - should be a flat Map<String, String>
                 let result_dict = result.downcast::<PyDict>().map_err(|_| {
                     lance_core::Error::InvalidInput {
-                        source: "get_credentials() must return a dict with 'storage_options' and 'expires_at_millis' keys".into(),
+                        source: "get_credentials() must return a dict of string key-value pairs".into(),
                         location: snafu::location!(),
                     }
                 })?;
 
-                // Extract storage_options
-                let storage_options_obj = result_dict
-                    .get_item("storage_options")
-                    .map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("Failed to get storage_options from result: {}", e).into(),
-                        location: snafu::location!(),
-                    })?
-                    .ok_or_else(|| lance_core::Error::InvalidInput {
-                        source: "get_credentials() result must contain 'storage_options' key".into(),
-                        location: snafu::location!(),
-                    })?;
-
-                let storage_options_dict = storage_options_obj.downcast::<PyDict>().map_err(|_| {
-                    lance_core::Error::InvalidInput {
-                        source: "storage_options must be a dict".into(),
-                        location: snafu::location!(),
-                    }
-                })?;
-
-                let mut storage_options = HashMap::new();
-                for (key, value) in storage_options_dict.iter() {
+                // Convert all entries to HashMap<String, String>
+                let mut credentials = HashMap::new();
+                for (key, value) in result_dict.iter() {
                     let key_str: String = key.extract().map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("storage_options keys must be strings: {}", e).into(),
+                        source: format!("credential keys must be strings: {}", e).into(),
                         location: snafu::location!(),
                     })?;
                     let value_str: String = value.extract().map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("storage_options values must be strings: {}", e).into(),
+                        source: format!("credential values must be strings: {}", e).into(),
                         location: snafu::location!(),
                     })?;
-                    storage_options.insert(key_str, value_str);
+                    credentials.insert(key_str, value_str);
                 }
 
-                // Extract expires_at_millis
-                let expires_at_millis_obj = result_dict
-                    .get_item("expires_at_millis")
-                    .map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("Failed to get expires_at_millis from result: {}", e).into(),
-                        location: snafu::location!(),
-                    })?
+                // Extract and parse expires_at_millis
+                let expires_at_millis_str = credentials
+                    .get("expires_at_millis")
                     .ok_or_else(|| lance_core::Error::InvalidInput {
                         source: "get_credentials() result must contain 'expires_at_millis' key".into(),
                         location: snafu::location!(),
                     })?;
 
-                let expires_at_millis: u64 = expires_at_millis_obj.extract().map_err(|e| {
+                let expires_at_millis: u64 = expires_at_millis_str.parse().map_err(|e| {
                     lance_core::Error::InvalidInput {
-                        source: format!("expires_at_millis must be an integer: {}", e).into(),
+                        source: format!("expires_at_millis must be a valid integer string: {}", e).into(),
                         location: snafu::location!(),
                     }
                 })?;
 
-                Ok((storage_options, expires_at_millis))
+                // Remove expires_at_millis from credentials map as it's returned separately
+                credentials.remove("expires_at_millis");
+
+                Ok((credentials, expires_at_millis))
             })
         })
         .await

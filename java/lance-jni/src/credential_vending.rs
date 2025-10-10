@@ -56,7 +56,7 @@ impl CredentialVendor for JavaCredentialVendor {
             })?;
 
             // Call getCredentials() method on Java object
-            // Returns Map<String, Object> with "storage_options" (Map<String, String>) and "expires_at_millis" (Long)
+            // Returns Map<String, String> with all credentials including "expires_at_millis"
             let result = env
                 .call_method(
                     &java_vendor,
@@ -80,55 +80,21 @@ impl CredentialVendor for JavaCredentialVendor {
                 location: snafu::location!(),
             })?;
 
-            // Extract storage_options from the map
-            let storage_options_key = env
-                .new_string("storage_options")
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to create 'storage_options' string: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
-
-            let storage_options_obj = env
-                .call_method(
-                    &result_map,
-                    "get",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[JValue::Object(&storage_options_key)],
-                )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to get storage_options from result: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?
-                .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "storage_options is not an object: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
-
             // Convert Java Map to Rust HashMap
-            let storage_options_map = JMap::from_env(&mut env, &storage_options_obj)
+            let credentials_map = JMap::from_env(&mut env, &result_map)
                 .map_err(|e| lance_core::Error::IO {
                     source: Box::new(std::io::Error::other(format!(
-                        "storage_options is not a Map: {}",
+                        "getCredentials result is not a Map: {}",
                         e
                     ))),
                     location: snafu::location!(),
                 })?;
 
-            let mut storage_options = HashMap::new();
-            let mut iter = storage_options_map.iter(&mut env).map_err(|e| {
+            let mut credentials = HashMap::new();
+            let mut iter = credentials_map.iter(&mut env).map_err(|e| {
                 lance_core::Error::IO {
                     source: Box::new(std::io::Error::other(format!(
-                        "Failed to iterate storage_options: {}",
+                        "Failed to iterate credentials: {}",
                         e
                     ))),
                     location: snafu::location!(),
@@ -138,7 +104,7 @@ impl CredentialVendor for JavaCredentialVendor {
             while let Some((key, value)) = iter.next(&mut env).map_err(|e| {
                 lance_core::Error::IO {
                     source: Box::new(std::io::Error::other(format!(
-                        "Failed to get next entry: {}",
+                        "Failed to get next credential entry: {}",
                         e
                     ))),
                     location: snafu::location!(),
@@ -148,7 +114,7 @@ impl CredentialVendor for JavaCredentialVendor {
                     .get_string(&JString::from(key))
                     .map_err(|e| lance_core::Error::IO {
                         source: Box::new(std::io::Error::other(format!(
-                            "storage_options key is not a string: {}",
+                            "credential key is not a string: {}",
                             e
                         ))),
                         location: snafu::location!(),
@@ -159,70 +125,35 @@ impl CredentialVendor for JavaCredentialVendor {
                     .get_string(&JString::from(value))
                     .map_err(|e| lance_core::Error::IO {
                         source: Box::new(std::io::Error::other(format!(
-                            "storage_options value is not a string: {}",
+                            "credential value is not a string: {}",
                             e
                         ))),
                         location: snafu::location!(),
                     })?
                     .into();
 
-                storage_options.insert(key_str, value_str);
+                credentials.insert(key_str, value_str);
             }
 
-            // Extract expires_at_millis from the map
-            let expires_key = env
-                .new_string("expires_at_millis")
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to create 'expires_at_millis' string: {}",
-                        e
-                    ))),
+            // Extract and parse expires_at_millis
+            let expires_at_millis_str = credentials
+                .get("expires_at_millis")
+                .ok_or_else(|| lance_core::Error::InvalidInput {
+                    source: "getCredentials() result must contain 'expires_at_millis' key".into(),
                     location: snafu::location!(),
                 })?;
 
-            let expires_obj = env
-                .call_method(
-                    &result_map,
-                    "get",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[JValue::Object(&expires_key)],
-                )
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to get expires_at_millis from result: {}",
-                        e
-                    ))),
+            let expires_at_millis: u64 = expires_at_millis_str.parse().map_err(|e| {
+                lance_core::Error::InvalidInput {
+                    source: format!("expires_at_millis must be a valid integer string: {}", e).into(),
                     location: snafu::location!(),
-                })?
-                .l()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "expires_at_millis is not an object: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?;
+                }
+            })?;
 
-            // Call longValue() to get the primitive long
-            let expires_at_millis = env
-                .call_method(&expires_obj, "longValue", "()J", &[])
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to call longValue on expires_at_millis: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })?
-                .j()
-                .map_err(|e| lance_core::Error::IO {
-                    source: Box::new(std::io::Error::other(format!(
-                        "expires_at_millis longValue is not a long: {}",
-                        e
-                    ))),
-                    location: snafu::location!(),
-                })? as u64;
+            // Remove expires_at_millis from credentials map as it's returned separately
+            credentials.remove("expires_at_millis");
 
-            Ok((storage_options, expires_at_millis))
+            Ok((credentials, expires_at_millis))
         })
         .await
         .map_err(|e| lance_core::Error::IO {

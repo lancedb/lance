@@ -29,22 +29,19 @@ class CustomCredentialVendor(CredentialVendor):
         Called by Lance to get fresh credentials.
 
         Returns:
-            dict with 'storage_options' and 'expires_at_millis' keys
+            dict of string key-value pairs including credentials and expires_at_millis
         """
         self.call_count += 1
 
         # Calculate expiration time
         expires_at_millis = int((time.time() + self.expires_in_seconds) * 1000)
 
-        # Return credentials in the expected format
+        # Return credentials in the expected flat format
         return {
-            "storage_options": {
-                "aws_access_key_id": f"{self.access_key}_{self.call_count}",
-                "aws_secret_access_key": "secret_key",
-                "aws_session_token": "session_token",
-                "expires_at_millis": str(expires_at_millis),
-            },
-            "expires_at_millis": expires_at_millis,
+            "aws_access_key_id": f"{self.access_key}_{self.call_count}",
+            "aws_secret_access_key": "secret_key",
+            "aws_session_token": "session_token",
+            "expires_at_millis": str(expires_at_millis),
         }
 
 
@@ -56,14 +53,14 @@ def test_custom_credential_vendor():
 
     # Test that get_credentials works
     creds = vendor.get_credentials()
-    assert "storage_options" in creds
+    assert "aws_access_key_id" in creds
     assert "expires_at_millis" in creds
-    assert creds["storage_options"]["aws_access_key_id"] == "my_custom_key_1"
+    assert creds["aws_access_key_id"] == "my_custom_key_1"
     assert vendor.call_count == 1
 
     # Test that second call increments counter
     creds2 = vendor.get_credentials()
-    assert creds2["storage_options"]["aws_access_key_id"] == "my_custom_key_2"
+    assert creds2["aws_access_key_id"] == "my_custom_key_2"
     assert vendor.call_count == 2
 
 
@@ -167,11 +164,11 @@ def test_namespace_credential_vendor(tmp_path):
     # Get credentials
     creds = vendor.get_credentials()
 
-    # Verify structure
-    assert "storage_options" in creds
+    # Verify structure - should be flat Map<String, String>
+    assert "aws_access_key_id" in creds
     assert "expires_at_millis" in creds
-    assert creds["storage_options"]["aws_access_key_id"] == "ASIA_TEST"
-    assert isinstance(creds["expires_at_millis"], int)
+    assert creds["aws_access_key_id"] == "ASIA_TEST"
+    assert isinstance(creds["expires_at_millis"], str)
 
 
 def test_namespace_vendor_missing_credentials():

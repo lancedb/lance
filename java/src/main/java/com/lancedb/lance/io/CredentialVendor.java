@@ -29,17 +29,17 @@ import java.util.Map;
  *
  * <pre>{@code
  * public class MyCredentialVendor implements CredentialVendor {
- *   public Map<String, Object> getCredentials() {
+ *   public Map<String, String> getCredentials() {
  *     // Fetch from your credential service
- *     Map<String, String> storageOptions = new HashMap<>();
- *     storageOptions.put("aws_access_key_id", "ASIA...");
- *     storageOptions.put("aws_secret_access_key", "secret");
- *     storageOptions.put("aws_session_token", "token");
+ *     Map<String, String> credentials = new HashMap<>();
+ *     credentials.put("aws_access_key_id", "ASIA...");
+ *     credentials.put("aws_secret_access_key", "secret");
+ *     credentials.put("aws_session_token", "token");
  *
- *     Map<String, Object> result = new HashMap<>();
- *     result.put("storage_options", storageOptions);
- *     result.put("expires_at_millis", System.currentTimeMillis() + 3600000L);
- *     return result;
+ *     long expiresAtMillis = System.currentTimeMillis() + 3600000L;
+ *     credentials.put("expires_at_millis", String.valueOf(expiresAtMillis));
+ *
+ *     return credentials;
  *   }
  * }
  *
@@ -67,21 +67,21 @@ public interface CredentialVendor {
    * <p>This method is called automatically before each request and before existing credentials
    * expire. It must return credentials in the format described below.
    *
-   * @return Map containing two required keys:
+   * @return Map of string key-value pairs containing cloud storage credentials and expiration time.
+   *     Required key:
    *     <ul>
-   *       <li>"storage_options" (Map&lt;String, String&gt;): Cloud storage credentials. Keys vary
-   *           by provider:
-   *           <ul>
-   *             <li>AWS S3: "aws_access_key_id", "aws_secret_access_key", "aws_session_token"
-   *                 (optional)
-   *             <li>Azure Blob Storage: "account_name", "account_key" or "sas_token"
-   *             <li>Google Cloud Storage: "service_account_key" or "token"
-   *           </ul>
-   *       <li>"expires_at_millis" (Long): Unix timestamp in milliseconds when credentials expire.
-   *           Lance will automatically call getCredentials() again before this time.
+   *       <li>"expires_at_millis" (String): Unix timestamp in milliseconds (as string) when
+   *           credentials expire. Lance will automatically call getCredentials() again before this
+   *           time.
+   *     </ul>
+   *     Plus provider-specific credential keys:
+   *     <ul>
+   *       <li>AWS S3: "aws_access_key_id", "aws_secret_access_key", "aws_session_token" (optional)
+   *       <li>Azure Blob Storage: "account_name", "account_key" or "sas_token"
+   *       <li>Google Cloud Storage: "service_account_key" or "token"
    *     </ul>
    *
    * @throws RuntimeException if unable to fetch credentials
    */
-  Map<String, Object> getCredentials();
+  Map<String, String> getCredentials();
 }
