@@ -82,8 +82,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
         """
         # Call namespace to describe the table and get credentials
         table_info = self._namespace.describe_table(
-            table_id=self._table_id,
-            version=None
+            table_id=self._table_id, version=None
         )
 
         # Extract storage options

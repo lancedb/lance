@@ -161,8 +161,7 @@ def test_namespace_credential_vendor(tmp_path):
 
     mock_ns = MockNamespace()
     vendor = LanceNamespaceCredentialVendor(
-        namespace=mock_ns,
-        table_id=["workspace", "table"]
+        namespace=mock_ns, table_id=["workspace", "table"]
     )
 
     # Get credentials
@@ -188,8 +187,7 @@ def test_namespace_vendor_missing_credentials():
             return {"location": "s3://bucket/table.lance"}  # Missing storage_options
 
     vendor = LanceNamespaceCredentialVendor(
-        namespace=BadNamespace(),
-        table_id=["workspace", "table"]
+        namespace=BadNamespace(), table_id=["workspace", "table"]
     )
 
     with pytest.raises(RuntimeError, match="did not return storage_options"):
@@ -211,12 +209,11 @@ def test_namespace_vendor_missing_expiration():
                 "storage_options": {
                     "aws_access_key_id": "ASIA_TEST",
                     # Missing expires_at_millis
-                }
+                },
             }
 
     vendor = LanceNamespaceCredentialVendor(
-        namespace=BadNamespace(),
-        table_id=["workspace", "table"]
+        namespace=BadNamespace(), table_id=["workspace", "table"]
     )
 
     with pytest.raises(RuntimeError, match="missing 'expires_at_millis'"):

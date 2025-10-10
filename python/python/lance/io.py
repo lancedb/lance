@@ -16,7 +16,7 @@ class CredentialVendor(ABC):
 
     Credential vendors enable automatic credential refresh for long-running operations
     on cloud storage (S3, Azure, GCS). Implement this interface to integrate with
-    custom credential management systems such as AWS STS, HashiCorp Vault, or
+    custom credential management systems such as AWS STS, GCP STS, or
     proprietary credential services.
 
     The vendor is called automatically before credentials expire, ensuring
@@ -156,5 +156,3 @@ class StaticCredentialVendor(CredentialVendor):
             "storage_options": self._storage_options.copy(),
             "expires_at_millis": self._expires_at_millis,
         }
-
-

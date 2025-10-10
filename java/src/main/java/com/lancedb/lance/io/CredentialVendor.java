@@ -20,7 +20,7 @@ import java.util.Map;
  *
  * <p>Credential vendors enable automatic credential refresh for long-running operations on cloud
  * storage (S3, Azure, GCS). Implement this interface to integrate with custom credential management
- * systems such as AWS STS, HashiCorp Vault, or proprietary credential services.
+ * systems such as AWS STS, GCP STS, or proprietary credential services.
  *
  * <p>The vendor is called automatically before credentials expire, ensuring uninterrupted access
  * during long-running queries, training jobs, or data processing.
