@@ -558,7 +558,7 @@ mod test {
     use arrow_schema::{DataType, Field};
     use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
-    use lance_core::{ROW_ADDR, ROW_ID_FIELD};
+    use lance_core::ROW_ADDR;
     use lance_datafusion::exec::OneShotExec;
 
     use crate::dataset::WriteParams;
@@ -595,7 +595,7 @@ mod test {
         let dataset = Arc::new(dataset);
 
         let rowids = Arc::new(UInt64Array::from(vec![1, 2, 3]));
-        let schema = Schema::new(vec![ROW_ID_FIELD.clone()]);
+        let schema = Schema::new(vec![ROW_ADDR_FIELD.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![rowids.clone()]).unwrap();
 
         let result = apply_to_batch(batch, dataset).await.unwrap();
@@ -638,7 +638,7 @@ mod test {
         let dataset = sample_dataset_with_rowid_index().await;
 
         let rowids = Arc::new(UInt64Array::from(vec![0, 1, 2]));
-        let schema = Schema::new(vec![ROW_ID_FIELD.clone()]);
+        let schema = Schema::new(vec![ROW_ADDR_FIELD.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![rowids.clone()]).unwrap();
 
         let result = apply_to_batch(batch, dataset).await.unwrap();
@@ -655,7 +655,7 @@ mod test {
         let dataset = sample_dataset_with_rowid_index().await;
 
         let rowids = Arc::new(UInt64Array::from(vec![Some(0), None, Some(2)]));
-        let schema = Schema::new(vec![ROW_ID_FIELD.clone()]);
+        let schema = Schema::new(vec![ROW_ADDR_FIELD.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![rowids.clone()]).unwrap();
 
         let result = apply_to_batch(batch, dataset).await.unwrap();
@@ -684,7 +684,7 @@ mod test {
         let dataset = sample_dataset_with_rowid_index().await;
 
         let rowids = Arc::new(UInt64Array::from(vec![Some(0), None, Some(2)]));
-        let schema = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
+        let schema = Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()]));
         let batch = RecordBatch::try_new(schema.clone(), vec![rowids.clone()]).unwrap();
 
         let memory_exec =
