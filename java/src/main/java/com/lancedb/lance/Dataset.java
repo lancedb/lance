@@ -16,6 +16,7 @@ package com.lancedb.lance;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.io.CredentialVendor;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;

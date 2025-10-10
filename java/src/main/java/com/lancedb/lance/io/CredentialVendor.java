@@ -11,7 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance;
+package com.lancedb.lance.io;
 
 import java.util.Map;
 
@@ -19,8 +19,8 @@ import java.util.Map;
  * Interface for providing cloud storage credentials to Lance datasets.
  *
  * <p>Credential vendors enable automatic credential refresh for long-running operations on cloud
- * storage (S3, Azure, GCS). Implement this interface to integrate with custom credential
- * management systems such as AWS STS, HashiCorp Vault, or proprietary credential services.
+ * storage (S3, Azure, GCS). Implement this interface to integrate with custom credential management
+ * systems such as AWS STS, HashiCorp Vault, or proprietary credential services.
  *
  * <p>The vendor is called automatically before credentials expire, ensuring uninterrupted access
  * during long-running queries, training jobs, or data processing.
@@ -73,8 +73,8 @@ public interface CredentialVendor {
    *       <li>"storage_options" (Map&lt;String, String&gt;): Cloud storage credentials. Keys vary
    *           by provider:
    *           <ul>
-   *             <li>AWS S3: "aws_access_key_id", "aws_secret_access_key",
-   *                 "aws_session_token" (optional)
+   *             <li>AWS S3: "aws_access_key_id", "aws_secret_access_key", "aws_session_token"
+   *                 (optional)
    *             <li>Azure Blob Storage: "account_name", "account_key" or "sas_token"
    *             <li>Google Cloud Storage: "service_account_key" or "token"
    *           </ul>

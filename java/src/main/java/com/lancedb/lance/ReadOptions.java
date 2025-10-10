@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.io.CredentialVendor;
+
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
