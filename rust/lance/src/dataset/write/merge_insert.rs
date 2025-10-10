@@ -576,10 +576,6 @@ impl MergeInsertJob {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
         let schema = source.schema();
-        let add_row_addr = match self.check_compatible_schema(&schema)? {
-            SchemaComparison::FullCompatible => false,
-            SchemaComparison::Subschema => true,
-        };
 
         // 1 - Input from user
         let input = Arc::new(OneShotExec::new(source));
@@ -627,9 +623,10 @@ impl MergeInsertJob {
             .filter(|f| f.name() != ROW_ID && f.name() != ROW_ADDR)
             .cloned()
             .collect::<Vec<_>>();
-        if add_row_addr {
-            columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
-        }
+        columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        // if add_row_addr {
+        //     columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        // }
         target = Arc::new(project(target, &Schema::new(columns))?);
 
         let column_names = schema
@@ -1943,7 +1940,10 @@ impl Merger {
                         .capture(row_ids.values())?;
                 }
 
-                let projection = {
+                let projection = if self.output_schema.fields.len() == left_cols.len() {
+                    #[allow(clippy::redundant_clone)]
+                    left_cols.clone()
+                } else {
                     let mut cols = Vec::from_iter(left_cols.iter().cloned());
                     cols.push(row_addr_col);
                     cols
@@ -1963,10 +1963,14 @@ impl Merger {
         }
         if self.params.insert_not_matched {
             let not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
-            let left_cols_with_id = left_cols
-                .into_iter()
-                .chain(std::iter::once(row_addr_col))
-                .collect::<Vec<_>>();
+            let left_cols_with_id = if self.output_schema.fields.len() == left_cols.len() {
+                left_cols
+            } else {
+                left_cols
+                    .into_iter()
+                    .chain(std::iter::once(row_addr_col))
+                    .collect::<Vec<_>>()
+            };
             let not_matched = not_matched.project(&left_cols_with_id)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
