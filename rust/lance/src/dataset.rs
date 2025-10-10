@@ -167,7 +167,7 @@ pub struct Dataset {
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
-    pub(crate) store_params: Option<ObjectStoreParams>,
+    pub(crate) store_params: Option<Box<ObjectStoreParams>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -557,7 +557,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
-            self.store_params.clone(),
+            self.store_params.as_deref().cloned(),
         )
     }
 
@@ -695,7 +695,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
-            store_params,
+            store_params: store_params.map(Box::new),
         })
     }
 
@@ -838,7 +838,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 self.file_reader_options.clone(),
-                self.store_params.clone(),
+                self.store_params.as_deref().cloned(),
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1397,7 +1397,11 @@ impl Dataset {
         let (store, _) = ObjectStore::from_uri_and_params(
             self.session.store_registry(),
             &base_path.path,
-            &self.store_params.clone().unwrap_or_default(),
+            &self
+                .store_params
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
         )
         .await?;
 
@@ -2024,7 +2028,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
-                        dataset.store_params.clone(),
+                        dataset.store_params.as_deref().cloned(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -2062,7 +2066,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
-                dataset.store_params.clone(),
+                dataset.store_params.as_deref().cloned(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
