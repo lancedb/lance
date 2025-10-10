@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -294,6 +295,69 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
             }
             read_parameter = ReadBatchParams::Ranges(ranges.into_boxed_slice().into());
         }
+        inner_read_all(
+            &reader,
+            batch_size,
+            read_parameter,
+            reader_projection,
+            FilterExpression::no_filter(),
+            stream_addr,
+        )
+    })();
+    if let Err(e) = result {
+        e.throw(&mut env);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_takeNative(
+    mut env: JNIEnv<'_>,
+    reader: JObject,
+    batch_size: jint,
+    projected_names: JObject,
+    row_indices: JObject,
+    stream_addr: jlong,
+) {
+    let result = (|| -> Result<()> {
+        let mut read_parameter = ReadBatchParams::default();
+        let mut reader_projection: Option<ReaderProjection> = None;
+        // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
+        // If we get reader from env.get_rust_field, we can't use env (can't borrow again) until we drop the reader.
+        #[allow(unused_variables)]
+        let reader = unsafe {
+            let reader_ref = reader.as_ref();
+            let ptr = env.get_field(reader_ref, NATIVE_READER, "J")?.j()?
+                as *mut Mutex<BlockingFileReader>;
+            let guard = env.lock_obj(reader_ref)?;
+            if ptr.is_null() {
+                return Err(Error::io_error(
+                    "FileReader has already been closed".to_string(),
+                ));
+            }
+            (*ptr).lock().unwrap()
+        };
+
+        let file_version = reader.inner.metadata().version();
+
+        if !projected_names.is_null() {
+            let schema = Schema::try_from(reader.schema()?.as_ref())?;
+            let column_names: Vec<String> = env.get_strings(&projected_names)?;
+            let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+            reader_projection = Some(ReaderProjection::from_column_names(
+                file_version,
+                &schema,
+                names.as_slice(),
+            )?);
+        }
+
+        if row_indices.is_null() {
+            return Err(Error::input_error(
+                "Row indices cannot be null".to_string(),
+            ));
+        }
+        let expected_row_indices: Vec<u32> = unsafe { mem::transmute(env.get_integers(&row_indices)?) };
+        read_parameter = ReadBatchParams::Indices(expected_row_indices.into());
+
         inner_read_all(
             &reader,
             batch_size,
