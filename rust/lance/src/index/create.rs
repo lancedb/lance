@@ -38,6 +38,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     fragment_uuid: Option<String>,
+    old_indices: Vec<IndexMetadata>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -57,6 +58,7 @@ impl<'a> CreateIndexBuilder<'a> {
             train: true,
             fragments: None,
             fragment_uuid: None,
+            old_indices: vec![],
         }
     }
 
@@ -115,7 +117,12 @@ impl<'a> CreateIndexBuilder<'a> {
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
         let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
-        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
+        self.old_indices = indices
+            .iter()
+            .filter(|i| i.name == index_name)
+            .cloned()
+            .collect();
+        if let Some(idx) = self.old_indices.first() {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
                     message: format!(
@@ -353,7 +360,7 @@ impl<'a> CreateIndexBuilder<'a> {
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
-                removed_indices: vec![],
+                removed_indices: self.old_indices,
             },
             /*blobs_op= */ None,
             None,
@@ -379,12 +386,16 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteMode, WriteParams};
+    use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::RecordBatchIterator;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_linalg::distance::MetricType;
     use std::sync::Arc;
 
     // Helper function to create test data with text field suitable for inverted index
@@ -572,5 +583,129 @@ mod tests {
         let mut expected_fragments = fragment_ids.clone();
         expected_fragments.sort();
         assert_eq!(all_covered_fragments, expected_fragments);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_should_not_removes_delta_indices() {
+        // Create temporary directory
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Create initial dataset with 10,000 rows
+        let num_rows = 10_000;
+        let reader = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(num_rows),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        // Create IVF_PQ vector index
+        let vector_params = VectorIndexParams::ivf_pq(4, 8, 16, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create BTREE scalar index on id
+        let scalar_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None, // Will auto-generate name "id_idx"
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset to get updated indices
+        let mut dataset = Dataset::open(&dataset_uri).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2, "Should have 2 indices");
+
+        // Insert more data (5,000 rows)
+        let num_new_rows = 5_000;
+        let new_reader = lance_datagen::gen_batch()
+            .col(
+                "id",
+                lance_datagen::array::step_custom::<Int32Type>(num_rows as i32, 1),
+            )
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(num_new_rows),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        dataset = Dataset::write(
+            new_reader,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Load indices before optimization
+        let indices_before = dataset.load_indices().await.unwrap();
+        assert_eq!(indices_before.len(), 2, "Should still have 2 indices");
+
+        // Optimize with num_indices_to_merge=0
+        let optimize_options = OptimizeOptions::append();
+        dataset.optimize_indices(&optimize_options).await.unwrap();
+
+        // Load indices after optimization
+        let indices_after = dataset.load_indices().await.unwrap();
+
+        // There should be 3 indices:
+        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
+        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
+        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
+        assert_eq!(indices_after.len(), 3);
+        let id_idx = indices_after
+            .iter()
+            .find(|idx| idx.name == "id_idx")
+            .unwrap();
+        let vector_indices = indices_after
+            .iter()
+            .filter(|idx| idx.name == "vector_idx")
+            .collect::<Vec<_>>();
+        assert!(
+            id_idx
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains_range(0..2)
+                && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
+        );
+        assert_eq!(vector_indices.len(), 2);
+        assert!(vector_indices
+            .iter()
+            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(vector_indices
+            .iter()
+            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
     }
 }
