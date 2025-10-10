@@ -22,8 +22,8 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone)]
 pub struct SizedRecord {
-    record: ArcAny,
-    size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    pub record: ArcAny,
+    pub size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
 }
 
 impl std::fmt::Debug for SizedRecord {
@@ -275,6 +275,13 @@ impl LanceCache {
         self.cache.run_pending_tasks().await;
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+    }
+
+    // For testing: get all entries in the cache
+    #[doc(hidden)]
+    pub async fn entries(&self) -> Vec<((String, TypeId), SizedRecord)> {
+        self.cache.run_pending_tasks().await;
+        self.cache.iter().map(|(k, v)| ((*k).clone(), v)).collect()
     }
 
     // CacheKey-based methods

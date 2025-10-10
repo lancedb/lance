@@ -103,6 +103,7 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
