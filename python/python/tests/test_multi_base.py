@@ -8,12 +8,10 @@ Tests for multi-base dataset functionality.
 import shutil
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import lance
 import pandas as pd
-import pyarrow as pa
 import pytest
 from lance import DatasetBasePath
 
@@ -166,7 +164,7 @@ class TestMultiBase:
         assert any(bp.name == "path2" for bp in base_paths.values())
 
     def test_multi_base_overwrite_mode_primary_path_default(self):
-        """Test that OVERWRITE mode defaults to primary path when no target specified."""
+        """Test OVERWRITE mode defaults to primary path when no target."""
         # Create initial dataset with explicit data file bases
         initial_data = self.create_test_data(100)
 
@@ -277,7 +275,8 @@ class TestMultiBase:
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
 
-        # Verify that new data files were written to primary path (not to path1 or path2)
+        # Verify new data files were written to primary path
+        # (not to path1 or path2)
         fragments = list(updated_dataset.get_fragments())
         # The first 2 fragments should be in path1 (from initial write)
         # The remaining fragments should be in primary path (from append)
@@ -293,9 +292,12 @@ class TestMultiBase:
                 if base_path and base_path.name == "path1":
                     path1_fragments += 1
 
-        assert path1_fragments == 2, f"Expected 2 fragments in path1, got {path1_fragments}"
+        assert path1_fragments == 2, (
+            f"Expected 2 fragments in path1, got {path1_fragments}"
+        )
         assert primary_path_fragments >= 3, (
-            f"Expected at least 3 fragments in primary path, got {primary_path_fragments}"
+            f"Expected at least 3 fragments in primary path, "
+            f"got {primary_path_fragments}"
         )
 
     def test_multi_base_is_dataset_root_flag(self):
@@ -406,8 +408,12 @@ class TestMultiBase:
                 elif base_path and base_path.name == "path2":
                     path2_fragments += 1
 
-        assert path1_fragments == 2, f"Expected 2 fragments in path1, got {path1_fragments}"
-        assert path2_fragments == 2, f"Expected 2 fragments in path2, got {path2_fragments}"
+        assert path1_fragments == 2, (
+            f"Expected 2 fragments in path1, got {path1_fragments}"
+        )
+        assert path2_fragments == 2, (
+            f"Expected 2 fragments in path2, got {path2_fragments}"
+        )
 
     def test_validation_errors(self):
         """Test validation errors for invalid multi-base configurations."""

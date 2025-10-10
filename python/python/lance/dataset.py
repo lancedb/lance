@@ -4991,7 +4991,8 @@ def write_dataset(
         ... ]
 
     target_bases: list of str, optional
-        References to base paths where data should be written. Can be specified in all modes.
+        References to base paths where data should be written. Can be
+        specified in all modes.
 
         Each string is resolved by trying to match:
         1. Base name (e.g., "primary", "archive") from registered bases
