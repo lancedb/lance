@@ -587,11 +587,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_should_not_removes_delta_indices() {
-        // Create temporary directory
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
-        // Create initial dataset with 10,000 rows
         let num_rows = 256;
         let reader = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
@@ -606,7 +604,6 @@ mod tests {
 
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        // Create IVF_PQ vector index
         let vector_params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(
@@ -619,7 +616,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Create BTREE scalar index on id
         let scalar_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         dataset
@@ -633,13 +629,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Reload dataset to get updated indices
-        let mut dataset = Dataset::open(&dataset_uri).await.unwrap();
-
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2, "Should have 2 indices");
 
-        // Insert more data (5,000 rows)
         let num_new_rows = 32;
         let new_reader = lance_datagen::gen_batch()
             .col(
