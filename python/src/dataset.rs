@@ -558,7 +558,7 @@ impl Dataset {
             builder = builder.with_credential_vending(vendor_arc, None);
         }
 
-        let dataset = RT.block_on(Some(py), builder.load())?;
+        let dataset = rt().block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {

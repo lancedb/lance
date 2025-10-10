@@ -4788,7 +4788,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "arrow",
  "arrow-ipc",

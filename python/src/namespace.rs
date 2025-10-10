@@ -8,7 +8,7 @@ use lance_namespace::LanceNamespace;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::RT;
+use crate::rt;
 
 /// Python wrapper for LanceNamespace implementations
 #[pyclass(name = "_Namespace", module = "_lib")]
@@ -54,7 +54,7 @@ impl PyNamespace {
             version: version.map(|v| v as i64),
         };
 
-        let response = RT.block_on(Some(py), async move {
+        let response = rt().block_on(Some(py), async move {
             namespace
                 .describe_table(request)
                 .await
@@ -106,7 +106,7 @@ pub fn connect_namespace(
     // Import lance-namespace-impls connect function
     use lance_namespace_impls::connect;
 
-    let namespace = RT.block_on(Some(py), async move {
+    let namespace = rt().block_on(Some(py), async move {
         connect(&impl_name, properties)
             .await
             .map_err(|e| {

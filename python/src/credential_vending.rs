@@ -9,7 +9,7 @@ use lance_io::object_store::CredentialVendor;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::RT;
+use crate::rt;
 
 /// Python-implemented credential vendor
 ///
@@ -62,7 +62,7 @@ impl CredentialVendor for PyCredentialVendorWrapper {
         // Call Python method from async context
         let py_vendor = self.py_vendor.clone();
 
-        RT.runtime.spawn_blocking(move || {
+        rt().runtime.spawn_blocking(move || {
             Python::with_gil(|py| {
                 // Call the Python get_credentials method
                 let result = py_vendor
