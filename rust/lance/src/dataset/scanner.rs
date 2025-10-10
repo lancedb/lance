@@ -3790,6 +3790,7 @@ mod test {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -5590,7 +5591,10 @@ mod test {
 
             // UPDATE
 
-            dataset.optimize_indices(&Default::default()).await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1))
+                .await
+                .unwrap();
             let updated_version = dataset.version().version;
 
             // APPEND -> DELETE

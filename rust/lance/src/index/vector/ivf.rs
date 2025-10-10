@@ -379,20 +379,12 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = options.num_indices_to_merge;
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - num_indices_to_merge
-    };
-    let indices_to_merge = existing_indices[start_pos..].to_vec();
-    let merged_num = indices_to_merge.len();
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
-    match index_type {
+    let merged_num = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -404,14 +396,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                     dataset.clone(),
@@ -421,14 +414,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             }
         }
         // IVF_PQ
@@ -441,14 +435,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
@@ -460,14 +455,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
@@ -478,80 +474,75 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (sub_index_type, quantization_type) => {
             unimplemented!(
@@ -560,7 +551,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 quantization_type
             )
         }
-    }
+    };
 
     Ok((new_uuid, merged_num))
 }
@@ -609,7 +600,7 @@ async fn optimize_ivf_pq_indices(
 
     let start_pos = existing_indices
         .len()
-        .saturating_sub(options.num_indices_to_merge);
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
 
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
@@ -683,10 +674,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    let start_pos = if num_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_to_merge
     };
 
     let indices_to_merge = existing_indices[start_pos..]
