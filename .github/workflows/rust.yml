@@ -156,7 +156,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --locked --features ${ALL_FEATURES}
   build-no-lock:
-    runs-on: warp-ubuntu-2404-x64-4x
+    runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
