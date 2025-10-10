@@ -518,6 +518,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
+            row_latest_update_version_meta: None,
         }
     }
 

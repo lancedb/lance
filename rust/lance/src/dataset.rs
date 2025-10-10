@@ -92,7 +92,7 @@ use self::transaction::{Operation, Transaction, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
+use crate::dataset::delta::{DatasetDelta, DatasetDiffBuilder};
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -806,6 +806,27 @@ impl Dataset {
             end_version,
             base_dataset: self.clone(),
         })
+    }
+
+    /// Diff a specified version and return a build to capture changed data.
+    /// This API depends on the Stable-RowID feature, which is not enabled by default.
+    /// Make sure to enable it when creating the dataset.
+    /// If not, an error will be returned.
+    pub async fn diff(&self, compared_version: u64) -> Result<DatasetDiffBuilder> {
+        if !self.manifest.uses_stable_row_ids() {
+            return Err(Error::NotSupported {
+                source: "Diff operation requires Stable Row ID feature to be enabled. \
+                 Please enable it when creating the dataset."
+                    .into(),
+                location: location!(),
+            });
+        }
+
+        self.validate_compared_version(compared_version).await?;
+        Ok(DatasetDiffBuilder::new(
+            Arc::new(self.clone()),
+            compared_version,
+        ))
     }
 
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
