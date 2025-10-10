@@ -2707,8 +2707,8 @@ impl Scanner {
         }
         let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
         let mut scan_node = self.scan_fragments(
-            true,
             false,
+            true,
             false,
             flat_fts_scan_schema,
             Arc::new(fragments),
