@@ -13,9 +13,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     execution_plan::EmissionType, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
+use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::Statistics;
 use futures::TryStreamExt;
+use lance_core::datatypes::Projection;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -30,6 +32,11 @@ use super::planner::PlannedFragmentRead;
 pub struct PlannedFilterReadExec {
     dataset: Arc<Dataset>,
     planned_fragments: Vec<PlannedFragmentRead>,
+    projection: Arc<Projection>,
+    with_deleted_rows: bool,
+    batch_size: u32,
+    full_filter: Option<Expr>,
+    refine_filter: Option<Expr>,
     output_schema: SchemaRef,
     limit: Option<usize>,
     fragment_readahead: Option<usize>,
@@ -45,6 +52,11 @@ impl PlannedFilterReadExec {
     pub fn new(
         dataset: Arc<Dataset>,
         planned_fragments: Vec<PlannedFragmentRead>,
+        projection: Arc<Projection>,
+        with_deleted_rows: bool,
+        batch_size: u32,
+        full_filter: Option<Expr>,
+        refine_filter: Option<Expr>,
         output_schema: SchemaRef,
         limit: Option<usize>,
     ) -> Self {
@@ -58,6 +70,11 @@ impl PlannedFilterReadExec {
         Self {
             dataset,
             planned_fragments,
+            projection,
+            with_deleted_rows,
+            batch_size,
+            full_filter,
+            refine_filter,
             output_schema,
             limit,
             fragment_readahead: None,
@@ -83,15 +100,24 @@ impl PlannedFilterReadExec {
     fn to_scoped_fragments(&self, scan_scheduler: Arc<ScanScheduler>) -> Vec<ScopedFragmentRead> {
         self.planned_fragments
             .iter()
-            .map(|p| ScopedFragmentRead {
-                fragment: p.fragment.clone(),
-                ranges: p.ranges.clone(),
-                projection: p.projection.clone(),
-                with_deleted_rows: p.with_deleted_rows,
-                batch_size: p.batch_size,
-                filter: p.filter.clone(),
-                priority: p.priority,
-                scan_scheduler: scan_scheduler.clone(),
+            .map(|p| {
+                // Determine which filter to use for this fragment
+                let filter = if p.use_refine {
+                    self.refine_filter.clone()
+                } else {
+                    self.full_filter.clone()
+                };
+
+                ScopedFragmentRead {
+                    fragment: p.fragment.clone(),
+                    ranges: p.ranges.clone(),
+                    projection: self.projection.clone(),
+                    with_deleted_rows: self.with_deleted_rows,
+                    batch_size: self.batch_size,
+                    filter,
+                    priority: p.priority,
+                    scan_scheduler: scan_scheduler.clone(),
+                }
             })
             .collect()
     }
@@ -179,6 +205,11 @@ impl ExecutionPlan for PlannedFilterReadExec {
         let output_schema = self.output_schema.clone();
         let limit = self.limit;
         let fragment_readahead = self.fragment_readahead;
+        let projection = self.projection.clone();
+        let with_deleted_rows = self.with_deleted_rows;
+        let batch_size = self.batch_size;
+        let full_filter = self.full_filter.clone();
+        let refine_filter = self.refine_filter.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream_lock = running_stream.lock().await;
@@ -198,15 +229,24 @@ impl ExecutionPlan for PlannedFilterReadExec {
                 // Convert PlannedFragmentRead to ScopedFragmentRead for execution
                 let scoped_fragments: Vec<ScopedFragmentRead> = planned_fragments
                     .into_iter()
-                    .map(|p| ScopedFragmentRead {
-                        fragment: p.fragment,
-                        ranges: p.ranges,
-                        projection: p.projection,
-                        with_deleted_rows: p.with_deleted_rows,
-                        batch_size: p.batch_size,
-                        filter: p.filter,
-                        priority: p.priority,
-                        scan_scheduler: scan_scheduler.clone(),
+                    .map(|p| {
+                        // Determine which filter to use for this fragment
+                        let filter = if p.use_refine {
+                            refine_filter.clone()
+                        } else {
+                            full_filter.clone()
+                        };
+
+                        ScopedFragmentRead {
+                            fragment: p.fragment,
+                            ranges: p.ranges,
+                            projection: projection.clone(),
+                            with_deleted_rows,
+                            batch_size,
+                            filter,
+                            priority: p.priority,
+                            scan_scheduler: scan_scheduler.clone(),
+                        }
                     })
                     .collect();
 

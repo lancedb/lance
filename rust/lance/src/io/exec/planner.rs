@@ -6,7 +6,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use datafusion_expr::Expr;
-use lance_core::datatypes::Projection;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::Result;
 use lance_index::scalar::expression::IndexExprResult;
@@ -36,11 +35,8 @@ pub struct LoadedFragment {
 pub struct PlannedFragmentRead {
     pub fragment: FileFragment,
     pub ranges: Vec<Range<u64>>,
-    pub projection: Arc<Projection>,
-    pub with_deleted_rows: bool,
-    pub batch_size: u32,
-    /// An in-memory filter to apply after reading the fragment
-    pub filter: Option<Expr>,
+    /// Whether to use refine filter for this fragment (true for exact index matches)
+    pub use_refine: bool,
     pub priority: u32,
 }
 
@@ -177,13 +173,13 @@ impl ScanPlanner {
             }
         }
 
-        let default_batch_size = options.batch_size.unwrap_or_else(|| {
+        let _default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
                 std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
             }) as u32
         });
 
-        let projection = Arc::new(options.projection.clone());
+        let _projection = Arc::new(options.projection.clone());
 
         let mut planned_fragments = Vec::with_capacity(loaded_fragments.len());
         for (priority, fragment) in loaded_fragments.into_iter().enumerate() {
@@ -205,13 +201,13 @@ impl ScanPlanner {
                         filter
                     );
 
+                    // Determine if this fragment should use refine filter
+                    let use_refine = filter.is_some() && filter == options.refine_filter;
+
                     planned_fragments.push(PlannedFragmentRead {
                         fragment: fragment.fragment.clone(),
                         ranges: to_read.clone(),
-                        projection: projection.clone(),
-                        with_deleted_rows: options.with_deleted_rows,
-                        batch_size: default_batch_size,
-                        filter,
+                        use_refine,
                         priority: priority as u32,
                     });
                 }
