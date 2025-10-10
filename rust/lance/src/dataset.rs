@@ -2830,6 +2830,8 @@ mod tests {
         .await
         .unwrap();
 
+        let _ = io_tracker.incremental_stats(); //reset
+
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {

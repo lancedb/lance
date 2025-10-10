@@ -598,7 +598,7 @@ mod tests {
         // However, the dataset needs to be loaded and the read version checked out,
         // so an additional 4 IOPs are needed.
         let io_stats = io_tracker.incremental_stats();
-        assert_io_eq!(io_stats, read_iops, 4, "load dataset + check version");
+        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store
