@@ -316,6 +316,7 @@ impl DatasetBuilder {
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
+        let store_params = self.options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
@@ -364,6 +365,7 @@ impl DatasetBuilder {
             object_store,
             base_path,
             commit_handler,
+            Some(store_params),
         )
         .await?;
 
@@ -398,6 +400,7 @@ impl DatasetBuilder {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         commit_handler: Arc<dyn CommitHandler>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
@@ -458,6 +461,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             file_reader_options,
+            store_params,
         )
     }
 }

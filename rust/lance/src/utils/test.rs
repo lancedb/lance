@@ -113,6 +113,7 @@ impl TestDatasetGenerator {
             fragments,
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
 
         Dataset::commit(
