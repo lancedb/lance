@@ -37,7 +37,7 @@ impl WrappingObjectStore for IOTracker {
         target: Arc<dyn ObjectStore>,
         _storage_options: Option<&std::collections::HashMap<String, String>>,
     ) -> Arc<dyn ObjectStore> {
-        Arc::new(IoTrackingStore::new(target))
+        Arc::new(IoTrackingStore::new(target, self.0.clone()))
     }
 }
 
@@ -161,10 +161,10 @@ impl Display for IoTrackingStore {
 }
 
 impl IoTrackingStore {
-    fn new(target: Arc<dyn ObjectStore>) -> Self {
+    fn new(target: Arc<dyn ObjectStore>, stats: Arc<Mutex<IoStats>>) -> Self {
         Self {
             target,
-            stats: Arc::new(Mutex::new(IoStats::default())),
+            stats,
             active_requests: Arc::new(AtomicU16::new(0)),
         }
     }
@@ -186,10 +186,15 @@ impl IoTrackingStore {
         });
     }
 
-    fn record_write(&self, num_bytes: u64) {
+    fn record_write(&self, method: &'static str, path: Path, num_bytes: u64) {
         let mut stats = self.stats.lock().unwrap();
         stats.write_iops += 1;
         stats.write_bytes += num_bytes;
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range: None,
+        });
     }
 
     fn hop_guard(&self) -> HopGuard {
@@ -202,7 +207,7 @@ impl IoTrackingStore {
 impl ObjectStore for IoTrackingStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         let _guard = self.hop_guard();
-        self.record_write(bytes.content_length() as u64);
+        self.record_write("put", location.to_owned(), bytes.content_length() as u64);
         self.target.put(location, bytes).await
     }
 
@@ -213,7 +218,11 @@ impl ObjectStore for IoTrackingStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         let _guard = self.hop_guard();
-        self.record_write(bytes.content_length() as u64);
+        self.record_write(
+            "put_opts",
+            location.to_owned(),
+            bytes.content_length() as u64,
+        );
         self.target.put_opts(location, bytes, opts).await
     }
 
@@ -223,6 +232,7 @@ impl ObjectStore for IoTrackingStore {
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            path: location.to_owned(),
             _guard,
         }))
     }
@@ -237,6 +247,7 @@ impl ObjectStore for IoTrackingStore {
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            path: location.to_owned(),
             _guard,
         }))
     }
@@ -302,7 +313,7 @@ impl ObjectStore for IoTrackingStore {
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
         let _guard = self.hop_guard();
-        self.record_write(0);
+        self.record_write("delete", location.to_owned(), 0);
         self.target.delete(location).await
     }
 
@@ -346,25 +357,25 @@ impl ObjectStore for IoTrackingStore {
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.hop_guard();
-        self.record_write(0);
+        self.record_write("copy", from.to_owned(), 0);
         self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.hop_guard();
-        self.record_write(0);
+        self.record_write("rename", from.to_owned(), 0);
         self.target.rename(from, to).await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.hop_guard();
-        self.record_write(0);
+        self.record_write("rename_if_not_exists", from.to_owned(), 0);
         self.target.rename_if_not_exists(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         let _guard = self.hop_guard();
-        self.record_write(0);
+        self.record_write("copy_if_not_exists", from.to_owned(), 0);
         self.target.copy_if_not_exists(from, to).await
     }
 }
@@ -372,6 +383,7 @@ impl ObjectStore for IoTrackingStore {
 #[derive(Debug)]
 struct IoTrackingMultipartUpload {
     target: Box<dyn MultipartUpload>,
+    path: Path,
     stats: Arc<Mutex<IoStats>>,
     _guard: HopGuard,
 }
@@ -391,6 +403,11 @@ impl MultipartUpload for IoTrackingMultipartUpload {
             let mut stats = self.stats.lock().unwrap();
             stats.write_iops += 1;
             stats.write_bytes += payload.content_length() as u64;
+            stats.requests.push(IoRequestRecord {
+                method: "put_part",
+                path: self.path.to_owned(),
+                range: None,
+            });
         }
         self.target.put_part(payload)
     }
