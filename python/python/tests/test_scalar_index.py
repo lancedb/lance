@@ -569,6 +569,38 @@ def test_full_text_search(dataset, with_position):
         )
 
 
+def test_unindexed_full_text_search_on_empty_index(tmp_path):
+    # Create fts index on empty table.
+    schema = pa.schema({"text": pa.string()})
+    ds = lance.write_dataset(pa.Table.from_pylist([], schema=schema), tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    # Append unindexed data.
+    ds.insert(pa.Table.from_pylist([{"text": "hello!"}], schema=schema))
+
+    # Fts search.
+    results = ds.scanner(
+        columns=["text"],
+        full_text_query="hello",
+    ).to_table()
+    assert results.num_rows == 1
+
+
+def test_full_text_search_without_index(dataset):
+    row = dataset.take(indices=[0], columns=["doc"])
+    query_text = row.column(0)[0].as_py()
+    query_text = query_text.split(" ")[0]
+    query = MatchQuery(query_text, column="doc")
+    results = dataset.scanner(
+        columns=["doc"],
+        full_text_query=query,
+    ).to_table()
+    assert results.num_rows > 0
+    results = results.column(0)
+    for row in results:
+        assert query_text in row.as_py()
+
+
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(
