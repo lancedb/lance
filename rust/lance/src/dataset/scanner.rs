@@ -3770,7 +3770,6 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
     use std::vec;
 
     use arrow::array::as_primitive_array;
@@ -3797,7 +3796,9 @@ mod test {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
@@ -3810,8 +3811,7 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, IoStats,
-        IoTrackingStore,
+        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
     };
 
     #[tokio::test]
@@ -6142,6 +6142,7 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
+        use lance_io::assert_io_lt;
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         use lance_table::io::commit::RenameCommitHandler;
@@ -6154,13 +6155,13 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
 
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
@@ -6181,15 +6182,13 @@ mod test {
             .await
             .unwrap();
 
-        let get_bytes = || io_stats.lock().unwrap().read_bytes;
-
         // First run a full scan to get a baseline
-        let start_bytes = get_bytes();
+        let _ = io_tracker.incremental_stats(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let full_scan_bytes = get_bytes() - start_bytes;
+        let io_stats = io_tracker.incremental_stats();
+        let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .use_stats(false)
@@ -6198,14 +6197,13 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let filtered_scan_bytes = get_bytes() - start_bytes;
-
-        assert!(filtered_scan_bytes < full_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+        let filtered_scan_bytes = io_stats.read_bytes;
 
         // Now do a scan with pushdown, the benefit should be even greater
         // Pushdown only works with the legacy format for now.
         if data_storage_version == LanceFileVersion::Legacy {
-            let start_bytes = get_bytes();
             dataset
                 .scan()
                 .filter("not_indexed = 50")
@@ -6213,15 +6211,13 @@ mod test {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let pushdown_scan_bytes = get_bytes() - start_bytes;
-
-            assert!(pushdown_scan_bytes < filtered_scan_bytes);
+            let io_stats = io_tracker.incremental_stats();
+            assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
         // Now do a scalar index scan, this should be better than a
         // full scan but since we have to load the index might be more
         // expensive than late / pushdown scan
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .filter("indexed = 50")
@@ -6229,12 +6225,12 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let index_scan_bytes = get_bytes() - start_bytes;
-        assert!(index_scan_bytes < full_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+        let index_scan_bytes = io_stats.read_bytes;
 
         // A second scalar index scan should be cheaper than the first
         // since we should have the index in cache
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .filter("indexed = 50")
@@ -6242,8 +6238,8 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let second_index_scan_bytes = get_bytes() - start_bytes;
-        assert!(second_index_scan_bytes < index_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
     #[rstest]
@@ -7295,6 +7291,7 @@ mod test {
         // indexed column
 
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use lance_io::assert_io_eq;
         let data = gen_batch()
             .col(
                 "vector",
@@ -7305,13 +7302,13 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(5));
 
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 data_storage_version: Some(data_storage_version),
@@ -7367,31 +7364,6 @@ mod test {
             .await
             .unwrap();
 
-        struct IopsTracker {
-            baseline: u64,
-            new_iops: u64,
-            io_stats: Arc<Mutex<IoStats>>,
-        }
-
-        impl IopsTracker {
-            fn update(&mut self) {
-                let iops = self.io_stats.lock().unwrap().read_iops;
-                self.new_iops = iops - self.baseline;
-                self.baseline = iops;
-            }
-
-            fn new_iops(&mut self) -> u64 {
-                self.update();
-                self.new_iops
-            }
-        }
-
-        let mut tracker = IopsTracker {
-            baseline: 0,
-            new_iops: 0,
-            io_stats,
-        };
-
         // First planning cycle needs to do some I/O to determine what scalar indices are available
         dataset
             .scan()
@@ -7403,7 +7375,8 @@ mod test {
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        assert!(tracker.new_iops() > 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
         dataset
@@ -7415,7 +7388,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7426,7 +7400,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7438,7 +7413,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7450,7 +7426,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
     }
 
     #[rstest]

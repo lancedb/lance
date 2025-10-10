@@ -1536,7 +1536,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
     use lance_file::version::LanceFileVersion;
+    use lance_io::assert_io_eq;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
@@ -1546,14 +1548,13 @@ mod tests {
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
-        utils::test::StatsHolder,
     };
 
-    async fn test_dataset(num_rows: usize, num_fragments: usize) -> (Dataset, Arc<StatsHolder>) {
-        let io_stats = Arc::new(StatsHolder::default());
+    async fn test_dataset(num_rows: usize, num_fragments: usize) -> (Dataset, Arc<IOTracker>) {
+        let io_tracker = Arc::new(IOTracker::default());
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
+                object_store_wrapper: Some(io_tracker.clone()),
                 ..Default::default()
             }),
             max_rows_per_file: num_rows / num_fragments,
@@ -1577,7 +1578,7 @@ mod tests {
             .execute(vec![data])
             .await
             .unwrap();
-        (dataset, io_stats)
+        (dataset, io_tracker)
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -1676,8 +1677,8 @@ mod tests {
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
             let io_stats = io_tracker.incremental_stats();
-            assert_eq!(io_stats.read_iops, 0);
-            assert_eq!(io_stats.write_iops, 0);
+            assert_io_eq!(io_stats, read_iops, 0);
+            assert_io_eq!(io_stats, write_iops, 0);
         }
 
         let expected_transaction = Transaction {
@@ -1690,8 +1691,8 @@ mod tests {
         assert_eq!(rebased_transaction, expected_transaction);
         // We didn't need to do any IO, so the stats should be 0.
         let io_stats = io_tracker.incremental_stats();
-        assert_eq!(io_stats.read_iops, 0);
-        assert_eq!(io_stats.write_iops, 0);
+        assert_io_eq!(io_stats, read_iops, 0);
+        assert_io_eq!(io_stats, write_iops, 0);
     }
 
     async fn apply_deletion(
@@ -1798,8 +1799,8 @@ mod tests {
                     .check_txn(other_transaction, other_version as u64)
                     .unwrap();
                 let io_stats = io_tracker.incremental_stats();
-                assert_eq!(io_stats.read_iops, 0);
-                assert_eq!(io_stats.write_iops, 0);
+                assert_io_eq!(io_stats, read_iops, 0);
+                assert_io_eq!(io_stats, write_iops, 0);
             }
 
             // First iteration, we don't need to rewrite the deletion file.
@@ -1811,8 +1812,8 @@ mod tests {
             let io_stats = io_tracker.incremental_stats();
             if expected_rewrite {
                 // Read the current deletion file, and write the new one.
-                assert_eq!(io_stats.read_iops, 0); // Cached
-                assert_eq!(io_stats.write_iops, 1);
+                assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
+                assert_io_eq!(io_stats, write_iops, 1, "write one deletion file");
 
                 // TODO: The old deletion file should be gone.
                 // This can be done later, as it will be cleaned up by the
@@ -1853,11 +1854,11 @@ mod tests {
                 );
                 assert!(dataset.object_store().exists(&new_path).await.unwrap());
 
-                assert_eq!(io_stats.num_hops, 1);
+                assert_io_eq!(io_stats, num_hops, 1);
             } else {
                 // No IO should have happened.
-                assert_eq!(io_stats.read_iops, 0);
-                assert_eq!(io_stats.write_iops, 0);
+                assert_io_eq!(io_stats, read_iops, 0);
+                assert_io_eq!(io_stats, write_iops, 0);
             }
 
             dataset = CommitBuilder::new(Arc::new(dataset))
@@ -1961,8 +1962,8 @@ mod tests {
             .unwrap();
 
         let io_stats = io_tracker.incremental_stats();
-        assert_eq!(io_stats.read_iops, 0);
-        assert_eq!(io_stats.write_iops, 0);
+        assert_io_eq!(io_stats, read_iops, 0);
+        assert_io_eq!(io_stats, write_iops, 0);
 
         let res = rebase.check_txn(&other_txn, 1);
         if other.ends_with("full") || ours.ends_with("full") {
@@ -1986,8 +1987,8 @@ mod tests {
         );
 
         let io_stats = io_tracker.incremental_stats();
-        assert_eq!(io_stats.read_iops, 0);
-        assert_eq!(io_stats.write_iops, 0);
+        assert_io_eq!(io_stats, read_iops, 0);
+        assert_io_eq!(io_stats, write_iops, 0);
 
         let res = rebase.finish(&latest_dataset).await;
         assert!(matches!(
@@ -1996,8 +1997,8 @@ mod tests {
         ));
 
         let io_stats = io_tracker.incremental_stats();
-        assert_eq!(io_stats.read_iops, 0); // Cached deletion file
-        assert_eq!(io_stats.write_iops, 0); // Failed before writing
+        assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
+        assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
