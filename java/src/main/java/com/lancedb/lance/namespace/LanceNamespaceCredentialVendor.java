@@ -17,7 +17,6 @@ import com.lancedb.lance.io.CredentialVendor;
 import com.lancedb.lance.namespace.model.DescribeTableRequest;
 import com.lancedb.lance.namespace.model.DescribeTableResponse;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -77,11 +76,11 @@ public class LanceNamespaceCredentialVendor implements CredentialVendor {
    * <p>This calls namespace.describeTable() to get the latest credentials and their expiration
    * time.
    *
-   * @return Map containing "storage_options" and "expires_at_millis"
+   * @return Flat map of string key-value pairs containing credentials and expires_at_millis
    * @throws RuntimeException if the namespace doesn't return storage credentials or expiration time
    */
   @Override
-  public Map<String, Object> getCredentials() {
+  public Map<String, String> getCredentials() {
     // Create describe table request with table ID
     DescribeTableRequest request = new DescribeTableRequest();
     request.setId(tableId);
@@ -89,7 +88,7 @@ public class LanceNamespaceCredentialVendor implements CredentialVendor {
     // Call namespace to describe the table and get credentials
     DescribeTableResponse response = namespace.describeTable(request);
 
-    // Extract storage options
+    // Extract storage options - should already be a flat Map<String, String>
     Map<String, String> storageOptions = response.getStorageOptions();
     if (storageOptions == null || storageOptions.isEmpty()) {
       throw new RuntimeException(
@@ -97,21 +96,14 @@ public class LanceNamespaceCredentialVendor implements CredentialVendor {
               + "Ensure the namespace supports credential vending.");
     }
 
-    // Extract expiration time from storage_options
-    String expiresAtMillisStr = storageOptions.get("expires_at_millis");
-    if (expiresAtMillisStr == null) {
+    // Verify expires_at_millis is present
+    if (!storageOptions.containsKey("expires_at_millis")) {
       throw new RuntimeException(
           "Namespace storage_options missing 'expires_at_millis'. "
               + "Credential refresh will not work properly.");
     }
 
-    long expiresAtMillis = Long.parseLong(expiresAtMillisStr);
-
-    // Return credentials in the expected format
-    Map<String, Object> result = new HashMap<>();
-    result.put("storage_options", storageOptions);
-    result.put("expires_at_millis", expiresAtMillis);
-
-    return result;
+    // Return storage_options directly - it's already a flat Map<String, String>
+    return storageOptions;
   }
 }
