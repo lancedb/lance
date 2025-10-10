@@ -17,18 +17,7 @@ use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{get_default_batch_size, BATCH_SIZE_FALLBACK};
 use crate::Dataset;
 
-use super::filtered_read::{EvaluatedIndex, FilteredReadOptions};
-
-/// A fragment with all of its metadata loaded
-pub struct LoadedFragment {
-    pub row_id_sequence: Arc<RowIdSequence>,
-    pub deletion_vector: Option<Arc<DeletionVector>>,
-    pub fragment: FileFragment,
-    /// The number of physical rows in the fragment (includes deleted rows)
-    pub num_physical_rows: u64,
-    /// The number of logical rows in the fragment (excludes deleted rows)
-    pub num_logical_rows: u64,
-}
+use super::filtered_read::{EvaluatedIndex, FilteredReadOptions, LoadedFragment};
 
 /// A planned fragment read with all information needed for execution
 #[derive(Debug, Clone)]

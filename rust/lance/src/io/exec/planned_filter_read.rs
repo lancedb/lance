@@ -24,7 +24,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::Dataset;
 
 use super::filtered_read::{
-    FilteredReadGlobalMetrics, FilteredReadStream, FilteredReadThreadingMode, ScopedFragmentRead,
+    FilteredReadGlobalMetrics, FilteredReadStream, FilteredReadThreadingMode,
 };
 use super::planner::PlannedFragmentRead;
 
@@ -49,6 +49,7 @@ pub struct PlannedFilterReadExec {
 }
 
 impl PlannedFilterReadExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Arc<Dataset>,
         planned_fragments: Vec<PlannedFragmentRead>,
@@ -93,33 +94,6 @@ impl PlannedFilterReadExec {
     pub fn with_threading_mode(mut self, mode: FilteredReadThreadingMode) -> Self {
         self.threading_mode = mode;
         self
-    }
-
-    /// Convert PlannedFragmentRead to ScopedFragmentRead for execution
-    #[allow(dead_code)]
-    fn to_scoped_fragments(&self, scan_scheduler: Arc<ScanScheduler>) -> Vec<ScopedFragmentRead> {
-        self.planned_fragments
-            .iter()
-            .map(|p| {
-                // Determine which filter to use for this fragment
-                let filter = if p.use_refine {
-                    self.refine_filter.clone()
-                } else {
-                    self.full_filter.clone()
-                };
-
-                ScopedFragmentRead {
-                    fragment: p.fragment.clone(),
-                    ranges: p.ranges.clone(),
-                    projection: self.projection.clone(),
-                    with_deleted_rows: self.with_deleted_rows,
-                    batch_size: self.batch_size,
-                    filter,
-                    priority: p.priority,
-                    scan_scheduler: scan_scheduler.clone(),
-                }
-            })
-            .collect()
     }
 }
 
@@ -226,36 +200,17 @@ impl ExecutionPlan for PlannedFilterReadExec {
 
                 let fragment_readahead = fragment_readahead.unwrap_or(4).max(1);
 
-                // Convert PlannedFragmentRead to ScopedFragmentRead for execution
-                let scoped_fragments: Vec<ScopedFragmentRead> = planned_fragments
-                    .into_iter()
-                    .map(|p| {
-                        // Determine which filter to use for this fragment
-                        let filter = if p.use_refine {
-                            refine_filter.clone()
-                        } else {
-                            full_filter.clone()
-                        };
-
-                        ScopedFragmentRead {
-                            fragment: p.fragment,
-                            ranges: p.ranges,
-                            projection: projection.clone(),
-                            with_deleted_rows,
-                            batch_size,
-                            filter,
-                            priority: p.priority,
-                            scan_scheduler: scan_scheduler.clone(),
-                        }
-                    })
-                    .collect();
-
                 // Create global metrics
                 let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(&metrics));
 
                 // Create FilteredReadStream from planned fragments
                 let new_running_stream = FilteredReadStream::from_planned(
-                    scoped_fragments,
+                    planned_fragments,
+                    projection,
+                    with_deleted_rows,
+                    batch_size,
+                    full_filter,
+                    refine_filter,
                     output_schema,
                     scan_scheduler,
                     global_metrics,

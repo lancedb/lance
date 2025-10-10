@@ -23,7 +23,7 @@ pub mod testing;
 pub mod utils;
 
 pub use filter::LanceFilterExec;
-pub use filtered_read::{FilteredReadGlobalMetrics, FilteredReadStream, ScopedFragmentRead};
+pub use filtered_read::{FilteredReadGlobalMetrics, FilteredReadStream};
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
