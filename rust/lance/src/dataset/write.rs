@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_dataset_root_flag() {
+    async fn test_multi_base_is_dataset_root_flag() {
         use lance_core::utils::tempfile::TempDir;
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
@@ -2110,5 +2110,103 @@ mod tests {
                 "base2/data should NOT contain .lance files"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_target_by_path_uri() {
+        use lance_core::utils::tempfile::TempDir;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create dataset with named bases
+        let test_dir = TempDir::default();
+        let primary_uri = test_dir.path_str();
+        let base1_dir = test_dir.std_path().join("base1");
+        let base2_dir = test_dir.std_path().join("base2");
+
+        std::fs::create_dir_all(&base1_dir).unwrap();
+        std::fs::create_dir_all(&base2_dir).unwrap();
+
+        let base1_uri = format!("file://{}", base1_dir.display());
+        let base2_uri = format!("file://{}", base2_dir.display());
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        // Create initial dataset writing to base1 using name
+        let dataset = Dataset::write(
+            data_gen.batch(10),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 5,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        path: base1_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        path: base2_uri.clone(),
+                        is_dataset_root: true,
+                    },
+                ]),
+                target_base_names_or_paths: Some(vec!["base1".to_string()]), // Use name
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+
+        // Verify data was written to base1
+        let fragments = dataset.get_fragments();
+        assert!(fragments.iter().all(|f| f
+            .metadata
+            .files
+            .iter()
+            .all(|file| file.base_id == Some(1))));
+
+        // Now append using the path URI instead of name
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen2.batch(5),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                // Use the actual path URI instead of the name
+                target_base_names_or_paths: Some(vec![base2_uri.clone()]),
+                max_rows_per_file: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 15);
+
+        // Verify data is now in both bases
+        let fragments = dataset.get_fragments();
+        let has_base1_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(1)));
+        let has_base2_data = fragments
+            .iter()
+            .any(|f| f.metadata.files.iter().any(|file| file.base_id == Some(2)));
+
+        assert!(has_base1_data, "Should have data in base1");
+        assert!(has_base2_data, "Should have data in base2");
+
+        // Verify base2 has exactly 1 fragment (from the append)
+        let base2_fragments: Vec<_> = fragments
+            .iter()
+            .filter(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
+            .collect();
+        assert_eq!(base2_fragments.len(), 1, "Should have 1 fragment in base2");
     }
 }

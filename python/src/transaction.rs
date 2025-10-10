@@ -170,9 +170,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let initial_bases = ob
                     .getattr("initial_bases")
                     .ok()
-                    .and_then(|attr| {
-                        attr.extract::<Option<Vec<DatasetBasePath>>>().ok()
-                    })
+                    .and_then(|attr| attr.extract::<Option<Vec<DatasetBasePath>>>().ok())
                     .flatten()
                     .map(|py_bases| {
                         py_bases

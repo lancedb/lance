@@ -427,7 +427,7 @@ impl From<BasePath> for DatasetBasePath {
 
 impl From<DatasetBasePath> for BasePath {
     fn from(py_base_path: DatasetBasePath) -> Self {
-        BasePath::new(
+        Self::new(
             py_base_path.id,
             py_base_path.path.clone(),
             py_base_path.name,
@@ -2711,7 +2711,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         p.commit_handler = get_commit_handler(options)?;
 
         // Handle initial_bases parameter (list of DatasetBasePath objects)
-        if let Some(initial_bases_list) = get_dict_opt::<Vec<Bound<PyAny>>>(options, "initial_bases")? {
+        if let Some(initial_bases_list) =
+            get_dict_opt::<Vec<Bound<PyAny>>>(options, "initial_bases")?
+        {
             let mut new_bases = Vec::new();
 
             for item in initial_bases_list.iter() {
@@ -2719,7 +2721,7 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                     new_bases.push(BasePath::from(dataset_base_path));
                 } else {
                     return Err(PyValueError::new_err(
-                        "initial_bases must contain DatasetBasePath objects only"
+                        "initial_bases must contain DatasetBasePath objects only",
                     ));
                 }
             }

@@ -343,6 +343,72 @@ class TestMultiBase:
         result = dataset.to_table().to_pandas()
         assert len(result) == 100
 
+    def test_multi_base_target_by_path_uri(self):
+        """Test using path URIs instead of names in target_bases."""
+        # Create initial dataset with named bases
+        initial_data = self.create_test_data(100)
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.path1_uri, name="path1"),
+                DatasetBasePath(self.path2_uri, name="path2"),
+            ],
+            target_bases=["path1"],  # Write to path1 using name
+            max_rows_per_file=50,
+        )
+
+        # Get the base_paths to find the actual path URI for path2
+        base_paths = dataset._ds.base_paths()
+        path2_base = None
+        for base_path in base_paths.values():
+            if base_path.name == "path2":
+                path2_base = base_path
+                break
+
+        assert path2_base is not None, "path2 base not found"
+
+        # Append using the path URI instead of name
+        append_data = self.create_test_data(50, id_offset=100)
+
+        updated_dataset = lance.write_dataset(
+            append_data,
+            dataset,
+            mode="append",
+            target_bases=[path2_base.path],  # Use path URI instead of name
+            max_rows_per_file=25,
+        )
+
+        # Verify appended data
+        result = updated_dataset.to_table().to_pandas()
+        assert len(result) == 150
+
+        # Verify data content
+        expected_ids = set(range(150))
+        actual_ids = set(result["id"].tolist())
+        assert actual_ids == expected_ids
+
+        # Verify that new fragments are in path2 (not primary or path1)
+        fragments = list(updated_dataset.get_fragments())
+        base_paths_updated = updated_dataset._ds.base_paths()
+
+        path1_fragments = 0
+        path2_fragments = 0
+
+        for fragment in fragments:
+            data_file = fragment.data_files()[0]
+            if data_file.base_id is not None:
+                base_path = base_paths_updated.get(data_file.base_id)
+                if base_path and base_path.name == "path1":
+                    path1_fragments += 1
+                elif base_path and base_path.name == "path2":
+                    path2_fragments += 1
+
+        assert path1_fragments == 2, f"Expected 2 fragments in path1, got {path1_fragments}"
+        assert path2_fragments == 2, f"Expected 2 fragments in path2, got {path2_fragments}"
+
     def test_validation_errors(self):
         """Test validation errors for invalid multi-base configurations."""
         data = self.create_test_data(100)
