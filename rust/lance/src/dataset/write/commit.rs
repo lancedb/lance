@@ -357,6 +357,7 @@ impl<'a> CommitBuilder<'a> {
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
+                session.store_registry(),
             )
             .await?
         };
