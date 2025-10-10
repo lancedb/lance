@@ -1881,7 +1881,7 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: String::from(self.base.clone()),
+            ref_path: self.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None, None);
