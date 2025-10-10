@@ -878,6 +878,47 @@ public class Dataset implements Closeable {
    */
   private native void releaseNativeDataset(long handle);
 
+  // ===== BlobFile / Blob dataset entry points (JNI) =====
+  private native List<BlobFile> nativeTakeBlobs(List<Long> rowIds, String column);
+
+  private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
+
+  /**
+   * Open blob files for given row ids on a blob column. Names and semantics align with Rust/Python.
+   *
+   * @param rowIds stable row ids (row addresses)
+   * @param column blob column name
+   * @return list of BlobFile objects
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          rowIds != null && !rowIds.isEmpty(), "rowIds cannot be null or empty");
+      Preconditions.checkArgument(
+          column != null && !column.isEmpty(), "column cannot be null or empty");
+      return nativeTakeBlobs(rowIds, column);
+    }
+  }
+
+  /**
+   * Open blob files for given row indices on a blob column.
+   *
+   * @param rowIndices row offsets within dataset
+   * @param column blob column name
+   * @return list of BlobFile objects
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          rowIndices != null && !rowIndices.isEmpty(), "rowIndices cannot be null or empty");
+      Preconditions.checkArgument(
+          column != null && !column.isEmpty(), "column cannot be null or empty");
+      return nativeTakeBlobsByIndices(rowIndices, column);
+    }
+  }
+
   /**
    * Checks if the dataset is closed.
    *
