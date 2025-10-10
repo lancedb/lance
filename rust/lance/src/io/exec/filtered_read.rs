@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
 
+use super::planner::PlannedFragmentRead;
 use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
@@ -60,8 +61,8 @@ use super::utils::IoMetrics;
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
-    index_result: IndexExprResult,
-    applicable_fragments: RoaringBitmap,
+    pub(crate) index_result: IndexExprResult,
+    pub(crate) applicable_fragments: RoaringBitmap,
 }
 
 impl EvaluatedIndex {
@@ -125,32 +126,32 @@ impl ScopedFragmentRead {
 }
 
 /// A fragment with all of its metadata loaded
-struct LoadedFragment {
-    row_id_sequence: Arc<RowIdSequence>,
-    deletion_vector: Option<Arc<DeletionVector>>,
-    fragment: FileFragment,
+pub(crate) struct LoadedFragment {
+    pub(crate) row_id_sequence: Arc<RowIdSequence>,
+    pub(crate) deletion_vector: Option<Arc<DeletionVector>>,
+    pub(crate) fragment: FileFragment,
     // The number of physical rows in the fragment
     //
     // This count includes deleted rows
-    num_physical_rows: u64,
+    pub(crate) num_physical_rows: u64,
     // The number of logical rows in the fragment
     //
     // This count does not include deleted rows
-    num_logical_rows: u64,
+    pub(crate) num_logical_rows: u64,
 }
 
 /// Given a sorted iterator of deleted row offsets, return a sorted iterator of valid row ranges
 ///
 /// For example, given a fragment with 100 rows, and a deletion vector of 10, 15, 16 this would
 /// return 0..10, 11..15, 17..100
-struct DvToValidRanges<I: Iterator<Item = u64> + Send> {
+pub struct DvToValidRanges<I: Iterator<Item = u64> + Send> {
     deleted_rows: I,
     num_rows: u64,
     position: u64,
 }
 
 impl<I: Iterator<Item = u64> + Send> DvToValidRanges<I> {
-    fn new(deleted_rows: I, num_rows: u64) -> Self {
+    pub fn new(deleted_rows: I, num_rows: u64) -> Self {
         Self {
             deleted_rows,
             num_rows,
@@ -312,7 +313,7 @@ pub enum FilteredReadThreadingMode {
 /// For each fragment, we may read the entire fragment or we may read a portion of it.  We
 /// can use both the scan range and the index result to limit the amount of a fragment that
 /// we read.
-struct FilteredReadStream {
+pub struct FilteredReadStream {
     /// The schema of the output of the scan
     output_schema: SchemaRef,
     /// The stream of filtered rows, expressed as a stream of tasks (batch futures)
@@ -341,6 +342,68 @@ impl std::fmt::Debug for FilteredReadStream {
 }
 
 impl FilteredReadStream {
+    /// Create FilteredReadStream from pre-planned fragments  
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_planned(
+        planned_fragments: Vec<PlannedFragmentRead>,
+        projection: Arc<Projection>,
+        with_deleted_rows: bool,
+        batch_size: u32,
+        full_filter: Option<Expr>,
+        refine_filter: Option<Expr>,
+        output_schema: SchemaRef,
+        scan_scheduler: Arc<ScanScheduler>,
+        metrics: Arc<FilteredReadGlobalMetrics>,
+        fragment_readahead: usize,
+        limit: Option<usize>,
+    ) -> Self {
+        let soft_limit = limit.map(|l| l as u64).unwrap_or(u64::MAX);
+        let metrics_clone = metrics.clone();
+
+        // Convert PlannedFragmentRead to ScopedFragmentRead internally
+        let scoped_fragments: Vec<ScopedFragmentRead> = planned_fragments
+            .into_iter()
+            .map(|p| {
+                let filter = if p.use_refine {
+                    refine_filter.clone()
+                } else {
+                    full_filter.clone()
+                };
+
+                ScopedFragmentRead {
+                    fragment: p.fragment,
+                    ranges: p.ranges,
+                    projection: projection.clone(),
+                    with_deleted_rows,
+                    batch_size,
+                    filter,
+                    priority: p.priority,
+                    scan_scheduler: scan_scheduler.clone(),
+                }
+            })
+            .collect();
+
+        let task_stream = futures::stream::iter(scoped_fragments)
+            .map(move |fragment| {
+                let metrics = metrics_clone.clone();
+                Self::read_fragment(fragment, metrics, Some(soft_limit))
+            })
+            .buffer_unordered(fragment_readahead);
+
+        let task_stream = task_stream.try_flatten();
+        let task_stream: BoxStream<'static, Result<ReadBatchFut>> = Box::pin(task_stream);
+
+        Self {
+            output_schema,
+            task_stream: Arc::new(AsyncMutex::new(task_stream)),
+            scan_scheduler,
+            metrics,
+            active_partitions_counter: Arc::new(AtomicUsize::new(0)),
+            threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(1),
+            scan_range_after_filter: None,
+        }
+    }
+
     #[instrument(name = "init_filtered_read_stream", skip_all)]
     async fn try_new(
         dataset: Arc<Dataset>,
@@ -859,7 +922,7 @@ impl FilteredReadStream {
     // generally fine because grabbing a task is cheap (unless we are waiting on I/O).
     //
     // If the threading mode is `MultiplePartitions` then we may operate on the data out-of-order.
-    fn get_stream(
+    pub(crate) fn get_stream(
         &self,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
