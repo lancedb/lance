@@ -4869,7 +4869,7 @@ mod test {
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.minimum_nprobes(100);
-        scan.with_row_id();
+        scan.with_row_address();
 
         let batches = scan
             .try_into_stream()
@@ -4892,7 +4892,7 @@ mod test {
             .unwrap();
         assert_eq!(batches.len(), 1);
 
-        let first_match = batches[0][ROW_ID].as_primitive::<UInt64Type>().values()[0];
+        let first_match = batches[0][ROW_ADDR].as_primitive::<UInt64Type>().values()[0];
 
         assert_eq!(6, first_match);
     }
