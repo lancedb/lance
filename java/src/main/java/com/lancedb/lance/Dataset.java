@@ -16,6 +16,7 @@ package com.lancedb.lance;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.io.CredentialVendor;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -216,7 +217,8 @@ public class Dataset implements Closeable {
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
-            options.getSerializedManifest());
+            options.getSerializedManifest(),
+            options.getCredentialVendor());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -229,7 +231,8 @@ public class Dataset implements Closeable {
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
-      Optional<ByteBuffer> serializedManifest);
+      Optional<ByteBuffer> serializedManifest,
+      Optional<CredentialVendor> credentialVendor);
 
   /**
    * Create a new version of dataset. Use {@link Transaction} instead

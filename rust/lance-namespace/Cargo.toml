@@ -1,0 +1,39 @@
+[package]
+name = "lance-namespace"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Lance Namespace Rust Client - A unified interface for managing namespaces and tables"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = "1.0"
+bytes = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "charset",
+    "gzip",
+    "http2",
+    "stream",
+    "rustls-tls-native-roots"
+] }
+serde_json = { workspace = true }
+url = { workspace = true }
+arrow = { workspace = true }
+
+# Use models from the reqwest client
+lance-namespace-reqwest-client = "0.0.16"
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

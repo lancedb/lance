@@ -60,6 +60,80 @@ impl DatasetBuilder {
             file_reader_options: None,
         }
     }
+
+    /// Create a DatasetBuilder from a LanceNamespace
+    ///
+    /// This will automatically fetch the table location and credentials from the namespace
+    /// via `describe_table()`. Credentials will be automatically refreshed before they expire.
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace implementation to fetch table info from
+    /// * `table_id` - The table identifier (e.g., vec!["my_table"])
+    /// * `params` - Optional credential vending parameters (None for defaults)
+    ///
+    /// # Example
+    /// ```ignore
+    /// use lance_namespace_impls::connect;
+    /// use lance::dataset::DatasetBuilder;
+    ///
+    /// let namespace = connect("rest", properties).await?;
+    /// let dataset = DatasetBuilder::from_namespace(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    ///     None, // Use default credential refresh params
+    /// )
+    /// .await?
+    /// .load()
+    /// .await?;
+    /// ```
+    pub async fn from_namespace(
+        namespace: Arc<dyn lance_namespace::LanceNamespace>,
+        table_id: Vec<String>,
+        params: Option<lance_io::object_store::CredentialVendingParams>,
+    ) -> Result<Self> {
+        use lance_namespace::models::DescribeTableRequest;
+
+        // Fetch table location from namespace
+        let request = DescribeTableRequest {
+            id: Some(table_id.clone()),
+            version: None,
+        };
+
+        let response = namespace
+            .describe_table(request)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: Box::new(e),
+                location: location!(),
+            })?;
+
+        let table_uri = response.location.ok_or_else(|| Error::Namespace {
+            source: Box::new(std::io::Error::other(
+                "Table location not found in namespace response",
+            )),
+            location: location!(),
+        })?;
+
+        // Create builder with location from namespace
+        let mut builder = Self::from_uri(table_uri);
+
+        // Set up credential vending with initial storage options from describe_table
+        let params = if let Some(storage_options) = response.storage_options {
+            // Use provided params or create new ones, then add initial storage options
+            let mut params = params.unwrap_or_default();
+            params.initial_storage_options = Some(storage_options);
+            Some(params)
+        } else {
+            params
+        };
+
+        // Create LanceNamespaceCredentialVendor and add to builder
+        let vendor =
+            lance_io::object_store::LanceNamespaceCredentialVendor::new(namespace, table_id);
+        builder = builder.with_credential_vending(Arc::new(vendor), params);
+
+        Ok(builder)
+    }
 }
 
 // Much of this builder is directly inspired from the to delta-rs table builder implementation
@@ -192,6 +266,69 @@ impl DatasetBuilder {
         let mut storage_options = self.options.storage_options.unwrap_or_default();
         storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
         self.options.storage_options = Some(storage_options);
+        self
+    }
+
+    /// Enable credential vending from a LanceNamespace
+    ///
+    /// Credentials will be automatically refreshed from the namespace
+    /// before they expire. The namespace should return `expires_at_millis`
+    /// in the storage_options from `describe_table()`.
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace implementation to fetch credentials from
+    /// * `table_id` - The table identifier (e.g., vec!["my_table"])
+    /// * `params` - Configuration parameters (use None for defaults)
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use lance_namespace_impls::connect;
+    /// use lance_io::object_store::{CredentialVendor, LanceNamespaceCredentialVendor, CredentialVendingParams};
+    ///
+    /// let namespace = connect("rest", properties).await?;
+    ///
+    /// // Create a credential vendor from namespace
+    /// let vendor = Arc::new(LanceNamespaceCredentialVendor::new(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    /// ));
+    ///
+    /// // With custom params
+    /// let params = CredentialVendingParams::new()
+    ///     .with_refresh_lead_time_ms(300_000); // 5 minutes
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_credential_vending(vendor.clone(), Some(params))
+    ///     .load()
+    ///     .await?;
+    ///
+    /// // With default params
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_credential_vending(vendor, None)
+    ///     .load()
+    ///     .await?;
+    /// ```
+    pub fn with_credential_vending(
+        mut self,
+        vendor: Arc<dyn lance_io::object_store::CredentialVendor>,
+        params: Option<lance_io::object_store::CredentialVendingParams>,
+    ) -> Self {
+        use lance_io::object_store::{
+            ChainedWrappingObjectStore, CredentialVendingObjectStoreWrapper,
+        };
+
+        let params = params.unwrap_or_default();
+        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
+
+        // Chain with existing wrappers if any
+        if let Some(existing) = self.options.object_store_wrapper {
+            let mut chained = ChainedWrappingObjectStore::new(vec![existing]);
+            chained.add_wrapper(Arc::new(wrapper));
+            self.options.object_store_wrapper = Some(Arc::new(chained));
+        } else {
+            self.options.object_store_wrapper = Some(Arc::new(wrapper));
+        }
+
         self
     }
 

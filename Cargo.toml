@@ -10,6 +10,8 @@ members = [
     "rust/lance-index",
     "rust/lance-io",
     "rust/lance-linalg",
+    "rust/lance-namespace",
+    "rust/lance-namespace-impls",
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
@@ -56,11 +58,13 @@ lance-file = { version = "=0.38.2", path = "./rust/lance-file" }
 lance-index = { version = "=0.38.2", path = "./rust/lance-index" }
 lance-io = { version = "=0.38.2", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=0.38.2", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=0.38.2", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=0.38.2", path = "./rust/lance-namespace-impls" }
 lance-table = { version = "=0.38.2", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.38.2", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.38.2", path = "./rust/lance-testing" }
-approx = "0.5.1"
 # Note that this one does not include pyarrow
+approx = "0.5"
 arrow = { version = "56.1", optional = false, features = ["prettyprint"] }
 arrow-arith = "56.1"
 arrow-array = "56.1"

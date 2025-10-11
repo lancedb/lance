@@ -105,6 +105,11 @@
             <artifactId>guava</artifactId>
             <version>33.3.1-jre</version>
         </dependency>
+        <dependency>
+            <groupId>com.lancedb</groupId>
+            <artifactId>lance-namespace-core</artifactId>
+            <version>0.0.18</version>
+        </dependency>
     </dependencies>
 
     <distributionManagement>
