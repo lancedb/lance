@@ -153,7 +153,7 @@ mod tests {
             None,
             HashMap::new(), // Empty base_paths
         );
-        apply_feature_flags(&mut normal_manifest, false).unwrap();
+        apply_feature_flags(&mut normal_manifest, false, false).unwrap();
         assert_eq!(normal_manifest.reader_feature_flags & FLAG_SHALLOW_CLONE, 0);
         assert_eq!(normal_manifest.writer_feature_flags & FLAG_SHALLOW_CLONE, 0);
         // Test 2: Cloned dataset (with base_paths) should have FLAG_SHALLOW_CLONE
