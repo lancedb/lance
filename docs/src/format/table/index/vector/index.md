@@ -29,7 +29,8 @@ The sub-index determines how vectors are organized for search. Lance currently s
 The quantization method determines how vectors are stored and compressed. Lance currently supports:
 
 - **Product Quantization (PQ)**: Compresses vectors by splitting them into smaller sub-vectors and quantizing each independently
-- **Scalar Quantization (SQ)**: Applies scalar quantization to each dimension of the vector independently  
+- **Scalar Quantization (SQ)**: Applies scalar quantization to each dimension of the vector independently
+- **RabitQ (RQ)**: Uses random rotation and binary quantization for extreme compression
 - **FLAT**: No quantization, keeps original vectors for exact search
 
 ### Common Combinations
@@ -39,10 +40,11 @@ If sub-index is just `FLAT`, we usually omit it and just refer to it by `{cluste
 Here are the commonly used combinations:
 
 | Index Type      | Name                                            | Description                                                                              |
-|-----------------|-------------------------------------------------|------------------------------------------------------------------------------------------|
+| --------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | **IVF_PQ**      | Inverted File with Product Quantization         | Combines IVF clustering with PQ compression for efficient storage and search             |
 | **IVF_HNSW_SQ** | Inverted File with HNSW and Scalar Quantization | Uses IVF for coarse clustering and HNSW for fine-grained search with scalar quantization |
 | **IVF_SQ**      | Inverted File with Scalar Quantization          | Combines IVF clustering with scalar quantization for balanced compression                |
+| **IVF_RQ**      | Inverted File with RabitQ                       | Combines IVF clustering with RabitQ for extreme compression using binary quantization    |
 | **IVF_FLAT**    | Inverted File without quantization              | Uses IVF clustering with exact vector storage for precise search within clusters         |
 
 ### Versioning
@@ -73,7 +75,7 @@ The Arrow schema of the Lance file varies depending on the sub-index type used.
 FLAT indices perform exact search with no approximation. This is essentially an empty file with a minimal schema:
 
 | Column          | Type   | Nullable | Description                                  |
-|-----------------|--------|----------|----------------------------------------------|
+| --------------- | ------ | -------- | -------------------------------------------- |
 | `__flat_marker` | uint64 | false    | Marker field for FLAT index (no actual data) |
 
 ##### HNSW
@@ -81,7 +83,7 @@ FLAT indices perform exact search with no approximation. This is essentially an 
 HNSW (Hierarchical Navigable Small World) indices provide fast approximate search through a multi-level graph structure. This stores the HNSW graph with the following schema:
 
 | Column        | Type          | Nullable | Description            |
-|---------------|---------------|----------|------------------------|
+| ------------- | ------------- | -------- | ---------------------- |
 | `__vector_id` | uint64        | false    | Vector identifier      |
 | `__neighbors` | list<uint32>  | false    | Neighbor node IDs      |
 | `_distance`   | list<float32> | false    | Distances to neighbors |
@@ -98,10 +100,10 @@ Here are the metadata keys and their corresponding values:
 
 Contains basic index configuration information in JSON:
 
-| JSON Key        | Type   | Expected Values                                 |
-|-----------------|--------|-------------------------------------------------|
-| `type`          | String | Index type (e.g., "IVF_PQ", "IVF_HNSW", "FLAT") |
-| `distance_type` | String | Distance metric (e.g., "l2", "cosine", "dot")   |
+| JSON Key        | Type   | Expected Values                                           |
+| --------------- | ------ | --------------------------------------------------------- |
+| `type`          | String | Index type (e.g., "IVF_PQ", "IVF_RQ", "IVF_HNSW", "FLAT") |
+| `distance_type` | String | Distance metric (e.g., "l2", "cosine", "dot")             |
 
 ##### "lance:ivf"
 
@@ -121,16 +123,16 @@ This is an empty string since FLAT indices don't require additional metadata at 
 
 Contains the HNSW-specific JSON metadata for each partition, including graph structure information:
 
-| JSON Key        | Type         | Expected Values                    |
-|-----------------|--------------|------------------------------------|
-| `entry_point`   | u32          | Starting node for graph traversal  |
+| JSON Key        | Type         | Expected Values                          |
+| --------------- | ------------ | ---------------------------------------- |
+| `entry_point`   | u32          | Starting node for graph traversal        |
 | `params`        | Object       | HNSW construction parameters (see below) |
-| `level_offsets` | Array<usize> | Offset for each level in the graph |
+| `level_offsets` | Array<usize> | Offset for each level in the graph       |
 
 The `params` object contains the following HNSW construction parameters:
 
 | JSON Key            | Type          | Description                                                    | Default |
-|---------------------|---------------|----------------------------------------------------------------|---------|
+| ------------------- | ------------- | -------------------------------------------------------------- | ------- |
 | `max_level`         | u16           | Maximum level of the HNSW graph                                | 7       |
 | `m`                 | usize         | Number of connections to establish while inserting new element | 20      |
 | `ef_construction`   | usize         | Size of the dynamic list for candidates                        | 150     |
@@ -163,17 +165,17 @@ the Arrow schema of the Lance file varies depending on the quantization method u
 
 No quantization applied - stores original vectors in their full precision:
 
-| Column   | Type                            | Nullable | Description                                           |
-|----------|---------------------------------|----------|-------------------------------------------------------|
-| `_rowid` | uint64                          | false    | Row identifier                                        |
-| `flat`   | list<float32>[dimension]        | false    | Original vector values (list_size = vector dimension) |
+| Column   | Type                     | Nullable | Description                                           |
+| -------- | ------------------------ | -------- | ----------------------------------------------------- |
+| `_rowid` | uint64                   | false    | Row identifier                                        |
+| `flat`   | list<float32>[dimension] | false    | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
 Compresses vectors using product quantization for significant memory savings:
 
 | Column      | Type           | Nullable | Description                                 |
-|-------------|----------------|----------|---------------------------------------------|
+| ----------- | -------------- | -------- | ------------------------------------------- |
 | `_rowid`    | uint64         | false    | Row identifier                              |
 | `__pq_code` | list<uint8>[m] | false    | PQ codes (list_size = number of subvectors) |
 
@@ -182,9 +184,20 @@ Compresses vectors using product quantization for significant memory savings:
 Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
-|-------------|------------------------|----------|-----------------------------------------|
+| ----------- | ---------------------- | -------- | --------------------------------------- |
 | `_rowid`    | uint64                 | false    | Row identifier                          |
 | `__sq_code` | list<uint8>[dimension] | false    | SQ codes (list_size = vector dimension) |
+
+##### RQ
+
+Compresses vectors using RabitQ with random rotation and binary quantization for extreme compression:
+
+| Column            | Type                       | Nullable | Description                                                     |
+| ----------------- | -------------------------- | -------- | --------------------------------------------------------------- |
+| `_rowid`          | uint64                     | false    | Row identifier                                                  |
+| `_rabit_codes`    | list<uint8>[dimension / 8] | false    | Binary quantized codes (1 bit per dimension, packed into bytes) |
+| `__add_factors`   | float32                    | false    | Additive correction factors for distance computation            |
+| `__scale_factors` | float32                    | false    | Scale correction factors for distance computation               |
 
 #### Arrow Schema Metadata
 
@@ -200,6 +213,12 @@ Similar to the index file's "lance:ivf" but focused on vector storage layout.
 This doesn't contain the partitions' centroids.
 It's only used for tracking each partition's offset and length in the auxiliary file.
 
+##### "lance:rabit"
+
+Contains RabitQ-specific metadata in JSON format (only present for RQ quantization).
+This includes the rotation matrix position, number of bits, and packing information.
+See the RQ metadata specification in the "storage_metadata" section below.
+
 ##### "storage_metadata"
 
 Contains quantizer-specific metadata as a list of JSON strings.
@@ -208,7 +227,7 @@ Currently, the list always contains exactly 1 element with the quantizer metadat
 For **Product Quantization (PQ)**:
 
 | JSON Key            | Type  | Description                                                      |
-|---------------------|-------|------------------------------------------------------------------|
+| ------------------- | ----- | ---------------------------------------------------------------- |
 | `codebook_position` | usize | Position of the codebook in the global buffer                    |
 | `nbits`             | u32   | Number of bits per subvector code (e.g., 8 bits = 256 codewords) |
 | `num_sub_vectors`   | usize | Number of subvectors (m)                                         |
@@ -218,10 +237,18 @@ For **Product Quantization (PQ)**:
 For **Scalar Quantization (SQ)**:
 
 | JSON Key   | Type       | Description                            |
-|------------|------------|----------------------------------------|
+| ---------- | ---------- | -------------------------------------- |
 | `dim`      | usize      | Vector dimension                       |
 | `num_bits` | u16        | Number of bits for quantization        |
 | `bounds`   | Range<f64> | Min/max bounds for scalar quantization |
+
+For **RabitQ (RQ)**:
+
+| JSON Key              | Type | Description                                          |
+| --------------------- | ---- | ---------------------------------------------------- |
+| `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
+| `num_bits`            | u8   | Number of bits per dimension (currently always 1)    |
+| `packed`              | bool | Whether codes are packed for optimized computation   |
 
 #### Lance File Global Buffer
 
@@ -233,6 +260,18 @@ in the auxiliary file's global buffer for efficient access:
 ```protobuf
 %%% proto.message.Tensor %%%
 ```
+
+##### Rotation Matrix
+
+For RabitQ, the rotation matrix is stored in `Tensor` format
+in the auxiliary file's global buffer. The rotation matrix is an orthogonal matrix used 
+to rotate vectors before binary quantization:
+
+```protobuf
+%%% proto.message.Tensor %%%
+```
+
+The rotation matrix has shape `[code_dim, code_dim]` where `code_dim = dimension * num_bits`.
 
 ## Appendices
 
@@ -272,7 +311,45 @@ pa.schema([
 ])
 ```
 
-### Appendix 2: Accessing Index File with Python
+### Appendix 2: Example IVF_RQ Format
+
+This example shows how an `IVF_RQ` index is physically laid out. Assume vectors have dimension 128,
+RQ uses 1 bit per dimension (num_bits=1), and distance type is "l2".
+
+#### Index File
+
+- Arrow Schema Metadata:
+    - `"lance:index"` → `{ "type": "IVF_RQ", "distance_type": "l2" }`
+    - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
+    - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_RQ uses a FLAT sub-index inside each partition)
+
+- Lance File Global buffer (Protobuf):
+    - `Ivf` message containing:
+        - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
+        - `offsets`: start offset (row) of each partition in `auxiliary.idx`
+        - `lengths`: number of vectors in each partition
+        - `loss`: k-means loss (optional)
+
+#### Auxiliary File
+
+- Arrow Schema Metadata:
+    - `"distance_type"` → `"l2"`
+    - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
+    - `"lance:rabit"` → `"{"rotate_mat_position":1,"num_bits":1,"packed":true}"`
+- Lance File Global buffer:
+    - `Tensor` rotation matrix with shape `[code_dim, code_dim]` = `[128, 128]` (float32)
+- Rows with Arrow schema: 
+
+```python
+pa.schema([
+    pa.field("_rowid", pa.uint64()),
+    pa.field("_rabit_codes", pa.list(pa.uint8(), list_size=16)), # dimension/8 = 128/8 = 16 bytes
+    pa.field("__add_factors", pa.float32()),
+    pa.field("__scale_factors", pa.float32()),
+])
+```
+
+### Appendix 3: Accessing Index File with Python
 
 The following example demonstrates how to read and parse different components in the Lance index files using Python:
 

@@ -15,7 +15,6 @@ use arrow::datatypes::UInt64Type;
 use arrow_schema::{DataType, Field, Schema};
 use itertools::Itertools;
 use lance::Dataset;
-use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::scalar::inverted::flat_full_text_search;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -25,7 +24,10 @@ use object_store::path::Path;
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    const TOTAL: usize = 10_000_000;
+
+    const TOTAL: usize = 10_000;
+    const DOC_ID: &str = "__example_doc_id";
+
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
 
@@ -43,7 +45,7 @@ async fn main() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("doc", DataType::LargeUtf8, false),
-                Field::new(ROW_ID, DataType::UInt64, false),
+                Field::new(DOC_ID, DataType::UInt64, false),
             ])),
             vec![doc_col.clone(), row_id_col.clone()],
         )
@@ -94,7 +96,7 @@ async fn main() {
         .try_into_batch()
         .await
         .unwrap();
-    let index_results = batch[ROW_ID]
+    let index_results = batch[DOC_ID]
         .as_primitive::<UInt64Type>()
         .iter()
         .map(|v| v.unwrap())

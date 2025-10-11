@@ -359,6 +359,27 @@ impl ObjectStore {
         Ok((store, path))
     }
 
+    /// Extract the path component from a URI without initializing the object store.
+    ///
+    /// This is a synchronous operation that only parses the URI and extracts the path,
+    /// without creating or initializing any object store instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - The object store registry to get the provider
+    /// * `uri` - The URI to extract the path from
+    ///
+    /// # Returns
+    ///
+    /// The extracted path component
+    pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
+        let url = uri_to_url(uri)?;
+        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
+            Error::invalid_input(format!("Unknown scheme: {}", url.scheme()), location!())
+        })?;
+        provider.extract_path(&url)
+    }
+
     #[deprecated(note = "Use `from_uri` instead")]
     pub fn from_path(str_path: &str) -> Result<(Arc<Self>, Path)> {
         Self::from_uri_and_params(

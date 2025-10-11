@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{ops::DerefMut, sync::Arc};
+use std::sync::Arc;
 
 use arrow::datatypes::Int32Type;
 
@@ -14,6 +14,8 @@ use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_s3::{config::Credentials, Client as S3Client};
 use futures::future::try_join_all;
 use lance_datagen::{array, gen_batch, RowCount};
+use lance_io::assert_io_eq;
+use lance_io::utils::tracking_store::IOTracker;
 
 const CONFIG: &[(&str, &str)] = &[
     ("access_key_id", "ACCESS_KEY"),
@@ -175,16 +177,14 @@ impl Drop for DynamoDBCommitTable {
 
 #[tokio::test]
 async fn test_concurrent_writers() {
-    use crate::utils::test::IoTrackingStore;
-
     let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
-    let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+    let io_tracker = Arc::new(IOTracker::default());
 
     // Create a table
     let store_params = ObjectStoreParams {
-        object_store_wrapper: Some(io_stats_wrapper),
+        object_store_wrapper: Some(io_tracker.clone()),
         storage_options: Some(
             CONFIG
                 .iter()
@@ -207,11 +207,8 @@ async fn test_concurrent_writers() {
         .unwrap();
 
     // 1 IOPS for uncommitted write
-    let incremental_stats = || {
-        let mut stats = io_stats.as_ref().lock().unwrap();
-        std::mem::take(stats.deref_mut())
-    };
-    assert_eq!(incremental_stats().write_iops, 1);
+    let io_stats = io_tracker.incremental_stats();
+    assert_io_eq!(io_stats, write_iops, 1);
 
     let dataset = CommitBuilder::new(&uri)
         .with_store_params(store_params.clone())
@@ -219,7 +216,8 @@ async fn test_concurrent_writers() {
         .await
         .unwrap();
     // Commit: 2 IOPs. 1 for transaction file, 1 for manifest file
-    assert_eq!(incremental_stats().write_iops, 2);
+    let io_stats = io_tracker.incremental_stats();
+    assert_io_eq!(io_stats, write_iops, 2);
     let dataset = Arc::new(dataset);
     let old_version = dataset.manifest().version;
 
@@ -259,8 +257,6 @@ async fn test_concurrent_writers() {
 
 #[tokio::test]
 async fn test_ddb_open_iops() {
-    use crate::utils::test::IoTrackingStore;
-
     let bucket = S3Bucket::new("test-ddb-iops").await;
     let ddb_table = DynamoDBCommitTable::new("test-ddb-iops").await;
     let uri = format!("s3+ddb://{}/test?ddbTableName={}", bucket.0, ddb_table.0);
@@ -268,11 +264,11 @@ async fn test_ddb_open_iops() {
     let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
-    let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+    let io_tracker = Arc::new(IOTracker::default());
 
     // Create a table
     let store_params = ObjectStoreParams {
-        object_store_wrapper: Some(io_stats_wrapper),
+        object_store_wrapper: Some(io_tracker.clone()),
         storage_options: Some(
             CONFIG
                 .iter()
@@ -293,11 +289,8 @@ async fn test_ddb_open_iops() {
         .unwrap();
 
     // 1 IOPS for uncommitted write
-    let incremental_stats = || {
-        let mut stats = io_stats.as_ref().lock().unwrap();
-        std::mem::take(stats.deref_mut())
-    };
-    assert_eq!(incremental_stats().write_iops, 1);
+    let io_stats = io_tracker.incremental_stats();
+    assert_io_eq!(io_stats, write_iops, 1);
 
     let _ = CommitBuilder::new(&uri)
         .with_store_params(store_params.clone())
@@ -310,10 +303,9 @@ async fn test_ddb_open_iops() {
     //    * write staged file
     //    * copy to final file
     //    * delete staged file
-    let stats = incremental_stats();
-
-    assert_eq!(stats.write_iops, 4);
-    assert_eq!(stats.read_iops, 1);
+    let io_stats = io_tracker.incremental_stats();
+    assert_io_eq!(io_stats, write_iops, 4);
+    assert_io_eq!(io_stats, read_iops, 1);
 
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
@@ -323,11 +315,11 @@ async fn test_ddb_open_iops() {
         .load()
         .await
         .unwrap();
-    let stats = incremental_stats();
+    let io_stats = io_tracker.incremental_stats();
     // Open dataset can be read with 1 IOP, just to read the manifest.
     // Looking up latest manifest is handled in dynamodb.
-    assert_eq!(stats.read_iops, 1);
-    assert_eq!(stats.write_iops, 0);
+    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, write_iops, 0);
 
     // Append
     let dataset = InsertBuilder::new(Arc::new(dataset))
@@ -338,17 +330,17 @@ async fn test_ddb_open_iops() {
         .execute(vec![data.clone()])
         .await
         .unwrap();
-    let stats = incremental_stats();
+    let io_stats = io_tracker.incremental_stats();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
-    assert_eq!(stats.write_iops, 5);
+    assert_io_eq!(io_stats, write_iops, 5);
     // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
     // for the DDB commit handler.
-    assert_eq!(stats.read_iops, 1);
+    assert_io_eq!(io_stats, read_iops, 1);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
-    let stats = incremental_stats();
+    let io_stats = io_tracker.incremental_stats();
     // Checkout: 1 IOPS: manifest file
-    assert_eq!(stats.read_iops, 1);
-    assert_eq!(stats.write_iops, 0);
+    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, write_iops, 0);
 }

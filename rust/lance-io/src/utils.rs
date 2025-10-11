@@ -23,6 +23,8 @@ use crate::{
 use crate::{traits::Reader, ReadBatchParams};
 use lance_core::{Error, Result};
 
+pub mod tracking_store;
+
 /// Read a binary array from a [Reader].
 ///
 pub async fn read_binary_array(

@@ -894,15 +894,25 @@ impl FilteredReadStream {
                     }
                 });
                 let partition_metrics_clone = partition_metrics.clone();
-                let base_batch_stream = futures_stream
-                    .try_buffered(num_threads)
-                    .try_filter_map(move |batch| {
-                        std::future::ready(Ok(if batch.num_rows() == 0 {
-                            None
-                        } else {
-                            Some(batch)
-                        }))
-                    })
+                let base_batch_stream =
+                    futures_stream
+                        .try_buffered(num_threads)
+                        .try_filter_map(move |batch| {
+                            std::future::ready(Ok(if batch.num_rows() == 0 {
+                                None
+                            } else {
+                                Some(batch)
+                            }))
+                        });
+
+                let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
+                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                } else {
+                    // Need to box here otherwise the if/else returns incompatible types
+                    base_batch_stream.boxed()
+                };
+
+                let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
                             .baseline_metrics
@@ -911,17 +921,9 @@ impl FilteredReadStream {
                     })
                     .finally(move || {
                         partition_metrics.baseline_metrics.done();
-                    });
-
-                let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    Self::apply_hard_range(base_batch_stream, range.clone())
-                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
-                        .boxed()
-                } else {
-                    base_batch_stream
-                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
-                        .boxed()
-                };
+                    })
+                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                    .boxed();
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }

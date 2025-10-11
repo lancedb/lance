@@ -2221,16 +2221,16 @@ impl Scanner {
                     .for_column(column)
                     .supports_fts(),
             )
-            .await?
-            .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
-                location!(),
-            ))?;
-        if let Some(fragmap) = &index.fragment_bitmap {
-            *accum |= fragmap;
-            Ok(true)
-        } else {
-            Ok(false)
+            .await?;
+        match index {
+            Some(index) => match &index.fragment_bitmap {
+                Some(fragmap) => {
+                    *accum |= fragmap;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            None => Ok(false),
         }
     }
 
@@ -2628,67 +2628,106 @@ impl Scanner {
                     .for_column(&column)
                     .supports_fts(),
             )
-            .await?
-            .ok_or(Error::invalid_input(
-                format!(
-                    "Column {} has no inverted index",
-                    query.column.as_ref().unwrap()
-                ),
-                location!(),
-            ))?;
+            .await?;
 
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        let mut match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+        let (match_plan, flat_match_plan) = match &index {
+            Some(index) => {
+                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                ));
+
+                let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+                if unindexed_fragments.is_empty() {
+                    (Some(match_plan), None)
+                } else {
+                    let flat_match_plan = self
+                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .await?;
+                    (Some(match_plan), Some(flat_match_plan))
+                }
+            }
+            None => {
+                let unindexed_fragments = self.dataset.fragments().iter().cloned().collect();
+                let flat_match_plan = self
+                    .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                    .await?;
+                (None, Some(flat_match_plan))
+            }
+        };
+
+        // Combine plans
+        let plan = match (match_plan, flat_match_plan) {
+            (Some(match_plan), Some(flat_match_plan)) => {
+                let match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
+                let match_plan = Arc::new(RepartitionExec::try_new(
+                    match_plan,
+                    Partitioning::RoundRobinBatch(1),
+                )?);
+                let sort_expr = PhysicalSortExpr {
+                    expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                };
+                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit))
+            }
+            (Some(match_plan), None) => match_plan,
+            (None, Some(flat_match_plan)) => flat_match_plan,
+            (None, None) => unreachable!(),
+        };
+
+        Ok(plan)
+    }
+
+    /// Plan match query on unindexed fragments
+    async fn plan_flat_match_query(
+        &self,
+        fragments: Vec<Fragment>,
+        query: &MatchQuery,
+        params: &FtsSearchParams,
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query
+            .column
+            .as_ref()
+            .ok_or(Error::invalid_input(
+                "the column must be specified in the query".to_string(),
+                location!(),
+            ))?
+            .clone();
+
+        let mut columns = vec![column];
+        if let Some(expr) = filter_plan.full_expr.as_ref() {
+            let filter_columns = Planner::column_names_in_expr(expr);
+            columns.extend(filter_columns);
+        }
+        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
+        let mut scan_node = self.scan_fragments(
+            true,
+            false,
+            false,
+            flat_fts_scan_schema,
+            Arc::new(fragments),
+            None,
+            false,
+        );
+
+        if let Some(expr) = filter_plan.full_expr.as_ref() {
+            // If there is a prefilter we need to manually apply it to the new data
+            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+        }
+
+        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            prefilter_source.clone(),
+            scan_node,
         ));
-        if !unindexed_fragments.is_empty() {
-            let mut columns = vec![column.clone()];
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(expr);
-                columns.extend(filter_columns);
-            }
-            let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                flat_fts_scan_schema,
-                Arc::new(unindexed_fragments),
-                None,
-                false,
-            );
-
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
-                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-            }
-
-            let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                scan_node,
-            ));
-
-            match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
-            match_plan = Arc::new(RepartitionExec::try_new(
-                match_plan,
-                Partitioning::RoundRobinBatch(1),
-            )?);
-            let sort_expr = PhysicalSortExpr {
-                expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: true,
-                    nulls_first: false,
-                },
-            };
-            match_plan =
-                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit));
-        }
-        Ok(match_plan)
+        Ok(flat_match_plan)
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -3731,7 +3770,6 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
     use std::vec;
 
     use arrow::array::as_primitive_array;
@@ -3739,10 +3777,10 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, Int64Array, LargeStringArray,
-        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
+        RecordBatchIterator, StringArray, StructArray,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::Fields;
     use arrow_select::take;
@@ -3758,7 +3796,9 @@ mod test {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
@@ -3771,8 +3811,7 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, IoStats,
-        IoTrackingStore,
+        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
     };
 
     #[tokio::test]
@@ -3899,97 +3938,6 @@ mod test {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_filter_with_nullable_struct_list_schema_mismatch() {
-        let test_uri = TempStrDir::default();
-
-        let struct_fields = Fields::from(vec![
-            Arc::new(ArrowField::new("company_id", DataType::Int64, true)),
-            Arc::new(ArrowField::new("company_name", DataType::Utf8, true)),
-            Arc::new(ArrowField::new("count", DataType::Int64, true)),
-        ]);
-        let list_item_field = Arc::new(ArrowField::new(
-            "item",
-            DataType::Struct(struct_fields.clone()),
-            true,
-        ));
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("cid", DataType::Utf8, false),
-            ArrowField::new("companies", DataType::List(list_item_field.clone()), true),
-        ]));
-
-        let companies_values: ArrayRef = Arc::new(
-            StructArray::try_new(
-                struct_fields.clone(),
-                vec![
-                    Arc::new(Int64Array::from(vec![
-                        Option::<i64>::None,
-                        None,
-                        None,
-                        None,
-                        Some(100),
-                        Some(101),
-                    ])) as ArrayRef,
-                    Arc::new(StringArray::from(vec![
-                        Some("Google"),
-                        Some("Microsoft"),
-                        None,
-                        None,
-                        Some("Apple"),
-                        Some("Amazon"),
-                    ])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![
-                        Option::<i64>::None,
-                        None,
-                        None,
-                        None,
-                        Some(50),
-                        Some(60),
-                    ])) as ArrayRef,
-                ],
-                None,
-            )
-            .unwrap(),
-        );
-
-        let companies_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 4, 6]));
-        let companies_array: ArrayRef = Arc::new(ListArray::new(
-            list_item_field,
-            companies_offsets,
-            companies_values,
-            None,
-        ));
-
-        let cid_array: ArrayRef = Arc::new(StringArray::from(vec!["1", "2", "3"]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![cid_array.clone(), companies_array.clone()],
-        )
-        .unwrap();
-
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-        Dataset::write(reader, &test_uri, None).await.unwrap();
-
-        let dataset = Dataset::open(&test_uri).await.unwrap();
-        let mut scan = dataset.scan();
-        scan.filter("cid = '1'").unwrap();
-
-        let batches = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("filter should not trigger schema mismatch");
-
-        assert_eq!(batches.len(), 1);
-        let companies_col = batches[0]
-            .column_by_name("companies")
-            .expect("companies column missing");
-        assert_eq!(companies_col.len(), 1);
     }
 
     #[cfg(not(windows))]
@@ -6194,6 +6142,7 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
+        use lance_io::assert_io_lt;
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         use lance_table::io::commit::RenameCommitHandler;
@@ -6206,13 +6155,13 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
 
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
@@ -6233,15 +6182,13 @@ mod test {
             .await
             .unwrap();
 
-        let get_bytes = || io_stats.lock().unwrap().read_bytes;
-
         // First run a full scan to get a baseline
-        let start_bytes = get_bytes();
+        let _ = io_tracker.incremental_stats(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let full_scan_bytes = get_bytes() - start_bytes;
+        let io_stats = io_tracker.incremental_stats();
+        let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .use_stats(false)
@@ -6250,14 +6197,13 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let filtered_scan_bytes = get_bytes() - start_bytes;
-
-        assert!(filtered_scan_bytes < full_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+        let filtered_scan_bytes = io_stats.read_bytes;
 
         // Now do a scan with pushdown, the benefit should be even greater
         // Pushdown only works with the legacy format for now.
         if data_storage_version == LanceFileVersion::Legacy {
-            let start_bytes = get_bytes();
             dataset
                 .scan()
                 .filter("not_indexed = 50")
@@ -6265,15 +6211,13 @@ mod test {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let pushdown_scan_bytes = get_bytes() - start_bytes;
-
-            assert!(pushdown_scan_bytes < filtered_scan_bytes);
+            let io_stats = io_tracker.incremental_stats();
+            assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
         // Now do a scalar index scan, this should be better than a
         // full scan but since we have to load the index might be more
         // expensive than late / pushdown scan
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .filter("indexed = 50")
@@ -6281,12 +6225,12 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let index_scan_bytes = get_bytes() - start_bytes;
-        assert!(index_scan_bytes < full_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+        let index_scan_bytes = io_stats.read_bytes;
 
         // A second scalar index scan should be cheaper than the first
         // since we should have the index in cache
-        let start_bytes = get_bytes();
         dataset
             .scan()
             .filter("indexed = 50")
@@ -6294,8 +6238,8 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let second_index_scan_bytes = get_bytes() - start_bytes;
-        assert!(second_index_scan_bytes < index_scan_bytes);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
     #[rstest]
@@ -7347,6 +7291,7 @@ mod test {
         // indexed column
 
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use lance_io::assert_io_eq;
         let data = gen_batch()
             .col(
                 "vector",
@@ -7357,13 +7302,13 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(5));
 
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 data_storage_version: Some(data_storage_version),
@@ -7419,31 +7364,6 @@ mod test {
             .await
             .unwrap();
 
-        struct IopsTracker {
-            baseline: u64,
-            new_iops: u64,
-            io_stats: Arc<Mutex<IoStats>>,
-        }
-
-        impl IopsTracker {
-            fn update(&mut self) {
-                let iops = self.io_stats.lock().unwrap().read_iops;
-                self.new_iops = iops - self.baseline;
-                self.baseline = iops;
-            }
-
-            fn new_iops(&mut self) -> u64 {
-                self.update();
-                self.new_iops
-            }
-        }
-
-        let mut tracker = IopsTracker {
-            baseline: 0,
-            new_iops: 0,
-            io_stats,
-        };
-
         // First planning cycle needs to do some I/O to determine what scalar indices are available
         dataset
             .scan()
@@ -7455,7 +7375,8 @@ mod test {
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        assert!(tracker.new_iops() > 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
         dataset
@@ -7467,7 +7388,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7478,7 +7400,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7490,7 +7413,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
             .scan()
@@ -7502,7 +7426,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(tracker.new_iops(), 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 0);
     }
 
     #[rstest]

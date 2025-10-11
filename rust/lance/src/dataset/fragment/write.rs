@@ -210,6 +210,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params.into_owned(),
             LanceFileVersion::Stable,
+            None, // Fragment creation doesn't use target_bases
         )
         .await
     }

@@ -823,6 +823,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),
+                None, // Merge insert doesn't use target_bases
             )
             .await?;
 

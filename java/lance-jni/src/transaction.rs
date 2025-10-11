@@ -472,6 +472,7 @@ fn convert_to_java_operation_inner<'local>(
             fragments: rust_fragments,
             schema,
             config_upsert_values,
+            initial_bases: _,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
             let java_schema = convert_to_java_schema(env, schema)?;
@@ -890,6 +891,7 @@ fn convert_to_rust_operation(
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_bases: None,
             }
         }
         "Rewrite" => {

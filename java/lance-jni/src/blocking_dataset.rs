@@ -564,6 +564,7 @@ pub fn inner_commit_overwrite<'local>(
         fragments,
         schema,
         config_upsert_values: None,
+        initial_bases: None,
     };
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;

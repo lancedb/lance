@@ -329,6 +329,7 @@ impl UpdateJob {
             self.dataset.schema().clone(),
             Box::pin(stream),
             WriteParams::with_storage_version(version),
+            None, // TODO: support multiple bases for update
         )
         .await?;
 
