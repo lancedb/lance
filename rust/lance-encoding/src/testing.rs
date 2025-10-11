@@ -333,6 +333,7 @@ pub async fn check_round_trip_encoding_generated(
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                support_large_chunk: version >= LanceFileVersion::V2_2,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -712,6 +713,7 @@ pub async fn check_round_trip_encoding_of_data(
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                support_large_chunk: file_version >= LanceFileVersion::V2_2,
             };
             let encoder = encoding_strategy
                 .create_field_encoder(

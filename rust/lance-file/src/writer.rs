@@ -314,11 +314,15 @@ impl FileWriter {
             default_encoding_strategy(version).into()
         });
 
+        // when using v2.1, we use chunks with smaller chunk sizes in metadata
+        let support_large_chunk = self.version() >= LanceFileVersion::V2_2;
+
         let encoding_options = EncodingOptions {
             cache_bytes_per_column,
             max_page_bytes,
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
+            support_large_chunk,
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
