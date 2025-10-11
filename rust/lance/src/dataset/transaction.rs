@@ -1954,7 +1954,11 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_stable_row_ids, config.disable_transaction_file)?;
+            apply_feature_flags(
+                &mut manifest,
+                config.use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 

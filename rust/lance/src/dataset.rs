@@ -2522,7 +2522,6 @@ impl Default for ManifestWriteConfig {
 }
 
 impl ManifestWriteConfig {
-
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
     }
@@ -2541,7 +2540,11 @@ pub(crate) async fn write_manifest_file(
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_stable_row_ids, config.disable_transaction_file)?;
+        apply_feature_flags(
+            manifest,
+            config.use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2577,7 +2580,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{copy_test_data_to_tmp, StatsHolder};
+    use crate::utils::test::{copy_test_data_to_tmp};
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -3070,6 +3073,7 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                disable_transaction_file: false,
             },
             dataset.manifest_location.naming_scheme,
             None,
@@ -8596,7 +8600,7 @@ mod tests {
         }
 
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(StatsHolder::default());
+        let io_tracker = Arc::new(IOTracker::default());
 
         // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
         let ds = create_dataset(5).await;
@@ -8615,7 +8619,7 @@ mod tests {
             .with_session(session.clone())
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -8624,12 +8628,12 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let stats = io_stats.incremental_stats(); // Reset
+        let stats = io_tracker.incremental_stats(); // Reset
         assert!(stats.read_bytes < 64 * 1024);
         // Because the manifest is so small, we should have opportunistically
         // cached the transaction in memory already.
         let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-        let stats = io_stats.incremental_stats();
+        let stats = io_tracker.incremental_stats();
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(inline_tx, tx);

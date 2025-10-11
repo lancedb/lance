@@ -112,7 +112,7 @@ async fn do_commit_new_dataset(
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &transaction).await?
+        write_transaction_file(object_store, base_path, transaction).await?
     } else {
         String::new()
     };
@@ -630,7 +630,7 @@ pub(crate) async fn do_commit_detached_transaction(
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, &transaction).await?
+        write_transaction_file(object_store, &dataset.base, transaction).await?
     } else {
         String::new()
     };

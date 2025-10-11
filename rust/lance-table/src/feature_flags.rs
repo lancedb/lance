@@ -26,7 +26,11 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 pub const FLAG_UNKNOWN: u64 = 64;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool, disable_transaction_file: bool) -> Result<()> {
+pub fn apply_feature_flags(
+    manifest: &mut Manifest,
+    enable_stable_row_id: bool,
+    disable_transaction_file: bool,
+) -> Result<()> {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -174,8 +178,7 @@ mod tests {
             None,
             base_paths,
         );
-        apply_feature_flags(&mut cloned_manifest, false, false).unwrap();
-        apply_feature_flags(&mut multi_base_manifest, false).unwrap();
+        apply_feature_flags(&mut multi_base_manifest, false, false).unwrap();
         assert_ne!(
             multi_base_manifest.reader_feature_flags & FLAG_BASE_PATHS,
             0
