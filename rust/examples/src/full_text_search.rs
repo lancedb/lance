@@ -20,7 +20,7 @@ use lance_index::scalar::inverted::flat_full_text_search;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
-
+const ROW_ID:&str="row_id";
 #[tokio::main]
 async fn main() {
     env_logger::init();
