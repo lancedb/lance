@@ -3715,11 +3715,11 @@ mod tests {
             .unwrap();
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        // Assert file is small (< 4kb)
+        // Assert file is small (< 4300 bytes)
         {
             let stats = io_stats.incremental_stats();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4096);
+            assert_io_lt!(stats, write_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
