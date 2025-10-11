@@ -3502,6 +3502,8 @@ class Transaction:
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    tag: Optional[str] = None
+    primary_key_bloom_filter: Optional[bytes] = None
 
 
 class Tag(TypedDict):

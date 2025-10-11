@@ -522,6 +522,7 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        let primary_key_bloom_filter = ob.getattr("primary_key_bloom_filter")?.extract()?;
         Ok(Self(Transaction {
             read_version,
             uuid,
@@ -529,6 +530,7 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             blobs_op,
             tag: None,
             transaction_properties,
+            primary_key_bloom_filter,
         }))
     }
 }
