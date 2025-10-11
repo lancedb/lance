@@ -28,7 +28,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{Result, ROW_ADDR, ROW_ID};
+use lance_core::{Result, ROW_ADDR};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
 

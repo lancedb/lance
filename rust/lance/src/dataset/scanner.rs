@@ -1448,7 +1448,6 @@ impl Scanner {
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
         let schema = stream.schema();
-        println!("The schema is : {}", schema);
         let batches = stream.try_collect::<Vec<_>>().await?;
         Ok(concat_batches(&schema, &batches)?)
     }
@@ -5694,9 +5693,7 @@ mod test {
             scan.filter(query).unwrap();
             scan.prefilter(true);
 
-            println!("-------------> Running query: {query} with params: {params:?}");
             let plan = scan.explain_plan(true).await.unwrap();
-            println!("-------------> the plan is : {plan}");
 
             let batch = scan.try_into_batch().await.unwrap();
 
@@ -5915,77 +5912,60 @@ mod test {
     // There are many different ways that a query can be run and they all have slightly different
     // effects on the plan that gets built.  This test attempts to run the same queries in various
     // different configurations to ensure that we get consistent results
-    // #[rstest]
+    #[rstest]
     #[tokio::test]
     async fn test_secondary_index_scans(
-        // #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        // data_storage_version: LanceFileVersion,
-        // #[values(false, true)] use_stable_row_ids: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] use_stable_row_ids: bool,
     ) {
-        let data_storage_version = LanceFileVersion::Legacy;
-        let use_stable_row_ids = true;
-
         let fixture = Box::pin(ScalarIndexTestFixture::new(
             data_storage_version,
             use_stable_row_ids,
         ))
         .await;
 
-        // for use_index in [false, true] {
-        //     for use_projection in [false, true] {
-        //         for use_deleted_data in [false, true] {
-        //             for use_new_data in [false, true] {
-        //                 // Don't test compaction in conjunction with deletion and new data, it's too
-        //                 // many combinations with no clear benefit.  Feel free to update if there is
-        //                 // a need
-        //                 // TODO: enable compaction for stable row id once supported.
-        //                 let compaction_choices =
-        //                     if use_deleted_data || use_new_data || use_stable_row_ids {
-        //                         vec![false]
-        //                     } else {
-        //                         vec![false, true]
-        //                     };
-        //                 for use_compaction in compaction_choices {
-        //                     let updated_choices =
-        //                         if use_deleted_data || use_new_data || use_compaction {
-        //                             vec![false]
-        //                         } else {
-        //                             vec![false, true]
-        //                         };
-        //                     for use_updated in updated_choices {
-        //                         for with_row_addr in [false, true] {
-        //                             let params = ScalarTestParams {
-        //                                 use_index,
-        //                                 use_projection,
-        //                                 use_deleted_data,
-        //                                 use_new_data,
-        //                                 with_row_addr,
-        //                                 use_compaction,
-        //                                 use_updated,
-        //                             };
-        //                             println!("\n\n================== Running test with params: {params:?}");
-        //                             fixture.check_vector_queries(&params).await;
-        //                             fixture.check_simple_queries(&params).await;
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-
-
-        let params = ScalarTestParams {
-            use_index: false,
-            use_projection: false,
-            use_deleted_data: false,
-            use_new_data: false,
-            with_row_addr: false,
-            use_compaction: false,
-            use_updated: false,
-        };
-        println!("\n\n================== Running test with params: {params:?}");
-        fixture.check_vector_queries(&params).await;
+        for use_index in [false, true] {
+            for use_projection in [false, true] {
+                for use_deleted_data in [false, true] {
+                    for use_new_data in [false, true] {
+                        // Don't test compaction in conjunction with deletion and new data, it's too
+                        // many combinations with no clear benefit.  Feel free to update if there is
+                        // a need
+                        // TODO: enable compaction for stable row id once supported.
+                        let compaction_choices =
+                            if use_deleted_data || use_new_data || use_stable_row_ids {
+                                vec![false]
+                            } else {
+                                vec![false, true]
+                            };
+                        for use_compaction in compaction_choices {
+                            let updated_choices =
+                                if use_deleted_data || use_new_data || use_compaction {
+                                    vec![false]
+                                } else {
+                                    vec![false, true]
+                                };
+                            for use_updated in updated_choices {
+                                for with_row_addr in [false, true] {
+                                    let params = ScalarTestParams {
+                                        use_index,
+                                        use_projection,
+                                        use_deleted_data,
+                                        use_new_data,
+                                        with_row_addr,
+                                        use_compaction,
+                                        use_updated,
+                                    };
+                                    fixture.check_vector_queries(&params).await;
+                                    fixture.check_simple_queries(&params).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

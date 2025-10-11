@@ -26,6 +26,7 @@ use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::io::exec::AddRowAddrExec;
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
@@ -73,7 +74,7 @@ use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
     utils::{futures::Capacity, mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
-    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID,
+    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::chunk_stream,
@@ -576,6 +577,10 @@ impl MergeInsertJob {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
         let schema = source.schema();
+        let add_row_addr = match self.check_compatible_schema(&schema)? {
+            SchemaComparison::FullCompatible => false,
+            SchemaComparison::Subschema => true,
+        };
 
         // 1 - Input from user
         let input = Arc::new(OneShotExec::new(source));
@@ -596,13 +601,23 @@ impl MergeInsertJob {
 
         // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
-        let index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
+        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
             // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
             index.name.clone(),
             index_mapper_input,
         ));
+
+        // If requested, add row addresses to the output
+        if add_row_addr {
+            let pos = index_mapper.schema().fields().len(); // Add to end
+            index_mapper = Arc::new(AddRowAddrExec::try_new(
+                index_mapper,
+                self.dataset.clone(),
+                pos,
+            )?);
+        }
 
         // 4 - Take the mapped row ids
         let projection = self
@@ -623,10 +638,10 @@ impl MergeInsertJob {
             .filter(|f| f.name() != ROW_ID && f.name() != ROW_ADDR)
             .cloned()
             .collect::<Vec<_>>();
-        columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
-        // if add_row_addr {
-        //     columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
-        // }
+        columns.push(Arc::new(ROW_ID_FIELD.clone()));
+        if add_row_addr {
+            columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        }
         target = Arc::new(project(target, &Schema::new(columns))?);
 
         let column_names = schema
@@ -639,6 +654,9 @@ impl MergeInsertJob {
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
             let mut builder = self.dataset.scan();
+            if add_row_addr {
+                builder.with_row_address();
+            }
             let unindexed_data = builder
                 .with_row_address()
                 .with_fragments(unindexed_fragments)
@@ -1867,15 +1885,16 @@ impl Merger {
         let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
         // The schema of the combined batches will be:
-        // source_keys, source_payload, target_keys, target_payload, row_addr?
+        // source_keys, source_payload, target_keys, target_payload, row_id, row_addr?
         // The keys and non_keys on both sides will be equal
-        let (row_addr_col, right_offset) = if num_fields % 2 == 1 {
+        let (row_id_col, row_addr_col, right_offset) = if num_fields % 2 == 1 {
             // No rowaddr
-            (num_fields - 1, num_fields / 2)
+            assert!(!self.with_row_addr);
+            (num_fields - 1, None, num_fields / 2)
         } else {
             // Has rowaddr
             assert!(self.with_row_addr);
-            (num_fields - 1, (num_fields - 2) / 2)
+            (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
         let num_keys = self.params.on.len();
@@ -1918,7 +1937,7 @@ impl Merger {
             // If the filter eliminated all rows then its important we don't try and write
             // the batch at all.  Writing an empty batch currently panics
             if matched.num_rows() > 0 {
-                let row_ids = matched.column(row_addr_col).as_primitive::<UInt64Type>();
+                let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
 
                 let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
                 for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
@@ -1940,14 +1959,15 @@ impl Merger {
                         .capture(row_ids.values())?;
                 }
 
-                let projection = if self.output_schema.fields.len() == left_cols.len() {
-                    #[allow(clippy::redundant_clone)]
-                    left_cols.clone()
-                } else {
+                let projection = if let Some(row_addr_col) = row_addr_col {
                     let mut cols = Vec::from_iter(left_cols.iter().cloned());
                     cols.push(row_addr_col);
                     cols
+                } else {
+                    #[allow(clippy::redundant_clone)]
+                    left_cols.clone()
                 };
+
                 let matched = matched.project(&projection)?;
                 // The payload columns of an outer join are always nullable.  We need to restore
                 // non-nullable to columns that were originally non-nullable.  This should be safe
@@ -1963,14 +1983,10 @@ impl Merger {
         }
         if self.params.insert_not_matched {
             let not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
-            let left_cols_with_id = if self.output_schema.fields.len() == left_cols.len() {
-                left_cols
-            } else {
-                left_cols
-                    .into_iter()
-                    .chain(std::iter::once(row_addr_col))
-                    .collect::<Vec<_>>()
-            };
+            let left_cols_with_id = left_cols
+                .into_iter()
+                .chain(row_addr_col)
+                .collect::<Vec<_>>();
             let not_matched = not_matched.project(&left_cols_with_id)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
@@ -1983,7 +1999,7 @@ impl Merger {
         }
         match self.params.delete_not_matched_by_source {
             WhenNotMatchedBySource::Delete => {
-                let unmatched = arrow::compute::filter(batch.column(row_addr_col), &right_only)?;
+                let unmatched = arrow::compute::filter(batch.column(row_id_col), &right_only)?;
                 merge_statistics.num_deleted_rows += unmatched.len() as u64;
                 let row_ids = unmatched.as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
