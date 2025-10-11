@@ -75,6 +75,7 @@ impl SqlQueryBuilder {
                 row_addr,
             )),
         )?;
+        lance_datafusion::udf::register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
     }
