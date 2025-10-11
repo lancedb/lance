@@ -324,8 +324,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Use non-recursive listing to avoid issues with object stores that don't have directory concept
         let entries = self.operator.list("").await.map_err(|e| {
-            NamespaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            NamespaceError::Io(std::io::Error::other(
                 format!("Failed to list directory: {}", e),
             ))
         })?;
@@ -633,7 +632,7 @@ mod tests {
 
         let id_field = JsonArrowField {
             name: "id".to_string(),
-            r#type: Box::new(int_type.clone()),
+            r#type: Box::new(int_type),
             nullable: false,
             metadata: None,
         };
