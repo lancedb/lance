@@ -112,8 +112,8 @@ def test_credential_vendor_validation(tmp_path):
     """
     Test that invalid credential vendors are rejected.
     """
-    import pytest
     import pyarrow as pa
+    import pytest
 
     # Object without get_credentials method
     class InvalidVendor:
@@ -136,13 +136,11 @@ def test_namespace_credential_vendor(tmp_path):
     Test LanceNamespaceCredentialVendor with directory namespace.
     """
     import time
+
     from lance import LanceNamespaceCredentialVendor
 
-    # Connect to directory namespace
-    namespace = lance._lib.connect_namespace("dir", {"path": str(tmp_path)})
-
-    # Note: In a real scenario, the namespace would have tables registered
-    # For this test, we create a mock vendor to show the pattern
+    # Note: In a real scenario, you would connect to a real namespace
+    # For this test, we create a mock namespace that returns credentials
 
     # Create a custom mock namespace that returns credentials
     class MockNamespace:
@@ -220,7 +218,8 @@ def test_namespace_vendor_missing_expiration():
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))

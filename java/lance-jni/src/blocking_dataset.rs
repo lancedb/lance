@@ -10,7 +10,6 @@ use crate::utils::{
     get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
 use crate::{traits::IntoJava, RT};
-use lance_io::object_store::CredentialVendor;
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
@@ -39,6 +38,7 @@ use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
+use lance_io::object_store::CredentialVendor;
 use lance_io::object_store::ObjectStoreRegistry;
 use std::collections::HashMap;
 use std::iter::empty;
@@ -692,8 +692,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject, // Map<String, String>
-    serialized_manifest: JObject, // Optional<ByteBuffer>
+    storage_options_obj: JObject,   // Map<String, String>
+    serialized_manifest: JObject,   // Optional<ByteBuffer>
     credential_vendor_obj: JObject, // Optional<CredentialVendor>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -720,8 +720,8 @@ fn inner_open_native<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject, // Map<String, String>
-    serialized_manifest: JObject, // Optional<ByteBuffer>
+    storage_options_obj: JObject,   // Map<String, String>
+    serialized_manifest: JObject,   // Optional<ByteBuffer>
     credential_vendor_obj: JObject, // Optional<CredentialVendor>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
@@ -733,11 +733,13 @@ fn inner_open_native<'local>(
     // Extract credential vendor first (before get_bytes_opt which borrows env)
     let credential_vendor = if !credential_vendor_obj.is_null() {
         // Check if it's an Optional.empty()
-        let is_present = env.call_method(&credential_vendor_obj, "isPresent", "()Z", &[])?
+        let is_present = env
+            .call_method(&credential_vendor_obj, "isPresent", "()Z", &[])?
             .z()?;
         if is_present {
             // Get the value from Optional
-            let vendor_obj = env.call_method(&credential_vendor_obj, "get", "()Ljava/lang/Object;", &[])?
+            let vendor_obj = env
+                .call_method(&credential_vendor_obj, "get", "()Ljava/lang/Object;", &[])?
                 .l()?;
             Some(JavaCredentialVendor::new(env, vendor_obj)?)
         } else {

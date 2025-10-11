@@ -66,7 +66,8 @@ class CredentialVendor(ABC):
             AWS S3:
               - "aws_access_key_id" (str): AWS access key
               - "aws_secret_access_key" (str): AWS secret key
-              - "aws_session_token" (str, optional): Session token for temporary credentials
+              - "aws_session_token" (str, optional): Session token for temporary
+                credentials
 
             Azure Blob Storage:
               - "account_name" (str): Storage account name

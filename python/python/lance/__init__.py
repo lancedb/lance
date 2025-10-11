@@ -26,7 +26,6 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .io import CredentialVendor, StaticCredentialVendor
-from .namespace import LanceNamespaceCredentialVendor
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
@@ -34,6 +33,7 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
+from .namespace import LanceNamespaceCredentialVendor
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
