@@ -63,12 +63,12 @@ use scanner::ScanStatistics;
 use session::Session;
 
 pub(crate) mod arrow;
+pub(crate) mod credential_vending;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
 pub(crate) mod debug;
 pub(crate) mod error;
-pub(crate) mod credential_vending;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
@@ -84,8 +84,8 @@ pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::file::LanceFileSession;
-use crate::namespace::{connect_namespace, PyNamespace};
 use crate::fragment::{write_fragments, write_fragments_transaction};
+use crate::namespace::{connect_namespace, PyNamespace};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;

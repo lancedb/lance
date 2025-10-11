@@ -324,9 +324,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Use non-recursive listing to avoid issues with object stores that don't have directory concept
         let entries = self.operator.list("").await.map_err(|e| {
-            NamespaceError::Io(std::io::Error::other(
-                format!("Failed to list directory: {}", e),
-            ))
+            NamespaceError::Io(std::io::Error::other(format!(
+                "Failed to list directory: {}",
+                e
+            )))
         })?;
 
         for entry in entries {

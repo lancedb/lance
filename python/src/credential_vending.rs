@@ -48,86 +48,97 @@ impl PyCredentialVendorWrapper {
 
 #[async_trait]
 impl CredentialVendor for PyCredentialVendorWrapper {
-    async fn get_credentials(
-        &self,
-    ) -> lance_core::Result<(HashMap<String, String>, u64)> {
+    async fn get_credentials(&self) -> lance_core::Result<(HashMap<String, String>, u64)> {
         // Call Python method from async context
         let py_vendor = self.py_vendor.clone();
 
-        rt().runtime.spawn_blocking(move || {
-            Python::with_gil(|py| {
-                // Call the Python get_credentials method
-                let result = py_vendor
-                    .inner
-                    .bind(py)
-                    .call_method0("get_credentials")
-                    .map_err(|e| lance_core::Error::IO {
-                        source: Box::new(std::io::Error::other(format!(
-                            "Failed to call get_credentials: {}",
-                            e
-                        ))),
-                        location: snafu::location!(),
+        rt().runtime
+            .spawn_blocking(move || {
+                Python::with_gil(|py| {
+                    // Call the Python get_credentials method
+                    let result = py_vendor
+                        .inner
+                        .bind(py)
+                        .call_method0("get_credentials")
+                        .map_err(|e| lance_core::Error::IO {
+                            source: Box::new(std::io::Error::other(format!(
+                                "Failed to call get_credentials: {}",
+                                e
+                            ))),
+                            location: snafu::location!(),
+                        })?;
+
+                    // Extract the result dict - should be a flat Map<String, String>
+                    let result_dict = result.downcast::<PyDict>().map_err(|_| {
+                        lance_core::Error::InvalidInput {
+                            source:
+                                "get_credentials() must return a dict of string key-value pairs"
+                                    .into(),
+                            location: snafu::location!(),
+                        }
                     })?;
 
-                // Extract the result dict - should be a flat Map<String, String>
-                let result_dict = result.downcast::<PyDict>().map_err(|_| {
-                    lance_core::Error::InvalidInput {
-                        source: "get_credentials() must return a dict of string key-value pairs".into(),
-                        location: snafu::location!(),
+                    // Convert all entries to HashMap<String, String>
+                    let mut credentials = HashMap::new();
+                    for (key, value) in result_dict.iter() {
+                        let key_str: String =
+                            key.extract().map_err(|e| lance_core::Error::InvalidInput {
+                                source: format!("credential keys must be strings: {}", e).into(),
+                                location: snafu::location!(),
+                            })?;
+                        let value_str: String =
+                            value
+                                .extract()
+                                .map_err(|e| lance_core::Error::InvalidInput {
+                                    source: format!("credential values must be strings: {}", e)
+                                        .into(),
+                                    location: snafu::location!(),
+                                })?;
+                        credentials.insert(key_str, value_str);
                     }
-                })?;
 
-                // Convert all entries to HashMap<String, String>
-                let mut credentials = HashMap::new();
-                for (key, value) in result_dict.iter() {
-                    let key_str: String = key.extract().map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("credential keys must be strings: {}", e).into(),
-                        location: snafu::location!(),
+                    // Extract and parse expires_at_millis
+                    let expires_at_millis_str =
+                        credentials.get("expires_at_millis").ok_or_else(|| {
+                            lance_core::Error::InvalidInput {
+                                source:
+                                    "get_credentials() result must contain 'expires_at_millis' key"
+                                        .into(),
+                                location: snafu::location!(),
+                            }
+                        })?;
+
+                    let expires_at_millis: u64 = expires_at_millis_str.parse().map_err(|e| {
+                        lance_core::Error::InvalidInput {
+                            source: format!(
+                                "expires_at_millis must be a valid integer string: {}",
+                                e
+                            )
+                            .into(),
+                            location: snafu::location!(),
+                        }
                     })?;
-                    let value_str: String = value.extract().map_err(|e| lance_core::Error::InvalidInput {
-                        source: format!("credential values must be strings: {}", e).into(),
-                        location: snafu::location!(),
-                    })?;
-                    credentials.insert(key_str, value_str);
-                }
 
-                // Extract and parse expires_at_millis
-                let expires_at_millis_str = credentials
-                    .get("expires_at_millis")
-                    .ok_or_else(|| lance_core::Error::InvalidInput {
-                        source: "get_credentials() result must contain 'expires_at_millis' key".into(),
-                        location: snafu::location!(),
-                    })?;
+                    // Remove expires_at_millis from credentials map as it's returned separately
+                    credentials.remove("expires_at_millis");
 
-                let expires_at_millis: u64 = expires_at_millis_str.parse().map_err(|e| {
-                    lance_core::Error::InvalidInput {
-                        source: format!("expires_at_millis must be a valid integer string: {}", e).into(),
-                        location: snafu::location!(),
-                    }
-                })?;
-
-                // Remove expires_at_millis from credentials map as it's returned separately
-                credentials.remove("expires_at_millis");
-
-                Ok((credentials, expires_at_millis))
+                    Ok((credentials, expires_at_millis))
+                })
             })
-        })
-        .await
-        .map_err(|e| lance_core::Error::IO {
-            source: Box::new(std::io::Error::other(format!(
-                "Failed to call Python get_credentials: {}",
-                e
-            ))),
-            location: snafu::location!(),
-        })?
+            .await
+            .map_err(|e| lance_core::Error::IO {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to call Python get_credentials: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?
     }
 }
 
 /// Convert a Python object to an Arc<dyn CredentialVendor>
 /// This is the main entry point for converting Python credential vendors to Rust
-pub fn py_object_to_credential_vendor(
-    py_obj: PyObject,
-) -> PyResult<Arc<dyn CredentialVendor>> {
+pub fn py_object_to_credential_vendor(py_obj: PyObject) -> PyResult<Arc<dyn CredentialVendor>> {
     let py_vendor = PyCredentialVendor::new(py_obj)?;
     Ok(Arc::new(PyCredentialVendorWrapper::new(py_vendor)))
 }

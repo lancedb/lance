@@ -55,15 +55,12 @@ impl PyNamespace {
         };
 
         let response = rt().block_on(Some(py), async move {
-            namespace
-                .describe_table(request)
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to describe table: {}",
-                        e
-                    ))
-                })
+            namespace.describe_table(request).await.map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to describe table: {}",
+                    e
+                ))
+            })
         })??;
 
         // Convert response to Python dict
@@ -74,7 +71,7 @@ impl PyNamespace {
         }
 
         if let Some(version) = response.version {
-            result.set_item("version", version as i64)?;
+            result.set_item("version", version)?;
         }
 
         if let Some(storage_options) = response.storage_options {
@@ -107,14 +104,12 @@ pub fn connect_namespace(
     use lance_namespace_impls::connect;
 
     let namespace = rt().block_on(Some(py), async move {
-        connect(&impl_name, properties)
-            .await
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to connect to namespace: {}",
-                    e
-                ))
-            })
+        connect(&impl_name, properties).await.map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to connect to namespace: {}",
+                e
+            ))
+        })
     })??;
 
     Ok(PyNamespace::new(namespace))

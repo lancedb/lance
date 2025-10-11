@@ -62,20 +62,22 @@ public class LanceNamespaceCredentialVendorTest {
         new LanceNamespaceCredentialVendor(mockNamespace, tableId);
 
     // Get credentials
-    Map<String, Object> credentials = vendor.getCredentials();
+    Map<String, String> credentials = vendor.getCredentials();
 
-    // Verify structure
+    // Verify structure - should be flat Map<String, String>
     assertNotNull(credentials);
-    assertTrue(credentials.containsKey("storage_options"));
+    assertTrue(credentials.containsKey("aws_access_key_id"));
     assertTrue(credentials.containsKey("expires_at_millis"));
 
-    @SuppressWarnings("unchecked")
-    Map<String, String> storageOptions = (Map<String, String>) credentials.get("storage_options");
-    assertEquals("ASIA_TEST", storageOptions.get("aws_access_key_id"));
-    assertEquals("test_secret", storageOptions.get("aws_secret_access_key"));
-    assertEquals("test_token", storageOptions.get("aws_session_token"));
+    // Verify credential values
+    assertEquals("ASIA_TEST", credentials.get("aws_access_key_id"));
+    assertEquals("test_secret", credentials.get("aws_secret_access_key"));
+    assertEquals("test_token", credentials.get("aws_session_token"));
 
-    Long expiresAtMillis = (Long) credentials.get("expires_at_millis");
+    // Verify expires_at_millis is a valid string that can be parsed
+    String expiresAtMillisStr = credentials.get("expires_at_millis");
+    assertNotNull(expiresAtMillisStr);
+    long expiresAtMillis = Long.parseLong(expiresAtMillisStr);
     assertTrue(expiresAtMillis > System.currentTimeMillis());
   }
 
