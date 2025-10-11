@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -11,7 +12,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
+use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
@@ -35,13 +36,15 @@ use datafusion_expr::ExprSchemable;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::joins::PartitionMode;
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
-use lance_arrow::DataTypeExt;
+use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
     escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
 };
@@ -60,7 +63,7 @@ use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EX
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
 };
-use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::ScalarIndexCriteria;
@@ -89,11 +92,11 @@ use crate::io::exec::{
 use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
 
-use snafu::location;
-
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
+use snafu::location;
+use tokio::join;
 
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 // For backwards compatibility / historical reasons we re-calculate the default batch size
@@ -1800,11 +1803,116 @@ impl Scanner {
                     planned_read.plan
                 }
             }
-            _ => {
-                return Err(Error::InvalidInput {
-                    source: "Cannot have both nearest and full text search".into(),
-                    location: location!(),
-                })
+            (Some(vec_query), Some(full_text_query)) => {
+                // Fill column for fts query if it is missing
+                let fts_params = full_text_query.params();
+                let fts_query = if full_text_query.query.is_missing_column() {
+                    let indexed_columns = self.fts_indexed_columns().await?;
+                    Cow::Owned(fill_fts_query_column(
+                        &full_text_query.query,
+                        &indexed_columns,
+                        false,
+                    )?)
+                } else {
+                    Cow::Borrowed(&full_text_query.query)
+                };
+
+                match (self.prefilter, fts_query) {
+                    // Prefilter is enabled, perform vector query based on fts query result
+                    (true, _) => {
+                        let fts_plan = self
+                            .fts_search_source(&mut filter_plan, full_text_query)
+                            .await?;
+
+                        let projection = self
+                            .dataset
+                            .empty_projection()
+                            .union_column(&vec_query.column, OnMissing::Error)?;
+                        let plan = self.take(fts_plan, projection)?;
+
+                        self.flat_knn(plan, vec_query)?
+                    }
+                    // Post-filter with match query, perform match query based on vector query result
+                    (
+                        false,
+                        Cow::Borrowed(FtsQuery::Match(ref match_query))
+                        | Cow::Owned(FtsQuery::Match(ref match_query)),
+                    ) => {
+                        let vector_plan = self.vector_search_source(&mut filter_plan).await?;
+
+                        let column = match_query
+                            .column
+                            .as_ref()
+                            .ok_or(Error::invalid_input(
+                                "the column must be specified in the query".to_string(),
+                                location!(),
+                            ))?
+                            .clone();
+                        let projection = self
+                            .dataset
+                            .empty_projection()
+                            .union_column(&column, OnMissing::Error)?;
+                        let plan = self.take(vector_plan, projection)?;
+
+                        let schema =
+                            Arc::new((plan.schema()).try_with_column(SCORE_FIELD.clone())?);
+                        Arc::new(FlatMatchQueryExec::new(
+                            self.dataset.clone(),
+                            match_query.clone(),
+                            fts_params,
+                            plan,
+                            schema,
+                        ))
+                    }
+                    // Post-filter with other fts query, join vector and fts query result on _rowid
+                    (false, _) => {
+                        filter_plan.make_refine_only();
+                        let (mut default_filter_vec, mut default_filter_fts) =
+                            (FilterPlan::default(), FilterPlan::default());
+                        let (vector_plan, fts_plan) = join!(
+                            self.vector_search_source(&mut default_filter_vec),
+                            self.fts_search_source(&mut default_filter_fts, full_text_query)
+                        );
+                        let vector_plan = vector_plan?;
+                        let fts_plan = fts_plan?;
+
+                        let vector_row_id =
+                            Column::new_with_schema(ROW_ID, vector_plan.schema().as_ref())?;
+                        let fts_row_id =
+                            Column::new_with_schema(ROW_ID, fts_plan.schema().as_ref())?;
+                        let join = HashJoinExec::try_new(
+                            vector_plan,
+                            fts_plan,
+                            vec![(Arc::new(vector_row_id), Arc::new(fts_row_id))],
+                            None,
+                            &JoinType::Inner,
+                            None,
+                            PartitionMode::CollectLeft,
+                            NullEquality::NullEqualsNull,
+                        )?;
+
+                        let schema = join.schema();
+                        let mut projection_exprs = Vec::new();
+                        let mut contain_rowid = false;
+                        for field in schema.fields() {
+                            if field.name() == ROW_ID {
+                                if contain_rowid {
+                                    continue;
+                                }
+                                contain_rowid = true;
+                            }
+                            projection_exprs.push((
+                                Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?)
+                                    as Arc<dyn PhysicalExpr>,
+                                field.name().clone(),
+                            ));
+                        }
+
+                        let projection_exec =
+                            ProjectionExec::try_new(projection_exprs, Arc::new(join))?;
+                        Arc::new(projection_exec)
+                    }
+                }
             }
         };
 
@@ -2342,49 +2450,7 @@ impl Scanner {
         let query = if columns.is_empty() {
             // the field is not specified,
             // try to search over all indexed fields including nested ones
-            let mut indexed_columns = Vec::new();
-            for field in self.dataset.schema().fields_pre_order() {
-                // Check if this field is a string type that could have an inverted index
-                let is_string_field = match field.data_type() {
-                    DataType::Utf8 | DataType::LargeUtf8 => true,
-                    DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-                        matches!(
-                            inner_field.data_type(),
-                            DataType::Utf8 | DataType::LargeUtf8
-                        )
-                    }
-                    _ => false,
-                };
-
-                if is_string_field {
-                    // Build the full field path for nested fields
-                    let column_path = if let Some(ancestors) =
-                        self.dataset.schema().field_ancestry_by_id(field.id)
-                    {
-                        let field_refs: Vec<&str> =
-                            ancestors.iter().map(|f| f.name.as_str()).collect();
-                        format_field_path(&field_refs)
-                    } else {
-                        continue; // Skip if we can't find the field ancestry
-                    };
-
-                    // Check if this field has an inverted index
-                    let has_fts_index = self
-                        .dataset
-                        .load_scalar_index(
-                            ScalarIndexCriteria::default()
-                                .for_column(&column_path)
-                                .supports_fts(),
-                        )
-                        .await?
-                        .is_some();
-
-                    if has_fts_index {
-                        indexed_columns.push(column_path);
-                    }
-                }
-            }
-
+            let indexed_columns = self.fts_indexed_columns().await?;
             fill_fts_query_column(&query.query, &indexed_columns, false)?
         } else {
             query.query.clone()
@@ -2403,6 +2469,53 @@ impl Scanner {
             .plan_fts(&query, &params, filter_plan, &prefilter_source)
             .await?;
         Ok(fts_exec)
+    }
+
+    // Search over all indexed fields including nested ones, collecting columns that have an
+    // inverted index
+    async fn fts_indexed_columns(&self) -> Result<Vec<String>> {
+        let mut indexed_columns = Vec::new();
+        for field in self.dataset.schema().fields_pre_order() {
+            // Check if this field is a string type that could have an inverted index
+            let is_string_field = match field.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 => true,
+                DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+                    matches!(
+                        inner_field.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8
+                    )
+                }
+                _ => false,
+            };
+
+            if is_string_field {
+                // Build the full field path for nested fields
+                let column_path = if let Some(ancestors) =
+                    self.dataset.schema().field_ancestry_by_id(field.id)
+                {
+                    let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                    format_field_path(&field_refs)
+                } else {
+                    continue; // Skip if we can't find the field ancestry
+                };
+
+                // Check if this field has an inverted index
+                let has_fts_index = self
+                    .dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default()
+                            .for_column(&column_path)
+                            .supports_fts(),
+                    )
+                    .await?
+                    .is_some();
+
+                if has_fts_index {
+                    indexed_columns.push(column_path);
+                }
+            }
+        }
+        Ok(indexed_columns)
     }
 
     async fn plan_fts(
@@ -2726,6 +2839,7 @@ impl Scanner {
             query.clone(),
             params.clone(),
             scan_node,
+            FTS_SCHEMA.clone(),
         ));
         Ok(flat_match_plan)
     }
