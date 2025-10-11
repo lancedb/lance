@@ -3067,8 +3067,8 @@ impl Scanner {
             let optimized_filter = planner.optimize_expr(filter.clone())?;
 
             let new_data_scan = self.scan_fragments(
+                self.projection_plan.physical_projection.with_row_id,
                 true,
-                self.projection_plan.physical_projection.with_row_addr,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -6346,15 +6346,15 @@ mod test {
         log::info!("Test case: Project and filter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@2 as s]
-  Take: columns=\"i, _rowid, (s)\"
+  Take: columns=\"i, _rowaddr, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@0 > 10 AND i@0 < 20
-        LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true, range=None"
+        LanceScan: uri..., projection=[i], row_id=false, row_addr=true, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[s@2 as s]
-  Take: columns=\"i, _rowid, (s)\"
+  Take: columns=\"i, _rowaddr, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
+      LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6372,16 +6372,16 @@ mod test {
         log::info!("Test case: Late materialization");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
-            Take: columns=\"i, s, _rowid, (vec)\"
+            Take: columns=\"i, s, _rowaddr, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 FilterExec: s@1 IS NOT NULL
-                  LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true, range=None"
+                  LanceScan: uri..., projection=[i, s], row_id=false, row_addr=true, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
-  Take: columns=\"i, s, _rowid, (vec)\"
+  Take: columns=\"i, s, _rowaddr, (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i, s], num_fragments=2, range_before=None, range_after=None, \
-      row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+      row_id=false, row_addr=true, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6395,11 +6395,11 @@ mod test {
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   FilterExec: s@1 IS NOT NULL
-    LanceScan: uri..., projection=[i, s, vec], row_id=true, row_addr=false, ordered=true, range=None"
+    LanceScan: uri..., projection=[i, s, vec], row_id=false, row_addr=true, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   LanceRead: uri=..., projection=[i, s, vec], num_fragments=2, range_before=None, \
-  range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+  range_after=None, row_id=false, row_addr=true, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6415,16 +6415,16 @@ mod test {
         log::info!("Test case: Custom materialization 2 (all late)");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
-  Take: columns=\"s, _rowid, (i), (vec)\"
+  Take: columns=\"s, _rowaddr, (i), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"
+        LanceScan: uri..., projection=[s], row_id=false, row_addr=true, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
-  Take: columns=\"s, _rowid, (i), (vec)\"
+  Take: columns=\"s, _rowaddr, (i), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, \
-      range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+      range_after=None, row_id=false, row_addr=true, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6440,16 +6440,16 @@ mod test {
         log::info!("Test case: Custom materialization 3 (mixed)");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
-  Take: columns=\"s, vec, _rowid, (i)\"
+  Take: columns=\"s, vec, _rowaddr, (i)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s, vec], row_id=true, row_addr=false, ordered=true, range=None"
+        LanceScan: uri..., projection=[s, vec], row_id=false, row_addr=true, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
-  Take: columns=\"s, vec, _rowid, (i)\"
+  Take: columns=\"s, vec, _rowaddr, (i)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s, vec], num_fragments=2, range_before=None, range_after=None, \
-      row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+      row_id=false, row_addr=true, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6484,21 +6484,21 @@ mod test {
         log::info!("Test case: Basic KNN");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+  Take: columns=\"vec, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@2 IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
-            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+            LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None"
         } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+            "ProjectionExec: expr=[i@4 as i, s@5 as s, vec@0 as vec, _distance@3 as _distance]
+  Take: columns=\"vec, _rowid, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@2 IS NOT NULL
+      FilterExec: _distance@3 IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
             LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+            row_id=true, row_addr=true, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6513,23 +6513,23 @@ mod test {
         log::info!("Test case: KNN with extraneous limit");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+  Take: columns=\"vec, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       GlobalLimitExec: skip=0, fetch=1
         FilterExec: _distance@2 IS NOT NULL
           SortExec: TopK(fetch=5), expr=...
             KNNVectorDistance: metric=l2
-              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+              LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None"
         } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+            "ProjectionExec: expr=[i@4 as i, s@5 as s, vec@0 as vec, _distance@3 as _distance]
+  Take: columns=\"vec, _rowid, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       GlobalLimitExec: skip=0, fetch=1
-        FilterExec: _distance@2 IS NOT NULL
+        FilterExec: _distance@3 IS NOT NULL
           SortExec: TopK(fetch=5), expr=...
             KNNVectorDistance: metric=l2
               LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-              row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+              row_id=true, row_addr=true, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6544,7 +6544,7 @@ mod test {
         log::info!("Test case: Basic ANN");
         let expected =
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
@@ -6559,12 +6559,12 @@ mod test {
         log::info!("Test case: ANN with refine");
         let expected =
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=10), expr=...
           KNNVectorDistance: metric=l2
-            Take: columns=\"_distance, _rowid, (vec)\"
+            Take: columns=\"_distance, _rowaddr, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
@@ -6580,21 +6580,21 @@ mod test {
         log::info!("Test case: ANN with index disabled");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+  Take: columns=\"vec, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
           KNNVectorDistance: metric=l2
-            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+            LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None"
         } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+            "ProjectionExec: expr=[i@4 as i, s@5 as s, vec@0 as vec, _distance@3 as _distance]
+  Take: columns=\"vec, _rowid, _rowaddr, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
           KNNVectorDistance: metric=l2
             LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+            row_id=true, row_addr=true, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6604,11 +6604,11 @@ mod test {
         .await?;
 
         log::info!("Test case: ANN with postfilter");
-        let expected = "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
-  Take: columns=\"_distance, _rowid, i, (s), (vec)\"
+        let expected = "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowaddr@1 as _rowaddr]
+  Take: columns=\"_distance, _rowaddr, i, (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@2 > 10
-        Take: columns=\"_distance, _rowid, (i)\"
+        Take: columns=\"_distance, _rowaddr, (i)\"
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
@@ -6620,7 +6620,7 @@ mod test {
                     .nearest("vec", &q, 17)?
                     .filter("i > 10")?
                     .project(&["s", "vec"])?
-                    .with_row_id())
+                    .with_row_address())
             },
             expected,
         )
@@ -6629,7 +6629,7 @@ mod test {
         log::info!("Test case: ANN with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
@@ -6638,7 +6638,7 @@ mod test {
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
@@ -6662,19 +6662,19 @@ mod test {
         dataset.append_new_data().await?;
         log::info!("Test case: Combined KNN/ANN");
         let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=6), expr=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@2 as _distance, _rowaddr@1 as _rowaddr, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=6), expr=...
                       KNNVectorDistance: metric=l2
-                        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
+                        LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None
+                Take: columns=\"_distance, _rowaddr, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
@@ -6691,22 +6691,22 @@ mod test {
         // new data and with filter
         log::info!("Test case: Combined KNN/ANN with postfilter");
         let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, i, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@3 > 10
-        Take: columns=\"_rowid, vec, _distance, (i)\"
+        Take: columns=\"_rowaddr, vec, _distance, (i)\"
           CoalesceBatchesExec: target_batch_size=8192
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=15), expr=...
                 KNNVectorDistance: metric=l2
                   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                     UnionExec
-                      ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                      ProjectionExec: expr=[_distance@2 as _distance, _rowaddr@1 as _rowaddr, vec@0 as vec]
                         FilterExec: _distance@... IS NOT NULL
                           SortExec: TopK(fetch=15), expr=...
                             KNNVectorDistance: metric=l2
-                              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                      Take: columns=\"_distance, _rowid, (vec)\"
+                              LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None
+                      Take: columns=\"_distance, _rowaddr, (vec)\"
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
@@ -6722,20 +6722,20 @@ mod test {
         log::info!("Test case: Combined KNN/ANN with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowaddr@2 as _rowaddr, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=5), expr=...
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
+                          LanceScan: uri=..., projection=[vec, i], row_id=false, row_addr=true, ordered=false, range=None
+                Take: columns=\"_distance, _rowaddr, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
@@ -6744,20 +6744,20 @@ mod test {
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowaddr@2 as _rowaddr, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=5), expr=...
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
+                          LanceScan: uri=..., projection=[vec, i], row_id=false, row_addr=true, ordered=false, range=None
+                Take: columns=\"_distance, _rowaddr, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
@@ -6788,7 +6788,7 @@ mod test {
         log::info!("Test case: ANN with scalar index");
         let expected =
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
@@ -6809,7 +6809,7 @@ mod test {
         log::info!("Test case: ANN with scalar index disabled");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
@@ -6818,7 +6818,7 @@ mod test {
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+  Take: columns=\"_distance, _rowaddr, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
@@ -6843,20 +6843,20 @@ mod test {
 
         log::info!("Test case: Combined KNN/ANN with scalar index");
         let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=8), expr=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowaddr@2 as _rowaddr, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=8), expr=...
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
+                          LanceScan: uri=..., projection=[vec, i], row_id=false, row_addr=true, ordered=false, range=None
+                Take: columns=\"_distance, _rowaddr, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
@@ -6879,20 +6879,20 @@ mod test {
             "Test case: Combined KNN/ANN with updated scalar index and outdated vector index"
         );
         let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+  Take: columns=\"_rowaddr, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=11), expr=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowaddr@2 as _rowaddr, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=11), expr=...
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
+                          LanceScan: uri=..., projection=[vec, i], row_id=false, row_addr=true, ordered=false, range=None
+                Take: columns=\"_distance, _rowaddr, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
@@ -6916,7 +6916,7 @@ mod test {
         log::info!("Test case: Filtered read with scalar index");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@1 as s]
-  Take: columns=\"_rowid, (s)\"
+  Take: columns=\"_rowaddr, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       MaterializeIndex: query=[i > 10]@i_idx"
         } else {
@@ -6943,21 +6943,21 @@ mod test {
                         .filter("i > 10")
                 },
                 "ProjectionExec: expr=[s@2 as s]
-  Take: columns=\"i, _rowid, (s)\"
+  Take: columns=\"i, _rowaddr, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i], num_fragments=4, range_before=None, \
-      range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
+      range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
             )
             .await?;
         }
 
         log::info!("Test case: Empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
-  AddRowAddrExec
+            "ProjectionExec: expr=[]
     MaterializeIndex: query=[i > 10]@i_idx"
         } else {
-            "LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
+            "ProjectionExec: expr=[]
+              LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
               ScalarIndexQuery: query=[i > 10]@i_idx"
         };
@@ -6966,7 +6966,6 @@ mod test {
             |scan| {
                 scan.filter("i > 10")
                     .unwrap()
-                    .with_row_address()
                     .project::<&str>(&[])
             },
             expected,
@@ -6979,12 +6978,12 @@ mod test {
             "ProjectionExec: expr=[s@1 as s]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
-      Take: columns=\"_rowid, (s)\"
+      Take: columns=\"_rowaddr, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
           MaterializeIndex: query=[i > 10]@i_idx
-      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+      ProjectionExec: expr=[_rowaddr@2 as _rowaddr, s@1 as s]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
+          LanceScan: uri=..., projection=[i, s], row_id=false, row_addr=true, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
@@ -6999,16 +6998,16 @@ mod test {
 
         log::info!("Test case: Combined Scalar/non-scalar filtered read with empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
+            "ProjectionExec: expr=[]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
-      AddRowAddrExec
         MaterializeIndex: query=[i > 10]@i_idx
-      ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
+      ProjectionExec: expr=[_rowaddr@1 as _rowaddr]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
+          LanceScan: uri=..., projection=[i], row_id=false, row_addr=true, ordered=false, range=None"
         } else {
-            "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
+            "ProjectionExec: expr=[]
+            LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
               ScalarIndexQuery: query=[i > 10]@i_idx"
         };
@@ -7017,7 +7016,6 @@ mod test {
             |scan| {
                 scan.filter("i > 10")
                     .unwrap()
-                    .with_row_address()
                     .project::<&str>(&[])
             },
             expected,
@@ -7031,12 +7029,12 @@ mod test {
             "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
-      Take: columns=\"_rowid, (s)\"
+      Take: columns=\"_rowaddr, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
           MaterializeIndex: query=[i > 10]@i_idx
-      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+      ProjectionExec: expr=[_rowaddr@2 as _rowaddr, s@1 as s]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
+          LanceScan: uri=..., row_id=false, row_addr=true, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
@@ -7058,15 +7056,15 @@ mod test {
         // All rows are indexed
         dataset.make_fts_index().await?;
         log::info!("Test case: Full text search (match query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
             },
             expected,
@@ -7074,8 +7072,8 @@ mod test {
         .await?;
 
         log::info!("Test case: Full text search (phrase query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       PhraseQuery: query=hello world"#;
         assert_plan_equals(
@@ -7083,7 +7081,7 @@ mod test {
             |scan| {
                 let query = PhraseQuery::new("hello world".to_owned());
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .full_text_search(FullTextSearchQuery::new_query(query.into()))
             },
             expected,
@@ -7091,8 +7089,8 @@ mod test {
         .await?;
 
         log::info!("Test case: Full text search (boost query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
         MatchQuery: query=hello
@@ -7106,7 +7104,7 @@ mod test {
                     MatchQuery::new("world".to_owned()).with_column(Some("s".to_owned()));
                 let query = BoostQuery::new(positive.into(), negative.into(), Some(1.0));
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .full_text_search(FullTextSearchQuery::new_query(query.into()))
             },
             expected,
@@ -7115,19 +7113,20 @@ mod test {
 
         log::info!("Test case: Full text search with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
+            AddRowAddrExec
             MaterializeIndex: query=[i > 10]@i_idx
-            ProjectionExec: expr=[_rowid@1 as _rowid]
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, _rowaddr@1 as _rowaddr]
               FilterExec: i@0 > 10
-                LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[i], row_id=false, row_addr=true, ordered=false, range=None"#
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
@@ -7137,7 +7136,7 @@ mod test {
             &dataset.dataset,
             |scan| {
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .filter("i > 10")?
                     .prefilter(true)
                     .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
@@ -7147,21 +7146,21 @@ mod test {
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MatchQuery: query=hello
             FlatMatchQuery: query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
+              LanceScan: uri=..., projection=[s], row_id=false, row_addr=true, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
             },
             expected,
@@ -7170,8 +7169,8 @@ mod test {
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
@@ -7179,16 +7178,17 @@ mod test {
             MatchQuery: query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
+                  AddRowAddrExec
                   MaterializeIndex: query=[i > 10]@i_idx
-                  ProjectionExec: expr=[_rowid@1 as _rowid]
+                  ProjectionExec: expr=[_rowaddr@1 as _rowaddr, _rowaddr@1 as _rowaddr]
                     FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
+                      LanceScan: uri=..., projection=[i], row_id=false, row_addr=true, ordered=false, range=None
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[s, i], row_id=false, row_addr=true, ordered=false, range=None"#
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowaddr@0 as _rowaddr]
+  Take: columns="_rowaddr, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
@@ -7198,13 +7198,13 @@ mod test {
                 ScalarIndexQuery: query=[i > 10]@i_idx
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[s, i], row_id=false, row_addr=true, ordered=false, range=None"#
         };
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
                 scan.project(&["s"])?
-                    .with_row_id()
+                    .with_row_address()
                     .filter("i > 10")?
                     .prefilter(true)
                     .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
@@ -7274,7 +7274,7 @@ mod test {
               FilterExec: _distance@2 IS NOT NULL
                 SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
-                    LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None
+                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowaddr, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
