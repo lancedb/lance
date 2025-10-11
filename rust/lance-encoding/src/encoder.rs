@@ -233,6 +233,10 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
+    /// If true (the default in Lance 2.2+), miniblock buffer sizes are u32  
+    /// to allow storing bigger chunk size for better compression.
+    /// For Lance 2.1, this is false, and miniblock buffer sizes are u16.
+    pub support_large_chunk: bool,
 }
 
 impl Default for EncodingOptions {
@@ -242,6 +246,7 @@ impl Default for EncodingOptions {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
+            support_large_chunk: LanceFileVersion::default() >= LanceFileVersion::V2_2,
         }
     }
 }

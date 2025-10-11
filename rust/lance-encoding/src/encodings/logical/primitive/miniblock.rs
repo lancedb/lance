@@ -44,7 +44,7 @@ pub struct MiniBlockCompressed {
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
     //
-    // Updated to support larger chunk sizes (up to 4GB per buffer)
+    // for Lance 2.1, the chunk size is limited to 32KiB so only 16-bit is stored here and used.
     pub buffer_sizes: Vec<u32>,
     // The log (base 2) of the number of values in the chunk.  If this is the final chunk
     // then this should be 0 (the number of values will be calculated by subtracting the
