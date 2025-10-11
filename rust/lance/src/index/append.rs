@@ -163,7 +163,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let mut scanner = dataset.scan();
                 scanner
                     .with_fragments(unindexed.to_vec())
-                    .with_row_id()
+                    .with_row_address()
                     .project(&[&field_path])?;
                 if column.nullable {
                     scanner.filter_expr(datafusion_expr::col(&field_path).is_not_null());

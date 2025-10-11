@@ -26,6 +26,7 @@ use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::io::exec::AddRowAddrExec;
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
@@ -34,9 +35,7 @@ use crate::{
         write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
     },
     index::DatasetIndexInternalExt,
-    io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    },
+    io::exec::{project, scalar_index::MapIndexExec, utils::ReplayExec, Planner, TakeExec},
     Dataset,
 };
 use arrow_array::{
@@ -659,7 +658,7 @@ impl MergeInsertJob {
                 builder.with_row_address();
             }
             let unindexed_data = builder
-                .with_row_id()
+                .with_row_address()
                 .with_fragments(unindexed_fragments)
                 .project(&column_names)
                 .unwrap()
@@ -1970,6 +1969,7 @@ impl Merger {
                     #[allow(clippy::redundant_clone)]
                     left_cols.clone()
                 };
+
                 let matched = matched.project(&projection)?;
                 // The payload columns of an outer join are always nullable.  We need to restore
                 // non-nullable to columns that were originally non-nullable.  This should be safe

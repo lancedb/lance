@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -267,7 +267,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
                 let new_row_ids = UInt64Array::from(new_row_ids);
                 let b = b
                     .take(&indices)?
-                    .replace_column_by_name(ROW_ID, Arc::new(new_row_ids))?;
+                    .replace_column_by_name(ROW_ADDR, Arc::new(new_row_ids))?;
                 Ok(b)
             })
             .collect::<Result<Vec<_>>>()?;
