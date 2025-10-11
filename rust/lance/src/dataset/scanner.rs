@@ -6963,11 +6963,7 @@ mod test {
         };
         assert_plan_equals(
             &dataset.dataset,
-            |scan| {
-                scan.filter("i > 10")
-                    .unwrap()
-                    .project::<&str>(&[])
-            },
+            |scan| scan.filter("i > 10").unwrap().project::<&str>(&[]),
             expected,
         )
         .await?;
@@ -7013,11 +7009,7 @@ mod test {
         };
         assert_plan_equals(
             &dataset.dataset,
-            |scan| {
-                scan.filter("i > 10")
-                    .unwrap()
-                    .project::<&str>(&[])
-            },
+            |scan| scan.filter("i > 10").unwrap().project::<&str>(&[]),
             expected,
         )
         .await?;
