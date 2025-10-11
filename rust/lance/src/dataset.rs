@@ -2580,7 +2580,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{copy_test_data_to_tmp};
+    use crate::utils::test::copy_test_data_to_tmp;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
