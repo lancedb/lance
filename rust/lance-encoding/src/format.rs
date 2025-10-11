@@ -483,6 +483,7 @@ impl ProtobufUtils21 {
         dictionary_encoding: Option<(CompressiveEncoding, u64)>,
         def_meaning: &[DefinitionInterpretation],
         num_items: u64,
+        support_large_chunk: bool,
     ) -> pb21::PageLayout {
         assert!(!def_meaning.is_empty());
         let (dictionary, num_dictionary_items) = dictionary_encoding
@@ -503,6 +504,7 @@ impl ProtobufUtils21 {
                         .map(|&def| Self::def_inter_to_repdef_layer(def))
                         .collect(),
                     num_items,
+                    support_large_chunk,
                 },
             )),
         }
