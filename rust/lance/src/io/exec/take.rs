@@ -137,11 +137,14 @@ impl TakeStream {
 
     async fn get_row_addrs(&self, batch: &RecordBatch) -> Result<Arc<dyn Array>> {
         if let Some(row_addr_array) = batch.column_by_name(ROW_ADDR) {
+            println!("entered get_row_addrs with ROW_ADDR column batch size is: {}", batch.num_rows());
             Ok(row_addr_array.clone())
         } else {
+            println!("entered get_row_addrs with ROW_ID column batch size is: {}", batch.num_rows());
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
 
             if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                println!("mapping row ids to row addresses");
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
                 let addresses = row_id_array
                     .values()
@@ -345,8 +348,10 @@ impl TakeExec {
         projection: Projection,
     ) -> Result<Option<Self>> {
         let original_projection = projection.clone();
+        println!("----------> the original projection: {:#?}", original_projection);
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
+        println!("***********> the projection after subtract: {:#?}", projection);
         if !projection.has_data_fields() {
             return Ok(None);
         }
