@@ -28,7 +28,7 @@ use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
+    IndexInformationProvider, IndexSelectionOptions, MultiQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -957,6 +957,10 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
 
     /// Loads information about all the available scalar indices on the dataset
+    async fn scalar_index_info_with_options(
+        &self,
+        options: Option<IndexSelectionOptions>,
+    ) -> Result<ScalarIndexInfo>;
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
     /// Return the fragments that are not covered by any of the deltas of the index.
@@ -1373,7 +1377,10 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     #[instrument(level = "trace", skip_all)]
-    async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
+    async fn scalar_index_info_with_options(
+        &self,
+        _options: Option<IndexSelectionOptions>,
+    ) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
@@ -1447,6 +1454,11 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
+        self.scalar_index_info_with_options(None).await
     }
 
     async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
