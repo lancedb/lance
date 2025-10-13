@@ -10,6 +10,7 @@ pub mod filtered_read;
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;
+pub mod planned_filter_read;
 mod projection;
 mod pushdown_scan;
 mod rowids;
@@ -21,10 +22,15 @@ pub mod testing;
 pub mod utils;
 
 pub use filter::LanceFilterExec;
+pub use filtered_read::FilteredReadStream;
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;
+pub use planned_filter_read::{
+    FilteredReadGlobalMetrics, FilteredReadThreadingMode, PlannedFilterReadExec,
+    PlannedFragmentRead, ScanPlanner,
+};
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
