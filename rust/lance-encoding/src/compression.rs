@@ -702,26 +702,8 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
             Compression::Rle(rle) => {
-                let Compression::Flat(values) =
-                    rle.values.as_ref().unwrap().compression.as_ref().unwrap()
-                else {
-                    panic!("RLE compression only supports flat values")
-                };
-                let Compression::Flat(run_lengths) = rle
-                    .run_lengths
-                    .as_ref()
-                    .unwrap()
-                    .compression
-                    .as_ref()
-                    .unwrap()
-                else {
-                    panic!("RLE compression only supports flat run lengths")
-                };
-                assert_eq!(
-                    run_lengths.bits_per_value, 8,
-                    "RLE compression only supports 8-bit run lengths"
-                );
-                Ok(Box::new(RleDecompressor::new(values.bits_per_value)))
+                let bits_per_value = validate_rle_compression(rle);
+                Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
@@ -854,9 +836,35 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let scheme = compression.scheme();
                 Ok(Box::new(CompressedBufferEncoder::from_scheme(scheme)?))
             }
+            Compression::Rle(rle) => {
+                let bits_per_value = validate_rle_compression(rle);
+                Ok(Box::new(RleDecompressor::new(bits_per_value)))
+            }
             _ => todo!(),
         }
     }
+}
+/// Validates RLE compression format and extracts bits_per_value
+fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> u64 {
+    let Compression::Flat(values) = rle.values.as_ref().unwrap().compression.as_ref().unwrap()
+    else {
+        panic!("RLE compression only supports flat values")
+    };
+    let Compression::Flat(run_lengths) = rle
+        .run_lengths
+        .as_ref()
+        .unwrap()
+        .compression
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("RLE compression only supports flat run lengths")
+    };
+    assert_eq!(
+        run_lengths.bits_per_value, 8,
+        "RLE compression only supports 8-bit run lengths"
+    );
+    values.bits_per_value
 }
 
 #[cfg(test)]
@@ -864,6 +872,7 @@ mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
     use crate::data::{BlockInfo, DataBlock};
+    use crate::statistics::ComputeStat;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
@@ -1274,5 +1283,82 @@ mod tests {
         // Should have BSS wrapped in general compression
         assert!(debug_str.contains("GeneralMiniBlockCompressor"));
         assert!(debug_str.contains("ByteStreamSplitEncoder"));
+    }
+
+    #[test]
+    fn test_rle_block_not_used_for_version_larger_than_v2_1() {
+        let field = create_test_field("test_repdef", DataType::UInt16);
+
+        // Create highly repetitive data
+        let num_values = 1000u64;
+        let mut data = Vec::with_capacity(num_values as usize);
+        for i in 0..10 {
+            for _ in 0..100 {
+                data.push(i as u16);
+            }
+        }
+
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+
+        block.compute_stat();
+
+        let data_block = DataBlock::FixedWidth(block);
+
+        let strategy = DefaultCompressionStrategy::with_params_and_version(
+            CompressionParams::new(),
+            LanceFileVersion::V2_2,
+        );
+
+        let (compressor, _) = strategy
+            .create_block_compressor(&field, &data_block)
+            .unwrap();
+
+        let debug_str = format!("{:?}", compressor);
+        assert!(debug_str.contains("RleEncoder"));
+    }
+
+    #[test]
+    fn test_rle_block_not_used_for_version_less_than_v2_2() {
+        let field = create_test_field("test_repdef", DataType::UInt16);
+
+        // Create highly repetitive data
+        let num_values = 1000u64;
+        let mut data = Vec::with_capacity(num_values as usize);
+        for i in 0..10 {
+            for _ in 0..100 {
+                data.push(i as u16);
+            }
+        }
+
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+
+        block.compute_stat();
+
+        let data_block = DataBlock::FixedWidth(block);
+
+        let strategy = DefaultCompressionStrategy::with_params_and_version(
+            CompressionParams::new(),
+            LanceFileVersion::V2_1,
+        );
+
+        let (compressor, _) = strategy
+            .create_block_compressor(&field, &data_block)
+            .unwrap();
+
+        let debug_str = format!("{:?}", compressor);
+        assert!(
+            !debug_str.contains("RleEncoder"),
+            "RLE should not be used for V2.1"
+        );
     }
 }
