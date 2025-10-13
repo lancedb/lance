@@ -964,17 +964,20 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
             .and_then(move |batch| {
-                let part_id_col = batch
-                    .column_by_name(PART_ID_COLUMN)
-                    .expect("ANNSubIndexExec: input missing part_id column");
+                let part_id_col = batch.column_by_name(PART_ID_COLUMN).expect(&format!(
+                    "ANNSubIndexExec: input missing {} column",
+                    PART_ID_COLUMN
+                ));
                 let part_id_arr = part_id_col.as_list::<i32>().clone();
-                let dist_q_c_col = batch
-                    .column_by_name(DIST_Q_C_COLUMN)
-                    .expect("ANNSubIndexExec: input missing dist_q_c column");
+                let dist_q_c_col = batch.column_by_name(DIST_Q_C_COLUMN).expect(&format!(
+                    "ANNSubIndexExec: input missing {} column",
+                    DIST_Q_C_COLUMN
+                ));
                 let dist_q_c_arr = dist_q_c_col.as_list::<i32>().clone();
-                let index_uuid_col = batch
-                    .column_by_name(INDEX_UUID_COLUMN)
-                    .expect("ANNSubIndexExec: input missing index_uuid column");
+                let index_uuid_col = batch.column_by_name(INDEX_UUID_COLUMN).expect(&format!(
+                    "ANNSubIndexExec: input missing {} column",
+                    INDEX_UUID_COLUMN
+                ));
                 let index_uuid = index_uuid_col.as_string::<i32>().clone();
 
                 let plan: Vec<DataFusionResult<(_, _, _)>> = part_id_arr
