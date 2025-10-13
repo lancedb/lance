@@ -689,6 +689,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                binary_minichunk_size: None,
             },
         );
 
