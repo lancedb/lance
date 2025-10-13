@@ -616,6 +616,47 @@ mod tests {
             .await
             .unwrap();
 
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Should have 1 index");
+        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
+            true
+        );
+
+        // create again with replace=false
+        let res = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                false,
+            )
+            .await;
+        assert!(res.is_err());
+
+        // create again with replace=true
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Should have 1 index");
+        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
+            true
+        );
+
         let scalar_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         dataset
