@@ -293,7 +293,9 @@ pub fn default_encoding_strategy_with_params(
             location!(),
         )),
         _ => {
-            let compression_strategy = Arc::new(DefaultCompressionStrategy::with_params(params));
+            let compression_strategy = Arc::new(
+                DefaultCompressionStrategy::with_params_and_version(params, version),
+            );
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,

@@ -45,7 +45,7 @@ use crate::{
             packed::{
                 PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
             },
-            rle::{RleMiniBlockDecompressor, RleMiniBlockEncoder},
+            rle::{RleDecompressor, RleEncoder},
             value::{ValueDecompressor, ValueEncoder},
         },
     },
@@ -130,6 +130,7 @@ pub struct DefaultCompressionStrategy {
     /// User-configured compression parameters
     params: CompressionParams,
     /// The lance file version for compatibilities.
+    // LanceFile Version
     version: LanceFileVersion,
 }
 
@@ -168,7 +169,35 @@ fn try_rle_for_mini_block(
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     if (run_count as f64) < (data.num_values as f64) * threshold {
-        return Some(Box::new(RleMiniBlockEncoder::new()));
+        return Some(Box::new(RleEncoder::new()));
+    }
+    None
+}
+
+fn try_rle_for_block(
+    data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
+) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    if version < LanceFileVersion::V2_2 {
+        return None;
+    }
+
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    // TODO: Make this configurable
+    let threshold = DEFAULT_RLE_COMPRESSION_THRESHOLD;
+
+    if (run_count as f64) < (data.num_values as f64) * threshold {
+        let compressor = Box::new(RleEncoder::new());
+        let encoding = ProtobufUtils21::rle(
+            ProtobufUtils21::flat(bits, None),
+            ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+        );
+        return Some((compressor, encoding));
     }
     None
 }
@@ -241,10 +270,7 @@ fn maybe_wrap_general_for_mini_block(
         None | Some("none") | Some("fsst") => Ok(inner),
         Some(raw) => {
             let scheme = CompressionScheme::from_str(raw).map_err(|_| {
-                lance_core::Error::invalid_input(
-                    format!("Unknown compression scheme: {raw}"),
-                    location!(),
-                )
+                Error::invalid_input(format!("Unknown compression scheme: {raw}"), location!())
             })?;
             let cfg = CompressionConfig::new(scheme, params.compression_level);
             Ok(Box::new(GeneralMiniBlockCompressor::new(inner, cfg)))
@@ -292,6 +318,10 @@ impl DefaultCompressionStrategy {
             params,
             version: LanceFileVersion::default(),
         }
+    }
+
+    pub fn with_params_and_version(params: CompressionParams, version: LanceFileVersion) -> Self {
+        Self { params, version }
     }
 
     /// Parse compression parameters from field metadata
@@ -524,6 +554,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width) => {
+                if let Some((compressor, encoding)) = try_rle_for_block(fixed_width, self.version) {
+                    return Ok((compressor, encoding));
+                }
                 if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
                     return Ok((compressor, encoding));
                 }
@@ -688,9 +721,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     run_lengths.bits_per_value, 8,
                     "RLE compression only supports 8-bit run lengths"
                 );
-                Ok(Box::new(RleMiniBlockDecompressor::new(
-                    values.bits_per_value,
-                )))
+                Ok(Box::new(RleDecompressor::new(values.bits_per_value)))
             }
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
@@ -718,10 +749,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
                 let scheme = compression.scheme().try_into()?;
 
-                let compression_config = crate::encodings::physical::block::CompressionConfig::new(
-                    scheme,
-                    compression.level,
-                );
+                let compression_config = CompressionConfig::new(scheme, compression.level);
 
                 Ok(Box::new(GeneralMiniBlockDecompressor::new(
                     inner_decompressor,
