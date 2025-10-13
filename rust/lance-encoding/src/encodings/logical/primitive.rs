@@ -1649,15 +1649,15 @@ enum WordsIter<'a> {
 impl Words {
     pub fn len(&self) -> usize {
         match self {
-            Words::U16(b) => b.len(),
-            Words::U32(b) => b.len(),
+            Self::U16(b) => b.len(),
+            Self::U32(b) => b.len(),
         }
     }
 
     pub fn iter(&self) -> WordsIter<'_> {
         match self {
-            Words::U16(buf) => WordsIter::U16(buf.iter()),
-            Words::U32(buf) => WordsIter::U32(buf.iter()),
+            Self::U16(buf) => WordsIter::U16(buf.iter()),
+            Self::U32(buf) => WordsIter::U32(buf.iter()),
         }
     }
 
@@ -1665,11 +1665,11 @@ impl Words {
         if support_large_chunk {
             assert_eq!(bytes.len() % 4, 0);
             let buffer = LanceBuffer::from_bytes(bytes, 4);
-            Ok(Words::U32(buffer.borrow_to_typed_slice::<u32>()))
+            Ok(Self::U32(buffer.borrow_to_typed_slice::<u32>()))
         } else {
             assert_eq!(bytes.len() % 2, 0);
             let buffer = LanceBuffer::from_bytes(bytes, 2);
-            Ok(Words::U16(buffer.borrow_to_typed_slice::<u16>()))
+            Ok(Self::U16(buffer.borrow_to_typed_slice::<u16>()))
         }
     }
 }
@@ -1679,8 +1679,8 @@ impl<'a> Iterator for WordsIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            WordsIter::U16(it) => it.next().map(|&x| x as u32),
-            WordsIter::U32(it) => it.next().map(|&x| x),
+            Self::U16(it) => it.next().map(|&x| x as u32),
+            Self::U32(it) => it.next().copied(),
         }
     }
 }
@@ -5610,6 +5610,76 @@ mod tests {
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
 
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
+    }
+
+    #[tokio::test]
+    async fn test_binary_minichunk_size_roundtrip() {
+        use crate::constants::BINARY_MINICHUNK_SIZE_META_KEY;
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        // Test that binary minichunk size can be configured and works correctly in round-trip encoding
+        let string_data = vec![
+            Some("hello".to_string()),
+            Some("world".to_string()),
+            Some("lance".to_string()),
+            Some("encoding".to_string()),
+            Some("test".to_string()),
+        ];
+        let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
+
+        // Create field with binary minichunk size specified in metadata
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            BINARY_MINICHUNK_SIZE_META_KEY.to_string(),
+            "64".to_string(), // 64 bytes minichunk size
+        );
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(1000);
+
+        // This should work without errors and respect the minichunk size parameter
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_binary_minichunk_size_128kb_v2_2() {
+        use crate::constants::BINARY_MINICHUNK_SIZE_META_KEY;
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        // Test that binary minichunk size can be configured to 128KB and works correctly with Lance 2.2
+        // Create larger string data to better test the chunk size configuration
+        let mut string_data = Vec::new();
+        for i in 0..100 {
+            string_data.push(Some(format!("test_string_{}", i).repeat(50))); // Create larger strings
+        }
+        let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
+
+        // Create field with binary minichunk size specified in metadata (128KB = 131072 bytes)
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            BINARY_MINICHUNK_SIZE_META_KEY.to_string(),
+            (128 * 1024).to_string(),
+        );
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(1000);
+
+        // This should work without errors and respect the 128KB minichunk size parameter with Lance 2.2
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
     }
 
     #[tokio::test]

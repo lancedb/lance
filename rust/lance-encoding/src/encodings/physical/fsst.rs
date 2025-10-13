@@ -138,8 +138,9 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
         let data_block = DataBlock::VariableWidth(compressed.data);
 
         // compress the fsst compressed data using `BinaryMiniBlockEncoder`
-        let binary_compressor =
-            Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
+        let binary_minichunk_size = *super::binary::AIM_MINICHUNK_SIZE;
+        let binary_compressor = Box::new(BinaryMiniBlockEncoder::new(Some(binary_minichunk_size)))
+            as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
             binary_compressor.compress(data_block)?;
