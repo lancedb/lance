@@ -539,9 +539,7 @@ fn must_recalculate_fragment_bitmap(
 ) -> bool {
     // If the fragment bitmap was written by an old version of lance then we need to recalculate
     // it because it could be corrupt due to a bug in versions < 0.8.15
-    index.index_version < 1     // Skip recalculation for newer indices (index_version >= 1) since they already have correct fragment bitmaps
-        && (index.fragment_bitmap.is_none()
-            || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true))
+    index.fragment_bitmap.is_none() || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true)
 }
 
 /// Update indices with new fields.
@@ -555,17 +553,10 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     };
     for index in indices {
-        // Skip recalculation for newer indices (index_version >= 1) since they already have
-        // correct fragment bitmaps set during creation and don't implement calculate_included_frags
-        let should_recalculate = if index.index_version >= 1 {
-            false
-        } else {
-            needs_recalculating.contains(&index.name)
-                || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
-                    && !is_system_index(index)
-        };
-
-        if should_recalculate {
+        if needs_recalculating.contains(&index.name)
+            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
+                && !is_system_index(index)
+        {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
