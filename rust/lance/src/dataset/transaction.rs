@@ -291,6 +291,12 @@ pub enum Operation {
         ref_path: String,
         branch_name: Option<String>,
     },
+
+    // Add new base paths to the dataset.
+    AddBases {
+        /// The new base paths to add to the manifest.
+        new_bases: Vec<BasePath>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -323,6 +329,7 @@ impl std::fmt::Display for Operation {
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
+            Self::AddBases { .. } => write!(f, "AddBases"),
         }
     }
 }
@@ -1069,6 +1076,94 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+
+            (Self::AddBases { new_bases: a }, Self::AddBases { new_bases: b }) => compare_vec(a, b),
+
+            (Self::AddBases { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::AddBases { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Append { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::AddBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -1218,6 +1313,7 @@ impl Operation {
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
+            Self::AddBases { .. } => "AddBases",
         }
     }
 }
@@ -1896,6 +1992,11 @@ impl Transaction {
                     removed.clone(),
                 )?;
             }
+            Operation::AddBases { .. } => {
+                // AddBases operation doesn't modify fragments or indices
+                // Base paths are handled in the manifest creation section below
+                final_fragments.extend(maybe_existing_fragments?.clone());
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -1992,6 +2093,34 @@ impl Transaction {
                 }
             }
             _ => {}
+        }
+
+        // Handle AddBases operation to update manifest base_paths
+        if let Operation::AddBases { new_bases } = &self.operation {
+            // Validate and add new base paths to the manifest
+            for new_base in new_bases {
+                // Check for conflicts with existing base paths
+                if let Some(existing_base) = manifest.base_paths.values().find(|bp| {
+                    bp.name == new_base.name || bp.path == new_base.path
+                }) {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
+                            new_base.name, new_base.path, existing_base.name, existing_base.path
+                        ),
+                        location!(),
+                    ));
+                }
+                
+                // Assign a new ID if not already assigned
+                let mut base_to_add = new_base.clone();
+                if base_to_add.id == 0 {
+                    let next_id = manifest.base_paths.keys().max().map(|&id| id + 1).unwrap_or(1);
+                    base_to_add.id = next_id;
+                }
+                
+                manifest.base_paths.insert(base_to_add.id, base_to_add);
+            }
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
@@ -2715,6 +2844,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(|m| MemWal::try_from(m).unwrap())
                     .collect(),
             },
+            Some(pb::transaction::Operation::AddBases(pb::transaction::AddBases {
+                new_bases,
+            })) => Operation::AddBases {
+                new_bases: new_bases
+                    .into_iter()
+                    .map(BasePath::from)
+                    .collect(),
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -3022,6 +3159,15 @@ impl From<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::mem_wal_index_details::MemWal::from)
                         .collect::<Vec<_>>(),
+                })
+            }
+            Operation::AddBases { new_bases } => {
+                pb::transaction::Operation::AddBases(pb::transaction::AddBases {
+                    new_bases: new_bases
+                        .iter()
+                        .cloned()
+                        .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                        .collect::<Vec<pb::BasePath>>(),
                 })
             }
         };

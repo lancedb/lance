@@ -51,7 +51,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
-            | Operation::Restore { .. } => Ok(Self {
+            | Operation::Restore { .. }
+            | Operation::AddBases { .. } => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -212,6 +213,9 @@ impl<'a> TransactionRebase<'a> {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
             Operation::Clone { .. } => Ok(()),
+            Operation::AddBases { .. } => {
+                self.check_add_bases_txn(other_transaction, other_version)
+            }
         }
     }
 
@@ -227,7 +231,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
-                | Operation::UpdateConfig { .. } => Ok(()),
+                | Operation::UpdateConfig { .. }
+                | Operation::AddBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -347,7 +352,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::Clone { .. }
-                | Operation::UpdateConfig { .. } => Ok(()),
+                | Operation::UpdateConfig { .. }
+                | Operation::AddBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -475,7 +481,7 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Append { .. } | Operation::Clone { .. } => Ok(()),
+                Operation::Append { .. } | Operation::Clone { .. } | Operation::AddBases { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 // unless it is the same frag reuse index
                 Operation::CreateIndex {
@@ -605,7 +611,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
-                | Operation::UpdateMemWalState { .. } => Ok(()),
+                | Operation::UpdateMemWalState { .. }
+                | Operation::AddBases { .. } => Ok(()),
                 Operation::Delete {
                     updated_fragments,
                     deleted_fragment_ids,
@@ -785,7 +792,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
-            | Operation::Project { .. } => Ok(()),
+            | Operation::Project { .. }
+            | Operation::AddBases { .. } => Ok(()),
         }
     }
 
@@ -809,6 +817,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
+            | Operation::AddBases { .. }
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
@@ -829,7 +838,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::Project { .. } => Ok(()),
+            | Operation::Project { .. }
+            | Operation::AddBases { .. } => Ok(()),
             Operation::CreateIndex { .. } => {
                 // TODO(rmeng): check that the new indices isn't on the column being replaced
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
@@ -859,7 +869,8 @@ impl<'a> TransactionRebase<'a> {
             Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
-            | Operation::UpdateConfig { .. } => Ok(()),
+            | Operation::UpdateConfig { .. }
+            | Operation::AddBases { .. } => Ok(()),
 
             Operation::Update { .. }
             | Operation::Append { .. }
@@ -893,6 +904,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::AddBases { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::Clone { .. }
@@ -923,7 +935,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::UpdateMemWalState { .. } => Ok(()),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::AddBases { .. } => Ok(()),
         }
     }
 
@@ -942,7 +955,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataReplacement { .. }
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
-            | Operation::ReserveFragments { .. } => Ok(()),
+            | Operation::ReserveFragments { .. }
+            | Operation::AddBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
@@ -1016,7 +1030,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::ReserveFragments { .. }
                 | Operation::Update { .. }
                 | Operation::Project { .. }
-                | Operation::UpdateMemWalState { .. } => Ok(()),
+                | Operation::UpdateMemWalState { .. }
+                | Operation::AddBases { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1095,7 +1110,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateConfig { .. }
                 | Operation::Rewrite { .. }
                 | Operation::CreateIndex { .. }
-                | Operation::ReserveFragments { .. } => Ok(()),
+                | Operation::ReserveFragments { .. }
+                | Operation::AddBases { .. } => Ok(()),
                 Operation::Append { .. }
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
@@ -1108,6 +1124,55 @@ impl<'a> TransactionRebase<'a> {
                     other_version,
                     location!(),
                 )),
+            }
+        } else {
+            Err(wrong_operation_err(&self.transaction.operation))
+        }
+    }
+
+    fn check_add_bases_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if let Operation::AddBases { new_bases } = &self.transaction.operation {
+            match &other_transaction.operation {
+                Operation::AddBases {
+                    new_bases: committed_bases,
+                } => {
+                    // Check if any of the bases being added conflict with committed bases
+                    for new_base in new_bases {
+                        for committed_base in committed_bases {
+                            // Check for ID conflicts (if both have non-zero IDs)
+                            if new_base.id != 0 && committed_base.id != 0 && new_base.id == committed_base.id {
+                                return Err(self.incompatible_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                            // Check for name conflicts
+                            if new_base.name == committed_base.name && new_base.name.is_some() {
+                                return Err(self.incompatible_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                            // Check for path conflicts
+                            if new_base.path == committed_base.path {
+                                return Err(self.incompatible_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                // AddBases doesn't conflict with data operations
+                _ => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1178,7 +1243,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::UpdateMemWalState { .. } => Ok(self.transaction),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::AddBases { .. } => Ok(self.transaction),
         }
     }
 
@@ -2496,6 +2562,323 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_add_bases_non_conflicting() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Create two transactions adding different bases
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 2,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // txn1 should not conflict with txn2
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_name_conflict() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Create two transactions adding bases with the same name
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: Some("duplicate_name".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 2,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: Some("duplicate_name".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // txn1 should conflict with txn2 due to duplicate name
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected CommitConflict error for duplicate name, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_path_conflict() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Create two transactions adding bases with the same path
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket/duplicate_path".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 2,
+                    path: "s3://bucket/duplicate_path".to_string(),
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // txn1 should conflict with txn2 due to duplicate path
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected CommitConflict error for duplicate path, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_id_conflict() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Create two transactions adding bases with the same non-zero ID
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 42,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 42,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // txn1 should conflict with txn2 due to duplicate non-zero ID
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected CommitConflict error for duplicate ID, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_no_conflict_with_data_operations() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        let add_bases_txn = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket/path".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // Test against various data operations
+        let data_operations = vec![
+            Operation::Append {
+                fragments: vec![],
+            },
+            Operation::Delete {
+                deleted_fragment_ids: vec![0],
+                updated_fragments: vec![],
+                predicate: "a > 5".to_string(),
+            },
+            Operation::Update {
+                updated_fragments: vec![Fragment::new(0)],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+            },
+        ];
+
+        for operation in data_operations {
+            let data_txn = Transaction::new_from_version(1, operation.clone());
+            let mut rebase = TransactionRebase::try_new(&dataset, add_bases_txn.clone(), None)
+                .await
+                .unwrap();
+            assert!(
+                rebase.check_txn(&data_txn, 2).is_ok(),
+                "AddBases should not conflict with {:?}",
+                operation
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_multiple_bases() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // txn1 adds two bases
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![
+                    lance_table::format::BasePath {
+                        id: 1,
+                        path: "s3://bucket1/path1".to_string(),
+                        name: Some("base1".to_string()),
+                        is_dataset_root: false,
+                    },
+                    lance_table::format::BasePath {
+                        id: 2,
+                        path: "s3://bucket2/path2".to_string(),
+                        name: Some("base2".to_string()),
+                        is_dataset_root: false,
+                    },
+                ],
+            },
+        );
+
+        // txn2 adds a base that conflicts with one of txn1's bases
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 3,
+                    path: "s3://bucket1/path1".to_string(), // Same path as txn1's first base
+                    name: Some("base3".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // Should conflict due to path conflict
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::CommitConflict { .. })),
+            "Expected CommitConflict error, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_with_none_name() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Bases with None names should not conflict on name
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: None,
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 2,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: None,
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // Should not conflict despite both having None names
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_bases_with_zero_id() {
+        let (dataset, _) = test_dataset(10, 2).await;
+
+        // Bases with zero IDs should not conflict on ID
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 0,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::AddBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 0,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        // Should not conflict despite both having zero IDs
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
     /// Returns the IDs of fragments that have been modified by this operation.
     ///
     /// This does not include new fragments.
@@ -2509,6 +2892,7 @@ mod tests {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::AddBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
             Operation::Delete {
