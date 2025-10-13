@@ -1695,12 +1695,9 @@ impl Transaction {
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 final_indices.retain(|existing_index| {
-                    !new_indices
+                    !removed_indices
                         .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                        .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
