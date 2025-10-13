@@ -781,7 +781,7 @@ impl IvfSubIndex for HNSW {
     ) -> Result<Self> {
         // We can't simply remap the row ids in the graph because the vectors are changed,
         // so the graph needs to be rebuilt.
-        HNSW::index_vectors(store, self.inner.params.clone())
+        Self::index_vectors(store, self.inner.params.clone())
     }
 
     /// Encode the sub index into a record batch
