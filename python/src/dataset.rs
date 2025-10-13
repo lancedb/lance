@@ -177,6 +177,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn when_matched_delete(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_matched(WhenMatched::Delete);
+        Ok(slf)
+    }
+
     pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
         slf.builder.when_not_matched(WhenNotMatched::InsertAll);
         Ok(slf)

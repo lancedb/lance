@@ -10,9 +10,9 @@
 //! being inserted into the dataset.
 //!
 //! In order for this operation to work we need to be able to match rows from the source table with rows in the
-//! target table.  For example, given a row we need to know if this is a brand new row or matches an existing row.
+//! target table.  For example, given a row we need to know if this is a brand-new row or matches an existing row.
 //!
-//! This match condition is currently limited to an key-match.  This means we consider a row to be a match if the
+//! This match condition is currently limited to a key-match.  This means we consider a row to be a match if the
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
@@ -243,6 +243,9 @@ pub enum WhenMatched {
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
     UpdateIf(String),
+    /// The row is deleted from the target table with no other side effects.
+    /// This can be used to achieve a "when matched delete" behavior
+    Delete,
 }
 
 impl WhenMatched {
@@ -1331,7 +1334,7 @@ impl MergeInsertJob {
     /// Check if the merge insert operation can use the fast path (create_plan).
     ///
     /// The fast path is only available for specific conditions:
-    /// - when_matched is UpdateAll or UpdateIf
+    /// - when_matched is UpdateAll or UpdateIf or Delete
     /// - Either use_index is false OR there's no scalar index on join key
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep
@@ -1351,7 +1354,7 @@ impl MergeInsertJob {
 
         Ok(matches!(
             self.params.when_matched,
-            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
+            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::Delete
         ) && (!self.params.use_index || !has_scalar_index)
             && is_full_schema
             && matches!(
@@ -2054,7 +2057,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{
         types::{Int32Type, UInt32Type},
-        FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
+        Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
         RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
@@ -2162,6 +2165,20 @@ mod tests {
         .unwrap()
     }
 
+    /// Returns a dataset with the following format:
+    ///
+    /// ```text
+    /// ┌─────┬─────┬───────┬──────────┬──────────┐
+    /// │ Row │ Key │ Value │ FilterMe │ Fragment │
+    /// ├─────┼─────┼───────┼──────────┼──────────┤
+    /// │  0  │  1  │   1   │   "A"    │    1     │
+    /// │  1  │  2  │   1   │   "B"    │    1     │
+    /// │  2  │  3  │   1   │   "A"    │    1     │
+    /// │  3  │  4  │   1   │   "A"    │    2     │
+    /// │  4  │  5  │   1   │   "B"    │    2     │
+    /// │  5  │  6  │   1   │   "A"    │    2     │
+    /// └─────┴─────┴───────┴──────────┴──────────┘
+    /// ```
     async fn create_test_dataset(
         test_uri: &str,
         version: LanceFileVersion,
@@ -4789,5 +4806,193 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert_eq!(value_bitmap.len(), 2);
         assert!(value_bitmap.contains(0));
         assert!(value_bitmap.contains(1));
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_mixed_operations(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_stable_row_ids: bool,
+    ) {
+        // Test WhenMatched::Delete combined with WhenNotMatched::InsertAll
+
+        let test_uri = "memory://test_when_matched_delete_mixed.lance";
+        let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
+
+        let schema = create_test_schema();
+
+        // Source data with keys [4, 5, 6, 7] - mix of matching (4,5,6) and new (7)
+        // - Keys 4, 5, 6 exist in target -> DELETED
+        // - Key 7 doesn't exist in target -> INSERTED
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4u32, 5u32, 6u32, 7u32])),
+                Arc::new(UInt32Array::from(vec![400u32, 500u32, 600u32, 700u32])),
+                Arc::new(StringArray::from(vec!["new4", "new5", "new6", "new7"])),
+            ],
+        )
+        .unwrap();
+
+        let source = Box::new(RecordBatchIterator::new([Ok(source_batch)], schema));
+        let (updated_dataset, merge_stats) =
+            MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(source)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            merge_stats.num_deleted_rows, 3,
+            "Should have deleted 3 matched rows (4,5,6)"
+        );
+        assert_eq!(
+            merge_stats.num_inserted_rows, 1,
+            "Should have inserted 1 new row (7)"
+        );
+        assert_eq!(
+            merge_stats.num_updated_rows, 0,
+            "Should not have updated any rows"
+        );
+
+        // Verify final data should have keys [1, 2, 3, 7]
+        // Original: [1, 2, 3, 4, 5, 6] -> Delete [4, 5, 6] -> [1, 2, 3] -> Insert [7] -> [1, 2, 3, 7]
+        let final_batch = updated_dataset.scan().try_into_batch().await.unwrap();
+
+        let key_col = final_batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+
+        let mut final_keys: Vec<u32> = key_col.values().to_vec();
+        final_keys.sort();
+
+        assert_eq!(
+            final_keys,
+            vec![1, 2, 3, 7],
+            "Should have original unmatched keys plus new key"
+        );
+
+        // Verify the inserted row has the correct values
+        let value_col = final_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let filterme_col = final_batch
+            .column_by_name("filterme")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let key_7_pos = final_keys.iter().position(|&k| k == 7).unwrap();
+        assert_eq!(
+            value_col.value(key_7_pos),
+            700u32,
+            "Inserted row should have value 700"
+        );
+        assert_eq!(
+            filterme_col.value(key_7_pos),
+            "new7",
+            "Inserted row should have filterme 'new7'"
+        );
+
+        // Verify remaining original rows still have value=1
+        for (i, &key) in final_keys.iter().enumerate() {
+            if key != 7 {
+                // Skip the inserted row
+                assert_eq!(
+                    value_col.value(i),
+                    1u32,
+                    "Original rows should still have value=1, but key {} has value {}",
+                    key,
+                    value_col.value(i)
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_no_matches(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        // Test WhenMatched::Delete when no rows match should result in no changes to target dataset
+
+        let test_uri = "memory://test_when_matched_delete_no_matches.lance";
+        let ds = create_test_dataset(test_uri, version, false).await;
+
+        let schema = create_test_schema();
+
+        // Source data with keys that don't exist in target [100, 101, 102]
+        // Target has keys [1, 2, 3, 4, 5, 6], so no matches
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100, 101, 102])),
+                Arc::new(UInt32Array::from(vec![1000, 1001, 1002])),
+                Arc::new(StringArray::from(vec![
+                    "no_match1",
+                    "no_match2",
+                    "no_match3",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let source = Box::new(RecordBatchIterator::new([Ok(source_batch)], schema));
+        let (updated_dataset, merge_stats) =
+            MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(source)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            merge_stats.num_deleted_rows, 0,
+            "Should have deleted 0 rows (no matches)"
+        );
+        assert_eq!(
+            merge_stats.num_updated_rows, 0,
+            "Should not have updated any rows"
+        );
+        assert_eq!(
+            merge_stats.num_inserted_rows, 0,
+            "Should not have inserted any rows"
+        );
+
+        let final_batch = updated_dataset.scan().try_into_batch().await.unwrap();
+
+        let key_col = final_batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+
+        let mut final_keys: Vec<u32> = key_col.values().to_vec();
+        final_keys.sort();
+
+        assert_eq!(
+            final_keys,
+            vec![1, 2, 3, 4, 5, 6],
+            "All original keys should remain"
+        );
+
+        let value_col = final_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+
+        assert!(
+            value_col.values().iter().all(|&v| v == 1),
+            "All values should still be 1"
+        );
     }
 }

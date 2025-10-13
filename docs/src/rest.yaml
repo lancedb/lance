@@ -737,6 +737,13 @@ paths:
         required: true
         schema:
           type: string
+      - name: "when_matched_delete"
+        in: query
+        description: Delete all rows in target table where a match exists in source table
+        required: false
+        schema:
+          type: boolean
+          default: false
       - name: "when_matched_update_all"
         in: query
         description: Update all columns when rows match
@@ -786,6 +793,7 @@ paths:
         It passes in the `MergeInsertIntoTableRequest` information in the following way:
         - `id`: pass through path parameter of the same name
         - `on`: pass through query parameter of the same name
+        - `when_matched_delete`: pass through query parameter of the same name
         - `when_matched_update_all`: pass through query parameter of the same name
         - `when_matched_update_all_filt`: pass through query parameter of the same name
         - `when_not_matched_insert_all`: pass through query parameter of the same name
@@ -1938,6 +1946,10 @@ components:
         "on":
           description: Column name to use for matching rows (required)
           type: string
+        when_matched_delete:
+          description: Delete all rows in target table where a match exists in source table
+          type: boolean
+          default: false
         when_matched_update_all:
           description: Update all columns when rows match
           type: boolean

@@ -159,6 +159,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
+    def when_matched_delete(self) -> "MergeInsertBuilder":
+        """
+        Configure the operation to delete matched rows in the target table.
+
+        After this method is called, when the merge insert operation executes,
+        any rows that match both the source table and the target table will be
+        deleted.
+        """
+        return super(MergeInsertBuilder, self).when_matched_delete()
+
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
