@@ -748,7 +748,7 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::info!(
+        log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
@@ -756,6 +756,10 @@ impl IvfSubIndex for HNSW {
             hnsw.inner.params.ef_construction,
             storage.distance_type(),
         );
+
+        if storage.is_empty() {
+            return Ok(hnsw);
+        }
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
@@ -770,8 +774,14 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
-    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        unimplemented!("HNSW remap is not supported yet");
+    fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>, // we don't need the mapping here because we rebuild the graph from remapped storage
+        store: &impl VectorStore,
+    ) -> Result<Self> {
+        // We can't simply remap the row ids in the graph because the vectors are changed,
+        // so the graph needs to be rebuilt.
+        HNSW::index_vectors(store, self.inner.params.clone())
     }
 
     /// Encode the sub index into a record batch
