@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -43,7 +42,7 @@ use crate::dataset::rowids::load_row_id_sequence;
 use crate::Dataset;
 
 use super::filtered_read::{EvaluatedIndex, FilteredReadOptions};
-use super::utils::IoMetrics;
+use super::utils::{apply_hard_range, IoMetrics};
 
 // ============================================================================
 // Planning types and logic
@@ -247,7 +246,7 @@ impl ScanPlanner {
     /// Determine whether to use refine filter for a fragment based on index results
     ///
     /// Returns: true if refine filter should be used, false for full filter
-    pub fn determine_fragment_filter(
+    fn determine_fragment_filter(
         fragment_id: u32,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         limit_pushed: bool,
@@ -1024,10 +1023,15 @@ impl FilteredReadStream {
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    // Convert lance_core::Error to DataFusionError for apply_hard_range
+                    let df_stream = base_batch_stream
+                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                    apply_hard_range(df_stream, range.clone()).boxed()
                 } else {
                     // Need to box here otherwise the if/else returns incompatible types
-                    base_batch_stream.boxed()
+                    base_batch_stream
+                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                        .boxed()
                 };
 
                 let batch_stream = batch_stream
@@ -1040,7 +1044,6 @@ impl FilteredReadStream {
                     .finally(move || {
                         partition_metrics.baseline_metrics.done();
                     })
-                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
                     .boxed();
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
@@ -1240,44 +1243,6 @@ impl FilteredReadStream {
                         .boxed()
                 })
             })
-    }
-
-    fn apply_hard_range<S>(stream: S, range: Range<u64>) -> impl Stream<Item = Result<RecordBatch>>
-    where
-        S: Stream<Item = Result<RecordBatch>>,
-    {
-        let start = range.start as usize;
-        let end = range.end as usize;
-        let rows_seen = Arc::new(AtomicUsize::new(0));
-
-        stream.try_filter_map(move |batch| {
-            if batch.num_rows() == 0 {
-                return future::ready(Ok(None));
-            }
-
-            let batch_rows = batch.num_rows();
-            let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
-            let batch_end = current_position + batch_rows;
-
-            if batch_end <= start || current_position >= end {
-                return future::ready(Ok(None));
-            }
-
-            let skip = start.saturating_sub(current_position);
-            let end_pos = (end - current_position).min(batch_rows);
-            let take = end_pos.saturating_sub(skip);
-
-            if take == 0 {
-                return future::ready(Ok(None));
-            }
-
-            let result = if skip == 0 && take == batch_rows {
-                batch
-            } else {
-                batch.slice(skip, take)
-            };
-            future::ready(Ok(Some(result)))
-        })
     }
 }
 
