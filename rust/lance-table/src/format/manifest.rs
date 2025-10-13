@@ -21,7 +21,7 @@ use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 use snafu::location;
 
@@ -296,12 +296,7 @@ impl Manifest {
             blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
-                let base_path = BasePath {
-                    id: ref_base_id,
-                    name: ref_name,
-                    is_dataset_root: true,
-                    path: ref_path,
-                };
+                let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
                 base_paths.insert(ref_base_id, base_path);
                 base_paths
             },
@@ -575,12 +570,47 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasePath {
     pub id: u32,
     pub name: Option<String>,
     pub is_dataset_root: bool,
+    /// The full URI string (e.g., "s3://bucket/path")
     pub path: String,
+}
+
+impl BasePath {
+    /// Create a new BasePath
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique identifier for this base path
+    /// * `path` - Full URI string (e.g., "s3://bucket/path", "/local/path")
+    /// * `name` - Optional human-readable name for this base
+    /// * `is_dataset_root` - Whether this is the dataset root or a data-only base
+    pub fn new(id: u32, path: String, name: Option<String>, is_dataset_root: bool) -> Self {
+        Self {
+            id,
+            name,
+            is_dataset_root,
+            path,
+        }
+    }
+
+    /// Extract the object store path from this BasePath's URI.
+    ///
+    /// This is a synchronous operation that parses the URI without initializing an object store.
+    pub fn extract_path(&self, registry: Arc<ObjectStoreRegistry>) -> Result<Path> {
+        ObjectStore::extract_path_from_uri(registry, &self.path)
+    }
+}
+
+impl DeepSizeOf for BasePath {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.name.deep_size_of_children(context)
+            + self.path.deep_size_of_children(context) * 2
+            + size_of::<bool>()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -701,6 +731,12 @@ impl ProtoStruct for Manifest {
 
 impl From<pb::BasePath> for BasePath {
     fn from(p: pb::BasePath) -> Self {
+        Self::new(p.id, p.path, p.name, p.is_dataset_root)
+    }
+}
+
+impl From<BasePath> for pb::BasePath {
+    fn from(p: BasePath) -> Self {
         Self {
             id: p.id,
             name: p.name,
@@ -1029,7 +1065,11 @@ mod tests {
         let fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    vec![0, 1, 2],
+                    None,
+                )],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1037,8 +1077,8 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
-                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
+                    DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,

@@ -26,6 +26,7 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    DatasetBasePath,
     FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
@@ -194,7 +196,8 @@ def set_logger(
 
 def __warn_on_fork():
     warnings.warn(
-        "lance is not fork-safe. If you are using multiprocessing, use spawn instead."
+        "lance is not fork-safe. If you are using multiprocessing, use spawn or \
+forkserver instead."
     )
 
 

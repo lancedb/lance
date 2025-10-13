@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.38.1"
+version = "0.38.2"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.80"
@@ -47,6 +47,7 @@ lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
+libc = "0.2.176"
 log = "0.4"
 prost = "0.13"
 prost-types = "0.13"

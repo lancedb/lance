@@ -97,6 +97,7 @@ use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
+use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, read_transaction_file,
@@ -116,6 +117,7 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
 };
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -162,6 +164,10 @@ pub struct Dataset {
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+
+    /// Object store parameters used when opening this dataset.
+    /// These are used when creating object stores for additional base paths.
+    pub(crate) store_params: Option<Box<ObjectStoreParams>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -551,6 +557,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.store_params.as_deref().cloned(),
         )
     }
 
@@ -628,12 +635,12 @@ impl Dataset {
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
                 let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let indices: Vec<IndexMetadata> = section
+                let mut indices: Vec<IndexMetadata> = section
                     .indices
                     .into_iter()
                     .map(IndexMetadata::try_from)
                     .collect::<Result<Vec<_>>>()?;
-
+                retain_supported_indices(&mut indices);
                 let ds_index_cache = session.index_cache.for_dataset(uri);
                 let metadata_key = crate::session::index_caches::IndexMetadataKey {
                     version: manifest_location.version,
@@ -661,6 +668,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let refs = Refs::new(
             object_store.clone(),
@@ -687,6 +695,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
+            store_params: store_params.map(Box::new),
         })
     }
 
@@ -829,6 +838,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 self.file_reader_options.clone(),
+                self.store_params.as_deref().cloned(),
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1364,8 +1374,7 @@ impl Dataset {
                         location!(),
                     )
                 })?;
-
-                let path = Path::parse(base_path.path.as_str())?;
+                let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
                 } else {
@@ -1374,6 +1383,25 @@ impl Dataset {
             }
             None => Ok(self.base.child(DATA_DIR)),
         }
+    }
+
+    /// Get the ObjectStore for a specific path based on base_id
+    pub(crate) async fn object_store_for_base(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+        let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+            Error::invalid_input(
+                format!("Dataset base path with ID {} not found", base_id),
+                Default::default(),
+            )
+        })?;
+
+        let (store, _) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            &base_path.path,
+            &self.store_params.as_deref().cloned().unwrap_or_default(),
+        )
+        .await?;
+
+        Ok(store)
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -1399,7 +1427,7 @@ impl Dataset {
                         location: location!(),
                     });
                 }
-                Ok(Path::parse(base_path.path.as_str())?)
+                base_path.extract_path(self.session.store_registry())
             }
             None => Ok(self.base.clone()),
         }
@@ -1419,7 +1447,7 @@ impl Dataset {
                         location!(),
                     )
                 })?;
-                let path = Path::parse(base_path.path.as_str())?;
+                let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
                     Ok(path.child(INDICES_DIR))
                 } else {
@@ -1853,7 +1881,7 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: String::from(self.base.clone()),
+            ref_path: self.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None, None);
@@ -1996,6 +2024,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.store_params.as_deref().cloned(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -2033,6 +2062,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.store_params.as_deref().cloned(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
@@ -2543,6 +2573,8 @@ mod tests {
     };
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+    use lance_io::assert_io_eq;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2797,7 +2829,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_manifest_iops() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
+        let io_tracker = Arc::new(IOTracker::default());
 
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
@@ -2812,13 +2844,12 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let _original_ds = Dataset::write(
             batches,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -2828,12 +2859,12 @@ mod tests {
         .await
         .unwrap();
 
-        io_stats.lock().unwrap().read_iops = 0;
+        let _ = io_tracker.incremental_stats(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session),
@@ -2843,13 +2874,12 @@ mod tests {
             .await
             .unwrap();
 
-        let get_iops = || io_stats.lock().unwrap().read_iops;
-
         // There should be only two IOPS:
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        assert_eq!(get_iops(), 2);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 2);
     }
 
     #[rstest]
@@ -4171,6 +4201,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
         let test_dir = TempStdDir::default();
         let test_uri = test_dir.to_str().unwrap();
@@ -4203,6 +4234,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
         let test_uri = TempStrDir::default();
         let read_version_0_transaction = Transaction::new(0, operation, None, None);
@@ -5685,17 +5717,13 @@ mod tests {
     #[tokio::test]
     async fn test_fts_unindexed_data() {
         let params = InvertedIndexParams::default();
-        let title_col =
-            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
-        let content_col = GenericStringArray::<i32>::from(vec![
-            "content world",
-            "content database",
-            "content common",
-        ]);
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
-                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
             ])
             .into(),
             vec![
@@ -5706,8 +5734,9 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let test_uri = TempStrDir::default();
-        let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
         dataset
             .create_index(&["title"], IndexType::Inverted, None, &params, true)
             .await
@@ -5723,12 +5752,12 @@ mod tests {
         assert_eq!(results.num_rows(), 3);
 
         // write new data
-        let title_col = GenericStringArray::<i32>::from(vec!["new title"]);
-        let content_col = GenericStringArray::<i32>::from(vec!["new content"]);
+        let title_col = StringArray::from(vec!["new title"]);
+        let content_col = StringArray::from(vec!["new content"]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
-                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
             ])
             .into(),
             vec![
@@ -5739,16 +5768,7 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(
-            batches,
-            &test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        dataset.append(batches, None).await.unwrap();
 
         let results = dataset
             .scan()
@@ -5762,6 +5782,163 @@ mod tests {
         let results = dataset
             .scan()
             .full_text_search(FullTextSearchQuery::new("new".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fts_unindexed_data_on_empty_index() {
+        // Empty dataset with fts index
+        let params = InvertedIndexParams::default();
+        let title_col = StringArray::from(Vec::<&str>::new());
+        let content_col = StringArray::from(Vec::<&str>::new());
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["title"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        // Test fts search
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+
+        // write new data
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        dataset.append(batches, None).await.unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fts_without_index() {
+        // create table without index
+        let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+        let content_col =
+            StringArray::from(vec!["content world", "content database", "content common"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+            .await
+            .unwrap();
+
+        // match query on title and content
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("title".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        // write new data
+        let title_col = StringArray::from(vec!["new title"]);
+        let content_col = StringArray::from(vec!["new content"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        dataset.append(batches, None).await.unwrap();
+
+        // match query on title and content
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("title".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 4);
+
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("new".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
             .unwrap()
             .try_into_batch()
             .await

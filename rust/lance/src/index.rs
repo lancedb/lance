@@ -666,7 +666,7 @@ impl DatasetIndexExt for Dataset {
                 base_id: None, // Mew merged index file locates in the cloned dataset.
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed_indices.len() {
+            if deltas.len() > res.removed_indices.len() {
                 new_indices.extend(
                     deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
@@ -889,7 +889,7 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
-fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
     indices.retain(|idx| {
         let max_supported_version = idx
             .index_details
@@ -1609,10 +1609,10 @@ mod tests {
     use crate::dataset::{ReadParams, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{
-        copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount, StatsHolder,
-    };
+    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::Int32Array;
+    use lance_io::utils::tracking_store::IOTracker;
+    use lance_io::{assert_io_eq, assert_io_lt};
 
     use super::*;
 
@@ -2358,10 +2358,10 @@ mod tests {
     #[lance_test_macros::test(tokio::test)]
     async fn test_load_indices() {
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(StatsHolder::default());
+        let io_tracker = Arc::new(IOTracker::default());
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
+                object_store_wrapper: Some(io_tracker.clone()),
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -2392,17 +2392,13 @@ mod tests {
             )
             .await
             .unwrap();
-        io_stats.incremental_stats(); // Reset
+        io_tracker.incremental_stats(); // Reset
 
         let indices = dataset.load_indices().await.unwrap();
-        let stats = io_stats.incremental_stats();
+        let stats = io_tracker.incremental_stats();
         // We should already have this cached since we just wrote it.
-        assert_eq!(
-            stats.read_iops, 0,
-            "Read IOPS should be 0. Saw requests: {:?}",
-            stats.requests
-        );
-        assert_eq!(stats.read_bytes, 0);
+        assert_io_eq!(stats, read_iops, 0);
+        assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
         session.index_cache.clear().await; // Clear the cache
@@ -2411,7 +2407,7 @@ mod tests {
             .with_session(session.clone())
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -2420,15 +2416,15 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let stats = io_stats.incremental_stats(); // Reset
-        assert!(stats.read_bytes < 64 * 1024);
+        let stats = io_tracker.incremental_stats(); // Reset
+        assert_io_lt!(stats, read_bytes, 64 * 1024);
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
-        let stats = io_stats.incremental_stats();
-        assert_eq!(stats.read_iops, 0);
-        assert_eq!(stats.read_bytes, 0);
+        let stats = io_tracker.incremental_stats();
+        assert_io_eq!(stats, read_iops, 0);
+        assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices2.len(), 1);
     }
 
