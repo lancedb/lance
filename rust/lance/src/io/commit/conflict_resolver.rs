@@ -481,7 +481,9 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Append { .. } | Operation::Clone { .. } | Operation::AddBases { .. } => Ok(()),
+                Operation::Append { .. } | Operation::Clone { .. } | Operation::AddBases { .. } => {
+                    Ok(())
+                }
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 // unless it is the same frag reuse index
                 Operation::CreateIndex {
@@ -1144,7 +1146,10 @@ impl<'a> TransactionRebase<'a> {
                     for new_base in new_bases {
                         for committed_base in committed_bases {
                             // Check for ID conflicts (if both have non-zero IDs)
-                            if new_base.id != 0 && committed_base.id != 0 && new_base.id == committed_base.id {
+                            if new_base.id != 0
+                                && committed_base.id != 0
+                                && new_base.id == committed_base.id
+                            {
                                 return Err(self.incompatible_conflict_err(
                                     other_transaction,
                                     other_version,
@@ -2592,7 +2597,9 @@ mod tests {
         );
 
         // txn1 should not conflict with txn2
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         assert!(rebase.check_txn(&txn2, 2).is_ok());
     }
 
@@ -2626,7 +2633,9 @@ mod tests {
         );
 
         // txn1 should conflict with txn2 due to duplicate name
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
             matches!(result, Err(Error::CommitConflict { .. })),
@@ -2665,7 +2674,9 @@ mod tests {
         );
 
         // txn1 should conflict with txn2 due to duplicate path
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
             matches!(result, Err(Error::CommitConflict { .. })),
@@ -2704,7 +2715,9 @@ mod tests {
         );
 
         // txn1 should conflict with txn2 due to duplicate non-zero ID
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
             matches!(result, Err(Error::CommitConflict { .. })),
@@ -2731,9 +2744,7 @@ mod tests {
 
         // Test against various data operations
         let data_operations = vec![
-            Operation::Append {
-                fragments: vec![],
-            },
+            Operation::Append { fragments: vec![] },
             Operation::Delete {
                 deleted_fragment_ids: vec![0],
                 updated_fragments: vec![],
@@ -2802,7 +2813,9 @@ mod tests {
         );
 
         // Should conflict due to path conflict
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         let result = rebase.check_txn(&txn2, 2);
         assert!(
             matches!(result, Err(Error::CommitConflict { .. })),
@@ -2841,7 +2854,9 @@ mod tests {
         );
 
         // Should not conflict despite both having None names
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         assert!(rebase.check_txn(&txn2, 2).is_ok());
     }
 
@@ -2875,7 +2890,9 @@ mod tests {
         );
 
         // Should not conflict despite both having zero IDs
-        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None).await.unwrap();
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
         assert!(rebase.check_txn(&txn2, 2).is_ok());
     }
 

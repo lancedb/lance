@@ -1375,13 +1375,7 @@ impl Dataset {
     #[pyo3(signature=(new_bases))]
     fn add_bases(&mut self, new_bases: Vec<DatasetBasePath>) -> PyResult<()> {
         use lance_table::format::BasePath;
-
-        // Convert Python DatasetBasePath objects to Rust BasePath objects
-        let rust_bases: Vec<BasePath> = new_bases
-            .into_iter()
-            .map(|py_base| BasePath::from(py_base))
-            .collect();
-
+        let rust_bases: Vec<BasePath> = new_bases.into_iter().map(BasePath::from).collect();
         let new_dataset = rt()
             .block_on(None, self.ds.add_bases(rust_bases))?
             .map_err(|err| match err {

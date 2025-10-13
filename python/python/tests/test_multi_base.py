@@ -521,11 +521,13 @@ class TestAddBases:
     def test_add_bases_basic(self):
         """Test basic add_bases functionality - add one new base and write to it."""
         # Create initial dataset with one base
-        initial_data = pd.DataFrame({
-            "id": range(50),
-            "value": [f"initial_{i}" for i in range(50)],
-            "source": ["initial"] * 50,
-        })
+        initial_data = pd.DataFrame(
+            {
+                "id": range(50),
+                "value": [f"initial_{i}" for i in range(50)],
+                "source": ["initial"] * 50,
+            }
+        )
 
         dataset = lance.write_dataset(
             initial_data,
@@ -546,11 +548,13 @@ class TestAddBases:
         assert result is dataset
 
         # Write to the new base
-        new_data = pd.DataFrame({
-            "id": range(50, 75),
-            "value": [f"new_{i}" for i in range(50, 75)],
-            "source": ["new_base1"] * 25,
-        })
+        new_data = pd.DataFrame(
+            {
+                "id": range(50, 75),
+                "value": [f"new_{i}" for i in range(50, 75)],
+                "source": ["new_base1"] * 25,
+            }
+        )
 
         dataset = lance.write_dataset(
             new_data,
@@ -569,11 +573,13 @@ class TestAddBases:
     def test_add_bases_multiple(self):
         """Test adding multiple bases at once."""
         # Create initial dataset
-        initial_data = pd.DataFrame({
-            "id": range(30),
-            "value": [f"val_{i}" for i in range(30)],
-            "source": ["initial"] * 30,
-        })
+        initial_data = pd.DataFrame(
+            {
+                "id": range(30),
+                "value": [f"val_{i}" for i in range(30)],
+                "source": ["initial"] * 30,
+            }
+        )
 
         dataset = lance.write_dataset(
             initial_data,
@@ -585,26 +591,32 @@ class TestAddBases:
 
         # Add two bases at once
         dataset = lance.dataset(self.primary_uri)
-        dataset.add_bases([
-            DatasetBasePath(self.new_base1, name="new_base1"),
-            DatasetBasePath(self.new_base2, name="new_base2"),
-        ])
+        dataset.add_bases(
+            [
+                DatasetBasePath(self.new_base1, name="new_base1"),
+                DatasetBasePath(self.new_base2, name="new_base2"),
+            ]
+        )
 
         # Write to both new bases
-        data1 = pd.DataFrame({
-            "id": range(30, 45),
-            "value": [f"val_{i}" for i in range(30, 45)],
-            "source": ["new_base1"] * 15,
-        })
+        data1 = pd.DataFrame(
+            {
+                "id": range(30, 45),
+                "value": [f"val_{i}" for i in range(30, 45)],
+                "source": ["new_base1"] * 15,
+            }
+        )
         dataset = lance.write_dataset(
             data1, dataset, mode="append", target_bases=["new_base1"]
         )
 
-        data2 = pd.DataFrame({
-            "id": range(45, 60),
-            "value": [f"val_{i}" for i in range(45, 60)],
-            "source": ["new_base2"] * 15,
-        })
+        data2 = pd.DataFrame(
+            {
+                "id": range(45, 60),
+                "value": [f"val_{i}" for i in range(45, 60)],
+                "source": ["new_base2"] * 15,
+            }
+        )
         dataset = lance.write_dataset(
             data2, dataset, mode="append", target_bases=["new_base2"]
         )
@@ -667,9 +679,11 @@ class TestAddBases:
         # Try to add another base with the same name
         dataset = lance.dataset(self.primary_uri)
         with pytest.raises(Exception) as excinfo:
-            dataset.add_bases([
-                DatasetBasePath(self.new_base1, name="initial_base")  # Duplicate!
-            ])
+            dataset.add_bases(
+                [
+                    DatasetBasePath(self.new_base1, name="initial_base")  # Duplicate!
+                ]
+            )
 
         # Should mention conflict or similar
         error_msg = str(excinfo.value).lower()
@@ -716,6 +730,8 @@ class TestAddBases:
         assert len(result[result["round"] == "initial"]) == 10
         assert len(result[result["round"] == "round1"]) == 10
         assert len(result[result["round"] == "round2"]) == 10
+
+    def test_add_bases_empty_list(self):
         """Test that adding an empty list of bases doesn't cause issues."""
         # Create dataset
         data = pd.DataFrame({"id": range(10), "value": range(10)})
@@ -783,10 +799,12 @@ class TestAddBases:
 
         # Add new bases
         dataset = lance.dataset(self.primary_uri)
-        dataset.add_bases([
-            DatasetBasePath(self.new_base1, name="new_base1"),
-            DatasetBasePath(self.new_base2, name="new_base2"),
-        ])
+        dataset.add_bases(
+            [
+                DatasetBasePath(self.new_base1, name="new_base1"),
+                DatasetBasePath(self.new_base2, name="new_base2"),
+            ]
+        )
 
         # Get base paths
         base_paths = dataset._ds.base_paths()
@@ -803,11 +821,13 @@ class TestAddBases:
     def test_add_bases_large_data_distribution(self):
         """Test adding bases and distributing large amounts of data."""
         # Create initial dataset with some data
-        data = pd.DataFrame({
-            "id": range(100),
-            "value": [f"val_{i}" for i in range(100)],
-            "source": ["initial"] * 100,
-        })
+        data = pd.DataFrame(
+            {
+                "id": range(100),
+                "value": [f"val_{i}" for i in range(100)],
+                "source": ["initial"] * 100,
+            }
+        )
 
         dataset = lance.write_dataset(
             data,
@@ -820,38 +840,58 @@ class TestAddBases:
 
         # Add multiple bases
         dataset = lance.dataset(self.primary_uri)
-        dataset.add_bases([
-            DatasetBasePath(self.new_base1, name="new_base1"),
-            DatasetBasePath(self.new_base2, name="new_base2"),
-            DatasetBasePath(self.new_base3, name="new_base3"),
-        ])
+        dataset.add_bases(
+            [
+                DatasetBasePath(self.new_base1, name="new_base1"),
+                DatasetBasePath(self.new_base2, name="new_base2"),
+                DatasetBasePath(self.new_base3, name="new_base3"),
+            ]
+        )
 
         # Write large amounts of data to each new base
-        data1 = pd.DataFrame({
-            "id": range(100, 300),
-            "value": [f"val_{i}" for i in range(100, 300)],
-            "source": ["new_base1"] * 200,
-        })
+        data1 = pd.DataFrame(
+            {
+                "id": range(100, 300),
+                "value": [f"val_{i}" for i in range(100, 300)],
+                "source": ["new_base1"] * 200,
+            }
+        )
         dataset = lance.write_dataset(
-            data1, dataset, mode="append", target_bases=["new_base1"], max_rows_per_file=50
+            data1,
+            dataset,
+            mode="append",
+            target_bases=["new_base1"],
+            max_rows_per_file=50,
         )
 
-        data2 = pd.DataFrame({
-            "id": range(300, 500),
-            "value": [f"val_{i}" for i in range(300, 500)],
-            "source": ["new_base2"] * 200,
-        })
+        data2 = pd.DataFrame(
+            {
+                "id": range(300, 500),
+                "value": [f"val_{i}" for i in range(300, 500)],
+                "source": ["new_base2"] * 200,
+            }
+        )
         dataset = lance.write_dataset(
-            data2, dataset, mode="append", target_bases=["new_base2"], max_rows_per_file=50
+            data2,
+            dataset,
+            mode="append",
+            target_bases=["new_base2"],
+            max_rows_per_file=50,
         )
 
-        data3 = pd.DataFrame({
-            "id": range(500, 700),
-            "value": [f"val_{i}" for i in range(500, 700)],
-            "source": ["new_base3"] * 200,
-        })
+        data3 = pd.DataFrame(
+            {
+                "id": range(500, 700),
+                "value": [f"val_{i}" for i in range(500, 700)],
+                "source": ["new_base3"] * 200,
+            }
+        )
         dataset = lance.write_dataset(
-            data3, dataset, mode="append", target_bases=["new_base3"], max_rows_per_file=50
+            data3,
+            dataset,
+            mode="append",
+            target_bases=["new_base3"],
+            max_rows_per_file=50,
         )
 
         # Verify all data
@@ -866,15 +906,19 @@ class TestAddBases:
 
         # Verify all IDs are present
         assert set(result["id"]) == set(range(700))
+
+    def test_add_bases_with_complex_schema(self):
         """Test add_bases with more complex data schemas."""
         # Create dataset with complex schema
-        initial_data = pd.DataFrame({
-            "id": range(20),
-            "name": [f"user_{i}" for i in range(20)],
-            "age": [20 + i for i in range(20)],
-            "score": [i * 1.5 for i in range(20)],
-            "active": [i % 2 == 0 for i in range(20)],
-        })
+        initial_data = pd.DataFrame(
+            {
+                "id": range(20),
+                "name": [f"user_{i}" for i in range(20)],
+                "age": [20 + i for i in range(20)],
+                "score": [i * 1.5 for i in range(20)],
+                "active": [i % 2 == 0 for i in range(20)],
+            }
+        )
 
         dataset = lance.write_dataset(
             initial_data,
@@ -889,13 +933,15 @@ class TestAddBases:
         dataset.add_bases([DatasetBasePath(self.new_base1, name="new_base1")])
 
         # Write more complex data to new base
-        new_data = pd.DataFrame({
-            "id": range(20, 40),
-            "name": [f"user_{i}" for i in range(20, 40)],
-            "age": [20 + i for i in range(20, 40)],
-            "score": [i * 1.5 for i in range(20, 40)],
-            "active": [i % 2 == 0 for i in range(20, 40)],
-        })
+        new_data = pd.DataFrame(
+            {
+                "id": range(20, 40),
+                "name": [f"user_{i}" for i in range(20, 40)],
+                "age": [20 + i for i in range(20, 40)],
+                "score": [i * 1.5 for i in range(20, 40)],
+                "active": [i % 2 == 0 for i in range(20, 40)],
+            }
+        )
 
         dataset = lance.write_dataset(
             new_data, dataset, mode="append", target_bases=["new_base1"]
@@ -911,6 +957,8 @@ class TestAddBases:
         # Test filtering on different columns
         filtered = dataset.scanner(filter="age > 30").to_table().to_pandas()
         assert all(filtered["age"] > 30)
+
+    def test_add_bases_method_chaining(self):
         """Test that add_bases supports method chaining."""
         # Create dataset
         data = pd.DataFrame({"id": range(10), "value": range(10)})
@@ -924,13 +972,11 @@ class TestAddBases:
 
         # Test method chaining
         dataset = lance.dataset(self.primary_uri)
-        
+
         # Chain add_bases calls
-        result = dataset.add_bases([
-            DatasetBasePath(self.new_base1, name="new_base1")
-        ]).add_bases([
-            DatasetBasePath(self.new_base2, name="new_base2")
-        ])
+        result = dataset.add_bases(
+            [DatasetBasePath(self.new_base1, name="new_base1")]
+        ).add_bases([DatasetBasePath(self.new_base2, name="new_base2")])
 
         # Should return the same dataset object
         assert result is dataset

@@ -2100,9 +2100,11 @@ impl Transaction {
             // Validate and add new base paths to the manifest
             for new_base in new_bases {
                 // Check for conflicts with existing base paths
-                if let Some(existing_base) = manifest.base_paths.values().find(|bp| {
-                    bp.name == new_base.name || bp.path == new_base.path
-                }) {
+                if let Some(existing_base) = manifest
+                    .base_paths
+                    .values()
+                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
+                {
                     return Err(Error::invalid_input(
                         format!(
                             "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
@@ -2111,14 +2113,19 @@ impl Transaction {
                         location!(),
                     ));
                 }
-                
+
                 // Assign a new ID if not already assigned
                 let mut base_to_add = new_base.clone();
                 if base_to_add.id == 0 {
-                    let next_id = manifest.base_paths.keys().max().map(|&id| id + 1).unwrap_or(1);
+                    let next_id = manifest
+                        .base_paths
+                        .keys()
+                        .max()
+                        .map(|&id| id + 1)
+                        .unwrap_or(1);
                     base_to_add.id = next_id;
                 }
-                
+
                 manifest.base_paths.insert(base_to_add.id, base_to_add);
             }
         }
@@ -2844,14 +2851,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(|m| MemWal::try_from(m).unwrap())
                     .collect(),
             },
-            Some(pb::transaction::Operation::AddBases(pb::transaction::AddBases {
-                new_bases,
-            })) => Operation::AddBases {
-                new_bases: new_bases
-                    .into_iter()
-                    .map(BasePath::from)
-                    .collect(),
-            },
+            Some(pb::transaction::Operation::AddBases(pb::transaction::AddBases { new_bases })) => {
+                Operation::AddBases {
+                    new_bases: new_bases.into_iter().map(BasePath::from).collect(),
+                }
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),

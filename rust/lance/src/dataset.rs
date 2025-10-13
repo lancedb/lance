@@ -473,8 +473,8 @@ impl Dataset {
         self.branches()
             .create(branch, version_number, source_branch.as_deref())
             .await?;
-    Ok(dataset)
-}
+        Ok(dataset)
+    }
 
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
@@ -1343,27 +1343,27 @@ impl Dataset {
 
     /// Add new base paths to the dataset.
     ///
-    /// This method allows you to register additional storage locations (buckets) 
-    /// that can be used for future data writes. The base paths are added to the 
+    /// This method allows you to register additional storage locations (buckets)
+    /// that can be used for future data writes. The base paths are added to the
     /// dataset's manifest and can be referenced by name in subsequent write operations.
     ///
     /// # Arguments
     ///
-    /// * `new_bases` - A vector of `lance_table::format::BasePath` objects representing the new storage 
+    /// * `new_bases` - A vector of `lance_table::format::BasePath` objects representing the new storage
     ///   locations to add. Each base path should have a unique name and path.
     ///
     /// # Returns
     ///
-    /// Returns a new `Dataset` instance with the updated manifest containing the 
+    /// Returns a new `Dataset` instance with the updated manifest containing the
     /// new base paths.
-
-    pub async fn add_bases(self: &Arc<Self>, new_bases: Vec<lance_table::format::BasePath>) -> Result<Dataset> {
+    pub async fn add_bases(
+        self: &Arc<Self>,
+        new_bases: Vec<lance_table::format::BasePath>,
+    ) -> Result<Self> {
         use crate::dataset::transaction::{Operation, Transaction};
         use crate::dataset::write::CommitBuilder;
 
-        let operation = Operation::AddBases {
-            new_bases,
-        };
+        let operation = Operation::AddBases { new_bases };
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -9056,14 +9056,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases() {
-        use std::sync::Arc;
         use lance_table::format::BasePath;
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-        
+        use std::sync::Arc;
+
         // Create a test dataset
         let test_uri = "memory://add_bases_test";
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
         let dataset = Dataset::write(
             data_gen.batch(5),
@@ -9080,19 +9080,35 @@ mod tests {
 
         // Test adding new base paths
         let new_bases = vec![
-            BasePath::new(0, "memory://bucket1".to_string(), Some("bucket1".to_string()), false),
-            BasePath::new(0, "memory://bucket2".to_string(), Some("bucket2".to_string()), true),
+            BasePath::new(
+                0,
+                "memory://bucket1".to_string(),
+                Some("bucket1".to_string()),
+                false,
+            ),
+            BasePath::new(
+                0,
+                "memory://bucket2".to_string(),
+                Some("bucket2".to_string()),
+                true,
+            ),
         ];
 
         let updated_dataset = dataset.add_bases(new_bases).await.unwrap();
 
         // Verify the base paths were added
         assert_eq!(updated_dataset.manifest.base_paths.len(), 2);
-        
-        let bucket1 = updated_dataset.manifest.base_paths.values()
+
+        let bucket1 = updated_dataset
+            .manifest
+            .base_paths
+            .values()
             .find(|bp| bp.name == Some("bucket1".to_string()))
             .expect("bucket1 not found");
-        let bucket2 = updated_dataset.manifest.base_paths.values()
+        let bucket2 = updated_dataset
+            .manifest
+            .base_paths
+            .values()
             .find(|bp| bp.name == Some("bucket2".to_string()))
             .expect("bucket2 not found");
 
@@ -9102,34 +9118,46 @@ mod tests {
         assert!(bucket2.is_dataset_root);
 
         // Test conflict detection - try to add a base with the same name
-        let conflicting_bases = vec![
-            BasePath::new(0, "memory://bucket3".to_string(), Some("bucket1".to_string()), false),
-        ];
+        let conflicting_bases = vec![BasePath::new(
+            0,
+            "memory://bucket3".to_string(),
+            Some("bucket1".to_string()),
+            false,
+        )];
 
         let result = Arc::new(updated_dataset).add_bases(conflicting_bases).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Conflict detected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected"));
 
         // Test conflict detection - try to add a base with the same path
-        let conflicting_bases = vec![
-            BasePath::new(0, "memory://bucket1".to_string(), Some("bucket3".to_string()), false),
-        ];
+        let conflicting_bases = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("bucket3".to_string()),
+            false,
+        )];
 
         let result = dataset.add_bases(conflicting_bases).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Conflict detected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected"));
     }
 
     #[tokio::test]
     async fn test_add_bases_validation() {
-        use std::sync::Arc;
         use lance_table::format::BasePath;
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-        
+        use std::sync::Arc;
+
         // Create a test dataset
         let test_uri = "memory://add_bases_validation_test";
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
         let dataset = Dataset::write(
             data_gen.batch(5),
@@ -9145,21 +9173,33 @@ mod tests {
         let dataset = Arc::new(dataset);
 
         // Test validation - empty name should fail
-        let invalid_bases = vec![
-            BasePath::new(0, "memory://bucket1".to_string(), Some("".to_string()), false),
-        ];
+        let invalid_bases = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("".to_string()),
+            false,
+        )];
 
         let result = dataset.add_bases(invalid_bases).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("name is required and cannot be empty"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("name is required and cannot be empty"));
 
         // Test validation - None name should fail
-        let invalid_bases = vec![
-            BasePath::new(0, "memory://bucket1".to_string(), None, false),
-        ];
+        let invalid_bases = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            None,
+            false,
+        )];
 
         let result = dataset.add_bases(invalid_bases).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("name is required and cannot be empty"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("name is required and cannot be empty"));
     }
 }
