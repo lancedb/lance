@@ -971,7 +971,7 @@ mod tests {
 
         // The compressor should be RLE wrapped in general compression
         assert!(debug_str.contains("GeneralMiniBlockCompressor"));
-        assert!(debug_str.contains("RleMiniBlockEncoder"));
+        assert!(debug_str.contains("RleEncoder"));
     }
 
     #[test]
@@ -996,7 +996,7 @@ mod tests {
 
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         // Should use RLE due to very low threshold
-        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
+        assert!(format!("{:?}", compressor).contains("RleEncoder"));
     }
 
     #[test]
@@ -1171,7 +1171,7 @@ mod tests {
 
         // Should use RLE because run_count (100) < num_values * threshold (800)
         let debug_str = format!("{:?}", compressor);
-        assert!(debug_str.contains("RleMiniBlockEncoder"));
+        assert!(debug_str.contains("RleEncoder"));
     }
 
     #[test]
