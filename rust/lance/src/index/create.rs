@@ -38,7 +38,6 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     fragment_uuid: Option<String>,
-    old_indices: Vec<IndexMetadata>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -58,7 +57,6 @@ impl<'a> CreateIndexBuilder<'a> {
             train: true,
             fragments: None,
             fragment_uuid: None,
-            old_indices: vec![],
         }
     }
 
@@ -117,12 +115,7 @@ impl<'a> CreateIndexBuilder<'a> {
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
         let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
-        self.old_indices = indices
-            .iter()
-            .filter(|i| i.name == index_name)
-            .cloned()
-            .collect();
-        if let Some(idx) = self.old_indices.first() {
+        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
                     message: format!(
@@ -360,7 +353,7 @@ impl<'a> CreateIndexBuilder<'a> {
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
-                removed_indices: self.old_indices,
+                removed_indices: vec![],
             },
             /*blobs_op= */ None,
             None,
