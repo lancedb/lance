@@ -278,11 +278,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             location: location!(),
                         },
                     )?;
-                    Result::Ok(Some((
-                        part.storage.remap(&mapping)?,
-                        part.index.remap(&mapping)?,
-                        0.0,
-                    )))
+
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    Result::Ok(Some((storage, index, 0.0)))
                 }
             })
             .buffered(get_num_compute_intensive_cpus())
