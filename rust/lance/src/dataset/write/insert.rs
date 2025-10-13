@@ -25,7 +25,7 @@ use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::write_fragments_internal;
+use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
@@ -195,6 +195,10 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
+        let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
+        let target_base_info =
+            validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
+
         let written_frags = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
@@ -202,6 +206,7 @@ impl<'a> InsertBuilder<'a> {
             schema.clone(),
             stream,
             context.params.clone(),
+            target_base_info,
         )
         .await?;
 
@@ -246,19 +251,24 @@ impl<'a> InsertBuilder<'a> {
                     }
                     None => None,
                 };
+
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
                     fragments: written_frags.default.0,
                     config_upsert_values,
+                    initial_bases: context.params.initial_bases.clone(),
                 }
             }
-            WriteMode::Overwrite => Operation::Overwrite {
-                // Use the full schema, not the written schema
-                schema,
-                fragments: written_frags.default.0,
-                config_upsert_values: None,
-            },
+            WriteMode::Overwrite => {
+                Operation::Overwrite {
+                    // Use the full schema, not the written schema
+                    schema,
+                    fragments: written_frags.default.0,
+                    config_upsert_values: None,
+                    initial_bases: context.params.initial_bases.clone(),
+                }
+            }
             WriteMode::Append => Operation::Append {
                 fragments: written_frags.default.0,
             },
@@ -269,6 +279,7 @@ impl<'a> InsertBuilder<'a> {
                 schema: blob.1,
                 fragments: blob.0,
                 config_upsert_values: None,
+                initial_bases: context.params.initial_bases.clone(),
             },
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });

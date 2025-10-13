@@ -117,6 +117,7 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
 };
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -163,6 +164,10 @@ pub struct Dataset {
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+
+    /// Object store parameters used when opening this dataset.
+    /// These are used when creating object stores for additional base paths.
+    pub(crate) store_params: Option<Box<ObjectStoreParams>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -552,6 +557,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.store_params.as_deref().cloned(),
         )
     }
 
@@ -662,6 +668,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let refs = Refs::new(
             object_store.clone(),
@@ -688,6 +695,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
+            store_params: store_params.map(Box::new),
         })
     }
 
@@ -830,6 +838,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 self.file_reader_options.clone(),
+                self.store_params.as_deref().cloned(),
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1365,8 +1374,7 @@ impl Dataset {
                         location!(),
                     )
                 })?;
-
-                let path = Path::parse(base_path.path.as_str())?;
+                let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
                 } else {
@@ -1375,6 +1383,25 @@ impl Dataset {
             }
             None => Ok(self.base.child(DATA_DIR)),
         }
+    }
+
+    /// Get the ObjectStore for a specific path based on base_id
+    pub(crate) async fn object_store_for_base(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+        let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+            Error::invalid_input(
+                format!("Dataset base path with ID {} not found", base_id),
+                Default::default(),
+            )
+        })?;
+
+        let (store, _) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            &base_path.path,
+            &self.store_params.as_deref().cloned().unwrap_or_default(),
+        )
+        .await?;
+
+        Ok(store)
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -1400,7 +1427,7 @@ impl Dataset {
                         location: location!(),
                     });
                 }
-                Ok(Path::parse(base_path.path.as_str())?)
+                base_path.extract_path(self.session.store_registry())
             }
             None => Ok(self.base.clone()),
         }
@@ -1420,7 +1447,7 @@ impl Dataset {
                         location!(),
                     )
                 })?;
-                let path = Path::parse(base_path.path.as_str())?;
+                let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
                     Ok(path.child(INDICES_DIR))
                 } else {
@@ -1854,7 +1881,7 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: String::from(self.base.clone()),
+            ref_path: self.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None, None);
@@ -1997,6 +2024,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.store_params.as_deref().cloned(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -2034,6 +2062,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.store_params.as_deref().cloned(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
@@ -2544,6 +2573,8 @@ mod tests {
     };
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+    use lance_io::assert_io_eq;
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2798,7 +2829,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_manifest_iops() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
+        let io_tracker = Arc::new(IOTracker::default());
 
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
@@ -2813,13 +2844,12 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let _original_ds = Dataset::write(
             batches,
             "memory://test",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -2829,12 +2859,12 @@ mod tests {
         .await
         .unwrap();
 
-        io_stats.lock().unwrap().read_iops = 0;
+        let _ = io_tracker.incremental_stats(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats_wrapper),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session),
@@ -2844,13 +2874,12 @@ mod tests {
             .await
             .unwrap();
 
-        let get_iops = || io_stats.lock().unwrap().read_iops;
-
         // There should be only two IOPS:
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        assert_eq!(get_iops(), 2);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 2);
     }
 
     #[rstest]
@@ -4172,6 +4201,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
         let test_dir = TempStdDir::default();
         let test_uri = test_dir.to_str().unwrap();
@@ -4204,6 +4234,7 @@ mod tests {
             fragments: vec![],
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
         let test_uri = TempStrDir::default();
         let read_version_0_transaction = Transaction::new(0, operation, None, None);

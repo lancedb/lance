@@ -58,7 +58,9 @@ use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
-    format::{pb, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta},
+    format::{
+        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+    },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
@@ -171,10 +173,12 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
         config_upsert_values: Option<HashMap<String, String>>,
+        initial_bases: Option<Vec<BasePath>>,
     },
     /// A new index has been created.
     CreateIndex {
-        /// The new secondary indices that are being added
+        /// The new secondary indices,
+        /// any existing indices with the same name will be replaced.
         new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
         removed_indices: Vec<IndexMetadata>,
@@ -378,16 +382,19 @@ impl PartialEq for Operation {
                     fragments: a_fragments,
                     schema: a_schema,
                     config_upsert_values: a_config,
+                    initial_bases: a_initial,
                 },
                 Self::Overwrite {
                     fragments: b_fragments,
                     schema: b_schema,
                     config_upsert_values: b_config,
+                    initial_bases: b_initial,
                 },
             ) => {
                 compare_vec(a_fragments, b_fragments)
                     && a_schema == b_schema
                     && a_config == b_config
+                    && a_initial == b_initial
             }
             (
                 Self::CreateIndex {
@@ -1479,10 +1486,41 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let reference_paths = match current_manifest {
+        let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
         };
+
+        if let Operation::Overwrite {
+            initial_bases: Some(initial_bases),
+            ..
+        } = &self.operation
+        {
+            if current_manifest.is_none() {
+                // CREATE mode: registering base paths
+                // Base IDs should have been assigned during write operation
+                // Validate uniqueness and insert them into the manifest
+                for base_path in initial_bases.iter() {
+                    if reference_paths.contains_key(&base_path.id) {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "Duplicate base path ID {} detected. Base path IDs must be unique.",
+                                base_path.id
+                            ),
+                            location!(),
+                        ));
+                    }
+                    reference_paths.insert(base_path.id, base_path.clone());
+                }
+            } else {
+                // OVERWRITE mode with initial_bases should have been rejected by validation
+                // This branch should never be reached
+                return Err(Error::invalid_input(
+                    "OVERWRITE mode cannot register new bases. This should have been caught by validation.",
+                    location!(),
+                ));
+            }
+        }
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1874,6 +1912,8 @@ impl Transaction {
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
+            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
+            // So we always use new_from_previous which preserves base_paths
             let mut prev_manifest = Manifest::new_from_previous(
                 current_manifest,
                 schema,
@@ -2448,6 +2488,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
                 config_upsert_values,
+                initial_bases,
             })) => {
                 let config_upsert_option = if config_upsert_values.is_empty() {
                     Some(config_upsert_values)
@@ -2462,6 +2503,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                     schema: Schema::from(&Fields(schema)),
                     config_upsert_values: config_upsert_option,
+                    initial_bases: if initial_bases.is_empty() {
+                        None
+                    } else {
+                        Some(initial_bases.into_iter().map(BasePath::from).collect())
+                    },
                 }
             }
             Some(pb::transaction::Operation::ReserveFragments(
@@ -2692,6 +2738,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     schema,
                     schema_metadata: _schema_metadata, // TODO: handle metadata
                     config_upsert_values,
+                    initial_bases,
                 }) => {
                     let config_upsert_option = if config_upsert_values.is_empty() {
                         Some(config_upsert_values)
@@ -2706,6 +2753,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                             .collect::<Result<Vec<_>>>()?,
                         schema: Schema::from(&Fields(schema)),
                         config_upsert_values: config_upsert_option,
+                        initial_bases: if initial_bases.is_empty() {
+                            None
+                        } else {
+                            Some(initial_bases.into_iter().map(BasePath::from).collect())
+                        },
                     })
                 }
             })
@@ -2825,6 +2877,7 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_bases,
             } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -2833,6 +2886,16 @@ impl From<&Transaction> for pb::Transaction {
                     config_upsert_values: config_upsert_values
                         .clone()
                         .unwrap_or(Default::default()),
+                    initial_bases: initial_bases
+                        .as_ref()
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .cloned()
+                                .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                                .collect::<Vec<pb::BasePath>>()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             Operation::ReserveFragments { num_fragments } => {
@@ -2973,6 +3036,7 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_bases,
             } => {
                 pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -2981,6 +3045,16 @@ impl From<&Transaction> for pb::Transaction {
                     config_upsert_values: config_upsert_values
                         .clone()
                         .unwrap_or(Default::default()),
+                    initial_bases: initial_bases
+                        .as_ref()
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .cloned()
+                                .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                                .collect::<Vec<pb::BasePath>>()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             _ => panic!("Invalid blob operation: {:?}", value),
@@ -3073,6 +3147,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments,
             schema,
             config_upsert_values: None,
+            initial_bases: _,
         } => schema_fragments_valid(Some(manifest), schema, fragments),
         Operation::Update {
             updated_fragments,
