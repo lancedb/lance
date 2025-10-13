@@ -620,10 +620,7 @@ mod tests {
         assert_eq!(indices.len(), 1, "Should have 1 index");
         assert_eq!(indices[0].name, "vector_idx");
         assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
-        assert_eq!(
-            indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
-            true
-        );
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
 
         // create again with replace=false
         let res = dataset
@@ -652,10 +649,7 @@ mod tests {
         assert_eq!(indices.len(), 1, "Should have 1 index");
         assert_eq!(indices[0].name, "vector_idx");
         assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
-        assert_eq!(
-            indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
-            true
-        );
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
 
         let scalar_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
