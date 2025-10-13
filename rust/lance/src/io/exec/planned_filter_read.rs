@@ -40,7 +40,6 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
-use crate::dataset::scanner::{get_default_batch_size, BATCH_SIZE_FALLBACK};
 use crate::Dataset;
 
 use super::filtered_read::{EvaluatedIndex, FilteredReadOptions};
@@ -213,36 +212,24 @@ impl ScanPlanner {
             }
         }
 
-        let _default_batch_size = options.batch_size.unwrap_or_else(|| {
-            get_default_batch_size().unwrap_or_else(|| {
-                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
-            }) as u32
-        });
-
-        let _projection = Arc::new(options.projection.clone());
-
         let mut planned_fragments = Vec::with_capacity(loaded_fragments.len());
         for (priority, fragment) in loaded_fragments.into_iter().enumerate() {
             let fragment_id = fragment.fragment.id() as u32;
             if let Some(to_read) = fragments_to_read.get(&fragment_id) {
                 if !to_read.is_empty() {
-                    let filter = Self::determine_fragment_filter(
+                    let use_refine = Self::determine_fragment_filter(
                         fragment_id,
                         &evaluated_index,
-                        options,
                         scan_planned_with_limit_pushed_down,
                     );
 
                     log::trace!(
-                        "Planning {} ranges ({} rows) from fragment {} with filter: {:?}",
+                        "Planning {} ranges ({} rows) from fragment {} with use_refine: {}",
                         to_read.len(),
                         to_read.iter().map(|r| r.end - r.start).sum::<u64>(),
                         fragment.fragment.id(),
-                        filter
+                        use_refine
                     );
-
-                    // Determine if this fragment should use refine filter
-                    let use_refine = filter.is_some() && filter == options.refine_filter;
 
                     planned_fragments.push(PlannedFragmentRead {
                         fragment: fragment.fragment.clone(),
@@ -257,29 +244,31 @@ impl ScanPlanner {
         Ok((planned_fragments, scan_planned_with_limit_pushed_down))
     }
 
-    /// Determine the appropriate filter for a fragment based on index results
+    /// Determine whether to use refine filter for a fragment based on index results
+    ///
+    /// Returns: true if refine filter should be used, false for full filter
     pub fn determine_fragment_filter(
         fragment_id: u32,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
-        options: &FilteredReadOptions,
         limit_pushed: bool,
-    ) -> Option<Expr> {
+    ) -> bool {
         if let Some(index) = evaluated_index {
             if index.applicable_fragments.contains(fragment_id) {
                 match &index.index_result {
-                    IndexExprResult::Exact(_) => options.refine_filter.clone(),
-                    IndexExprResult::AtLeast(_) if limit_pushed => options.refine_filter.clone(),
-                    _ => options.full_filter.clone(),
+                    IndexExprResult::Exact(_) => true,
+                    IndexExprResult::AtLeast(_) if limit_pushed => true,
+                    _ => false,
                 }
             } else {
-                options.full_filter.clone()
+                false
             }
         } else {
-            options.full_filter.clone()
+            false
         }
     }
 
     /// Get the full fragment range, excluding deleted rows if deletion vector exists
+    #[allow(clippy::single_range_in_vec_init)]
     fn full_frag_range(
         num_physical_rows: u64,
         deletion_vector: &Option<Arc<DeletionVector>>,
@@ -292,6 +281,8 @@ impl ScanPlanner {
             )
             .collect()
         } else {
+            // Clippy suggests using collect for a vec with a single range,
+            // but this is actually a vector containing one range element, not a vector of values
             vec![0..num_physical_rows]
         }
     }
@@ -1287,5 +1278,172 @@ impl FilteredReadStream {
             };
             future::ready(Ok(Some(result)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trim_ranges() {
+        // Test case 1: Trim ranges that fully overlap
+        let ranges = vec![0..10, 10..20, 20..30];
+        let fragment_range = 0..30;
+        let logical_range = 5..25;
+        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        assert_eq!(result, vec![5..10, 10..20, 20..25]);
+
+        // Test case 2: Trim with partial overlap at start
+        let ranges = vec![0..10, 10..20];
+        let fragment_range = 0..20;
+        let logical_range = 5..30;
+        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        assert_eq!(result, vec![5..10, 10..20]);
+
+        // Test case 3: Trim with no overlap
+        let ranges = vec![0..10, 10..20];
+        let fragment_range = 0..20;
+        let logical_range = 30..40;
+        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        assert_eq!(result, Vec::<Range<u64>>::new());
+
+        // Test case 4: Trim with single range
+        let ranges = vec![10..50];
+        let fragment_range = 10..50;
+        let logical_range = 20..30;
+        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        assert_eq!(result, vec![20..30]);
+
+        // Test case 5: Trim ranges with gaps (deletion vector case)
+        // The logical range 5..28 only includes 23 logical rows (5..28)
+        // From ranges: 0..10 (10 rows), 15..20 (5 rows), 25..30 (5 rows) = 20 logical rows total
+        // Skip first 5 rows from 0..10, take all 15 remaining: 5..10 (5 rows), 15..20 (5 rows), 25..30 (5 rows)
+        let ranges = vec![0..10, 15..20, 25..30];
+        let fragment_range = 0..30;
+        let logical_range = 5..28;
+        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        // We skip 5 from the first range (leaving 5..10), take all of 15..20, and all of 25..30
+        // because we only have 20 logical rows total and need 23
+        assert_eq!(result, vec![5..10, 15..20, 25..30]);
+    }
+
+    #[test]
+    fn test_intersect_ranges() {
+        // Test case 1: Perfect overlap
+        let ranges1 = vec![0..10, 20..30];
+        let ranges2 = vec![0..10, 20..30];
+        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        assert_eq!(result, vec![0..10, 20..30]);
+
+        // Test case 2: Partial overlap
+        let ranges1 = vec![0..15, 20..30];
+        let ranges2 = vec![10..25];
+        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        assert_eq!(result, vec![10..15, 20..25]);
+
+        // Test case 3: No overlap
+        let ranges1 = vec![0..10];
+        let ranges2 = vec![20..30];
+        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        assert_eq!(result, Vec::<Range<u64>>::new());
+
+        // Test case 4: Multiple intersections
+        let ranges1 = vec![0..10, 15..25, 30..40];
+        let ranges2 = vec![5..20, 28..35];
+        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        assert_eq!(result, vec![5..10, 15..20, 30..35]);
+
+        // Test case 5: One range fully contains another
+        let ranges1 = vec![0..100];
+        let ranges2 = vec![10..20, 30..40, 50..60];
+        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        assert_eq!(result, vec![10..20, 30..40, 50..60]);
+    }
+
+    #[test]
+    fn test_apply_skip_take_to_ranges() {
+        // Test case 1: Skip first range completely
+        let mut ranges = vec![0..10, 10..20, 20..30];
+        let mut to_skip = 10;
+        let mut to_take = 15;
+        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        assert_eq!(ranges, vec![10..20, 20..25]);
+        assert_eq!(to_skip, 0);
+        assert_eq!(to_take, 0);
+
+        // Test case 2: Skip partial range
+        let mut ranges = vec![0..10, 10..20, 20..30];
+        let mut to_skip = 5;
+        let mut to_take = 10;
+        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        assert_eq!(ranges, vec![5..10, 10..15]);
+        assert_eq!(to_skip, 0);
+        assert_eq!(to_take, 0);
+
+        // Test case 3: Take more than available
+        let mut ranges = vec![0..10, 10..20];
+        let mut to_skip = 0;
+        let mut to_take = 100;
+        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        assert_eq!(ranges, vec![0..10, 10..20]);
+        assert_eq!(to_skip, 0);
+        assert_eq!(to_take, 80);
+
+        // Test case 4: Skip everything
+        let mut ranges = vec![0..10, 10..20];
+        let mut to_skip = 25;
+        let mut to_take = 10;
+        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        assert_eq!(ranges, Vec::<Range<u64>>::new());
+        assert_eq!(to_skip, 5);
+        assert_eq!(to_take, 10);
+
+        // Test case 5: Take exactly one range
+        let mut ranges = vec![0..10, 10..20, 20..30];
+        let mut to_skip = 10;
+        let mut to_take = 10;
+        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        assert_eq!(ranges, vec![10..20]);
+        assert_eq!(to_skip, 0);
+        assert_eq!(to_take, 0);
+    }
+
+    #[test]
+    fn test_dv_to_valid_ranges() {
+        // Test case 1: No deletions
+        let dv = vec![];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, vec![0..10]);
+
+        // Test case 2: Single deletion at start
+        let dv = vec![0];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, vec![1..10]);
+
+        // Test case 3: Single deletion at end
+        let dv = vec![9];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, vec![0..9]);
+
+        // Test case 4: Multiple consecutive deletions
+        let dv = vec![3, 4, 5];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, vec![0..3, 6..10]);
+
+        // Test case 5: Multiple non-consecutive deletions
+        let dv = vec![2, 5, 8];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, vec![0..2, 3..5, 6..8, 9..10]);
+
+        // Test case 6: All rows deleted
+        let dv: Vec<u64> = (0..10).collect();
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 10).collect();
+        assert_eq!(ranges, Vec::<Range<u64>>::new());
+
+        // Test case 7: Example from docstring
+        let dv = vec![10, 15, 16];
+        let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 100).collect();
+        assert_eq!(ranges, vec![0..10, 11..15, 17..100]);
     }
 }

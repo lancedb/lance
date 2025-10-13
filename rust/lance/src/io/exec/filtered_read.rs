@@ -388,19 +388,18 @@ impl FilteredReadExec {
         let dataset = self.dataset.clone();
         let options = self.options.clone();
         let index_input = self.index_input.clone();
-        let context_clone = context.clone();
 
         let stream = futures::stream::once(async move {
             let mut planned_exec_guard = planned_exec_lock.lock().await;
             if let Some(planned_exec) = &*planned_exec_guard {
                 DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    planned_exec.execute(partition, context_clone)?,
+                    planned_exec.execute(partition, context.clone())?,
                 )
             } else {
                 // Evaluate index input to get EvaluatedIndex
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
-                    let mut index_search = index_input.execute(partition, context_clone.clone())?;
+                    let mut index_search = index_input.execute(partition, context.clone())?;
                     let index_search_result =
                         index_search.next().await.ok_or_else(|| Error::Internal {
                             message: "Index search did not yield any results".to_string(),
@@ -466,7 +465,7 @@ impl FilteredReadExec {
                 .with_fragment_readahead(fragment_readahead)
                 .with_threading_mode(options.threading_mode);
 
-                let first_stream = planned_exec.execute(partition, context_clone)?;
+                let first_stream = planned_exec.execute(partition, context.clone())?;
                 *planned_exec_guard = Some(Arc::new(planned_exec));
                 DataFusionResult::Ok(first_stream)
             }
