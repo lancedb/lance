@@ -84,52 +84,6 @@ pub struct PlannedFragmentRead {
 pub struct FilteredReadUtils;
 
 impl FilteredReadUtils {
-    /// Load fragment metadata that will be needed for planning
-    #[instrument(name = "load_fragments", skip_all)]
-    async fn load_fragments(
-        dataset: &Dataset,
-        fragments: Vec<Fragment>,
-    ) -> lance_core::Result<Vec<LoadedFragment>> {
-        let loaded_fragments = fragments.into_iter().map(|fragment| async move {
-            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
-
-            let num_physical_rows = file_fragment.physical_rows().await? as u64;
-
-            // Check if dataset uses stable row IDs
-            let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
-                let row_id_sequence = load_row_id_sequence(dataset, &fragment).await?;
-                let num_logical_rows = row_id_sequence.len();
-                (row_id_sequence, num_logical_rows)
-            } else {
-                // Create synthetic row ID sequence from row addresses
-                let row_ids_start = fragment.id << 32;
-                let row_ids_end = row_ids_start + num_physical_rows;
-                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
-                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-                (addrs_as_ids, num_logical_rows)
-            };
-
-            let deletion_vector = file_fragment.get_deletion_vector().await?;
-
-            // Adjust num_logical_rows if there's a deletion vector and we're not using stable row IDs
-            let num_logical_rows = match (&deletion_vector, dataset.manifest.uses_stable_row_ids())
-            {
-                (Some(dv), false) => num_physical_rows - dv.len() as u64,
-                _ => num_logical_rows,
-            };
-
-            lance_core::Result::Ok(LoadedFragment {
-                row_id_sequence,
-                deletion_vector,
-                fragment: file_fragment,
-                num_physical_rows,
-                num_logical_rows,
-            })
-        });
-
-        futures::future::try_join_all(loaded_fragments).await
-    }
-
     /// Public API for planning fragment scans
     ///
     /// Returns: (planned fragment reads, updated options with scan_range_after_filter cleared if pushed down)
@@ -140,7 +94,23 @@ impl FilteredReadUtils {
         evaluated_index: Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
     ) -> lance_core::Result<(Vec<PlannedFragmentRead>, FilteredReadOptions)> {
-        let loaded_fragments = Self::load_fragments(dataset, fragments).await?;
+        let io_parallelism = dataset.object_store.io_parallelism();
+        let dataset_arc = Arc::new(dataset.clone());
+        let frag_futs = fragments
+            .iter()
+            .map(|frag| {
+                Result::Ok(Self::load_fragment(
+                    dataset_arc.clone(),
+                    frag.clone(),
+                    options.with_deleted_rows,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let loaded_fragments = futures::stream::iter(frag_futs)
+            // Cannot use unordered because we need to populate logical_offset based on user-provided order
+            .try_buffered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         // For pushing down scan_range_after_filter (or limit in v2)
         let mut scan_planned_with_limit_pushed_down = false;
@@ -289,6 +259,39 @@ impl FilteredReadUtils {
                 batch.slice(skip, take)
             };
             future::ready(Ok(Some(result)))
+        })
+    }
+
+    async fn load_fragment(
+        dataset: Arc<Dataset>,
+        frag: Fragment,
+        include_deleted_rows: bool,
+    ) -> Result<LoadedFragment> {
+        let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
+        let deletion_vector = if include_deleted_rows {
+            None
+        } else {
+            file_fragment.get_deletion_vector().await?
+        };
+
+        let num_physical_rows = file_fragment.physical_rows().await? as u64;
+        let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
+            let row_id_sequence = load_row_id_sequence(dataset.as_ref(), &frag).await?;
+            let num_logical_rows = row_id_sequence.len();
+            (row_id_sequence, num_logical_rows)
+        } else {
+            let row_ids_start = frag.id << 32;
+            let row_ids_end = row_ids_start + num_physical_rows;
+            let num_logical_rows = file_fragment.count_rows(None).await? as u64;
+            let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+            (addrs_as_ids, num_logical_rows)
+        };
+        Ok(LoadedFragment {
+            row_id_sequence,
+            fragment: file_fragment,
+            num_physical_rows,
+            num_logical_rows,
+            deletion_vector,
         })
     }
 
