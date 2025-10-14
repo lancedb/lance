@@ -1435,12 +1435,15 @@ impl Dataset {
             ..Default::default()
         });
 
+        // Use a mutable clone of the inner dataset for operations that require &mut self
+        let mut new_self = self.ds.as_ref().clone();
+
         let ds = if let Ok(i) = version.downcast_bound::<PyInt>(py) {
             let v: u64 = i.extract()?;
-            rt().block_on(None, self.ds.shallow_clone(&target_path, v, store_params))?
+            rt().block_on(None, new_self.shallow_clone(&target_path, v, store_params))?
         } else if let Ok(s) = version.downcast_bound::<PyString>(py) {
             let tag: &str = &s.to_string_lossy();
-            rt().block_on(None, self.ds.shallow_clone(&target_path, tag, store_params))?
+            rt().block_on(None, new_self.shallow_clone(&target_path, tag, store_params))?
         } else {
             return Err(PyValueError::new_err(
                 "version must be an integer or a string.",
