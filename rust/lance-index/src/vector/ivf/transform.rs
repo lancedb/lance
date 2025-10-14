@@ -75,9 +75,8 @@ impl PartitionTransformer {
 impl Transformer for PartitionTransformer {
     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.column_by_name(&self.output_column).is_some()
-            && (!self.with_distance
-                || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_some())
+        if !(batch.column_by_name(&self.output_column).is_none()
+            || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
         {
             // If the output columns are already present, we don't need to compute it again.
             return Ok(batch.clone());
