@@ -16,6 +16,7 @@ fn main() -> Result<()> {
     prost_build.bytes(["."]); // Enable Bytes type for all messages to avoid Vec clones.
     prost_build.compile_protos(&["./protos/encodings_v2_0.proto"], &["./protos"])?;
     prost_build.compile_protos(&["./protos/encodings_v2_1.proto"], &["./protos"])?;
+    prost_build.compile_protos(&["./protos/encodings_v2_2.proto"], &["./protos"])?;
 
     Ok(())
 }
