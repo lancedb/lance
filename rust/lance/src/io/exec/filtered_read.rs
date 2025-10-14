@@ -414,7 +414,7 @@ impl FilteredReadExec {
                     .clone()
                     .unwrap_or_else(|| dataset.fragments().clone());
 
-                let (planned_fragments, updated_options) =
+                let (planned_fragments, planned_options) =
                     super::planned_filter_read::FilteredReadUtils::plan_scan(
                         &dataset,
                         fragments.as_ref().clone(),
@@ -428,7 +428,7 @@ impl FilteredReadExec {
                     Arc::new(super::planned_filter_read::PlannedFilterReadExec::new(
                         dataset.clone(),
                         planned_fragments,
-                        updated_options,
+                        planned_options,
                     ));
                 let first_stream = planned_exec.execute(partition, context)?;
                 *planned_exec_guard = Some(planned_exec);
