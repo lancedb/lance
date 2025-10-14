@@ -23,7 +23,9 @@ use roaring::RoaringTreemap;
 
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
-use crate::dataset::write::merge_insert::create_duplicate_row_error;
+use crate::dataset::write::merge_insert::{
+    create_duplicate_row_error, format_key_values_on_columns,
+};
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -119,6 +121,13 @@ impl MergeState {
             Action::Nothing => {
                 // Do nothing action - keep the row but don't count it
                 Ok(None)
+            }
+            Action::Fail => {
+                // Fail action - return an error to fail the operation
+                Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Merge insert failed: found matching row with key values: {}",
+                    format_key_values_on_columns(batch, row_idx, &self.on_columns)
+                )))
             }
         }
     }
@@ -691,6 +700,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     crate::dataset::WhenMatched::UpdateIf(condition) => {
                         format!("UpdateIf({})", condition)
                     }
+                    crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
