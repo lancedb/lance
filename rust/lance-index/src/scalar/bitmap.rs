@@ -104,13 +104,19 @@ pub struct BitmapIndex {
 
     value_type: DataType,
 
-    store: Arc<dyn IndexStore>,
-
+    // store: Arc<dyn IndexStore>,
     index_cache: WeakLanceCache,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 
     lazy_reader: LazyIndexReader,
+}
+
+impl Drop for BitmapIndex {
+    fn drop(&mut self) {
+        println!("Dropping BitmapIndex");
+        dbg!(DeepSizeOf::deep_size_of(self));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +146,7 @@ impl BitmapIndex {
             index_map,
             null_map,
             value_type,
-            store,
+            // store,
             index_cache,
             frag_reuse_index,
             lazy_reader,
@@ -296,9 +302,9 @@ impl DeepSizeOf for BitmapIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut total_size = 0;
 
-        total_size += self.index_map.deep_size_of_children(context);
-        total_size += self.store.deep_size_of_children(context);
-
+        total_size += dbg!(self.index_map.deep_size_of_children(context));
+        total_size += dbg!(self.null_map.deep_size_of_children(context));
+        // total_size += self.store.deep_size_of_children(context);
         total_size
     }
 }

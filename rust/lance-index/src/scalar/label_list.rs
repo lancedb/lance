@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Weak;
 use std::{any::Any, collections::HashMap, fmt::Debug, pin::Pin, sync::Arc};
 
 use arrow::array::AsArray;

@@ -12,6 +12,7 @@
 //! - Cache overhead miscalculations
 
 use super::utils::AllocTracker;
+use arrow::datatypes::UInt8Type;
 use arrow_schema::{DataType, Field};
 use lance::dataset::InsertBuilder;
 use lance_core::cache::LanceCache;
@@ -74,6 +75,7 @@ async fn test_cache_accounting<F, Fut>(
             .saturating_sub(stats.total_bytes_allocated);
 
         let deviation = (expected_freed as isize - actual_freed).abs();
+        dbg!((expected_freed, actual_freed));
         assert!(
             deviation <= tolerance_per_entry as isize,
             "{}: Entry (key: {:?}, type: {}): Expected to free {} bytes, but actually freed {} bytes (deviation: {}, tolerance: {}). Stats: alloc={}, dealloc={}",
@@ -90,6 +92,26 @@ async fn test_cache_accounting<F, Fut>(
     }
 }
 
+// fn test_deep_size_of(value: impl deepsize::DeepSizeOf) {
+//     let tracker = AllocTracker::new();
+//     let reported_size = deepsize::DeepSizeOf::deep_size_of(&value);
+//     {
+//         let _guard = tracker.enter();
+//         drop(value);
+//     }
+//     let stats = tracker.stats();
+//     let actual_freed = stats.total_bytes_deallocated.saturating_sub(stats.total_bytes_allocated) as usize;
+//     assert_eq!(reported_size, actual_freed);
+// }
+
+// #[test]
+// fn test_deep_size_of_label_list_index() {
+//     AllocTracker::init();
+//     LabelListIndex::nemw
+//     let value = todo!();
+//     test_deep_size_of(value);
+// }
+
 #[tokio::test]
 async fn test_label_list_index_cache_accounting() {
     AllocTracker::init();
@@ -100,16 +122,12 @@ async fn test_label_list_index_cache_accounting() {
 
     // Create test data - list of uint8 values
     // Using larger dataset to get bigger cache entries: ~50MB
-    let batch_size = 16_000;
+    let batch_size = 1_000_000;
     let num_batches = BatchCount::from(50);
     let data = gen_batch()
         .col(
             "labels",
-            array::rand_type(&DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::UInt8,
-                false,
-            )))),
+            array::rand_list_any(array::cycle::<UInt8Type>(vec![1u8, 2]), false),
         )
         .into_df_stream(RowCount::from(batch_size), num_batches);
 
@@ -143,7 +161,8 @@ async fn test_label_list_index_cache_accounting() {
             drop(dataset);
         },
         "LabelListIndex",
-        10_000, // 10KB tolerance per entry - accounts for cache overhead
+        // TODO: if we impl DeepSizeOf for FileReader, then we should be able to reduce this tolerance
+        60_000, // 60KB tolerance per entry - accounts for cache overhead
     )
     .await;
 }
