@@ -197,8 +197,8 @@ impl FilteredReadUtils {
             // Apply index and apply scan range after filter if applicable
             Self::apply_index_to_fragment(
                 &evaluated_index,
-                &fragment,
-                &row_id_sequence,
+                fragment,
+                row_id_sequence,
                 to_read,
                 &mut to_skip,
                 &mut to_take,
@@ -327,7 +327,10 @@ impl FilteredReadUtils {
             )
             .collect()
         } else {
-            vec![0..num_physical_rows]
+            #[allow(clippy::single_range_in_vec_init)]
+            {
+                vec![0..num_physical_rows]
+            }
         }
     }
 
