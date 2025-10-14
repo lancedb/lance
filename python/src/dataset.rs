@@ -104,6 +104,7 @@ pub mod optimize;
 pub mod stats;
 
 const DEFAULT_NPROBS: usize = 20;
+const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -1885,7 +1886,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -1896,13 +1897,21 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        commit_message: Option<String>,
     ) -> PyResult<Self> {
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             read_version.unwrap_or_default(),
             operation.0,
             blobs_op.map(|op| op.0),
             None,
         );
+
+        if let Some(commit_message) = commit_message {
+            transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+                LANCE_COMMIT_MESSAGE_KEY.to_string(),
+                commit_message,
+            )])));
+        }
 
         Self::commit_transaction(
             dest,
