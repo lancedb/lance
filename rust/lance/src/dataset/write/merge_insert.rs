@@ -71,6 +71,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
 };
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
@@ -825,6 +826,7 @@ impl MergeInsertJob {
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
+        current_version: u64,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
@@ -856,6 +858,7 @@ impl MergeInsertJob {
                 mut batches: Vec<RecordBatch>,
                 updated_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
+                current_version: u64,
             ) -> Result<usize> {
                 // batches still have _rowaddr
                 let write_schema = batches[0]
@@ -925,6 +928,15 @@ impl MergeInsertJob {
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
+
+                    if dataset.manifest.uses_stable_row_ids() {
+                        // in-place frag override: refresh row-level latest update version meta
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            &mut metadata,
+                            current_version,
+                        )?;
+                    }
+
                     updated_fragments.lock().unwrap().push(metadata);
                 } else {
                     // TODO: we could skip scanning row addresses we don't need.
@@ -1009,7 +1021,37 @@ impl MergeInsertJob {
                         updater.update(updated_batch).await?;
                     }
 
-                    let updated_fragment = updater.finish().await?;
+                    let mut updated_fragment = updater.finish().await?;
+
+                    if dataset.manifest.uses_stable_row_ids() {
+                        // in-place frag partial rows update, do the in-place refresh the frag's row_latest_update_version_meta
+                        // via compute updated local row offsets and write row-level version meta
+                        let mut updated_offsets: Vec<usize> = Vec::new();
+                        for b in batches.iter() {
+                            let row_addrs = b
+                                .column_by_name(ROW_ADDR)
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .unwrap();
+                            updated_offsets.extend(
+                                row_addrs
+                                    .values()
+                                    .iter()
+                                    .map(|addr| RowAddress::from(*addr).row_offset() as usize),
+                            );
+                        }
+                        updated_offsets.sort_unstable();
+                        updated_offsets.dedup();
+
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            &mut updated_fragment,
+                            &updated_offsets,
+                            current_version,
+                            dataset.manifest.version,
+                        )?;
+                    }
+
                     updated_fragments.lock().unwrap().push(updated_fragment);
                 }
                 Ok(reservation_size)
@@ -1106,6 +1148,7 @@ impl MergeInsertJob {
                         batches,
                         updated_fragments.clone(),
                         memory_size,
+                        current_version,
                     );
                     tasks.spawn(fut);
                 }
@@ -1413,8 +1456,12 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, fields_modified) =
-                Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
+            let (updated_fragments, new_fragments, fields_modified) = Self::update_fragments(
+                self.dataset.clone(),
+                Box::pin(stream),
+                self.dataset.manifest.version + 1,
+            )
+            .await?;
 
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
@@ -1535,7 +1582,7 @@ impl MergeInsertJob {
 
         enum FragmentChange {
             Unchanged,
-            Modified(Fragment),
+            Modified(Box<Fragment>),
             Removed(u64),
         }
 
@@ -1550,7 +1597,7 @@ impl MergeInsertJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -1565,7 +1612,7 @@ impl MergeInsertJob {
         while let Some(res) = stream.next().await.transpose()? {
             match res {
                 FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
                 FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
             }
         }

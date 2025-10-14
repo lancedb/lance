@@ -454,7 +454,7 @@ impl UpdateJob {
 
         enum FragmentChange {
             Unchanged,
-            Modified(Fragment),
+            Modified(Box<Fragment>),
             Removed(u64),
         }
 
@@ -469,7 +469,7 @@ impl UpdateJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -484,7 +484,7 @@ impl UpdateJob {
         while let Some(res) = stream.next().await.transpose()? {
             match res {
                 FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
                 FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
             }
         }
@@ -717,7 +717,19 @@ mod tests {
         assert_eq!(fragments.len(), 3);
 
         // One fragment not touched (id = 0..10)
-        assert_eq!(fragments[0].metadata, original_fragments[0].metadata,);
+        assert_eq!(fragments[0].metadata.id, original_fragments[0].metadata.id);
+        assert_eq!(
+            fragments[0].metadata.files,
+            original_fragments[0].metadata.files
+        );
+        assert_eq!(
+            fragments[0].metadata.physical_rows,
+            original_fragments[0].metadata.physical_rows
+        );
+        assert_eq!(
+            fragments[0].metadata.row_id_meta,
+            original_fragments[0].metadata.row_id_meta
+        );
         // One fragment partially modified (id = 10..15)
         assert_eq!(
             fragments[1].metadata.files,

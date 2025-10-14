@@ -29,8 +29,17 @@ impl DisplayAs for LanceFilterExec {
 
 impl LanceFilterExec {
     pub fn try_new(expr: Expr, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+        log::debug!(
+            "LanceFilterExec::try_new - creating filter with expr: {:?}",
+            expr
+        );
+        log::debug!(
+            "LanceFilterExec::try_new - input schema: {:?}",
+            input.schema()
+        );
         let planner = Planner::new(input.schema());
         let predicate = planner.create_physical_expr(&expr)?;
+        log::debug!("LanceFilterExec::try_new - created physical predicate");
         let filter_exec = FilterExec::try_new(predicate.clone(), input)?;
         Ok(Self {
             expr,

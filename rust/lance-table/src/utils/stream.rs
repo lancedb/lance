@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{
+    make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
+};
 use arrow_buffer::NullBuffer;
 use futures::{
     future::BoxFuture,
@@ -13,7 +15,8 @@ use futures::{
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::{instrument, Instrument};
@@ -169,10 +172,18 @@ pub struct RowIdAndDeletesConfig {
     pub with_row_id: bool,
     /// Whether to include the row address column in the final batch
     pub with_row_addr: bool,
+    /// Whether to include the last updated at version column in the final batch
+    pub with_row_last_updated_at_version: bool,
+    /// Whether to include the created at version column in the final batch
+    pub with_row_created_at_version: bool,
     /// An optional deletion vector to apply to the batch
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
+    /// The last_updated_at version sequence
+    pub last_updated_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
+    /// The created_at version sequence
+    pub created_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
     /// Whether to make deleted rows null instead of filtering them out
     pub make_deletions_null: bool,
     /// The total number of rows that will be loaded
@@ -188,6 +199,13 @@ pub fn apply_row_id_and_deletes(
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
 ) -> Result<RecordBatch> {
+    log::debug!(
+        "apply_row_id_and_deletes: batch_offset={}, fragment_id={}, with_row_id={}, batch_rows={}",
+        batch_offset,
+        fragment_id,
+        config.with_row_id,
+        batch.num_rows()
+    );
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
     if let Some(deletion_vector_inner) = deletion_vector {
@@ -229,7 +247,9 @@ pub fn apply_row_id_and_deletes(
 
     let row_ids = if config.with_row_id {
         let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
+        log::debug!("Fetching row IDs for batch with {} rows", num_rows);
         if let Some(row_id_sequence) = &config.row_id_sequence {
+            log::debug!("Using row_id_sequence to map row addresses to row IDs");
             let selection = config
                 .params
                 .slice(batch_offset as usize, num_rows as usize)
@@ -243,10 +263,12 @@ pub fn apply_row_id_and_deletes(
                         .flat_map(|r| r.start as usize..r.end as usize),
                 )
                 .collect::<UInt64Array>();
+            log::debug!("Generated {} row IDs from sequence", row_ids.len());
             Some(Arc::new(row_ids))
         } else {
             // If we don't have a row id sequence, can assume the row ids are
             // the same as the row addresses.
+            log::debug!("No row_id_sequence; using row addresses as row IDs");
             row_addrs.clone()
         }
     } else {
@@ -262,6 +284,10 @@ pub fn apply_row_id_and_deletes(
 
     let batch = if config.with_row_id {
         let row_id_arr = row_ids.unwrap();
+        log::debug!(
+            "Adding _rowid column to batch with {} rows",
+            row_id_arr.len()
+        );
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
     } else {
         batch
@@ -270,6 +296,72 @@ pub fn apply_row_id_and_deletes(
     let batch = if config.with_row_addr {
         let row_addr_arr = row_addrs.unwrap();
         batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
+    } else {
+        batch
+    };
+
+    // Add version columns if requested
+    let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
+        let mut batch = batch;
+
+        if config.with_row_last_updated_at_version {
+            let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u32> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .map(|v| v as u32)
+                    .collect();
+                Arc::new(UInt32Array::from(versions))
+            } else {
+                // Default to version 1 if sequence not provided
+                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+            };
+            batch =
+                batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        if config.with_row_created_at_version {
+            let version_arr = if let Some(sequence) = &config.created_at_sequence {
+                // Get the range of rows for this batch
+                let selection = config
+                    .params
+                    .slice(batch_offset as usize, num_rows as usize)
+                    .unwrap()
+                    .to_ranges()
+                    .unwrap();
+                // Extract version values for the selected ranges
+                let versions: Vec<u32> = selection
+                    .iter()
+                    .flat_map(|r| {
+                        sequence
+                            .versions()
+                            .skip(r.start as usize)
+                            .take((r.end - r.start) as usize)
+                    })
+                    .map(|v| v as u32)
+                    .collect();
+                Arc::new(UInt32Array::from(versions))
+            } else {
+                // Default to version 1 if sequence not provided
+                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+            };
+            batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
+        }
+
+        batch
     } else {
         batch
     };
@@ -395,8 +487,12 @@ mod tests {
                     params: params.clone(),
                     with_row_id: true,
                     with_row_addr: false,
+                    with_row_last_updated_at_version: false,
+                    with_row_created_at_version: false,
                     deletion_vector: None,
                     row_id_sequence: None,
+                    last_updated_at_sequence: None,
+                    created_at_sequence: None,
                     make_deletions_null: false,
                     total_num_rows: 100,
                 };
@@ -491,8 +587,12 @@ mod tests {
                                 params: ReadBatchParams::RangeFull,
                                 with_row_id,
                                 with_row_addr: false,
+                                with_row_last_updated_at_version: false,
+                                with_row_created_at_version: false,
                                 deletion_vector: deletion_vector.clone(),
                                 row_id_sequence: None,
+                                last_updated_at_sequence: None,
+                                created_at_sequence: None,
                                 make_deletions_null,
                                 total_num_rows: 100,
                             };

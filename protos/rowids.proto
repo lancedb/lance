@@ -96,3 +96,18 @@ message EncodedU64Array {
         U64Array u64_array = 3;
     }
 }
+
+/// A sequence of dataset versions. Similar to RowIdSequence but tracks
+/// version runs. It uses RLE (Run-Length Encoding) to efficiently
+// represent consecutive rows with the same version.
+message RowDatasetVersionSequence {
+    repeated RowDatasetVersionRun runs = 1;
+}
+
+/// A run of rows with the same version.
+message RowDatasetVersionRun {
+    /// The number of consecutive rows with the same version.
+    U64Segment span = 1;
+
+    uint64 version = 2;
+}

@@ -103,17 +103,31 @@ impl Stream for LanceStream {
         let this = self.get_mut();
         let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
 
-        let poll_result = match this.inner_stream.poll_next_unpin(cx) {
+        let inner_poll = this.inner_stream.poll_next_unpin(cx);
+        timer.done();
+
+        let poll_result = match inner_poll {
             Poll::Ready(None) => {
                 if let Some(scheduler) = &this.scan_scheduler {
                     this.scan_metrics.io_metrics.record(scheduler);
                 }
                 Poll::Ready(None)
             }
+            Poll::Ready(Some(Ok(batch))) => {
+                // Add version columns if requested
+                let result = if this.config.with_row_last_updated_at_version
+                    || this.config.with_row_created_at_version
+                {
+                    let schema = RecordBatchStream::schema(this);
+                    this.add_version_columns(batch, schema)
+                } else {
+                    Ok(batch)
+                };
+                Poll::Ready(Some(result))
+            }
             other => other,
         };
 
-        timer.done();
         this.scan_metrics.baseline_metrics.record_poll(poll_result)
     }
 }
@@ -133,9 +147,143 @@ pub struct LanceStream {
     ///
     /// Only set on v2 scans.  Used to record scan metrics.
     scan_scheduler: Option<Arc<ScanScheduler>>,
+
+    /// Fragments being scanned (needed for version column materialization)
+    fragments: Arc<Vec<Fragment>>,
+
+    /// Current fragment index and rows read in current fragment
+    /// (used for version column materialization)
+    current_fragment_idx: usize,
+    rows_read_in_fragment: usize,
+
+    /// Total number of logical rows read across all fragments
+    /// (used for fragment boundary detection with deletion vectors)
+    total_rows_read: usize,
 }
 
 impl LanceStream {
+    /// Add version columns to a record batch
+    fn add_version_columns(
+        &mut self,
+        batch: RecordBatch,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
+        use arrow_array::{ArrayRef, UInt64Array};
+        use datafusion::error::DataFusionError;
+        use lance_table::rowids::version::RowDatasetVersionSequence;
+
+        let num_rows = batch.num_rows();
+
+        // Use the current tracking state to determine which fragment we're reading from
+        // The tracking is updated after each batch to move to the next fragment when needed
+        let fragment_idx = self.current_fragment_idx;
+        let rows_offset = self.rows_read_in_fragment;
+
+        if fragment_idx >= self.fragments.len() {
+            return Err(DataFusionError::Internal(format!(
+                "Fragment index {} out of bounds (have {} fragments)",
+                fragment_idx,
+                self.fragments.len()
+            )));
+        }
+
+        let fragment = &self.fragments[fragment_idx];
+
+        // Build version arrays from fragment metadata
+        let last_updated_array: Option<ArrayRef> = if self.config.with_row_last_updated_at_version {
+            let seq = if let Some(meta) = &fragment.last_updated_at_version_meta {
+                meta.load_sequence().map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "Failed to load last_updated_at version sequence: {}",
+                        e
+                    ))
+                })?
+            } else {
+                // Default: fragment predates version tracking, use null
+                return Ok(batch);
+            };
+            let values: Vec<u64> = seq.versions().collect();
+            if values.len() < rows_offset + num_rows {
+                return Err(DataFusionError::Internal(format!(
+                    "Version sequence too short: expected at least {} rows, got {}. Fragment id: {}, physical_rows: {:?}, rows_offset: {}",
+                    rows_offset + num_rows,
+                    values.len(),
+                    fragment.id,
+                    fragment.physical_rows,
+                    rows_offset
+                )));
+            }
+            let batch_values = &values[rows_offset..rows_offset + num_rows];
+            Some(Arc::new(UInt64Array::from(batch_values.to_vec())))
+        } else {
+            None
+        };
+
+        let created_at_array: Option<ArrayRef> = if self.config.with_row_created_at_version {
+            let seq = if let Some(meta) = &fragment.created_at_version_meta {
+                meta.load_sequence().map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "Failed to load created_at version sequence: {}",
+                        e
+                    ))
+                })?
+            } else {
+                // Default: treat all rows as created at version 1
+                RowDatasetVersionSequence::from_uniform_row_count(
+                    fragment.physical_rows.unwrap_or(0) as u64,
+                    1,
+                )
+            };
+            let values: Vec<u64> = seq.versions().collect();
+            if values.len() < rows_offset + num_rows {
+                return Err(DataFusionError::Internal(format!(
+                    "Version sequence too short: expected at least {} rows, got {}. Fragment id: {}, physical_rows: {:?}, rows_offset: {}",
+                    rows_offset + num_rows,
+                    values.len(),
+                    fragment.id,
+                    fragment.physical_rows,
+                    rows_offset
+                )));
+            }
+            let batch_values = &values[rows_offset..rows_offset + num_rows];
+            Some(Arc::new(UInt64Array::from(batch_values.to_vec())))
+        } else {
+            None
+        };
+
+        // Append version columns to the batch
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        if let Some(arr) = last_updated_array {
+            columns.push(arr);
+        }
+        if let Some(arr) = created_at_array {
+            columns.push(arr);
+        }
+
+        let result_batch = RecordBatch::try_new(schema, columns).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "Failed to create batch with version columns: {}",
+                e
+            ))
+        })?;
+
+        // Update tracking for next batch
+        let new_rows_read_in_fragment = rows_offset + num_rows;
+        let logical_rows = fragment.num_rows().unwrap_or(0);
+
+        // If we've read all logical rows from this fragment, move to the next fragment
+        if new_rows_read_in_fragment >= logical_rows {
+            self.current_fragment_idx = fragment_idx + 1;
+            self.rows_read_in_fragment = 0;
+        } else {
+            self.current_fragment_idx = fragment_idx;
+            self.rows_read_in_fragment = new_rows_read_in_fragment;
+        }
+        self.total_rows_read += num_rows;
+
+        Ok(result_batch)
+    }
+
     /// Create a new dataset scan node.
     ///
     /// Parameters
@@ -340,6 +488,10 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: Some(scan_scheduler_clone),
+            fragments,
+            current_fragment_idx: 0,
+            rows_read_in_fragment: 0,
+            total_rows_read: 0,
         })
     }
 
@@ -439,6 +591,10 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: None,
+            fragments,
+            current_fragment_idx: 0,
+            rows_read_in_fragment: 0,
+            total_rows_read: 0,
         })
     }
 }
@@ -457,10 +613,22 @@ impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
         let mut schema: ArrowSchema = self.projection.as_ref().into();
         if self.config.with_row_id {
+            log::debug!("LanceStream: Adding _rowid column to output schema");
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
         if self.config.with_row_address {
+            log::debug!("LanceStream: Adding _rowaddr column to output schema");
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+        }
+        if self.config.with_row_last_updated_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if self.config.with_row_created_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .unwrap();
         }
         Arc::new(schema)
     }
@@ -474,6 +642,8 @@ pub struct LanceScanConfig {
     pub io_buffer_size: u64,
     pub with_row_id: bool,
     pub with_row_address: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
 }
@@ -489,6 +659,8 @@ impl Default for LanceScanConfig {
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: false,
             with_row_address: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
         }
@@ -563,6 +735,16 @@ impl LanceScanExec {
         if config.with_row_address {
             output_schema = output_schema
                 .try_with_column(ROW_ADDR_FIELD.clone())
+                .unwrap();
+        }
+        if config.with_row_last_updated_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if config.with_row_created_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
