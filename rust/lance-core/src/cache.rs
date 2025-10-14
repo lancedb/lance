@@ -24,12 +24,13 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 pub struct SizedRecord {
     pub record: ArcAny,
     pub size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    pub type_name: &'static str,
 }
 
 impl std::fmt::Debug for SizedRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SizedRecord")
-            .field("record", &self.record)
+            .field("type", &self.type_name)
             .finish()
     }
 }
@@ -42,12 +43,14 @@ impl DeepSizeOf for SizedRecord {
 
 impl SizedRecord {
     fn new<T: DeepSizeOf + Send + Sync + 'static>(record: Arc<T>) -> Self {
+        // Calculate size once and store it
         // +8 for the size of the Arc pointer itself
         let size_accessor =
             |record: &ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() + 8 };
         Self {
             record,
             size_accessor: Arc::new(size_accessor),
+            type_name: std::any::type_name::<T>(),
         }
     }
 }

@@ -58,6 +58,7 @@ async fn test_cache_accounting<F, Fut>(
             Arc::strong_count(&entry.record)
         );
         let expected_freed = deepsize::DeepSizeOf::deep_size_of(&entry);
+        let type_name = entry.type_name;
 
         let tracker = AllocTracker::new();
         {
@@ -72,13 +73,16 @@ async fn test_cache_accounting<F, Fut>(
             .total_bytes_deallocated
             .saturating_sub(stats.total_bytes_allocated);
 
+        let deviation = (expected_freed as isize - actual_freed).abs();
         assert!(
-            (expected_freed as isize - actual_freed).abs() <= tolerance_per_entry as isize,
-            "{}: Entry (key: {:?}): Expected to free {} bytes, but actually freed {} bytes (tolerance: {}). Stats: alloc={}, dealloc={}",
+            deviation <= tolerance_per_entry as isize,
+            "{}: Entry (key: {:?}, type: {}): Expected to free {} bytes, but actually freed {} bytes (deviation: {}, tolerance: {}). Stats: alloc={}, dealloc={}",
             test_name,
             key,
+            type_name,
             expected_freed,
             actual_freed,
+            deviation,
             tolerance_per_entry,
             stats.total_bytes_allocated,
             stats.total_bytes_deallocated,
@@ -88,6 +92,8 @@ async fn test_cache_accounting<F, Fut>(
 
 #[tokio::test]
 async fn test_label_list_index_cache_accounting() {
+    AllocTracker::init();
+
     // Create a dataset with a label list (inverted) index
     let tmp_dir = tempfile::tempdir().unwrap();
     let tmp_path = tmp_dir.path().to_str().unwrap();

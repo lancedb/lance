@@ -39,9 +39,11 @@ impl AllocationTracker for MemoryTracker {
         wrapped_size: usize,
         group_id: AllocationGroupId,
     ) {
+        if group_id == AllocationGroupId::ROOT {
+            // We don't track root allocations
+            return;
+        }
         let mut guard = GLOBAL_STATS.lock().unwrap();
-        // if
-        // dbg!(&group_id);
         let stats = guard.entry(group_id).or_default();
         stats.total_bytes_allocated += wrapped_size as isize;
         stats.total_allocations += 1;
@@ -54,10 +56,19 @@ impl AllocationTracker for MemoryTracker {
         _object_size: usize,
         wrapped_size: usize,
         source_group_id: AllocationGroupId,
-        _current_group_id: AllocationGroupId,
+        current_group_id: AllocationGroupId,
     ) {
+        let group_id = if source_group_id != AllocationGroupId::ROOT {
+            source_group_id
+        } else {
+            current_group_id
+        };
+        if group_id == AllocationGroupId::ROOT {
+            // We don't track root allocations
+            return;
+        }
         let mut guard = GLOBAL_STATS.lock().unwrap();
-        let stats = guard.entry(source_group_id).or_default();
+        let stats = guard.entry(group_id).or_default();
         stats.total_bytes_deallocated += wrapped_size as isize;
         stats.total_deallocations += 1;
     }
@@ -72,13 +83,17 @@ pub struct AllocTracker {
 }
 
 impl AllocTracker {
-    pub fn new() -> Self {
+    pub fn init() {
         INIT.call_once(init_memory_tracking);
+    }
 
-        let span = tracing::span!(tracing::Level::INFO, "AllocTracker");
+    pub fn new() -> Self {
+        Self::init();
 
         let token = AllocationGroupToken::register().expect("failed to register token");
         let group_id = token.id();
+
+        let span = tracing::span!(tracing::Level::INFO, "AllocTracker");
         token.attach_to_span(&span);
 
         Self { group_id, span }
