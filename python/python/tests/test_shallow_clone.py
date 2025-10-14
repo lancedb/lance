@@ -24,7 +24,10 @@ except ModuleNotFoundError:  # pragma: no cover - environment constraint
 
 
 @pytest.mark.skip(
-    reason="In this environment, memory:// object store content is not retained across cloned dataset reads"
+    reason=(
+        "In this environment, memory:// object store content is not retained "
+        "across cloned dataset reads"
+    )
 )
 def test_shallow_clone_memory_uri():
     """Shallow clone by version number and tag using memory:// URIs.
@@ -57,7 +60,8 @@ def test_shallow_clone_memory_uri():
     clone_v1 = ds.shallow_clone(clone_v1_uri, version=1)
 
     # Verify clone is openable and content matches source v1
-    # Re-open via URI can be environment-specific for memory://, so we assert on the cloned object directly.
+    # Re-open via URI can be environment-specific for memory://.
+    # Assert on the cloned object directly to avoid env coupling.
     assert clone_v1.to_table() == table_v1
 
     # Clone version 2 by numeric version and verify
@@ -70,7 +74,8 @@ def test_shallow_clone_memory_uri():
     clone_v1_tag_uri = "memory://clone_v1_tag"
     clone_v1_tag = ds.shallow_clone(clone_v1_tag_uri, version="v1")
     assert clone_v1_tag.to_table() == table_v1
-    # Re-open via URI can be environment-specific for memory://, so we assert on the cloned object directly.
+    # Re-open via URI can be environment-specific for memory://.
+    # Assert on the cloned object directly to avoid env coupling.
     assert clone_v1_tag.to_table() == table_v1
 
 
