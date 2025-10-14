@@ -1397,7 +1397,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
             return Ok(AssignResult {
                 assign_batches: vec![None; ivf.num_partitions() - 1],
-                new_centroids: new_centroids,
+                new_centroids,
             });
         };
 
@@ -1776,6 +1776,7 @@ struct AssignResult {
 #[derive(Debug, Clone)]
 enum AssignOp {
     // (row_id, vector)
+    // TODO: add the distance to the centroid to avoid recomputing it for RQ
     Add((u64, ArrayRef)),
     // row_id
     Remove(u64),
