@@ -430,69 +430,6 @@ impl MetricsCollector for IndexMetrics {
     }
 }
 
-/// Apply a hard limit/range to a stream of record batches.
-/// This function applies exact skip/fetch limits by tracking rows seen across batches.
-///
-/// # Arguments
-///
-/// * `stream` - The input stream of record batches
-/// * `range` - The range of rows to include (start..end)
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use futures::StreamExt;
-/// use lance::io::exec::utils::apply_hard_range;
-/// use std::ops::Range;
-/// # async fn example(stream: impl futures::Stream<Item = lance_core::Result<arrow_array::RecordBatch>>) {
-/// let range = Range { start: 10, end: 20 }; // Skip 10 rows, take 10 rows
-/// let limited_stream = apply_hard_range(stream, range);
-/// # }
-/// ```
-pub fn apply_hard_range<S>(
-    stream: S,
-    range: std::ops::Range<u64>,
-) -> impl Stream<Item = Result<RecordBatch>>
-where
-    S: Stream<Item = Result<RecordBatch>>,
-{
-    use futures::future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let start = range.start as usize;
-    let end = range.end as usize;
-    let rows_seen = Arc::new(AtomicUsize::new(0));
-
-    stream.try_filter_map(move |batch| {
-        if batch.num_rows() == 0 {
-            return future::ready(Ok(None));
-        }
-
-        let batch_rows = batch.num_rows();
-        let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
-        let batch_end = current_position + batch_rows;
-
-        if batch_end <= start || current_position >= end {
-            return future::ready(Ok(None));
-        }
-
-        let skip = start.saturating_sub(current_position);
-        let end_pos = (end - current_position).min(batch_rows);
-        let take = end_pos.saturating_sub(skip);
-
-        if take == 0 {
-            return future::ready(Ok(None));
-        }
-
-        let result = if skip == 0 && take == batch_rows {
-            batch
-        } else {
-            batch.slice(skip, take)
-        };
-        future::ready(Ok(Some(result)))
-    })
-}
-
 #[cfg(test)]
 mod tests {
 

@@ -393,10 +393,9 @@ impl FilteredReadExec {
             let mut planned_exec_guard = planned_exec_lock.lock().await;
             if let Some(planned_exec) = &*planned_exec_guard {
                 DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    planned_exec.execute(partition, context.clone())?,
+                    planned_exec.execute(partition, context)?,
                 )
             } else {
-                // Evaluate index input to get EvaluatedIndex
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
                     let mut index_search = index_input.execute(partition, context.clone())?;
@@ -410,63 +409,29 @@ impl FilteredReadExec {
                     )?));
                 }
 
-                // Plan the scan using ScanPlanner
-                use crate::io::exec::planned_filter_read::{PlannedFilterReadExec, ScanPlanner};
-
                 let fragments = options
                     .fragments
                     .clone()
                     .unwrap_or_else(|| dataset.fragments().clone());
 
-                let (planned_fragments, limit_pushed) = ScanPlanner::plan_scan(
-                    &dataset,
-                    fragments.as_ref().clone(),
-                    evaluated_index,
-                    &options,
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let (planned_fragments, updated_options) =
+                    super::planned_filter_read::FilteredReadUtils::plan_scan(
+                        &dataset,
+                        fragments.as_ref().clone(),
+                        evaluated_index,
+                        &options,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let output_schema = Arc::new(options.projection.to_arrow_schema());
-                let batch_size = options.batch_size.unwrap_or_else(|| {
-                    use crate::dataset::scanner::get_default_batch_size;
-                    get_default_batch_size().unwrap_or(8192) as u32
-                });
-
-                let fragment_readahead = options
-                    .fragment_readahead
-                    .unwrap_or_else(|| {
-                        use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
-                        (*DEFAULT_FRAGMENT_READAHEAD)
-                            .unwrap_or(dataset.object_store().io_parallelism() * 2)
-                    })
-                    .max(1);
-
-                // If limit was pushed down during planning, we don't need to apply it again
-                // Otherwise, pass the scan_range_after_filter to apply as a hard range
-                let scan_range_after_filter = if limit_pushed {
-                    None
-                } else {
-                    options.scan_range_after_filter.clone()
-                };
-
-                // Create PlannedFilterReadExec and delegate to it
-                let planned_exec = PlannedFilterReadExec::new(
-                    dataset.clone(),
-                    planned_fragments,
-                    Arc::new(options.projection.clone()),
-                    options.with_deleted_rows,
-                    batch_size,
-                    options.full_filter.clone(),
-                    options.refine_filter.clone(),
-                    output_schema,
-                    scan_range_after_filter,
-                )
-                .with_fragment_readahead(fragment_readahead)
-                .with_threading_mode(options.threading_mode);
-
-                let first_stream = planned_exec.execute(partition, context.clone())?;
-                *planned_exec_guard = Some(Arc::new(planned_exec));
+                let planned_exec =
+                    Arc::new(super::planned_filter_read::PlannedFilterReadExec::new(
+                        dataset.clone(),
+                        planned_fragments,
+                        updated_options,
+                    ));
+                let first_stream = planned_exec.execute(partition, context)?;
+                *planned_exec_guard = Some(planned_exec);
                 DataFusionResult::Ok(first_stream)
             }
         })

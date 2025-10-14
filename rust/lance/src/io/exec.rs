@@ -28,8 +28,8 @@ pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;
 pub use planned_filter_read::{
-    FilteredReadGlobalMetrics, FilteredReadThreadingMode, PlannedFilterReadExec,
-    PlannedFragmentRead, ScanPlanner,
+    FilteredReadGlobalMetrics, FilteredReadThreadingMode, FilteredReadUtils, PlannedFilterReadExec,
+    PlannedFragmentRead,
 };
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};

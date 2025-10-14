@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -40,9 +41,10 @@ use tracing::{instrument, Instrument};
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::Dataset;
+use lance_table::format::Fragment;
 
 use super::filtered_read::{EvaluatedIndex, FilteredReadOptions};
-use super::utils::{apply_hard_range, IoMetrics};
+use super::utils::IoMetrics;
 
 // ============================================================================
 // Planning types and logic
@@ -79,14 +81,14 @@ pub struct PlannedFragmentRead {
 }
 
 /// Public API for planning fragment scans
-pub struct ScanPlanner;
+pub struct FilteredReadUtils;
 
-impl ScanPlanner {
+impl FilteredReadUtils {
     /// Load fragment metadata that will be needed for planning
     #[instrument(name = "load_fragments", skip_all)]
     async fn load_fragments(
         dataset: &Dataset,
-        fragments: Vec<lance_table::format::Fragment>,
+        fragments: Vec<Fragment>,
     ) -> lance_core::Result<Vec<LoadedFragment>> {
         let loaded_fragments = fragments.into_iter().map(|fragment| async move {
             let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
@@ -130,14 +132,14 @@ impl ScanPlanner {
 
     /// Public API for planning fragment scans
     ///
-    /// Returns: (planned fragment reads, whether limit was pushed down to fragment ranges)
+    /// Returns: (planned fragment reads, updated options with scan_range_after_filter cleared if pushed down)
     #[instrument(name = "plan_scan", skip_all)]
     pub async fn plan_scan(
         dataset: &Dataset,
-        fragments: Vec<lance_table::format::Fragment>,
+        fragments: Vec<Fragment>,
         evaluated_index: Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
-    ) -> lance_core::Result<(Vec<PlannedFragmentRead>, bool)> {
+    ) -> lance_core::Result<(Vec<PlannedFragmentRead>, FilteredReadOptions)> {
         let loaded_fragments = Self::load_fragments(dataset, fragments).await?;
 
         // For pushing down scan_range_after_filter (or limit in v2)
@@ -195,8 +197,8 @@ impl ScanPlanner {
             // Apply index and apply scan range after filter if applicable
             Self::apply_index_to_fragment(
                 &evaluated_index,
-                fragment,
-                row_id_sequence,
+                &fragment,
+                &row_id_sequence,
                 to_read,
                 &mut to_skip,
                 &mut to_take,
@@ -240,7 +242,54 @@ impl ScanPlanner {
             }
         }
 
-        Ok((planned_fragments, scan_planned_with_limit_pushed_down))
+        // Create updated options - if limit was pushed down, clear scan_range_after_filter
+        let mut updated_options = options.clone();
+        if scan_planned_with_limit_pushed_down {
+            updated_options.scan_range_after_filter = None;
+        }
+
+        Ok((planned_fragments, updated_options))
+    }
+
+    pub fn apply_hard_range<S>(
+        stream: S,
+        range: Range<u64>,
+    ) -> impl Stream<Item = Result<RecordBatch>>
+    where
+        S: Stream<Item = Result<RecordBatch>>,
+    {
+        let start = range.start as usize;
+        let end = range.end as usize;
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+
+        stream.try_filter_map(move |batch| {
+            if batch.num_rows() == 0 {
+                return future::ready(Ok(None));
+            }
+
+            let batch_rows = batch.num_rows();
+            let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
+            let batch_end = current_position + batch_rows;
+
+            if batch_end <= start || current_position >= end {
+                return future::ready(Ok(None));
+            }
+
+            let skip = start.saturating_sub(current_position);
+            let end_pos = (end - current_position).min(batch_rows);
+            let take = end_pos.saturating_sub(skip);
+
+            if take == 0 {
+                return future::ready(Ok(None));
+            }
+
+            let result = if skip == 0 && take == batch_rows {
+                batch
+            } else {
+                batch.slice(skip, take)
+            };
+            future::ready(Ok(Some(result)))
+        })
     }
 
     /// Determine whether to use refine filter for a fragment based on index results
@@ -266,75 +315,89 @@ impl ScanPlanner {
         }
     }
 
-    /// Get the full fragment range, excluding deleted rows if deletion vector exists
-    #[allow(clippy::single_range_in_vec_init)]
+    #[instrument(level = "debug", skip_all)]
     fn full_frag_range(
         num_physical_rows: u64,
         deletion_vector: &Option<Arc<DeletionVector>>,
     ) -> Vec<Range<u64>> {
         if let Some(deletion_vector) = deletion_vector {
-            // Use DvToValidRanges to convert deletion vector to valid ranges
             DvToValidRanges::new(
                 deletion_vector.to_sorted_iter().map(|pos| pos as u64),
                 num_physical_rows,
             )
             .collect()
         } else {
-            // Clippy suggests using collect for a vec with a single range,
-            // but this is actually a vector containing one range element, not a vector of values
             vec![0..num_physical_rows]
         }
     }
 
-    /// Trim ranges to fit within a logical range
+    #[instrument(level = "debug", skip_all)]
     fn trim_ranges(
-        ranges: Vec<Range<u64>>,
-        fragment_range: Range<u64>,
-        logical_range: &Range<u64>,
+        physical_ranges: Vec<Range<u64>>,
+        logical_position: Range<u64>,
+        bounds: &Range<u64>,
     ) -> Vec<Range<u64>> {
-        let mut trimmed_ranges = Vec::new();
+        let num_logical_rows = logical_position.end - logical_position.start;
+        let (mut to_skip, mut to_take) = Self::calculate_fetch(logical_position, bounds);
 
-        // Calculate the overlap between fragment_range and logical_range
-        let overlap_start = fragment_range.start.max(logical_range.start);
-        let overlap_end = fragment_range.end.min(logical_range.end);
-
-        if overlap_start >= overlap_end {
-            return trimmed_ranges;
+        if to_skip == 0 && to_take == num_logical_rows {
+            return physical_ranges;
         }
 
-        // Calculate how much to skip from the beginning and take
-        let skip = overlap_start.saturating_sub(fragment_range.start);
-        let take = overlap_end - overlap_start;
-
-        let mut skipped = 0;
-        let mut taken = 0;
-
-        for range in ranges {
+        let mut trimmed = Vec::with_capacity(physical_ranges.len());
+        for range in physical_ranges {
             let range_len = range.end - range.start;
-
-            // Skip ranges that are before our skip point
-            if skipped + range_len <= skip {
-                skipped += range_len;
+            if to_skip >= range_len {
+                to_skip -= range_len;
                 continue;
             }
-
-            // We've taken enough
-            if taken >= take {
+            let avail_here = range_len - to_skip;
+            let to_take_here = avail_here.min(to_take);
+            to_take -= to_take_here;
+            if to_take_here > 0 {
+                trimmed.push(range.start + to_skip..range.start + to_skip + to_take_here);
+            }
+            to_skip = 0;
+            if to_take == 0 {
                 break;
             }
-
-            // Calculate the portion of this range to take
-            let start_offset = skip.saturating_sub(skipped);
-            let range_start = range.start + start_offset;
-            let range_take = (range_len - start_offset).min(take - taken);
-            let range_end = range_start + range_take;
-
-            trimmed_ranges.push(range_start..range_end);
-            taken += range_take;
-            skipped += range_len;
         }
 
-        trimmed_ranges
+        trimmed
+    }
+
+    // Given a logical position and bounds, calculate the number of rows to skip and take
+    fn calculate_fetch(
+        position: Range<u64>, // position of the fragment in dataset/fragment coordinates
+        bounds: &Range<u64>,  // bounds of the scan in dataset/fragment coordinates
+    ) -> (u64, u64) {
+        // Position:         | --- |
+        // Bounds  : | --- |
+        // Result  : to_skip = 0, to_take = 0
+        //
+        // Position: | --- |
+        // Bounds  :         | --- |
+        // Result  : to_skip = 0, to_take = 0
+        //
+        // Position: | --- |
+        // Bounds  :   | --- |
+        // Result  : to_skip > 0, to_take = (position.end - bounds.start)
+        //
+        // Position:   | --- |
+        // Bounds  : | -------- |
+        // Result  : to_skip = 0, to_take = (position.end - position.start)
+        //
+        // Position:   | --- |
+        // Bounds  : | --- |
+        // Result  : to_skip = 0, to_take = (bounds.end - position.start)
+        let to_skip = bounds.start.saturating_sub(position.start);
+        let to_take = bounds
+            .end
+            .min(position.end)
+            .saturating_sub(position.start.max(bounds.start));
+
+        // Note: to_skip may be > 0 even if to_take == 0
+        (to_skip, to_take)
     }
 
     /// Apply index to a fragment and apply skip/take to matched ranges if possible
@@ -389,43 +452,75 @@ impl ScanPlanner {
         }
     }
 
-    /// Apply skip and take to ranges in place
+    /// Apply skip and take to ranges and update the counters
     fn apply_skip_take_to_ranges(
-        ranges: &mut Vec<Range<u64>>,
+        to_read: &mut Vec<Range<u64>>,
         to_skip: &mut u64,
         to_take: &mut u64,
     ) {
-        let mut new_ranges = Vec::new();
+        if *to_take == 0 {
+            to_read.clear();
+            *to_skip = 0;
+            return;
+        }
+        let original_rows: u64 = to_read.iter().map(|r| r.end - r.start).sum();
+        if *to_skip >= original_rows {
+            to_read.clear();
+            *to_skip -= original_rows;
+            return;
+        }
+        *to_read = Self::trim_ranges_by_offset(to_read, *to_skip, *to_take);
+        let rows_taken: u64 = to_read.iter().map(|r| r.end - r.start).sum();
+        *to_skip = 0;
+        *to_take = to_take.saturating_sub(rows_taken);
+    }
 
-        for range in ranges.iter() {
+    /// Trim ranges by offset (skip) and limit (take)
+    fn trim_ranges_by_offset(ranges: &[Range<u64>], skip: u64, take: u64) -> Vec<Range<u64>> {
+        let mut result = Vec::new();
+        let mut skipped = 0u64;
+        let mut taken = 0u64;
+
+        for range in ranges {
             let range_len = range.end - range.start;
 
-            if *to_skip >= range_len {
-                // Skip entire range
-                *to_skip -= range_len;
-                continue;
+            // Still skipping rows
+            if skipped < skip {
+                let to_skip_in_range = (skip - skipped).min(range_len);
+                skipped += to_skip_in_range;
+
+                // If we've skipped past this entire range, continue
+                if to_skip_in_range >= range_len {
+                    continue;
+                }
+
+                // Partial skip within this range
+                let new_start = range.start + to_skip_in_range;
+                let remaining = range.end - new_start;
+                let to_take_here = remaining.min(take - taken);
+
+                if to_take_here > 0 {
+                    result.push(new_start..(new_start + to_take_here));
+                    taken += to_take_here;
+                }
+            } else {
+                // No more skipping, just take rows
+                let to_take_here = range_len.min(take - taken);
+                if to_take_here > 0 {
+                    result.push(range.start..(range.start + to_take_here));
+                    taken += to_take_here;
+                }
             }
 
-            let start = range.start + *to_skip;
-            let available = range.end - start;
-            let take_from_range = available.min(*to_take);
-            let end = start + take_from_range;
-
-            if start < end {
-                new_ranges.push(start..end);
-                *to_take -= take_from_range;
-                *to_skip = 0;
-
-                if *to_take == 0 {
-                    break;
-                }
+            if taken >= take {
+                break;
             }
         }
 
-        *ranges = new_ranges;
+        result
     }
 
-    /// Intersect two sets of ranges
+    /// Intersect two sets of sorted ranges
     fn intersect_ranges(ranges1: &[Range<u64>], ranges2: &[Range<u64>]) -> Vec<Range<u64>> {
         let mut result = Vec::new();
         let mut i = 0;
@@ -435,6 +530,7 @@ impl ScanPlanner {
             let r1 = &ranges1[i];
             let r2 = &ranges2[j];
 
+            // Check for intersection
             let start = r1.start.max(r2.start);
             let end = r1.end.min(r2.end);
 
@@ -442,7 +538,8 @@ impl ScanPlanner {
                 result.push(start..end);
             }
 
-            if r1.end < r2.end {
+            // Advance the range that ends first
+            if r1.end <= r2.end {
                 i += 1;
             } else {
                 j += 1;
@@ -461,15 +558,7 @@ impl ScanPlanner {
 pub struct PlannedFilterReadExec {
     dataset: Arc<Dataset>,
     planned_fragments: Vec<PlannedFragmentRead>,
-    projection: Arc<Projection>,
-    with_deleted_rows: bool,
-    batch_size: u32,
-    full_filter: Option<Expr>,
-    refine_filter: Option<Expr>,
-    output_schema: SchemaRef,
-    scan_range_after_filter: Option<Range<u64>>,
-    fragment_readahead: Option<usize>,
-    threading_mode: FilteredReadThreadingMode,
+    options: FilteredReadOptions,
     metrics: ExecutionPlanMetricsSet,
     properties: PlanProperties,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
@@ -478,20 +567,14 @@ pub struct PlannedFilterReadExec {
 }
 
 impl PlannedFilterReadExec {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Arc<Dataset>,
         planned_fragments: Vec<PlannedFragmentRead>,
-        projection: Arc<Projection>,
-        with_deleted_rows: bool,
-        batch_size: u32,
-        full_filter: Option<Expr>,
-        refine_filter: Option<Expr>,
-        output_schema: SchemaRef,
-        scan_range_after_filter: Option<Range<u64>>,
+        options: FilteredReadOptions,
     ) -> Self {
+        let output_schema = Arc::new(options.projection.to_arrow_schema());
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
+            EquivalenceProperties::new(output_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
@@ -500,29 +583,11 @@ impl PlannedFilterReadExec {
         Self {
             dataset,
             planned_fragments,
-            projection,
-            with_deleted_rows,
-            batch_size,
-            full_filter,
-            refine_filter,
-            output_schema,
-            scan_range_after_filter,
-            fragment_readahead: None,
-            threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(1),
+            options,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
             running_stream: Arc::new(AsyncMutex::new(None)),
         }
-    }
-
-    pub fn with_fragment_readahead(mut self, readahead: usize) -> Self {
-        self.fragment_readahead = Some(readahead);
-        self
-    }
-
-    pub fn with_threading_mode(mut self, mode: FilteredReadThreadingMode) -> Self {
-        self.threading_mode = mode;
-        self
     }
 }
 
@@ -530,7 +595,10 @@ impl std::fmt::Debug for PlannedFilterReadExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlannedFilterReadExec")
             .field("num_fragments", &self.planned_fragments.len())
-            .field("scan_range_after_filter", &self.scan_range_after_filter)
+            .field(
+                "scan_range_after_filter",
+                &self.options.scan_range_after_filter,
+            )
             .finish()
     }
 }
@@ -544,7 +612,7 @@ impl DisplayAs for PlannedFilterReadExec {
                     "PlannedFilterReadExec: {} fragments",
                     self.planned_fragments.len()
                 )?;
-                if let Some(ref range) = self.scan_range_after_filter {
+                if let Some(ref range) = self.options.scan_range_after_filter {
                     write!(f, ", scan_range={:?}", range)?;
                 }
                 Ok(())
@@ -554,7 +622,7 @@ impl DisplayAs for PlannedFilterReadExec {
                     f,
                     "PlannedFilterReadExec\nfragments={}\nscan_range={:?}",
                     self.planned_fragments.len(),
-                    self.scan_range_after_filter
+                    self.options.scan_range_after_filter
                 )
             }
         }
@@ -571,7 +639,7 @@ impl ExecutionPlan for PlannedFilterReadExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+        Arc::new(self.options.projection.to_arrow_schema())
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -600,55 +668,28 @@ impl ExecutionPlan for PlannedFilterReadExec {
                 partition
             )));
         }
-
+        let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
-        let running_stream = self.running_stream.clone();
-        let metrics = self.metrics.clone();
         let planned_fragments = self.planned_fragments.clone();
-        let output_schema = self.output_schema.clone();
-        let scan_range_after_filter = self.scan_range_after_filter.clone();
-        let fragment_readahead = self.fragment_readahead;
-        let projection = self.projection.clone();
-        let with_deleted_rows = self.with_deleted_rows;
-        let batch_size = self.batch_size;
-        let full_filter = self.full_filter.clone();
-        let refine_filter = self.refine_filter.clone();
+        let options = self.options.clone();
+        let metrics = self.metrics.clone();
 
         let stream = futures::stream::once(async move {
-            let mut running_stream_lock = running_stream.lock().await;
-            if let Some(running_stream) = &*running_stream_lock {
+            let mut running_stream_lock_guard = running_stream_lock.lock().await;
+            if let Some(running_stream) = &*running_stream_lock_guard {
                 DataFusionResult::<SendableRecordBatchStream>::Ok(
                     running_stream.get_stream(&metrics, partition),
                 )
             } else {
-                // Create ScanScheduler only when actually executing (not during planning)
-                let scan_scheduler = ScanScheduler::new(
-                    Arc::new(dataset.object_store().clone()),
-                    SchedulerConfig::max_bandwidth(dataset.object_store()),
-                );
-
-                let fragment_readahead = fragment_readahead.unwrap_or(4).max(1);
-
-                // Create global metrics
-                let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(&metrics));
-
-                // Create FilteredReadStream from planned fragments
                 let new_running_stream = FilteredReadStream::from_planned(
+                    dataset,
                     planned_fragments,
-                    projection,
-                    with_deleted_rows,
-                    batch_size,
-                    full_filter,
-                    refine_filter,
-                    output_schema,
-                    scan_scheduler,
-                    global_metrics,
-                    fragment_readahead,
-                    scan_range_after_filter,
+                    options,
+                    Arc::new(FilteredReadGlobalMetrics::new(&metrics)),
                 );
 
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
-                *running_stream_lock = Some(new_running_stream);
+                *running_stream_lock_guard = Some(new_running_stream);
                 DataFusionResult::Ok(first_stream)
             }
         })
@@ -900,57 +941,59 @@ impl std::fmt::Debug for FilteredReadStream {
 
 impl FilteredReadStream {
     /// Create FilteredReadStream from pre-planned fragments
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_planned(
+        dataset: Arc<Dataset>,
         planned_fragments: Vec<PlannedFragmentRead>,
-        projection: Arc<Projection>,
-        with_deleted_rows: bool,
-        batch_size: u32,
-        full_filter: Option<Expr>,
-        refine_filter: Option<Expr>,
-        output_schema: SchemaRef,
-        scan_scheduler: Arc<ScanScheduler>,
+        options: FilteredReadOptions,
         metrics: Arc<FilteredReadGlobalMetrics>,
-        fragment_readahead: usize,
-        scan_range_after_filter: Option<Range<u64>>,
     ) -> Self {
-        // If scan_range_after_filter is not set, we don't apply any soft limit
-        // If it is set, we only use it as a hard range (applied after filtering)
-        let soft_limit = None; // No soft limit since we'll apply hard range if needed
-        let metrics_clone = metrics.clone();
+        let output_schema = Arc::new(options.projection.to_arrow_schema());
 
-        // Convert PlannedFragmentRead to ScopedFragmentRead internally
+        let obj_store = dataset.object_store().clone();
+        let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
+        let scan_scheduler = ScanScheduler::new(Arc::new(obj_store), scheduler_config);
+
+        let io_parallelism = dataset.object_store().io_parallelism();
+        let fragment_readahead = options
+            .fragment_readahead
+            .unwrap_or(io_parallelism * 2)
+            .max(1);
+
         let scoped_fragments: Vec<ScopedFragmentRead> = planned_fragments
             .into_iter()
-            .map(|p| {
-                let filter = if p.use_refine {
-                    refine_filter.clone()
+            .map(|pf| ScopedFragmentRead {
+                fragment: pf.fragment,
+                ranges: pf.ranges,
+                projection: Arc::new(options.projection.clone()),
+                with_deleted_rows: options.with_deleted_rows,
+                batch_size: options.batch_size.unwrap_or(8192),
+                filter: if pf.use_refine {
+                    options.refine_filter.clone()
                 } else {
-                    full_filter.clone()
-                };
-
-                ScopedFragmentRead {
-                    fragment: p.fragment,
-                    ranges: p.ranges,
-                    projection: projection.clone(),
-                    with_deleted_rows,
-                    batch_size,
-                    filter,
-                    priority: p.priority,
-                    scan_scheduler: scan_scheduler.clone(),
-                }
+                    options.full_filter.clone()
+                },
+                priority: pf.priority,
+                scan_scheduler: scan_scheduler.clone(),
             })
             .collect();
 
-        let task_stream = futures::stream::iter(scoped_fragments)
-            .map(move |fragment| {
-                let metrics = metrics_clone.clone();
-                Self::read_fragment(fragment, metrics, soft_limit)
-            })
-            .buffer_unordered(fragment_readahead);
+        let global_metrics_clone = metrics.clone();
+        let scan_range_after_filter = options.scan_range_after_filter.clone();
 
-        let task_stream = task_stream.try_flatten();
-        let task_stream: BoxStream<'static, Result<ReadBatchFut>> = Box::pin(task_stream);
+        let fragment_streams = futures::stream::iter(scoped_fragments)
+            .map({
+                let scan_range_after_filter_clone = scan_range_after_filter.clone();
+                move |scoped_fragment| {
+                    let metrics = global_metrics_clone.clone();
+                    let limit = scan_range_after_filter_clone.as_ref().map(|r| r.end);
+                    tokio::task::spawn(
+                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                    )
+                    .map(|thread_result| thread_result.unwrap())
+                }
+            })
+            .buffered(fragment_readahead);
+        let task_stream = fragment_streams.try_flatten().boxed();
 
         Self {
             output_schema,
@@ -958,7 +1001,7 @@ impl FilteredReadStream {
             scan_scheduler,
             metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
-            threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(1),
+            threading_mode: options.threading_mode,
             scan_range_after_filter,
         }
     }
@@ -976,7 +1019,7 @@ impl FilteredReadStream {
     // generally fine because grabbing a task is cheap (unless we are waiting on I/O).
     //
     // If the threading mode is `MultiplePartitions` then we may operate on the data out-of-order.
-    pub(crate) fn get_stream(
+    fn get_stream(
         &self,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
@@ -1023,7 +1066,7 @@ impl FilteredReadStream {
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    FilteredReadUtils::apply_hard_range(base_batch_stream, range.clone()).boxed()
                 } else {
                     // Need to box here otherwise the if/else returns incompatible types
                     base_batch_stream.boxed()
@@ -1252,28 +1295,28 @@ mod tests {
         let ranges = vec![0..10, 10..20, 20..30];
         let fragment_range = 0..30;
         let logical_range = 5..25;
-        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        let result = FilteredReadUtils::trim_ranges(ranges, fragment_range, &logical_range);
         assert_eq!(result, vec![5..10, 10..20, 20..25]);
 
         // Test case 2: Trim with partial overlap at start
         let ranges = vec![0..10, 10..20];
         let fragment_range = 0..20;
         let logical_range = 5..30;
-        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        let result = FilteredReadUtils::trim_ranges(ranges, fragment_range, &logical_range);
         assert_eq!(result, vec![5..10, 10..20]);
 
         // Test case 3: Trim with no overlap
         let ranges = vec![0..10, 10..20];
         let fragment_range = 0..20;
         let logical_range = 30..40;
-        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        let result = FilteredReadUtils::trim_ranges(ranges, fragment_range, &logical_range);
         assert_eq!(result, Vec::<Range<u64>>::new());
 
         // Test case 4: Trim with single range
         let ranges = vec![10..50];
         let fragment_range = 10..50;
         let logical_range = 20..30;
-        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        let result = FilteredReadUtils::trim_ranges(ranges, fragment_range, &logical_range);
         assert_eq!(result, vec![20..30]);
 
         // Test case 5: Trim ranges with gaps (deletion vector case)
@@ -1283,7 +1326,7 @@ mod tests {
         let ranges = vec![0..10, 15..20, 25..30];
         let fragment_range = 0..30;
         let logical_range = 5..28;
-        let result = ScanPlanner::trim_ranges(ranges, fragment_range, &logical_range);
+        let result = FilteredReadUtils::trim_ranges(ranges, fragment_range, &logical_range);
         // We skip 5 from the first range (leaving 5..10), take all of 15..20, and all of 25..30
         // because we only have 20 logical rows total and need 23
         assert_eq!(result, vec![5..10, 15..20, 25..30]);
@@ -1294,31 +1337,31 @@ mod tests {
         // Test case 1: Perfect overlap
         let ranges1 = vec![0..10, 20..30];
         let ranges2 = vec![0..10, 20..30];
-        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        let result = FilteredReadUtils::intersect_ranges(&ranges1, &ranges2);
         assert_eq!(result, vec![0..10, 20..30]);
 
         // Test case 2: Partial overlap
         let ranges1 = vec![0..15, 20..30];
         let ranges2 = vec![10..25];
-        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        let result = FilteredReadUtils::intersect_ranges(&ranges1, &ranges2);
         assert_eq!(result, vec![10..15, 20..25]);
 
         // Test case 3: No overlap
         let ranges1 = vec![0..10];
         let ranges2 = vec![20..30];
-        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        let result = FilteredReadUtils::intersect_ranges(&ranges1, &ranges2);
         assert_eq!(result, Vec::<Range<u64>>::new());
 
         // Test case 4: Multiple intersections
         let ranges1 = vec![0..10, 15..25, 30..40];
         let ranges2 = vec![5..20, 28..35];
-        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        let result = FilteredReadUtils::intersect_ranges(&ranges1, &ranges2);
         assert_eq!(result, vec![5..10, 15..20, 30..35]);
 
         // Test case 5: One range fully contains another
         let ranges1 = vec![0..100];
         let ranges2 = vec![10..20, 30..40, 50..60];
-        let result = ScanPlanner::intersect_ranges(&ranges1, &ranges2);
+        let result = FilteredReadUtils::intersect_ranges(&ranges1, &ranges2);
         assert_eq!(result, vec![10..20, 30..40, 50..60]);
     }
 
@@ -1328,7 +1371,7 @@ mod tests {
         let mut ranges = vec![0..10, 10..20, 20..30];
         let mut to_skip = 10;
         let mut to_take = 15;
-        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        FilteredReadUtils::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
         assert_eq!(ranges, vec![10..20, 20..25]);
         assert_eq!(to_skip, 0);
         assert_eq!(to_take, 0);
@@ -1337,7 +1380,7 @@ mod tests {
         let mut ranges = vec![0..10, 10..20, 20..30];
         let mut to_skip = 5;
         let mut to_take = 10;
-        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        FilteredReadUtils::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
         assert_eq!(ranges, vec![5..10, 10..15]);
         assert_eq!(to_skip, 0);
         assert_eq!(to_take, 0);
@@ -1346,7 +1389,7 @@ mod tests {
         let mut ranges = vec![0..10, 10..20];
         let mut to_skip = 0;
         let mut to_take = 100;
-        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        FilteredReadUtils::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
         assert_eq!(ranges, vec![0..10, 10..20]);
         assert_eq!(to_skip, 0);
         assert_eq!(to_take, 80);
@@ -1355,7 +1398,7 @@ mod tests {
         let mut ranges = vec![0..10, 10..20];
         let mut to_skip = 25;
         let mut to_take = 10;
-        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        FilteredReadUtils::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
         assert_eq!(ranges, Vec::<Range<u64>>::new());
         assert_eq!(to_skip, 5);
         assert_eq!(to_take, 10);
@@ -1364,7 +1407,7 @@ mod tests {
         let mut ranges = vec![0..10, 10..20, 20..30];
         let mut to_skip = 10;
         let mut to_take = 10;
-        ScanPlanner::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
+        FilteredReadUtils::apply_skip_take_to_ranges(&mut ranges, &mut to_skip, &mut to_take);
         assert_eq!(ranges, vec![10..20]);
         assert_eq!(to_skip, 0);
         assert_eq!(to_take, 0);

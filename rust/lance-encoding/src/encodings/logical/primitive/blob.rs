@@ -288,7 +288,9 @@ impl StructuralPageScheduler for BlobPageScheduler {
         let num_rows = self.num_rows;
         async move {
             let cached = self.inner_scheduler.initialize(&io).await?;
-            let mut desc_decoders = self.inner_scheduler.schedule_ranges(&[0..num_rows], &io)?;
+            #[allow(clippy::single_range_in_vec_init)]
+            let ranges = vec![0..num_rows];
+            let mut desc_decoders = self.inner_scheduler.schedule_ranges(&ranges, &io)?;
             if desc_decoders.len() != 1 {
                 // This can't happen yet today so being a little lazy but if it did happen we just
                 // need to concatenate the descriptions.  I'm guessing by then we might be doing something
