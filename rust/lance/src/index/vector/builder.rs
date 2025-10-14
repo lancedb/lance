@@ -1113,7 +1113,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     async fn load_partition_raw_vectors(
         &self,
         part_idx: usize,
-    ) -> Result<(UInt64Array, FixedSizeListArray)> {
+    ) -> Result<Option<(UInt64Array, FixedSizeListArray)>> {
         let row_ids = self.partition_row_ids(part_idx).await?;
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
@@ -1121,12 +1121,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 location!(),
             ));
         };
+
         let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        if batches.is_empty() {
+            return Ok(None);
+        }
         let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let vectors = batch[&self.column].as_fixed_size_list().clone();
-        Ok((row_ids, vectors))
+        Ok(Some((row_ids, vectors)))
     }
 
     // return the partition ids that should be split.
@@ -1164,7 +1168,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // 3. reassign the vectors to the 2 new partitions
     async fn split_partition(&self, part_idx: usize, ivf: &IvfModel) -> Result<AssignResult> {
         // take the raw vectors from dataset
-        let (row_ids, vectors) = self.load_partition_raw_vectors(part_idx).await?;
+        let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+            return Ok(AssignResult {
+                assign_batches: vec![None; ivf.num_partitions()],
+                new_centroids: ivf.centroids_array().unwrap().clone(),
+            });
+        };
 
         match vectors.value_type() {
             DataType::Float16 => {
@@ -1270,7 +1279,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // assign the vectors in the reassigned partitions
         for (i, idx) in reassign_part_ids.values().iter().enumerate() {
             let part_idx = *idx as usize;
-            let (row_ids, vectors) = self.load_partition_raw_vectors(part_idx).await?;
+            let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+                // all vectors in this partition have been deleted
+                continue;
+            };
 
             let d0 =
                 self.distance_type.arrow_batch_func()(&reassign_part_centroids.value(i), &vectors)?;
@@ -1364,25 +1376,71 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // 1. delete the original parttion
     // 2. reasign all vectors of the original partitions
     async fn join_partition(&self, part_idx: usize, ivf: &IvfModel) -> Result<AssignResult> {
+        let centroids = ivf.centroids_array().unwrap();
+        let mut new_centroids: Vec<ArrayRef> = Vec::with_capacity(ivf.num_partitions() - 1);
+        new_centroids.extend(centroids.iter().enumerate().filter_map(|(i, vec)| {
+            if i == part_idx {
+                None
+            } else {
+                Some(vec.unwrap())
+            }
+        }));
+        let new_centroids = new_centroids
+            .iter()
+            .map(|vec| vec.as_ref())
+            .collect::<Vec<_>>();
+        let new_centroids = arrow::compute::concat(&new_centroids)?;
+        let new_centroids =
+            FixedSizeListArray::try_new_from_values(new_centroids, centroids.value_length())?;
+
         // take the raw vectors from dataset
-        let (row_ids, vectors) = self.load_partition_raw_vectors(part_idx).await?;
+        let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+            return Ok(AssignResult {
+                assign_batches: vec![None; ivf.num_partitions() - 1],
+                new_centroids: new_centroids,
+            });
+        };
 
         match vectors.value_type() {
             DataType::Float16 => {
-                self.join_partition_impl::<Float16Type>(part_idx, ivf, &row_ids, &vectors)
-                    .await
+                self.join_partition_impl::<Float16Type>(
+                    part_idx,
+                    ivf,
+                    &row_ids,
+                    &vectors,
+                    new_centroids,
+                )
+                .await
             }
             DataType::Float32 => {
-                self.join_partition_impl::<Float32Type>(part_idx, ivf, &row_ids, &vectors)
-                    .await
+                self.join_partition_impl::<Float32Type>(
+                    part_idx,
+                    ivf,
+                    &row_ids,
+                    &vectors,
+                    new_centroids,
+                )
+                .await
             }
             DataType::Float64 => {
-                self.join_partition_impl::<Float64Type>(part_idx, ivf, &row_ids, &vectors)
-                    .await
+                self.join_partition_impl::<Float64Type>(
+                    part_idx,
+                    ivf,
+                    &row_ids,
+                    &vectors,
+                    new_centroids,
+                )
+                .await
             }
             DataType::UInt8 => {
-                self.join_partition_impl::<UInt8Type>(part_idx, ivf, &row_ids, &vectors)
-                    .await
+                self.join_partition_impl::<UInt8Type>(
+                    part_idx,
+                    ivf,
+                    &row_ids,
+                    &vectors,
+                    new_centroids,
+                )
+                .await
             }
             dt => Err(Error::invalid_input(
                 format!(
@@ -1400,26 +1458,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         row_ids: &UInt64Array,
         vectors: &FixedSizeListArray,
+        new_centroids: FixedSizeListArray,
     ) -> Result<AssignResult>
     where
         T::Native: Dot + L2 + Normalize,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         assert_eq!(row_ids.len(), vectors.len());
-        let centroids = ivf.centroids_array().unwrap();
-        let mut new_centroids: Vec<ArrayRef> = Vec::with_capacity(ivf.num_partitions() + 1);
-        new_centroids.extend(centroids.iter().enumerate().filter_map(|(i, vec)| {
-            if i == part_idx {
-                None
-            } else {
-                Some(vec.unwrap())
-            }
-        }));
-        let new_centroids = new_centroids
-            .iter()
-            .map(|vec| vec.as_ref())
-            .collect::<Vec<_>>();
-        let new_centroids = arrow::compute::concat(&new_centroids)?;
 
         // the original centroid
         let c0 = ivf.centroid(part_idx).ok_or(Error::invalid_input(
@@ -1455,8 +1500,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
             assign_ops[new_part_id(idx as usize)].push(AssignOp::Add((row_id, vectors.value(i))));
         }
-        let new_centroids =
-            FixedSizeListArray::try_new_from_values(new_centroids, centroids.value_length())?;
         let assign_batches = self.build_assign_batch::<T>(&new_centroids, &assign_ops)?;
 
         Ok(AssignResult {
