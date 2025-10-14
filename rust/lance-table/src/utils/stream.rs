@@ -199,13 +199,6 @@ pub fn apply_row_id_and_deletes(
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
 ) -> Result<RecordBatch> {
-    log::debug!(
-        "apply_row_id_and_deletes: batch_offset={}, fragment_id={}, with_row_id={}, batch_rows={}",
-        batch_offset,
-        fragment_id,
-        config.with_row_id,
-        batch.num_rows()
-    );
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
     if let Some(deletion_vector_inner) = deletion_vector {
@@ -247,9 +240,7 @@ pub fn apply_row_id_and_deletes(
 
     let row_ids = if config.with_row_id {
         let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
-        log::debug!("Fetching row IDs for batch with {} rows", num_rows);
         if let Some(row_id_sequence) = &config.row_id_sequence {
-            log::debug!("Using row_id_sequence to map row addresses to row IDs");
             let selection = config
                 .params
                 .slice(batch_offset as usize, num_rows as usize)
@@ -263,12 +254,10 @@ pub fn apply_row_id_and_deletes(
                         .flat_map(|r| r.start as usize..r.end as usize),
                 )
                 .collect::<UInt64Array>();
-            log::debug!("Generated {} row IDs from sequence", row_ids.len());
             Some(Arc::new(row_ids))
         } else {
             // If we don't have a row id sequence, can assume the row ids are
             // the same as the row addresses.
-            log::debug!("No row_id_sequence; using row addresses as row IDs");
             row_addrs.clone()
         }
     } else {
@@ -284,10 +273,6 @@ pub fn apply_row_id_and_deletes(
 
     let batch = if config.with_row_id {
         let row_id_arr = row_ids.unwrap();
-        log::debug!(
-            "Adding _rowid column to batch with {} rows",
-            row_id_arr.len()
-        );
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
     } else {
         batch

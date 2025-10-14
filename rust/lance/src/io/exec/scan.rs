@@ -613,11 +613,9 @@ impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
         let mut schema: ArrowSchema = self.projection.as_ref().into();
         if self.config.with_row_id {
-            log::debug!("LanceStream: Adding _rowid column to output schema");
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
         if self.config.with_row_address {
-            log::debug!("LanceStream: Adding _rowaddr column to output schema");
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
         if self.config.with_row_last_updated_at_version {

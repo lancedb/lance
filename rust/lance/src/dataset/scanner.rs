@@ -251,11 +251,9 @@ impl LanceFilter {
     pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
         match self {
             Self::Sql(sql) => {
-                log::debug!("Converting SQL filter to DataFusion expression: {}", sql);
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
                 let filter = planner.parse_filter(sql)?;
-                log::debug!("Parsed filter expression: {:?}", filter);
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
@@ -272,7 +270,6 @@ impl LanceFilter {
                         location!(),
                     )
                 })?;
-                log::debug!("Optimized filter expression: {:?}", optimized);
                 Ok(optimized)
             }
             #[cfg(feature = "substrait")]
@@ -778,7 +775,6 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        log::debug!("Scanner::filter called with: {}", filter);
         self.filter = Some(LanceFilter::Sql(filter.to_string()));
         Ok(self)
     }
@@ -1379,10 +1375,6 @@ impl Scanner {
             .with_row_created_at_version()
             .to_schema();
 
-        log::debug!("Filterable schema includes version columns: _row_last_updated_at_version={}, _row_created_at_version={}",
-            base_schema.field(lance_core::ROW_LAST_UPDATED_AT_VERSION).is_some(),
-            base_schema.field(lance_core::ROW_CREATED_AT_VERSION).is_some());
-
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
@@ -1694,31 +1686,13 @@ impl Scanner {
 
     async fn create_filter_plan(&self, use_scalar_index: bool) -> Result<FilterPlan> {
         let filter_schema = self.filterable_schema()?;
-        log::debug!(
-            "Filterable schema columns: {:?}",
-            filter_schema
-                .fields
-                .iter()
-                .map(|f| &f.name)
-                .collect::<Vec<_>>()
-        );
         let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
         if let Some(filter) = self.filter.as_ref() {
             let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
             let index_info = self.dataset.scalar_index_info().await?;
-            log::debug!(
-                "Creating filter plan with use_scalar_index={}, filter={:?}",
-                use_scalar_index,
-                filter
-            );
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
-            log::debug!(
-                "Filter plan created - has_index_query={}, has_refine={}",
-                filter_plan.has_index_query(),
-                filter_plan.has_refine()
-            );
 
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
@@ -1999,13 +1973,8 @@ impl Scanner {
 
         if let Some(refine_expr) = &filter_plan.refine_expr {
             let column_names = Planner::column_names_in_expr(refine_expr);
-            log::debug!("Filter references columns: {:?}", column_names);
             for col_name in column_names {
                 if col_name == ROW_CREATED_AT_VERSION || col_name == ROW_LAST_UPDATED_AT_VERSION {
-                    log::debug!(
-                        "Filter references version column: {}, skipping pushdown scan",
-                        col_name
-                    );
                     return true;
                 }
             }

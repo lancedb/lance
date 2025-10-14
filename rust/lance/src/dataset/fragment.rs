@@ -625,7 +625,6 @@ pub struct FragReadConfig {
 
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
-        log::debug!("FragReadConfig::with_row_id set to {}", value);
         self.with_row_id = value;
         self
     }
