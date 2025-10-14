@@ -27,6 +27,8 @@ use snafu::location;
 
 use std::str::FromStr;
 
+use crate::compression::{BlockCompressor, BlockDecompressor};
+use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
     pb21::{self, CompressiveEncoding},
     pb22, ProtobufUtils21,
@@ -573,6 +575,40 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             num_values: data.num_values,
             block_info: BlockInfo::new(),
         }))
+    }
+}
+
+impl BlockCompressor for CompressedBufferEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let encoded = match data {
+            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+            DataBlock::VariableWidth(variable_width) => {
+                // Wrap VariableEncoder to handle the encoding
+                let encoder = VariableEncoder::default();
+                BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Unsupported data block type".into(),
+                    location: location!(),
+                })
+            }
+        };
+
+        let mut compressed = Vec::new();
+        self.compressor.compress(&encoded, &mut compressed)?;
+        Ok(LanceBuffer::from(compressed))
+    }
+}
+
+impl BlockDecompressor for CompressedBufferEncoder {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+
+        // Delegate to BinaryBlockDecompressor which handles the inline metadata
+        let inner_decoder = BinaryBlockDecompressor::default();
+        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
     }
 }
 
