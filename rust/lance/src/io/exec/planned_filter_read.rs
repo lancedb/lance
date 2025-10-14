@@ -1023,15 +1023,10 @@ impl FilteredReadStream {
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    // Convert lance_core::Error to DataFusionError for apply_hard_range
-                    let df_stream = base_batch_stream
-                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
-                    apply_hard_range(df_stream, range.clone()).boxed()
+                    apply_hard_range(base_batch_stream, range.clone()).boxed()
                 } else {
                     // Need to box here otherwise the if/else returns incompatible types
-                    base_batch_stream
-                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
-                        .boxed()
+                    base_batch_stream.boxed()
                 };
 
                 let batch_stream = batch_stream
@@ -1044,6 +1039,7 @@ impl FilteredReadStream {
                     .finally(move || {
                         partition_metrics.baseline_metrics.done();
                     })
+                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
                     .boxed();
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))

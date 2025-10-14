@@ -444,7 +444,7 @@ impl MetricsCollector for IndexMetrics {
 /// use futures::StreamExt;
 /// use lance::io::exec::utils::apply_hard_range;
 /// use std::ops::Range;
-/// # async fn example(stream: impl futures::Stream<Item = datafusion::error::Result<arrow_array::RecordBatch>>) {
+/// # async fn example(stream: impl futures::Stream<Item = lance_core::Result<arrow_array::RecordBatch>>) {
 /// let range = Range { start: 10, end: 20 }; // Skip 10 rows, take 10 rows
 /// let limited_stream = apply_hard_range(stream, range);
 /// # }
@@ -452,9 +452,9 @@ impl MetricsCollector for IndexMetrics {
 pub fn apply_hard_range<S>(
     stream: S,
     range: std::ops::Range<u64>,
-) -> impl Stream<Item = DataFusionResult<RecordBatch>>
+) -> impl Stream<Item = Result<RecordBatch>>
 where
-    S: Stream<Item = DataFusionResult<RecordBatch>>,
+    S: Stream<Item = Result<RecordBatch>>,
 {
     use futures::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
