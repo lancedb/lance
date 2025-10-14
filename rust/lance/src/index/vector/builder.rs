@@ -1312,6 +1312,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         existing_indices: &[Arc<dyn VectorIndex>],
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Option<usize>> {
+        if ivf.num_partitions() <= 1 {
+            // we have to keep at least one partition
+            return Ok(None);
+        }
+
         let index_type = IndexType::try_from(
             index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
         )?;
