@@ -19,6 +19,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
@@ -586,11 +587,13 @@ impl PlannedFilterReadExec {
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
 
+        let metrics = ExecutionPlanMetricsSet::new();
+
         Self {
             dataset,
             planned_fragments,
             options,
-            metrics: ExecutionPlanMetricsSet::new(),
+            metrics,
             properties,
             running_stream: Arc::new(AsyncMutex::new(None)),
         }
@@ -656,6 +659,17 @@ impl ExecutionPlan for PlannedFilterReadExec {
         vec![]
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        // This is to push the limit through the node and into an upstream node.
+        // The only upstream node is the index search and we can't push the limit
+        // to that node.
+        false
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -687,12 +701,8 @@ impl ExecutionPlan for PlannedFilterReadExec {
                     running_stream.get_stream(&metrics, partition),
                 )
             } else {
-                let new_running_stream = FilteredReadStream::from_planned(
-                    dataset,
-                    planned_fragments,
-                    options,
-                    Arc::new(FilteredReadGlobalMetrics::new(&metrics)),
-                );
+                let new_running_stream =
+                    FilteredReadStream::from_planned(dataset, planned_fragments, options, &metrics);
 
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream_lock_guard = Some(new_running_stream);
@@ -707,16 +717,123 @@ impl ExecutionPlan for PlannedFilterReadExec {
         )))
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::error::Result<Statistics> {
+        let fragments = self
+            .options
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().clone());
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Absent,
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![],
-        })
+        if fragments.iter().any(|f| f.num_rows().is_none()) {
+            return Err(DataFusionError::Internal(
+                "Fragments are missing row count stats".to_string(),
+            ));
+        }
+
+        let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
+
+        if self.options.full_filter.is_none() {
+            // If there is no filter, we just return the total number of rows (sans any before-filter range)
+            // divided by the number of partitions.
+            let total_rows =
+                if let Some(scan_range_before_filter) = &self.options.scan_range_before_filter {
+                    total_rows.min(scan_range_before_filter.end - scan_range_before_filter.start)
+                } else {
+                    total_rows
+                };
+
+            let total_rows = if partition.is_some() {
+                match self.options.threading_mode {
+                    FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
+                        total_rows / num_partitions as u64
+                    }
+                    // Pretty sure this shouldn't be encountered in practice
+                    FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => total_rows,
+                }
+            } else {
+                total_rows
+            };
+
+            Ok(Statistics {
+                num_rows: Precision::Exact(total_rows as usize),
+                ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+            })
+        } else {
+            // We could evaluate the indexed filter here but this is still during the planning
+            // phase so we want to avoid that.
+            //
+            // Instead, we create a mock input which is the filtered read (without the filter)
+            // and then use DF's FilterExec logic to calculate the statistics (which uses column
+            // stats and basic filter shape)
+            let filter = self.options.full_filter.as_ref().unwrap();
+
+            // Need to add in filter columns even though they aren't part of the projection
+            let filter_columns = Planner::column_names_in_expr(filter);
+            let read_projection = self
+                .options
+                .projection
+                .clone()
+                .union_columns(filter_columns, OnMissing::Error)?;
+
+            let read_schema = Arc::new(read_projection.to_arrow_schema());
+
+            let planner = Arc::new(Planner::new(read_schema.clone()));
+            let physical_filter = planner.create_physical_expr(filter)?;
+
+            let mock_input = Arc::new(Self::new(
+                self.dataset.clone(),
+                vec![], // empty planned fragments for mock
+                FilteredReadOptions {
+                    scan_range_after_filter: None,
+                    refine_filter: None,
+                    full_filter: None,
+                    projection: read_projection,
+                    ..self.options.clone()
+                },
+            ));
+            let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
+            let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+
+            // If we have an after-filter range, we should apply it to the stats (the before-filter range
+            // is applied in the mock input)
+            let total_rows = if let Some(scan_range_after_filter) =
+                &self.options.scan_range_after_filter
+            {
+                df_stats.num_rows.min(&Precision::Exact(
+                    scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
+                ))
+            } else {
+                df_stats.num_rows
+            };
+            df_stats.num_rows = total_rows;
+
+            let schema = self.schema();
+
+            // We might have added some columns to the schema so the filter compiles but we drop this
+            // columns during the filtered read and they aren't part of the output.  So we need to make
+            // sure and drop them from the column stats as well.
+            assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
+            let mut proj_iter = schema.fields.iter().peekable();
+            let mut stats_iter = read_schema.fields.iter();
+            df_stats.column_statistics.retain(|_| {
+                let stats_field = stats_iter.next().unwrap();
+                if let Some(proj_field) = proj_iter.peek() {
+                    if proj_field.name() == stats_field.name() {
+                        proj_iter.next();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            });
+
+            Ok(df_stats)
+        }
     }
 }
 
@@ -951,8 +1068,9 @@ impl FilteredReadStream {
         dataset: Arc<Dataset>,
         planned_fragments: Vec<PlannedFragmentRead>,
         options: FilteredReadOptions,
-        metrics: Arc<FilteredReadGlobalMetrics>,
+        metrics: &ExecutionPlanMetricsSet,
     ) -> Self {
+        let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store().clone();
@@ -983,7 +1101,7 @@ impl FilteredReadStream {
             })
             .collect();
 
-        let global_metrics_clone = metrics.clone();
+        let global_metrics_clone = global_metrics.clone();
         let scan_range_after_filter = options.scan_range_after_filter.clone();
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
@@ -1005,7 +1123,7 @@ impl FilteredReadStream {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
-            metrics,
+            metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode: options.threading_mode,
             scan_range_after_filter,
@@ -1294,6 +1412,12 @@ impl FilteredReadStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::UInt32Type;
+    use arrow_schema::DataType;
+    use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch};
 
     #[test]
     fn test_trim_ranges() {
@@ -1455,5 +1579,84 @@ mod tests {
         let dv = vec![10, 15, 16];
         let ranges: Vec<Range<u64>> = DvToValidRanges::new(dv.into_iter(), 100).collect();
         assert_eq!(ranges, vec![0..10, 11..15, 17..100]);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_limit_partial_fragment() {
+        // Create a simple dataset with 100 rows in one fragment
+        let tmp_path = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::rand_type(&DataType::Float32))
+            .into_dataset(
+                tmp_path.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Plan a scan that only reads the first 30 rows
+        let fragments = dataset.fragments().as_ref().clone();
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(10);
+        let (planned_fragments, _) =
+            FilteredReadUtils::plan_scan(&dataset, fragments, None, &options)
+                .await
+                .unwrap();
+
+        // Create PlannedFilterReadExec and execute
+        let planned_read = Arc::new(PlannedFilterReadExec::new(
+            dataset.clone(),
+            planned_fragments,
+            options,
+        ));
+
+        // Execute and take only 30 rows (3 batches of 10)
+        let batches = planned_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .take(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 30);
+
+        // Check metrics reflect partial fragment read
+        let metrics = planned_read.metrics().unwrap();
+
+        // Should show approximately 30 rows scanned (might be slightly more due to buffering)
+        // But should be significantly less than full fragment (100 rows)
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            (30..100).contains(&rows_scanned),
+            "rows_scanned ({}) should be close to limit (30), not full fragment (100)",
+            rows_scanned
+        );
+
+        // Should show 1 fragment was accessed
+        let fragments_scanned = metrics
+            .sum_by_name("fragments_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(fragments_scanned, 1);
+
+        let ranges_scanned = metrics
+            .sum_by_name("ranges_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(ranges_scanned > 0, "Should have scanned some ranges");
+
+        // Should have some IO metrics
+        let iops = metrics
+            .sum_by_name("iops")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(iops > 0, "Should have recorded IO operations");
     }
 }

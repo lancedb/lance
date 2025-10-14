@@ -519,6 +519,15 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
+        // Try to get metrics from the planned exec if it's been initialized
+        // Otherwise return empty metrics
+        let planned_exec_lock = self.planned_exec.try_lock();
+        if let Ok(guard) = planned_exec_lock {
+            if let Some(planned_exec) = &*guard {
+                return planned_exec.metrics();
+            }
+        }
+        // If planned exec hasn't been initialized yet, return empty metrics
         Some(self.metrics.clone_inner())
     }
 
