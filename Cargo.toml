@@ -45,6 +45,7 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
+libc = "0.2.176"
 lance = { version = "=0.38.2", path = "./rust/lance" }
 lance-arrow = { version = "=0.38.2", path = "./rust/lance-arrow" }
 lance-core = { version = "=0.38.2", path = "./rust/lance-core" }
@@ -156,7 +157,7 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.8"
-strum = "0.25"
+strum = "0.26"
 tantivy = { version = "0.24.1", features = ["stopwords"] }
 lindera = { version = "0.44.0" }
 lindera-tantivy = { version = "0.44.0" }

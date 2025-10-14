@@ -26,7 +26,7 @@ use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
 use crate::{
-    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT,
+    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
@@ -109,7 +109,7 @@ async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfMo
 
 #[pyfunction]
 fn get_ivf_model(py: Python<'_>, dataset: &Dataset, index_name: &str) -> PyResult<Py<PyIvfModel>> {
-    let ivf_model = RT.block_on(Some(py), do_get_ivf_model(dataset, index_name))??;
+    let ivf_model = rt().block_on(Some(py), do_get_ivf_model(dataset, index_name))??;
     Py::new(py, PyIvfModel { inner: ivf_model })
 }
 
@@ -155,7 +155,7 @@ fn train_ivf_model(
     sample_rate: u32,
     max_iters: u32,
 ) -> PyResult<PyObject> {
-    let centroids = RT.block_on(
+    let centroids = rt().block_on(
         Some(py),
         do_train_ivf_model(
             dataset,
@@ -224,7 +224,7 @@ fn train_pq_model(
         lengths: vec![],
         loss: None,
     };
-    let codebook = RT.block_on(
+    let codebook = rt().block_on(
         Some(py),
         do_train_pq_model(
             dataset,
@@ -311,7 +311,7 @@ pub fn transform_vectors(
         codebook,
         distance_type,
     );
-    RT.block_on(
+    rt().block_on(
         Some(py),
         do_transform_vectors(
             dataset,
@@ -362,7 +362,7 @@ pub fn shuffle_transformed_vectors(
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
-    let result = RT.block_on(
+    let result = rt().block_on(
         None,
         do_shuffle_transformed_vectors(
             unsorted_filenames,
@@ -455,7 +455,7 @@ pub fn load_shuffled_vectors(
         distance_type,
     );
 
-    RT.block_on(
+    rt().block_on(
         None,
         do_load_shuffled_vectors(
             filenames, dir_path, dataset, column, idx_name, ivf_model, pq_model,

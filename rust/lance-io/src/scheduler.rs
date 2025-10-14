@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(8, scheduler.stats().iops);
 
         let reads = (0..44)
-            .map(|i| (i * 1_000_000..(i + 1) * 1_000_000))
+            .map(|i| i * 1_000_000..(i + 1) * 1_000_000)
             .collect::<Vec<_>>();
         let req = file_scheduler.submit_request(reads, 0);
         let bytes = req.await.unwrap();

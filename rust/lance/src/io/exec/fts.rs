@@ -416,29 +416,23 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         .for_column(&column)
                         .supports_fts(),
                 )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let inverted_idx = match index_meta {
+                Some(index_meta) => {
+                    let uuid = index_meta.uuid.to_string();
+                    let index = ds
+                        .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                        .await?;
+                    index.as_any().downcast_ref::<InvertedIndex>().cloned()
+                }
+                None => None,
+            };
+
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
-                inverted_idx,
+                &inverted_idx,
             ))
         })
         .try_flatten_unordered(None)

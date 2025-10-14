@@ -935,21 +935,29 @@ impl FileFragment {
                 .dataset
                 .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
-            let (store_scheduler, reader_priority) =
-                if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
-                } else {
-                    (
-                        ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                        ),
-                        0,
-                    )
-                };
+            let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
+                // TODO: make object stores for non-default bases reuse the same scan scheduler
+                //  currently we always create a new one
+                let object_store = self.dataset.object_store_for_base(base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&object_store);
+                (
+                    ScanScheduler::new(object_store, config),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+                (
+                    scan_scheduler.clone(),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else {
+                (
+                    ScanScheduler::new(
+                        self.dataset.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    ),
+                    0,
+                )
+            };
             let file_scheduler = store_scheduler
                 .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
                 .await?;
@@ -2476,7 +2484,11 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+    use lance_io::{
+        assert_io_eq, assert_io_lt,
+        object_store::{ObjectStore, ObjectStoreParams},
+        utils::tracking_store::IOTracker,
+    };
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use v2::writer::FileWriterOptions;
@@ -2488,7 +2500,7 @@ mod tests {
             InsertBuilder,
         },
         session::Session,
-        utils::test::{StatsHolder, TestDatasetGenerator},
+        utils::test::TestDatasetGenerator,
     };
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
@@ -3168,6 +3180,7 @@ mod tests {
             schema: schema.clone(),
             fragments,
             config_upsert_values: None,
+            initial_bases: None,
         };
 
         let new_dataset =
@@ -3277,6 +3290,7 @@ mod tests {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
                 config_upsert_values: None,
+                initial_bases: None,
             };
 
             let dataset =
@@ -3685,7 +3699,7 @@ mod tests {
         )
         .unwrap();
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(StatsHolder::default());
+        let io_stats = Arc::new(IOTracker::default());
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
                 object_store_wrapper: Some(io_stats.clone()),
@@ -3704,8 +3718,8 @@ mod tests {
         // Assert file is small (< 4kb)
         {
             let stats = io_stats.incremental_stats();
-            assert_eq!(stats.write_iops, 3);
-            assert!(stats.write_bytes < 4096);
+            assert_io_eq!(stats, write_iops, 3);
+            assert_io_lt!(stats, write_bytes, 4096);
         }
 
         // Measure IOPS needed to scan all data first time.
@@ -3729,7 +3743,7 @@ mod tests {
         assert_eq!(data.num_columns(), 7);
 
         let stats = io_stats.incremental_stats();
-        assert_eq!(stats.read_iops, 1);
-        assert!(stats.read_bytes < 4096);
+        assert_io_eq!(stats, read_iops, 1);
+        assert_io_lt!(stats, read_bytes, 4096);
     }
 }
