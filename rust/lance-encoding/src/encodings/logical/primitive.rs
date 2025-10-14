@@ -4401,9 +4401,12 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
+    use crate::decoder::PageEncoding;
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::format::pb21;
+    use crate::format::pb21::compressive_encoding::Compression;
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
@@ -5381,5 +5384,59 @@ mod tests {
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
 
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
+    }
+
+    #[tokio::test]
+    async fn test_large_dictionary_general_compression() {
+        use arrow_array::{ArrayRef, StringArray};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Create large string dictionary data (>32KiB) with low cardinality
+        // Use 100 unique strings, each 500 bytes long = 50KB dictionary
+        let unique_values: Vec<String> = (0..100)
+            .map(|i| format!("value_{:04}_{}", i, "x".repeat(500)))
+            .collect();
+
+        // Repeat these strings many times to create a large array
+        let repeated_strings: Vec<_> = unique_values
+            .iter()
+            .cycle()
+            .take(100_000)
+            .map(|s| Some(s.as_str()))
+            .collect();
+
+        let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
+
+        // Configure test to use V2_2 and verify encoding
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_verify_encoding(Arc::new(|cols: &[crate::encoder::EncodedColumn], _| {
+                assert_eq!(cols.len(), 1);
+                let col = &cols[0];
+
+                // Navigate to the dictionary encoding in the page layout
+                if let Some(PageEncoding::Structural(page_layout)) = &col.final_pages.first().map(|p| &p.description) {
+                    // Check that dictionary is wrapped with general compression
+                    if let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) = &page_layout.layout {
+                        if let Some(dictionary_encoding) = &mini_block.dictionary {
+                            match dictionary_encoding.compression.as_ref() {
+                                Some(Compression::General(general)) => {
+                                    // Verify it's using LZ4 or Zstd
+                                    let compression = general.compression.as_ref().unwrap();
+                                    assert!(
+                                        compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                        || compression.scheme() == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                        "Expected LZ4 or Zstd compression for large dictionary"
+                                    );
+                                }
+                                _ => panic!("Expected General compression for large dictionary"),
+                            }
+                        }
+                    }
+                }
+            }));
+
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
     }
 }
