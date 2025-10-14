@@ -2056,7 +2056,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
-    def add_bases(self, new_bases: list):
+    def add_bases(self, new_bases: list, transaction_properties: dict = None):
         """
         Add new base paths to the dataset for multi-bucket storage.
 
@@ -2069,12 +2069,15 @@ class LanceDataset(pa.dataset.Dataset):
         new_bases : list[DatasetBasePath]
             A list of DatasetBasePath objects representing the new storage locations
             to add. Each base path should have a unique name and path.
+        transaction_properties: Optional[Dict[str, str]] = None,
+            Optional key-value pairs for audit metadata.
 
         Returns
         -------
         LanceDataset
+            Returns self to allow method chaining.
         """
-        self._ds.add_bases(new_bases)
+        self._ds.add_bases(new_bases, transaction_properties)
         return self
 
     def cleanup_old_versions(

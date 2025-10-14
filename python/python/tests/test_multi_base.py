@@ -986,3 +986,63 @@ class TestAddBases:
         names = [bp.name for bp in base_paths.values()]
         assert "new_base1" in names
         assert "new_base2" in names
+
+    def test_add_bases_with_transaction_properties(self):
+        """Test that transaction properties are stored with add_bases operation."""
+        from datetime import datetime
+
+        # Create initial dataset
+        data = pd.DataFrame({"id": range(20), "value": range(20)})
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[DatasetBasePath(self.initial_base, name="initial_base")],
+            target_bases=["initial_base"],
+        )
+
+        # Add new base with transaction properties
+        dataset = lance.dataset(self.primary_uri)
+        properties = {
+            "user": "alice@example.com",
+            "timestamp": datetime.now().isoformat(),
+            "purpose": "Adding new region storage for testing",
+            "team": "data-platform",
+            "__lance_commit_message": "Add new_base1 for improved performance",
+        }
+
+        dataset.add_bases(
+            [DatasetBasePath(self.new_base1, name="new_base1")],
+            transaction_properties=properties,
+        )
+
+        # Verify the base was added
+        base_paths = dataset._ds.base_paths()
+        names = [bp.name for bp in base_paths.values()]
+        assert "new_base1" in names
+
+        # Verify transaction properties are stored
+        transaction = dataset.read_transaction(
+            2
+        )  # Version 2 is the add_bases operation
+        props = transaction.transaction_properties
+
+        assert props.get("user") == "alice@example.com"
+        assert props.get("purpose") == "Adding new region storage for testing"
+        assert props.get("team") == "data-platform"
+        assert (
+            props.get("__lance_commit_message")
+            == "Add new_base1 for improved performance"
+        )
+        assert "timestamp" in props
+
+        # Verify we can still write to the new base
+        new_data = pd.DataFrame({"id": range(20, 30), "value": range(20, 30)})
+        dataset = lance.write_dataset(
+            new_data, dataset, mode="append", target_bases=["new_base1"]
+        )
+
+        # Verify all data
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 30
+        assert set(result["id"]) == set(range(30))

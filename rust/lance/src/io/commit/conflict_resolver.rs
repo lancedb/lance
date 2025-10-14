@@ -52,7 +52,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::AddBases { .. } => Ok(Self {
+            | Operation::UpdateBases { .. } => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -213,7 +213,7 @@ impl<'a> TransactionRebase<'a> {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
             Operation::Clone { .. } => Ok(()),
-            Operation::AddBases { .. } => {
+            Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
         }
@@ -232,7 +232,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. }
-                | Operation::AddBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -353,7 +353,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
-                | Operation::AddBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -481,9 +481,9 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Append { .. } | Operation::Clone { .. } | Operation::AddBases { .. } => {
-                    Ok(())
-                }
+                Operation::Append { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateBases { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 // unless it is the same frag reuse index
                 Operation::CreateIndex {
@@ -614,7 +614,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateMemWalState { .. }
-                | Operation::AddBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Delete {
                     updated_fragments,
                     deleted_fragment_ids,
@@ -795,7 +795,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
-            | Operation::AddBases { .. } => Ok(()),
+            | Operation::UpdateBases { .. } => Ok(()),
         }
     }
 
@@ -819,7 +819,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
-            | Operation::AddBases { .. }
+            | Operation::UpdateBases { .. }
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
@@ -841,7 +841,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
-            | Operation::AddBases { .. } => Ok(()),
+            | Operation::UpdateBases { .. } => Ok(()),
             Operation::CreateIndex { .. } => {
                 // TODO(rmeng): check that the new indices isn't on the column being replaced
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
@@ -872,7 +872,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::AddBases { .. } => Ok(()),
+            | Operation::UpdateBases { .. } => Ok(()),
 
             Operation::Update { .. }
             | Operation::Append { .. }
@@ -906,7 +906,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::AddBases { .. }
+            | Operation::UpdateBases { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::Clone { .. }
@@ -938,7 +938,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::AddBases { .. } => Ok(()),
+            | Operation::UpdateBases { .. } => Ok(()),
         }
     }
 
@@ -958,7 +958,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::AddBases { .. } => Ok(()),
+            | Operation::UpdateBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
@@ -1033,7 +1033,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Update { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
-                | Operation::AddBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1113,7 +1113,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Rewrite { .. }
                 | Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::AddBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Append { .. }
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
@@ -1137,9 +1137,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::AddBases { new_bases } = &self.transaction.operation {
+        if let Operation::UpdateBases { new_bases } = &self.transaction.operation {
             match &other_transaction.operation {
-                Operation::AddBases {
+                Operation::UpdateBases {
                     new_bases: committed_bases,
                 } => {
                     // Check if any of the bases being added conflict with committed bases
@@ -1176,7 +1176,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                // AddBases doesn't conflict with data operations
+                // UpdateBases doesn't conflict with data operations
                 _ => Ok(()),
             }
         } else {
@@ -1249,7 +1249,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::AddBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. } => Ok(self.transaction),
         }
     }
 
@@ -2574,7 +2574,7 @@ mod tests {
         // Create two transactions adding different bases
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 1,
                     path: "s3://bucket1/path1".to_string(),
@@ -2586,7 +2586,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 2,
                     path: "s3://bucket2/path2".to_string(),
@@ -2610,7 +2610,7 @@ mod tests {
         // Create two transactions adding bases with the same name
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 1,
                     path: "s3://bucket1/path1".to_string(),
@@ -2622,7 +2622,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 2,
                     path: "s3://bucket2/path2".to_string(),
@@ -2651,7 +2651,7 @@ mod tests {
         // Create two transactions adding bases with the same path
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 1,
                     path: "s3://bucket/duplicate_path".to_string(),
@@ -2663,7 +2663,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 2,
                     path: "s3://bucket/duplicate_path".to_string(),
@@ -2692,7 +2692,7 @@ mod tests {
         // Create two transactions adding bases with the same non-zero ID
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 42,
                     path: "s3://bucket1/path1".to_string(),
@@ -2704,7 +2704,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 42,
                     path: "s3://bucket2/path2".to_string(),
@@ -2732,7 +2732,7 @@ mod tests {
 
         let add_bases_txn = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 1,
                     path: "s3://bucket/path".to_string(),
@@ -2768,7 +2768,7 @@ mod tests {
                 .unwrap();
             assert!(
                 rebase.check_txn(&data_txn, 2).is_ok(),
-                "AddBases should not conflict with {:?}",
+                "UpdateBases should not conflict with {:?}",
                 operation
             );
         }
@@ -2781,7 +2781,7 @@ mod tests {
         // txn1 adds two bases
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![
                     lance_table::format::BasePath {
                         id: 1,
@@ -2802,7 +2802,7 @@ mod tests {
         // txn2 adds a base that conflicts with one of txn1's bases
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 3,
                     path: "s3://bucket1/path1".to_string(), // Same path as txn1's first base
@@ -2831,7 +2831,7 @@ mod tests {
         // Bases with None names should not conflict on name
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 1,
                     path: "s3://bucket1/path1".to_string(),
@@ -2843,7 +2843,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 2,
                     path: "s3://bucket2/path2".to_string(),
@@ -2867,7 +2867,7 @@ mod tests {
         // Bases with zero IDs should not conflict on ID
         let txn1 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 0,
                     path: "s3://bucket1/path1".to_string(),
@@ -2879,7 +2879,7 @@ mod tests {
 
         let txn2 = Transaction::new_from_version(
             1,
-            Operation::AddBases {
+            Operation::UpdateBases {
                 new_bases: vec![lance_table::format::BasePath {
                     id: 0,
                     path: "s3://bucket2/path2".to_string(),
@@ -2909,7 +2909,7 @@ mod tests {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::AddBases { .. }
+            | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
             Operation::Delete {

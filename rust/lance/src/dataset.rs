@@ -88,7 +88,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction, UpdateMapEntry};
+use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
@@ -1359,18 +1359,13 @@ impl Dataset {
     pub async fn add_bases(
         self: &Arc<Self>,
         new_bases: Vec<lance_table::format::BasePath>,
+        transaction_properties: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        use crate::dataset::transaction::{Operation, Transaction};
-        use crate::dataset::write::CommitBuilder;
+        let operation = Operation::UpdateBases { new_bases };
 
-        let operation = Operation::AddBases { new_bases };
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            operation,
-            None, // No blob operation for AddBases
-            None, // No transaction properties
-        );
+        let transaction = TransactionBuilder::new(self.manifest.version, operation)
+            .transaction_properties(transaction_properties.map(Arc::new))
+            .build();
 
         let new_dataset = CommitBuilder::new(self.clone())
             .execute(transaction)
@@ -9094,7 +9089,7 @@ mod tests {
             ),
         ];
 
-        let updated_dataset = dataset.add_bases(new_bases).await.unwrap();
+        let updated_dataset = dataset.add_bases(new_bases, None).await.unwrap();
 
         // Verify the base paths were added
         assert_eq!(updated_dataset.manifest.base_paths.len(), 2);
@@ -9125,7 +9120,9 @@ mod tests {
             false,
         )];
 
-        let result = Arc::new(updated_dataset).add_bases(conflicting_bases).await;
+        let result = Arc::new(updated_dataset)
+            .add_bases(conflicting_bases, None)
+            .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -9140,7 +9137,7 @@ mod tests {
             false,
         )];
 
-        let result = dataset.add_bases(conflicting_bases).await;
+        let result = dataset.add_bases(conflicting_bases, None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -9180,7 +9177,7 @@ mod tests {
             false,
         )];
 
-        let result = dataset.add_bases(invalid_bases).await;
+        let result = dataset.add_bases(invalid_bases, None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -9195,7 +9192,7 @@ mod tests {
             false,
         )];
 
-        let result = dataset.add_bases(invalid_bases).await;
+        let result = dataset.add_bases(invalid_bases, None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

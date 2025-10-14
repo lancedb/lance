@@ -1372,12 +1372,16 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    #[pyo3(signature=(new_bases))]
-    fn add_bases(&mut self, new_bases: Vec<DatasetBasePath>) -> PyResult<()> {
+    #[pyo3(signature=(new_bases, transaction_properties=None))]
+    fn add_bases(
+        &mut self,
+        new_bases: Vec<DatasetBasePath>,
+        transaction_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
         use lance_table::format::BasePath;
         let rust_bases: Vec<BasePath> = new_bases.into_iter().map(BasePath::from).collect();
         let new_dataset = rt()
-            .block_on(None, self.ds.add_bases(rust_bases))?
+            .block_on(None, self.ds.add_bases(rust_bases, transaction_properties))?
             .map_err(|err| match err {
                 lance::Error::InvalidInput { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
