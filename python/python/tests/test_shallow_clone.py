@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - environment constraint
 
 
 @pytest.mark.skip(
-@pytest.mark.skip(reason="In this environment, memory:// object store content is not retained across cloned dataset reads")
+    reason="In this environment, memory:// object store content is not retained across cloned dataset reads"
 )
 def test_shallow_clone_memory_uri():
     """Shallow clone by version number and tag using memory:// URIs.
