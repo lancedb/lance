@@ -28,10 +28,10 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
-    RowIdMeta as RowIdMeta,
+    RowDatasetVersionMeta as RowDatasetVersionMeta,
 )
 from .lance import (
-    RowDatasetVersionMeta as RowDatasetVersionMeta,
+    RowIdMeta as RowIdMeta,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
