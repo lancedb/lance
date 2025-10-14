@@ -177,7 +177,8 @@ pub enum Operation {
     },
     /// A new index has been created.
     CreateIndex {
-        /// The new secondary indices that are being added
+        /// The new secondary indices,
+        /// any existing indices with the same name will be replaced.
         new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
         removed_indices: Vec<IndexMetadata>,
