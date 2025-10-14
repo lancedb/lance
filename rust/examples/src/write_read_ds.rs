@@ -7,10 +7,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::StreamExt;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::Dataset;
-use std::sync::Arc;
 use lance::io::ObjectStore;
+use lance::Dataset;
 use lance_core::utils::tempfile::TempStrDir;
+use std::sync::Arc;
 
 // Writes sample dataset to the given path
 async fn write_dataset(data_path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_dataset(data_path).await?;
         read_dataset(data_path).await?;
         Ok(())
-    }.await;
+    }
+    .await;
 
     if let Err(e) = clean_resources(data_path).await {
         eprintln!("Failed to clean resources: {:?}", e);
