@@ -1421,7 +1421,7 @@ impl Dataset {
     /// Restore the current version
     #[pyo3(signature = (target_path, version, storage_options=None))]
     fn shallow_clone(
-        &self,
+        &mut self,
         py: Python,
         target_path: String,
         version: PyObject,
@@ -1442,10 +1442,11 @@ impl Dataset {
             let tag: &str = &s.to_string_lossy();
             rt().block_on(None, self.ds.shallow_clone(&target_path, tag, store_params))?
         } else {
-            return Err(PyIOError::new_err(
+            return Err(PyValueError::new_err(
                 "version must be an integer or a string.",
             ));
-        };
+        }
+        .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
 
         let uri = ds.uri().to_string();
         Ok(Self {

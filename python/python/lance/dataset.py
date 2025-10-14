@@ -3201,7 +3201,8 @@ class LanceDataset(pa.dataset.Dataset):
             The source version to clone. An integer specifies a version number; a string
             specifies a tag name.
         storage_options : dict, optional
-            Object store configuration for the new dataset (e.g., credentials, endpoints).
+            Object store configuration for the new dataset (e.g., credentials,
+            endpoints).
 
         Returns
         -------
