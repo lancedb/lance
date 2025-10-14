@@ -89,7 +89,7 @@ use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
-use fragment::{FileFragment, PyRowDatasetVersionMeta, PyDeletionFile, PyRowIdMeta};
+use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;

@@ -27,7 +27,7 @@ use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    DataFile, RowDatasetVersionMeta, DeletionFile, DeletionFileType, Fragment, RowIdMeta,
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
