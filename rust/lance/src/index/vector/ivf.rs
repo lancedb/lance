@@ -1463,10 +1463,84 @@ pub(crate) async fn remap_index_file_v3(
     mapping: &HashMap<u64, Option<u64>>,
     column: String,
 ) -> Result<()> {
+    let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().child(new_uuid);
-    index
-        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
-        .await
+    let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
+    match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "the field type {} is not supported for FLAT index",
+                        element_type
+                    ),
+                    location: location!(),
+                });
+            }
+        },
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
+                .remap(mapping)
+                .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
