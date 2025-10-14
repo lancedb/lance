@@ -612,9 +612,9 @@ def test_multithreaded_writer(tmp_path):
 
     # Check if total row count is correct
     expected_total_rows = num_threads * records_per_thread
-    assert result_table.num_rows == expected_total_rows, (
-        f"Expected {expected_total_rows} rows, got {result_table.num_rows}"
-    )
+    assert (
+        result_table.num_rows == expected_total_rows
+    ), f"Expected {expected_total_rows} rows, got {result_table.num_rows}"
 
     # Check data content correctness (order may differ, but data should be complete)
     # Convert results to dictionary list for comparison
