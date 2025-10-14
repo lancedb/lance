@@ -2058,9 +2058,9 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_bases(self, new_bases: list, transaction_properties: dict = None):
         """
-        Add new base paths to the dataset for multi-bucket storage.
+        Add new base paths to the dataset for multi-base storage.
 
-        This method allows you to register additional storage locations (buckets)
+        This method allows you to register additional storage locations (bases)
         that can be used for future data writes. The base paths are added to the
         dataset's manifest and can be referenced by name in subsequent write operations.
 
@@ -2069,7 +2069,7 @@ class LanceDataset(pa.dataset.Dataset):
         new_bases : list[DatasetBasePath]
             A list of DatasetBasePath objects representing the new storage locations
             to add. Each base path should have a unique name and path.
-        transaction_properties: Optional[Dict[str, str]] = None,
+        transaction_properties: Dict[str, str]] Optional
             Optional key-value pairs for audit metadata.
 
         Returns
