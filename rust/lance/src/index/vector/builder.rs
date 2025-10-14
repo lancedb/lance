@@ -1346,10 +1346,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let valid_num_rows = part
                     .storage
                     .row_ids()
-                    .filter(|row_id| match mapping.get(row_id) {
-                        Some(None) => false,
-                        _ => true,
-                    })
+                    .filter(|row_id| !matches!(mapping.get(row_id), Some(None)))
                     .count();
                 num_rows += valid_num_rows;
             }

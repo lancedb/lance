@@ -1482,15 +1482,13 @@ pub(crate) async fn remap_index_file_v3(
                 .remap(mapping)
                 .await
             }
-            _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "the field type {} is not supported for FLAT index",
-                        element_type
-                    ),
-                    location: location!(),
-                });
-            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "the field type {} is not supported for FLAT index",
+                    element_type
+                ),
+                location: location!(),
+            }),
         },
         (SubIndexType::Flat, QuantizationType::Product) => {
             IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
