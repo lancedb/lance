@@ -888,6 +888,18 @@ impl Dataset {
         let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
+        } else if cfg!(windows) {
+            let manifest_key_win = ManifestKey {
+                version: location.version,
+                e_tag: None,
+            };
+            let cached_manifest = self.metadata_cache.get_with_key(&manifest_key_win).await;
+            if let Some(cached_manifest) = cached_manifest {
+                self.metadata_cache
+                    .insert_with_key(&manifest_key, cached_manifest.clone())
+                    .await;
+                return Ok((cached_manifest, location));
+            }
         }
 
         if self.already_checked_out(&location, self.manifest.branch.clone()) {
