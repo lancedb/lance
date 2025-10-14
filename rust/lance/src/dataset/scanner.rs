@@ -1233,7 +1233,7 @@ impl Scanner {
     /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
     pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
         self.legacy_with_row_last_updated_at_version = true;
-        // Version column will be added in try_into_scan_plan
+        self.projection_plan.include_row_last_updated_at_version();
         self
     }
 
@@ -1242,7 +1242,7 @@ impl Scanner {
     /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
     pub fn with_row_created_at_version(&mut self) -> &mut Self {
         self.legacy_with_row_created_at_version = true;
-        // Version column will be added in try_into_scan_plan
+        self.projection_plan.include_row_created_at_version();
         self
     }
 
@@ -1326,7 +1326,7 @@ impl Scanner {
     }
 
     /// The Arrow schema of the output, including projections and vector / _distance
-    pub async fn schema(&mut self) -> Result<SchemaRef> {
+    pub async fn schema(&self) -> Result<SchemaRef> {
         let plan = self.create_plan().await?;
         Ok(plan.schema())
     }
@@ -1469,7 +1469,7 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub fn try_into_stream(&mut self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
+    pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1487,7 +1487,7 @@ impl Scanner {
     }
 
     pub(crate) async fn try_into_dfstream(
-        &mut self,
+        &self,
         mut options: LanceExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
@@ -1500,14 +1500,14 @@ impl Scanner {
         execute_plan(plan, options)
     }
 
-    pub async fn try_into_batch(&mut self) -> Result<RecordBatch> {
+    pub async fn try_into_batch(&self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
         let schema = stream.schema();
         let batches = stream.try_collect::<Vec<_>>().await?;
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&mut self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1565,7 +1565,7 @@ impl Scanner {
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
-    pub fn count_rows(&mut self) -> BoxFuture<'_, Result<u64>> {
+    pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;
@@ -1799,17 +1799,9 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&mut self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
-
-        // Add version columns to projection plan if requested
-        if self.legacy_with_row_last_updated_at_version {
-            self.projection_plan.include_row_last_updated_at_version();
-        }
-        if self.legacy_with_row_created_at_version {
-            self.projection_plan.include_row_created_at_version();
-        }
 
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());

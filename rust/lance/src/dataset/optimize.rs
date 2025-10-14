@@ -1599,7 +1599,7 @@ mod tests {
         assert_eq!(metrics.fragments_added, 1);
 
         // Assert order unchanged and data is all there.
-        let mut scanner = dataset.scan();
+        let scanner = dataset.scan();
         let batches = scanner
             .try_into_stream()
             .await
