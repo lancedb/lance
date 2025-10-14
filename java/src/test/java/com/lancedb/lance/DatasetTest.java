@@ -38,6 +38,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -1390,6 +1391,106 @@ public class DatasetTest {
         assertEquals(5, allOptions.getBatchSize().get().intValue());
         assertFalse(allOptions.getDeferIndexRemap().get());
       }
+    }
+  }
+
+  /**
+   * Attempt to ensure native library is available; otherwise skip tests.
+   *
+   * <p>This method triggers the JniLoader static initialization which loads the native library. If
+   * loading fails (UnsatisfiedLinkError or NoClassDefFoundError), the test is skipped using JUnit
+   * assumptions to avoid hard failures in environments without JNI.
+   */
+  private static void assumeNativeAvailable() {
+    try {
+      JniLoader.ensureLoaded();
+    } catch (UnsatisfiedLinkError | NoClassDefFoundError | ExceptionInInitializerError e) {
+      Assumptions.assumeTrue(false, "Skipping tests: native library not loaded: " + e);
+    }
+  }
+
+  @Test
+  void testShallowCloneByVersion(@TempDir Path tempDir) {
+    assumeNativeAvailable();
+
+    String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
+    String dstPath = tempDir.resolve("shallow_clone_version_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Prepare a simple source dataset with some rows
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 5)) { // write 5 rows -> version 2
+        assertEquals(2, src.version());
+        long srcRowCount = src.countRows();
+        Schema srcSchema = src.getSchema();
+
+        Optional<Map<String, String>> storageOptions = Optional.empty();
+        try (Dataset clone = src.shallowClone(dstPath, src.version(), storageOptions)) {
+          // Validate the cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPath, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened = Dataset.open(allocator, dstPath, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    } catch (UnsatisfiedLinkError | NoClassDefFoundError | ExceptionInInitializerError e) {
+      Assumptions.assumeTrue(false, "Skipping testShallowCloneByVersion: JNI not available: " + e);
+    }
+  }
+
+  @Test
+  void testShallowCloneByTag(@TempDir Path tempDir) {
+    assumeNativeAvailable();
+
+    String srcPath = tempDir.resolve("shallow_clone_tag_src").toString();
+    String dstPath = tempDir.resolve("shallow_clone_tag_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Prepare a source dataset and tag the current version
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 7)) { // write 7 rows -> version 2
+        assertEquals(2, src.version());
+        long srcRowCount = src.countRows();
+        Schema srcSchema = src.getSchema();
+
+        // Create a tag pointing to the current version
+        String tag = "v2";
+        src.tags().create(tag, src.version());
+        assertEquals(2, src.tags().getVersion(tag));
+
+        Optional<Map<String, String>> storageOptions = Optional.empty();
+        try (Dataset clone = src.shallowClone(dstPath, tag, storageOptions)) {
+          // Validate the cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPath, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened = Dataset.open(allocator, dstPath, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    } catch (UnsatisfiedLinkError | NoClassDefFoundError | ExceptionInInitializerError e) {
+      Assumptions.assumeTrue(false, "Skipping testShallowCloneByTag: JNI not available: " + e);
     }
   }
 }
