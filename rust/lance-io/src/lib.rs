@@ -279,7 +279,6 @@ impl ReadBatchParams {
     }
 
     /// Convert a read range into a vector of row ranges
-    #[allow(clippy::single_range_in_vec_init)]
     pub fn to_ranges(&self) -> Result<Vec<Range<u64>>> {
         match self {
             Self::Indices(indices) => Ok(indices
