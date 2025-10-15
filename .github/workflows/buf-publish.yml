@@ -1,0 +1,15 @@
+name: Publish protobuf to BSR
+
+on:
+  push:
+jobs:
+  push-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-push-action@v1
+        with:
+          buf_token: ${{ secrets.BUF_TOKEN }}
+          create_visibility: private
+          draft: ${{ github.ref_name != 'main'}}
