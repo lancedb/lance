@@ -11,6 +11,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
+use chrono::Utc;
 use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
@@ -1275,7 +1276,7 @@ impl Scanner {
 
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
-            let execution_props = ExecutionProps::default();
+            let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
             create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
                 message: format!(
                     "Failed to create physical expression for nested field '{}': {}",
