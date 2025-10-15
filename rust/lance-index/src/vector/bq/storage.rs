@@ -802,7 +802,7 @@ mod tests {
 
             let original_codes = FixedSizeListArray::try_new_from_values(
                 UInt8Array::from(codes_data.clone()),
-                code_len as i32,
+                code_len,
             )
             .unwrap();
 
