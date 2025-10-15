@@ -1,7 +1,11 @@
 name: Publish protobuf to BSR
 
 on:
+  pull_request:
   push:
+    paths:
+      - 'buf.yaml'
+      - 'protos/**'
 jobs:
   push-module:
     runs-on: ubuntu-latest
