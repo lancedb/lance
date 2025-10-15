@@ -1236,6 +1236,7 @@ mod tests {
         #[case] distance_type: DistanceType,
         #[case] recall_requirement: f32,
     ) {
+        let _ = env_logger::try_init();
         let ivf_params = IvfBuildParams::new(nlist);
         let rq_params = RQBuildParams::new(4);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);

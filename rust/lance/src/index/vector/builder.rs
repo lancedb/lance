@@ -31,7 +31,7 @@ use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
+use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -895,16 +895,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             continue;
                         }
 
-                        let codes = batch[RABIT_CODE_COLUMN]
-                            .as_fixed_size_list()
-                            .values()
-                            .as_primitive::<datatypes::UInt8Type>();
-                        let codes_num_bytes = codes.len() / batch.num_rows();
-                        let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
-                        let original_codes = FixedSizeListArray::try_new_from_values(
-                            original_codes,
-                            codes_num_bytes as i32,
-                        )?;
+                        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list();
+                        let original_codes = unpack_codes(codes);
                         *batch = batch
                             .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(original_codes))?
                             .drop_column(PART_ID_COLUMN)?;
