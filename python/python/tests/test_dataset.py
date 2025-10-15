@@ -4571,7 +4571,7 @@ def test_update_config_transaction(tmp_path: Path):
     }  # All previous metadata should be gone
 
 
-def test_shallow_clone_filesystem_flow(tmp_path: Path):
+def test_shallow_clone(tmp_path: Path):
     """Shallow clone a filesystem dataset by version number and by tag.
 
     Arrange:
