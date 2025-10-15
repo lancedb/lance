@@ -7,8 +7,7 @@ use crate::utils::to_rust_map;
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt,
-    RT,
+    JNIEnvExt, RT,
 };
 use arrow::{
     array::{RecordBatch, StructArray},
@@ -69,9 +68,17 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNative<'l
     _writer_class: JObject,
     file_uri: JString,
     data_storage_version: JObject, // Optional<String>
-    storage_options_obj: JObject, // Map<String, String>
+    storage_options_obj: JObject,  // Map<String, String>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_open(&mut env, file_uri, data_storage_version, storage_options_obj))
+    ok_or_throw!(
+        env,
+        inner_open(
+            &mut env,
+            file_uri,
+            data_storage_version,
+            storage_options_obj
+        )
+    )
 }
 
 fn inner_open<'local>(

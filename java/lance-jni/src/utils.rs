@@ -63,8 +63,9 @@ pub fn extract_write_params(
         write_params.enable_stable_row_ids = enable_stable_row_ids_val;
     }
     if let Some(data_storage_version_val) = env.get_string_opt(data_storage_version)? {
-        write_params.data_storage_version =
-            Some(LanceFileVersion::from_str(data_storage_version_val.as_str())?);
+        write_params.data_storage_version = Some(LanceFileVersion::from_str(
+            data_storage_version_val.as_str(),
+        )?);
     }
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
