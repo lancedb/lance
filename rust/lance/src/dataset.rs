@@ -6804,7 +6804,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -7899,20 +7899,20 @@ mod tests {
                 .with_metadata(packed_metadata),
         ]));
 
-        let int_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let x_values = UInt32Array::from(vec![1, 4, 7, 10, 13, 16, 19, 22]);
-        let y_values = UInt32Array::from(vec![2, 5, 8, 11, 14, 17, 20, 23]);
-        let struct_array = StructArray::new(
+        let int_values = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let x_values = Arc::new(UInt32Array::from(vec![1, 4, 7, 10, 13, 16, 19, 22]));
+        let y_values = Arc::new(UInt32Array::from(vec![2, 5, 8, 11, 14, 17, 20, 23]));
+        let struct_array = Arc::new(StructArray::new(
             struct_fields,
-            vec![Arc::new(x_values) as ArrayRef, Arc::new(y_values) as ArrayRef],
+            vec![x_values.clone() as ArrayRef, y_values.clone() as ArrayRef],
             None,
-        );
+        ));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(int_values) as ArrayRef,
-                Arc::new(struct_array) as ArrayRef,
+                int_values.clone() as ArrayRef,
+                struct_array.clone() as ArrayRef,
             ],
         )
         .unwrap();
@@ -7923,14 +7923,14 @@ mod tests {
             data_storage_version: Some(LanceFileVersion::V2_1),
             ..Default::default()
         };
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         Dataset::write(reader, &test_uri, Some(write_params))
             .await
             .unwrap();
 
         let dataset = Dataset::open(&test_uri).await.unwrap();
 
-        dataset
+        let result_batches = dataset
             .scan()
             .try_into_stream()
             .await
@@ -7938,8 +7938,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        assert_eq!(result_batches, vec![batch.clone()]);
 
-        dataset
+        let struct_batches = dataset
             .scan()
             .project(&["struct_col"])
             .unwrap()
@@ -7949,6 +7950,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        assert_eq!(struct_batches.len(), 1);
+        let read_struct = struct_batches[0].column(0).as_struct();
+        assert_eq!(read_struct, struct_array.as_ref());
     }
 
     #[tokio::test]
