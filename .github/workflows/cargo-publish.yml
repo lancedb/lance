@@ -2,9 +2,8 @@ name: Publish Rust crate
 
 on:
   release:
-    # Use released instead of published, since we don't publish preview/beta
-    # versions. Users instead install them from the git repo.
-    types: [released]
+    # Trigger on published to include both stable and preview/beta releases
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
