@@ -2056,7 +2056,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
-    def add_bases(self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None):
+    def add_bases(
+        self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
+    ):
         """
         Add new base paths to the dataset for multi-base storage.
 
