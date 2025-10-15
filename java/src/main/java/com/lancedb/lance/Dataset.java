@@ -16,6 +16,7 @@ package com.lancedb.lance;
 import com.lancedb.lance.cleanup.CleanupPolicy;
 import com.lancedb.lance.cleanup.RemovalStats;
 import com.lancedb.lance.compaction.CompactionOptions;
+import com.lancedb.lance.index.IndexOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.io.StorageOptionsProvider;
@@ -657,17 +658,17 @@ public class Dataset implements Closeable {
    * @param indexType the index type
    * @param name the name of the created index
    * @param params index params
-   * @param replace whether to replace the existing index
+   * @param options options for building index
    */
   public void createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
-      boolean replace) {
+      IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
+      nativeCreateIndex(columns, indexType.getValue(), name, params, options);
     }
   }
 
@@ -676,7 +677,15 @@ public class Dataset implements Closeable {
       int indexTypeCode,
       Optional<String> name,
       IndexParams params,
-      boolean replace);
+      IndexOptions options);
+
+  public void mergeIndexMetadata(
+      String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
+    innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+  }
+
+  private native void innerMergeIndexMetadata(
+      String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
   /**
    * Count the number of rows in the dataset.

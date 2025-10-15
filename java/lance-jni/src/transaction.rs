@@ -23,7 +23,6 @@ use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -98,18 +97,19 @@ impl IntoJava for &IndexMetadata {
         };
         let name = env.new_string(&self.name)?;
 
-        let fragment_bitmap = if let Some(bitmap) = &self.fragment_bitmap {
-            let mut bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bytes)
-                .map_err(|e| Error::input_error(e.to_string()))?;
-
-            let jbytes =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) };
-
-            let byte_array = env.new_byte_array(bytes.len() as i32)?;
-            env.set_byte_array_region(&byte_array, 0, jbytes)?;
-            byte_array.into()
+        let fragments = if let Some(bitmap) = &self.fragment_bitmap {
+            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for frag_id in bitmap.iter() {
+                let id_obj =
+                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(frag_id as i32)])?;
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&id_obj)],
+                )?;
+            }
+            array_list
         } else {
             JObject::null()
         };
@@ -152,13 +152,13 @@ impl IntoJava for &IndexMetadata {
         // Create IndexMetadata object
         Ok(env.new_object(
             "com/lancedb/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;Ljava/lang/Integer;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
                 JValue::Object(&name),
                 JValue::Long(self.dataset_version as i64),
-                JValue::Object(&fragment_bitmap),
+                JValue::Object(&fragments),
                 JValue::Object(&index_details),
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
@@ -251,12 +251,12 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
 
         let fragment_bitmap: Option<RoaringBitmap> =
-            env.get_optional_from_method(self, "fragmentBitmap", |env, bitmap_obj| {
-                let byte_array: JByteArray = bitmap_obj.into();
-                let bytes = env.convert_byte_array(&byte_array)?;
-                let bitmap = RoaringBitmap::deserialize_from(Cursor::new(bytes)).map_err(|e| {
-                    Error::input_error(format!("Invalid RoaringBitmap data: {}", e))
-                })?;
+            env.get_optional_from_method(self, "fragments", |env, fragments_obj| {
+                let frag_ids = env.get_integers(&fragments_obj)?;
+                let bitmap = frag_ids
+                    .iter()
+                    .map(|val| *val as u32)
+                    .collect::<RoaringBitmap>();
                 Ok(bitmap)
             })?;
 
@@ -985,6 +985,20 @@ fn convert_to_rust_operation(
                 .call_method(java_operation, "numFragments", "()I", &[])?
                 .i()? as u32;
             return Ok(Operation::ReserveFragments { num_fragments });
+        }
+        "CreateIndex" => {
+            let new_indices =
+                import_vec_from_method(env, java_operation, "getNewIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            let removed_indices =
+                import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            return Ok(Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            });
         }
         _ => unimplemented!(),
     };
