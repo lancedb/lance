@@ -12,11 +12,12 @@
 //! - Cache overhead miscalculations
 
 use super::utils::AllocTracker;
-use arrow::datatypes::UInt8Type;
+use arrow::datatypes::{UInt32Type, UInt8Type};
 use lance::dataset::InsertBuilder;
 use lance_core::cache::LanceCache;
 use lance_datafusion::datagen::DatafusionDatagenExt;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::DatasetIndexExt;
 use lance_index::{scalar::ScalarIndexParams, IndexType};
 use rand::seq::SliceRandom;
@@ -161,6 +162,103 @@ async fn test_label_list_index_cache_accounting() {
         },
         "LabelListIndex",
         5_000, // 5KB tolerance per entry
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_btree_index_cache_accounting() {
+    AllocTracker::init();
+
+    let batch_size = 100_000;
+    let num_batches = BatchCount::from(50);
+    let data = gen_batch()
+        .col("values", array::step::<UInt32Type>())
+        .into_df_stream(RowCount::from(batch_size), num_batches);
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_path = tmp_dir.path().to_str().unwrap();
+    InsertBuilder::new(tmp_path)
+        .execute_stream(data)
+        .await
+        .unwrap();
+
+    let mut dataset = lance::dataset::Dataset::open(tmp_path).await.unwrap();
+    dataset
+        .create_index_builder(
+            &["values"],
+            IndexType::Scalar,
+            &ScalarIndexParams::new("btree".to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Reload dataset to get fresh index with cache
+    let dataset = lance::dataset::Dataset::open(tmp_path).await.unwrap();
+
+    // Access the index cache (now public)
+    let cache = (*dataset.index_cache).clone();
+
+    // Test cache accounting by prewarming the index
+    test_cache_accounting(
+        cache,
+        || async {
+            dataset.prewarm_index("values_idx").await.unwrap();
+            drop(dataset);
+        },
+        "BTreeIndex",
+        5_000, // 5KB tolerance per entry
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_fts_index_cache_accounting() {
+    AllocTracker::init();
+
+    let batch_size = 10_000;
+    let num_batches = BatchCount::from(50);
+    // TODO: generate more realistic text data
+    let data = gen_batch()
+        .col(
+            "text",
+            array::rand_type(&arrow::datatypes::DataType::LargeUtf8),
+        )
+        .into_df_stream(RowCount::from(batch_size), num_batches);
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_path = tmp_dir.path().to_str().unwrap();
+    InsertBuilder::new(tmp_path)
+        .execute_stream(data)
+        .await
+        .unwrap();
+
+    let params = InvertedIndexParams::default();
+    let mut dataset = lance::dataset::Dataset::open(tmp_path).await.unwrap();
+    dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Scalar,
+            &ScalarIndexParams::new("inverted".to_string()).with_params(&params),
+        )
+        .await
+        .unwrap();
+
+    // Reload dataset to get fresh index with cache
+    let dataset = lance::dataset::Dataset::open(tmp_path).await.unwrap();
+
+    // Access the index cache (now public)
+    let cache = (*dataset.index_cache).clone();
+
+    // Test cache accounting by prewarming the index
+    test_cache_accounting(
+        cache,
+        || async {
+            dataset.prewarm_index("text_idx").await.unwrap();
+            drop(dataset);
+        },
+        "FTSIndex",
+        20_000, // 20KB tolerance per entry - FTS indices are larger and more complex
     )
     .await;
 }

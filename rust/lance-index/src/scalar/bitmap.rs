@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{frag_reuse, pbold};
+use crate::pbold;
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
