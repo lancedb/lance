@@ -273,10 +273,15 @@ mod tests {
 
     use crate::dataset::transaction::Operation;
     use crate::dataset::{Dataset, WriteParams};
+    use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
+    use arrow_array::types::UInt64Type;
     use chrono::Duration;
+    use futures::TryStreamExt;
     use lance_core::utils::testing::MockClock;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{array, BatchCount, RowCount};
+    use std::sync::Arc;
 
     async fn create_test_dataset() -> Dataset {
         let data = lance_datagen::gen_batch()
@@ -376,10 +381,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_created_at_version_basic() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::ROW_CREATED_AT_VERSION;
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -419,11 +420,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_last_updated_at_version_basic() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::ROW_LAST_UPDATED_AT_VERSION;
-        use std::sync::Arc;
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -519,11 +515,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_version_metadata_after_update() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-        use std::sync::Arc;
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -626,10 +617,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_version_metadata_after_append() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-
         // Create initial dataset
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -702,10 +689,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_version_metadata_after_delete() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -761,11 +744,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_version_metadata_combined() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-        use std::sync::Arc;
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -861,10 +839,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_by_row_created_at_version() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::ROW_CREATED_AT_VERSION;
-
         // Create initial dataset
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -969,11 +943,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_by_row_last_updated_at_version() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::ROW_LAST_UPDATED_AT_VERSION;
-        use std::sync::Arc;
-
         // Create dataset with stable row IDs enabled
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -1114,11 +1083,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_by_combined_version_columns() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-        use std::sync::Arc;
-
         // Create initial dataset
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -1290,11 +1254,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_version_columns_with_other_columns() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use lance_core::ROW_LAST_UPDATED_AT_VERSION;
-        use std::sync::Arc;
-
         // Create dataset
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -1350,11 +1309,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_inserted_rows() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use futures::TryStreamExt;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-
         // Create initial dataset (version 1)
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
@@ -1476,12 +1430,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_updated_rows() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::UInt64Type;
-        use futures::TryStreamExt;
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-        use std::sync::Arc;
-
         // Create initial dataset (version 1)
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
