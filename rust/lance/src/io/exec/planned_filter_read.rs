@@ -40,6 +40,7 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
+use crate::dataset::scanner::{get_default_batch_size, BATCH_SIZE_FALLBACK};
 use crate::Dataset;
 use lance_table::format::Fragment;
 
@@ -238,13 +239,18 @@ impl FilteredReadUtils {
 
         // Create PlannedFilterReadOptions with defaults applied
         let io_parallelism = dataset.object_store().io_parallelism();
+        let default_batch_size = options.batch_size.unwrap_or_else(|| {
+            get_default_batch_size().unwrap_or_else(|| {
+                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
+            }) as u32
+        });
         let planned_options = PlannedFilterReadOptions {
             projection: options.projection.clone(),
             refine_filter: options.refine_filter.clone(),
             full_filter: options.full_filter.clone(),
             threading_mode: options.threading_mode,
             with_deleted_rows: options.with_deleted_rows,
-            batch_size: options.batch_size.unwrap_or(8192),
+            batch_size: default_batch_size,
             fragment_readahead: options
                 .fragment_readahead
                 .unwrap_or(io_parallelism * 2)
