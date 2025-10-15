@@ -1874,7 +1874,7 @@ impl Scanner {
         }
 
         // Stage 4: limit / offset
-        if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
+        if use_limit_node && (self.limit.is_some() || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
@@ -7996,5 +7996,56 @@ mod test {
         assert_eq!(unsorted_values[0], 50);
         assert_eq!(unsorted_values[1], 20);
         assert_eq!(unsorted_values[2], 80);
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero() {
+        // Test that limit = 0 returns empty result with correct schema
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 10..(i + 1) * 10)),
+                        Arc::new(Int32Array::from_iter_values(
+                            (i * 10..(i + 1) * 10).map(|v| v * 10),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test 1: limit = 0 without filter
+        let mut scanner = dataset.scan();
+        scanner.limit(Some(0), None).unwrap();
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        // With limit = 0, we should get either no batches or one empty batch
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "Limit 0 should return no rows");
+
+        // Test 2: limit = 0 with filter
+        let mut scanner = dataset.scan();
+        scanner.filter("value > 50").unwrap();
+        scanner.limit(Some(0), None).unwrap();
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "Limit 0 with filter should return no rows");
     }
 }
