@@ -3794,20 +3794,23 @@ class LanceOperation:
             The fragments that have been updated with new deletion vectors.
         new_fragments: list[FragmentMetadata]
             The fragments that contain the new rows.
-        fields_modified: list[int]
-            If any fields are modified in updated_fragments, then they must be
-            listed here so those fragments can be removed from indices covering
-            those fields.
-        fields_for_preserving_frag_bitmap: list[int]
-            The fields that used to judge whether to preserve the new frag's id into
-            the frag bitmap of the specified indices.
+        bitmap_prune_field_ids: list[int]
+            Field IDs that drive index fragment bitmap pruning. If any fields are
+            modified in updated_fragments,
+            then they must be listed here so those fragments can be removed from
+            indices that cover any of these fields.
+        bitmap_preserve_field_ids: list[int]
+            Field IDs used to decide whether to preserve new fragment IDs in an index's
+             fragment bitmap.
+            Indices that do not cover these fields may preserve the new fragment IDs
+            when applicable.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
-        fields_modified: List[int]
-        fields_for_preserving_frag_bitmap: List[int]
+        bitmap_prune_field_ids: List[int]
+        bitmap_preserve_field_ids: List[int]
         update_mode: str
 
         def __post_init__(self):
