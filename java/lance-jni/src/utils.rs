@@ -35,6 +35,7 @@ pub fn extract_storage_options(
     Ok(storage_options)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
     max_rows_per_file: &JObject,
