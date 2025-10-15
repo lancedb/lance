@@ -28,6 +28,7 @@ use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
 
+pub mod bkd;
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;

@@ -16,7 +16,12 @@ import pyarrow as pa
 import lance
 import os
 import shutil
+import logging
 from geoarrow.pyarrow import point
+
+# Enable Rust logging
+os.environ['RUST_LOG'] = 'lance_index=debug'
+logging.basicConfig(level=logging.DEBUG)
 
 
 def main():
@@ -31,28 +36,54 @@ def main():
         print(f"✅ Cleaned up existing dataset: {dataset_path}")
 
 
-    # Step 1: Create GeoArrow Point data
-    print("\n🔵 Step 1: Creating GeoArrow Point data")
-    lat_np = np.array([37.7749, 34.0522, 40.7128], dtype="float64")  # SF, LA, NYC
-    lng_np = np.array([-122.4194, -118.2437, -74.0060], dtype="float64")
-
-
-    start_location = point().from_geobuffers(None, lng_np, lat_np)
-
-
+    # Step 1: Create GeoArrow Point data with enough points to test tree structure
+    print("\n🔵 Step 1: Creating GeoArrow Point data (5000+ points)")
+    
+    # Generate random points across the US
+    # US bounding box approximately: lng [-125, -65], lat [25, 50]
+    np.random.seed(42)  # For reproducibility
+    num_points = 5000
+    
+    lng_vals = np.random.uniform(-125, -65, num_points)
+    lat_vals = np.random.uniform(25, 50, num_points)
+    
+    # Add some known cities at the beginning for testing
+    known_cities = [
+        {"id": 1, "city": "San Francisco", "lng": -122.4194, "lat": 37.7749, "population": 883305},
+        {"id": 2, "city": "Los Angeles", "lng": -118.2437, "lat": 34.0522, "population": 3898747},
+        {"id": 3, "city": "New York", "lng": -74.0060, "lat": 40.7128, "population": 8336817},
+        {"id": 4, "city": "Chicago", "lng": -87.6298, "lat": 41.8781, "population": 2746388},
+        {"id": 5, "city": "Houston", "lng": -95.3698, "lat": 29.7604, "population": 2304580},
+    ]
+    
+    # Replace first 5 points with known cities
+    for i, city in enumerate(known_cities):
+        lng_vals[i] = city["lng"]
+        lat_vals[i] = city["lat"]
+    
+    start_location = point().from_geobuffers(None, lng_vals, lat_vals)
+    
+    # Create IDs and city names
+    ids = list(range(1, num_points + 1))
+    cities = [known_cities[i]["city"] if i < len(known_cities) else f"Point_{i+1}" 
+              for i in range(num_points)]
+    populations = [known_cities[i]["population"] if i < len(known_cities) else np.random.randint(10000, 1000000)
+                   for i in range(num_points)]
+    
     table = pa.table({
-        "id": [1, 2, 3],
-        "city": ["San Francisco", "Los Angeles", "New York"],
+        "id": ids,
+        "city": cities,
         "start_location": start_location,
-        "population": [883305, 3898747, 8336817]
+        "population": populations
     })
 
 
-    print("✅ Created GeoArrow Point data")
+    print(f"✅ Created GeoArrow Point data with {num_points} points")
     print("📊 Table schema:")
     print(table.schema)
     print(f"📍 Point column type: {table.schema.field('start_location').type}")
     print(f"📍 Point column metadata: {table.schema.field('start_location').metadata}")
+    print(f"📍 Known cities: {[c['city'] for c in known_cities]}")
 
 
     # Step 2: Write to Lance dataset
@@ -170,21 +201,28 @@ def main():
         print(f"📊 Number of rows: {len(table)}")
 
 
-        # Print complete results
-        for i in range(len(table)):
+        # Print first few results
+        max_rows_to_print = min(10, len(table))
+        for i in range(max_rows_to_print):
             row_data = {}
             for j, column in enumerate(table.columns):
                 col_name = table.schema.field(j).name
                 value = column.to_pylist()[i]
                 row_data[col_name] = value
             print(f"📍 Row {i}: {row_data}")
+        if len(table) > max_rows_to_print:
+            print(f"... and {len(table) - max_rows_to_print} more rows")
 
 
         cities = table.column('city').to_pylist()
-        print(f"\n✅ Found {len(cities)} cities with broad bbox: {cities}")
-        assert len(cities) == 2, f"Expected 2 cities, got {len(cities)}"
+        print(f"\n✅ Found {len(cities)} results with broad bbox")
+        print(f"📊 Known cities in results: {[c for c in cities if c in ['San Francisco', 'Los Angeles', 'New York', 'Chicago', 'Houston']]}")
+        
+        # With 5000 random points and a broad western US bbox, we should get hundreds/thousands of results
+        assert len(cities) > 100, f"Expected many results (>100) from broad bbox, got {len(cities)}"
         assert 'San Francisco' in cities, "Expected San Francisco in results"
         assert 'Los Angeles' in cities, "Expected Los Angeles in results"
+        print(f"✅ Verified SF and LA are in the {len(cities)} results")
     else:
         print("⚠️  No results returned")
 
@@ -205,18 +243,28 @@ def main():
         print("✅ Query Results:")
         print(f"📊 Number of rows: {len(tight_table)}")
 
-        for i in range(len(tight_table)):
+        # Print first few results
+        max_rows_to_print = min(10, len(tight_table))
+        for i in range(max_rows_to_print):
             row_data = {}
             for j, column in enumerate(tight_table.columns):
                 col_name = tight_table.schema.field(j).name
                 value = column.to_pylist()[i]
                 row_data[col_name] = value
             print(f"📍 Row {i}: {row_data}")
+        if len(tight_table) > max_rows_to_print:
+            print(f"... and {len(tight_table) - max_rows_to_print} more rows")
 
         cities = tight_table.column('city').to_pylist()
-        print(f"\n✅ Found {len(cities)} city with tight bbox: {cities}")
-        assert len(cities) == 1, f"Expected 1 city, got {len(cities)}"
-        assert cities[0] == 'San Francisco', f"Expected San Francisco, got {cities[0]}"
+        print(f"\n✅ Found {len(cities)} results with tight bbox")
+        known_cities_found = [c for c in cities if c in ['San Francisco', 'Los Angeles', 'New York', 'Chicago', 'Houston']]
+        print(f"📊 Known cities in results: {known_cities_found}")
+        
+        # The tight bbox around SF should include SF, and might include some random points
+        assert 'San Francisco' in cities, "Expected San Francisco in results"
+        assert len(known_cities_found) == 1 and known_cities_found[0] == 'San Francisco', \
+            f"Expected only San Francisco from known cities, got {known_cities_found}"
+        print(f"✅ Verified only SF is in the known cities, total results: {len(cities)}")
     else:
         print("⚠️  No results returned")
 
