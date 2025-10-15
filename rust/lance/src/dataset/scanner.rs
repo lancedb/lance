@@ -3621,7 +3621,7 @@ impl Scanner {
     }
 
     #[instrument(level = "info", skip(self))]
-    pub async fn analyze_plan(&mut self) -> Result<String> {
+    pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
         let res = analyze_plan(
             plan,
@@ -3635,7 +3635,7 @@ impl Scanner {
     }
 
     #[instrument(level = "info", skip(self))]
-    pub async fn explain_plan(&mut self, verbose: bool) -> Result<String> {
+    pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
         let plan = self.create_plan().await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
