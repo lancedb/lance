@@ -14,6 +14,7 @@
 package com.lancedb.lance.file;
 
 import com.lancedb.lance.JniLoader;
+import com.lancedb.lance.WriteParams;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -25,6 +26,7 @@ import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Optional;
 
 public class LanceFileWriter implements AutoCloseable {
 
@@ -37,7 +39,8 @@ public class LanceFileWriter implements AutoCloseable {
   private DictionaryProvider dictionaryProvider;
 
   private static native LanceFileWriter openNative(
-      String fileUri, Map<String, String> storageOptions) throws IOException;
+      String fileUri, Optional<String> dataStorageVersion, Map<String, String> storageOptions)
+      throws IOException;
 
   private native void closeNative(long nativeLanceFileReaderHandle) throws IOException;
 
@@ -75,7 +78,28 @@ public class LanceFileWriter implements AutoCloseable {
       DictionaryProvider dictionaryProvider,
       Map<String, String> storageOptions)
       throws IOException {
-    LanceFileWriter writer = openNative(path, storageOptions);
+    return open(path, allocator, dictionaryProvider, Optional.empty(), storageOptions);
+  }
+
+  /**
+   * Open a LanceFileWriter to write to a given file URI
+   *
+   * @param path the URI of the file to write to
+   * @param allocator the BufferAllocator to use for the writer
+   * @param dictionaryProvider the DictionaryProvider to use for the writer
+   * @param dataStorageVersion the version of the data storage format to use
+   * @return a new LanceFileWriter
+   */
+  public static LanceFileWriter open(
+      String path,
+      BufferAllocator allocator,
+      DictionaryProvider dictionaryProvider,
+      Optional<WriteParams.LanceFileVersion> dataStorageVersion,
+      Map<String, String> storageOptions)
+      throws IOException {
+    Optional<String> dataStorageVersionStr =
+        dataStorageVersion.map(WriteParams.LanceFileVersion::getVersionString);
+    LanceFileWriter writer = openNative(path, dataStorageVersionStr, storageOptions);
     writer.allocator = allocator;
     writer.dictionaryProvider = dictionaryProvider;
     return writer;

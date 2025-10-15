@@ -187,7 +187,7 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn remap(&self, _: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, _: &HashMap<u64, Option<u64>>, _: &impl VectorStore) -> Result<Self> {
         Ok(self.clone())
     }
 

@@ -268,6 +268,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -281,6 +282,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            data_storage_version,
             storage_options_obj
         )
     )
@@ -296,6 +298,7 @@ fn inner_create_with_ffi_schema<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -311,6 +314,7 @@ fn inner_create_with_ffi_schema<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -341,6 +345,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -354,6 +359,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            data_storage_version,
             storage_options_obj
         )
     )
@@ -369,6 +375,7 @@ fn inner_create_with_ffi_stream<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -381,6 +388,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -395,6 +403,7 @@ fn create_dataset<'local>(
     max_bytes_per_file: JObject,
     mode: JObject,
     enable_stable_row_ids: JObject,
+    data_storage_version: JObject,
     storage_options_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
@@ -407,6 +416,7 @@ fn create_dataset<'local>(
         &max_bytes_per_file,
         &mode,
         &enable_stable_row_ids,
+        &data_storage_version,
         &storage_options_obj,
     )?;
 

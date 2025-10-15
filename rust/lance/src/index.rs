@@ -666,7 +666,7 @@ impl DatasetIndexExt for Dataset {
                 base_id: None, // Mew merged index file locates in the cloned dataset.
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed_indices.len() {
+            if deltas.len() > res.removed_indices.len() {
                 new_indices.extend(
                     deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()

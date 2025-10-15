@@ -70,6 +70,11 @@ pub struct InvertedIndexParams {
     #[serde(default = "bool_true")]
     pub(crate) remove_stop_words: bool,
 
+    /// use customized stop words.
+    /// - `None`: use built-in stop words based on language
+    /// - `Some(words)`: use customized stop words
+    pub(crate) custom_stop_words: Option<Vec<String>>,
+
     /// ascii folding
     #[serde(default = "bool_true")]
     pub(crate) ascii_folding: bool,
@@ -149,6 +154,7 @@ impl InvertedIndexParams {
             lower_case: true,
             stem: true,
             remove_stop_words: true,
+            custom_stop_words: None,
             ascii_folding: true,
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
@@ -203,6 +209,11 @@ impl InvertedIndexParams {
         self
     }
 
+    pub fn custom_stop_words(mut self, custom_stop_words: Option<Vec<String>>) -> Self {
+        self.custom_stop_words = custom_stop_words;
+        self
+    }
+
     pub fn ascii_folding(mut self, ascii_folding: bool) -> Self {
         self.ascii_folding = ascii_folding;
         self
@@ -245,16 +256,20 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = tantivy::tokenizer::StopWordFilter::new(self.language)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "removing stop words for language {:?} is not supported yet",
-                            self.language
-                        ),
-                        location!(),
-                    )
-                })?;
+            let stop_word_filter = match &self.custom_stop_words {
+                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
+                None => {
+                    tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "removing stop words for language {:?} is not supported yet",
+                                self.language
+                            ),
+                            location!(),
+                        )
+                    })?
+                }
+            };
             builder = builder.filter_dynamic(stop_word_filter);
         }
         if self.ascii_folding {

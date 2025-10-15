@@ -273,6 +273,12 @@ message Transaction {
     repeated MemWalIndexDetails.MemWal removed = 3;
   }
 
+  // An operation that updates base paths in the dataset.
+  message UpdateBases {
+    // The new base paths to add to the manifest.
+    repeated BasePath new_bases = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -289,6 +295,7 @@ message Transaction {
     DataReplacement data_replacement = 111;
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
+    UpdateBases update_bases = 114;
   }
 
   // An operation to apply to the blob dataset

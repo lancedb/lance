@@ -592,20 +592,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         column: String,
         index_dir: Path,
     ) -> Result<()> {
-        match self.sub_index_type() {
-            (SubIndexType::Flat, _) => {
-                let mut remapper =
-                    IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
-                remapper.remap(mapping).await
-            }
-            _ => Err(Error::Index {
-                message: format!(
-                    "Remapping is not supported for index type {}",
-                    self.index_type(),
-                ),
-                location: location!(),
-            }),
-        }
+        let mut remapper = IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
+        remapper.remap(mapping).await
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -1285,8 +1273,9 @@ mod tests {
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1313,7 +1302,8 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params).await;
+        test_delete_all_rows(params.clone()).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1337,8 +1327,9 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]

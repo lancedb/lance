@@ -601,6 +601,39 @@ def test_full_text_search_without_index(dataset):
         assert query_text in row.as_py()
 
 
+def test_fts_custom_stop_words(tmp_path):
+    # Prepare dataset
+    set_language_model_path()
+    data = pa.table(
+        {
+            "text": ["他们拿着苹果手机", "他们穿着耐克阿迪"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="jieba/default",
+        remove_stop_words=True,
+        custom_stop_words=["他们"],
+    )
+
+    # Search
+    results = ds.to_table(
+        full_text_query="他们",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert len(results["_rowid"].to_pylist()) == 0
+
+    results = ds.to_table(
+        full_text_query="手机",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert len(results["_rowid"].to_pylist()) == 1
+
+
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(

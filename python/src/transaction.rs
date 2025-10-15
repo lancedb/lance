@@ -503,6 +503,20 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
+            Operation::UpdateBases { ref new_bases } => {
+                if let Ok(cls) = namespace.getattr("UpdateBases") {
+                    use crate::dataset::DatasetBasePath;
+                    let new_bases_py: Vec<DatasetBasePath> = new_bases
+                        .iter()
+                        .map(|bp| DatasetBasePath::from(bp.clone()))
+                        .collect();
+                    let new_bases_list = pyo3::types::PyList::new(py, new_bases_py)?;
+                    cls.call1((new_bases_list,))
+                } else {
+                    let base_op = namespace.getattr("BaseOperation")?;
+                    base_op.call0()
+                }
+            }
             _ => todo!(),
         }
     }
