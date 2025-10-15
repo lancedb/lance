@@ -30,12 +30,23 @@ public class WriteParams {
   }
 
   public enum LanceFileVersion {
-    LEGACY,
-    V2_0,
-    STABLE,
-    V2_1,
-    NEXT,
-    V2_2,
+    LEGACY("legacy"),
+    V0_1("0.1"),
+    V2_0("2.0"),
+    STABLE("stable"),
+    V2_1("2.1"),
+    NEXT("next"),
+    V2_2("2.2");
+
+    private final String versionString;
+
+    LanceFileVersion(String versionString) {
+      this.versionString = versionString;
+    }
+
+    public String getVersionString() {
+      return versionString;
+    }
   }
 
   private final Optional<Integer> maxRowsPerFile;
@@ -89,7 +100,7 @@ public class WriteParams {
   }
 
   public Optional<String> getDataStorageVersion() {
-    return dataStorageVersion.map(Enum::name);
+    return dataStorageVersion.map(LanceFileVersion::getVersionString);
   }
 
   public Map<String, String> getStorageOptions() {

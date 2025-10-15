@@ -97,7 +97,8 @@ public class LanceFileWriter implements AutoCloseable {
       Optional<WriteParams.LanceFileVersion> dataStorageVersion,
       Map<String, String> storageOptions)
       throws IOException {
-    Optional<String> dataStorageVersionStr = dataStorageVersion.map(Enum::name);
+    Optional<String> dataStorageVersionStr =
+        dataStorageVersion.map(WriteParams.LanceFileVersion::getVersionString);
     LanceFileWriter writer = openNative(path, dataStorageVersionStr, storageOptions);
     writer.allocator = allocator;
     writer.dictionaryProvider = dictionaryProvider;
