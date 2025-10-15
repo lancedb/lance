@@ -2131,14 +2131,8 @@ impl Scanner {
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
     ) -> Result<PlannedFilteredScan> {
-        // Use legacy path if:
-        // 1. Dataset uses legacy storage format, OR
-        // 2. Version columns are requested (temporary workaround until FilteredReadExec supports them)
-        let use_legacy = self.dataset.is_legacy_storage()
-            || projection.with_row_last_updated_at_version
-            || projection.with_row_created_at_version;
-
-        if use_legacy {
+        // Use legacy path if dataset uses legacy storage format
+        if self.dataset.is_legacy_storage() {
             self.legacy_filtered_read(
                 filter_plan,
                 projection,

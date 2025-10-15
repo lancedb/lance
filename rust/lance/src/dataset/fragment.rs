@@ -25,7 +25,10 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
@@ -2050,6 +2053,12 @@ impl FragmentReader {
             // If no metadata or load fails, sequence remains None (will default to version 1)
         }
 
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_last_updated_at_version");
+
         self
     }
 
@@ -2065,6 +2074,12 @@ impl FragmentReader {
             }
             // If no metadata or load fails, sequence remains None (will default to version 1)
         }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_created_at_version");
 
         self
     }

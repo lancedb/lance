@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
-};
+use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow_buffer::NullBuffer;
 use futures::{
     future::BoxFuture,
@@ -299,7 +297,7 @@ pub fn apply_row_id_and_deletes(
                     .to_ranges()
                     .unwrap();
                 // Extract version values for the selected ranges
-                let versions: Vec<u32> = selection
+                let versions: Vec<u64> = selection
                     .iter()
                     .flat_map(|r| {
                         sequence
@@ -307,12 +305,11 @@ pub fn apply_row_id_and_deletes(
                             .skip(r.start as usize)
                             .take((r.end - r.start) as usize)
                     })
-                    .map(|v| v as u32)
                     .collect();
-                Arc::new(UInt32Array::from(versions))
+                Arc::new(UInt64Array::from(versions))
             } else {
                 // Default to version 1 if sequence not provided
-                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
             };
             batch =
                 batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
@@ -328,7 +325,7 @@ pub fn apply_row_id_and_deletes(
                     .to_ranges()
                     .unwrap();
                 // Extract version values for the selected ranges
-                let versions: Vec<u32> = selection
+                let versions: Vec<u64> = selection
                     .iter()
                     .flat_map(|r| {
                         sequence
@@ -336,12 +333,11 @@ pub fn apply_row_id_and_deletes(
                             .skip(r.start as usize)
                             .take((r.end - r.start) as usize)
                     })
-                    .map(|v| v as u32)
                     .collect();
-                Arc::new(UInt32Array::from(versions))
+                Arc::new(UInt64Array::from(versions))
             } else {
                 // Default to version 1 if sequence not provided
-                Arc::new(UInt32Array::from(vec![1u32; num_rows as usize]))
+                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
             };
             batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
         }
