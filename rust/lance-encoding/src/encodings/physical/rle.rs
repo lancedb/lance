@@ -386,6 +386,7 @@ impl MiniBlockCompressor for RleEncoder {
 }
 
 impl BlockCompressor for RleEncoder {
+    // Block format: [8-byte header: values buffer size][values buffer][run_lengths buffer]
     fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
@@ -397,7 +398,6 @@ impl BlockCompressor for RleEncoder {
 
                 let values_size = all_buffers[0].len() as u64;
 
-                // Block format: [8-byte header: values buffer size][values buffer][run_lengths buffer]
                 let mut combined = Vec::new();
                 combined.extend_from_slice(&values_size.to_le_bytes());
                 combined.extend_from_slice(&all_buffers[0]);
