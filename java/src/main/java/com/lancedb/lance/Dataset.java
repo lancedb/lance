@@ -1060,7 +1060,9 @@ public class Dataset implements Closeable {
   public Dataset shallowClone(
       String targetPath, long version, Optional<Map<String, String>> storageOptions) {
     Preconditions.checkArgument(targetPath != null, "Target path can not be null");
-    Preconditions.checkArgument(storageOptions != null, "Storage options Optional can not be null");
+    Preconditions.checkArgument(
+        storageOptions != null,
+        "Optional storage options can not be null, use Optional.empty() instead");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Dataset newDataset = nativeShallowCloneVersion(targetPath, version, storageOptions);
@@ -1089,7 +1091,9 @@ public class Dataset implements Closeable {
       String targetPath, String tag, Optional<Map<String, String>> storageOptions) {
     Preconditions.checkArgument(targetPath != null, "Target path can not be null");
     Preconditions.checkArgument(tag != null, "Tag can not be null");
-    Preconditions.checkArgument(storageOptions != null, "Storage options Optional can not be null");
+    Preconditions.checkArgument(
+        storageOptions != null,
+        "Optional storage options can not be null, use Optional.empty() instead");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Dataset newDataset = nativeShallowCloneTag(targetPath, tag, storageOptions);
