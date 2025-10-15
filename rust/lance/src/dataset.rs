@@ -63,7 +63,7 @@ mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
-mod delta;
+pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -92,7 +92,6 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -792,26 +791,31 @@ impl Dataset {
         Ok(())
     }
 
-    async fn build_dataset_delta(&self, compared_version: u64) -> Result<DatasetDelta> {
-        let current_version = self.version().version;
-
-        let (begin_version, end_version) = if current_version > compared_version {
-            (compared_version, current_version)
-        } else {
-            (current_version, compared_version)
-        };
-
-        Ok(DatasetDelta {
-            begin_version,
-            end_version,
-            base_dataset: self.clone(),
-        })
+    /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let delta = dataset.delta()
+    ///     .compared_against_version(5)
+    ///     .build()?;
+    /// let inserted = delta.get_inserted_rows().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn delta(&self) -> delta::DatasetDeltaBuilder {
+        delta::DatasetDeltaBuilder::new(self.clone())
     }
 
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
     pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
         self.validate_compared_version(compared_version).await?;
-        let ds_delta = self.build_dataset_delta(compared_version).await?;
+        let ds_delta = self
+            .delta()
+            .compared_against_version(compared_version)
+            .build()?;
         ds_delta.list_transactions().await
     }
 

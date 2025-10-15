@@ -277,6 +277,20 @@ message DataFragment {
     ExternalFile external_row_ids = 6;
   } // row_id_sequence
 
+  oneof last_updated_at_version_sequence {
+    // If small (< 200KB), the row latest updated versions are stored inline.
+    bytes inline_last_updated_at_versions = 7;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_last_updated_at_versions = 8;
+  } // last_updated_at_version_sequence
+
+  oneof created_at_version_sequence {
+    // If small (< 200KB), the row created at versions are stored inline.
+    bytes inline_created_at_versions = 9;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_created_at_versions = 10;
+  } // created_at_version_sequence
+
   // Number of original rows in the fragment, this includes rows that are now marked with
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
