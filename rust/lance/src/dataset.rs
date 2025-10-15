@@ -7880,6 +7880,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_issue_4902_packed_struct_v2_1_read_error() {
+        use std::collections::HashMap;
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray, UInt32Array};
+        use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
+
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::UInt32, false),
+            ArrowField::new("y", DataType::UInt32, false),
+        ]);
+        let mut packed_metadata = HashMap::new();
+        packed_metadata.insert("packed".to_string(), "true".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("int_col", DataType::Int32, false),
+            ArrowField::new("struct_col", DataType::Struct(struct_fields.clone()), false)
+                .with_metadata(packed_metadata),
+        ]));
+
+        let int_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let x_values = UInt32Array::from(vec![1, 4, 7, 10, 13, 16, 19, 22]);
+        let y_values = UInt32Array::from(vec![2, 5, 8, 11, 14, 17, 20, 23]);
+        let struct_array = StructArray::new(
+            struct_fields,
+            vec![Arc::new(x_values) as ArrayRef, Arc::new(y_values) as ArrayRef],
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(int_values) as ArrayRef,
+                Arc::new(struct_array) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let test_uri = TempStrDir::default();
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, &test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+
+        dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        dataset
+            .scan()
+            .project(&["struct_col"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_issue_4429_nested_struct_encoding_v2_1_with_over_65k_structs() {
         // Regression test for miniblock 16KB limit with nested struct patterns
         // Tests encoding behavior when a nested struct<list<struct>> contains
