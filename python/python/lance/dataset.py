@@ -2056,6 +2056,32 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
+    def add_bases(
+        self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
+    ):
+        """
+        Add new base paths to the dataset for multi-base storage.
+
+        This method allows you to register additional storage locations (bases)
+        that can be used for future data writes. The base paths are added to the
+        dataset's manifest and can be referenced by name in subsequent write operations.
+
+        Parameters
+        ----------
+        new_bases : list[DatasetBasePath]
+            A list of DatasetBasePath objects representing the new storage locations
+            to add. Each base path should have a unique name and path.
+        transaction_properties : Optional[Dict[str, str]]
+            Optional key-value pairs for audit metadata.
+
+        Returns
+        -------
+        LanceDataset
+            Returns self to allow method chaining.
+        """
+        self._ds.add_bases(new_bases, transaction_properties)
+        return self
+
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
@@ -2252,6 +2278,11 @@ class LanceDataset(pa.dataset.Dataset):
         remove_stop_words: bool, default True
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
+        custom_stop_words: Optional[List[str]], default None
+            This is for the ``INVERTED`` index, only used when `remove_stop_words` is
+            true.
+            Users can specify their customised stop words, if none, the built-in stop
+            words for the specified language will be used.
         ascii_folding: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.

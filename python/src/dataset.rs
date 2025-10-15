@@ -1372,6 +1372,25 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    #[pyo3(signature=(new_bases, transaction_properties=None))]
+    fn add_bases(
+        &mut self,
+        new_bases: Vec<DatasetBasePath>,
+        transaction_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
+        use lance_table::format::BasePath;
+        let rust_bases: Vec<BasePath> = new_bases.into_iter().map(BasePath::from).collect();
+        let new_dataset = rt()
+            .block_on(None, self.ds.add_bases(rust_bases, transaction_properties))?
+            .map_err(|err| match err {
+                lance::Error::InvalidInput { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+
+        self.ds = Arc::new(new_dataset);
+        Ok(())
+    }
+
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let versions = self_.list_versions()?;
         Python::with_gil(|py| {
@@ -1664,6 +1683,9 @@ impl Dataset {
                     }
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
+                    }
+                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(stop_words_file.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
