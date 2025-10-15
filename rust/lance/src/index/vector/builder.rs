@@ -14,7 +14,7 @@ use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, PrimitiveArray,
     RecordBatch, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Fields};
+use arrow_schema::{DataType, Field, Fields};
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
     Stream,
@@ -39,6 +39,7 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::transform::Flatten;
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
@@ -67,6 +68,7 @@ use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, Normalize, L2};
+use lance_linalg::kernels::normalize_fsl;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
@@ -75,6 +77,7 @@ use tracing::{instrument, span, Level};
 
 use crate::dataset::ProjectionRequest;
 use crate::index::vector::ivf::v2::PartitionEntry;
+use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
 use crate::Dataset;
 
 use super::v2::IVFIndex;
@@ -1092,6 +1095,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let batch = dataset
                 .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
                 .await?;
+            if batch.num_rows() != chunk.len() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "batch.num_rows() != chunk.len() ({} != {})",
+                        batch.num_rows(),
+                        chunk.len()
+                    ),
+                    location!(),
+                ));
+            }
             let batch = batch.try_with_column(
                 ROW_ID_FIELD.clone(),
                 Arc::new(UInt64Array::from(chunk.to_vec())),
@@ -1106,7 +1119,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         &self,
         part_idx: usize,
     ) -> Result<Option<(UInt64Array, FixedSizeListArray)>> {
-        let row_ids = self.partition_row_ids(part_idx).await?;
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before split partition",
@@ -1114,11 +1126,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
+        let mut row_ids = self.partition_row_ids(part_idx).await?;
+        if !row_ids.is_sorted() {
+            row_ids.sort();
+        }
+        // dedup is needed if it's multivector
+        row_ids.dedup();
+
         let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
         if batches.is_empty() {
             return Ok(None);
         }
         let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+        // for multivector, we need to flatten the vectors
+        let batch = Flatten::new(&self.column).transform(&batch)?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let vectors = batch[&self.column].as_fixed_size_list().clone();
@@ -1167,7 +1188,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             });
         };
 
-        match vectors.value_type() {
+        let element_type = infer_vector_element_type(vectors.data_type())?;
+        match element_type {
             DataType::Float16 => {
                 self.split_partition_impl::<Float16Type>(part_idx, ivf, &row_ids, &vectors)
                     .await
@@ -1209,11 +1231,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut new_centroids: Vec<ArrayRef> = Vec::with_capacity(ivf.num_partitions() + 1);
         new_centroids.extend(centroids.iter().map(|vec| vec.unwrap()));
 
-        let dimension = vectors.value_length() as usize;
+        let dimension = infer_vector_dim(vectors.data_type())?;
         // train kmeans to get 2 new centroids
-        let params = KMeansParams::new(None, 50, 1, self.distance_type);
+        let (normalized_dist_type, normalized_vectors) = match self.distance_type {
+            DistanceType::Cosine => {
+                let vectors = normalize_fsl(vectors)?;
+                (DistanceType::L2, vectors)
+            }
+            _ => (self.distance_type, vectors.clone()),
+        };
+        let params = KMeansParams::new(None, 50, 1, normalized_dist_type);
         let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
-            vectors.values().as_primitive::<T>(),
+            normalized_vectors.values().as_primitive::<T>(),
             params,
             dimension,
             2,
@@ -1520,7 +1549,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let Some(vector_field) = dataset.schema().field(&self.column) else {
+        let Some(vector_field) =
+            dataset
+                .schema()
+                .field(&self.column)
+                .map(|f| match f.data_type() {
+                    DataType::List(inner) | DataType::LargeList(inner) => {
+                        Field::new(self.column.as_str(), inner.data_type().clone(), true)
+                    }
+                    _ => f.into(),
+                })
+        else {
             return Err(Error::invalid_input(
                 "vector field not found in dataset schema",
                 location!(),
@@ -1586,7 +1625,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let deleted_row_ids = deleted_row_ids.finish();
         let schema = arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
-            vector_field.into(),
+            vector_field,
             PART_ID_FIELD.clone(),
         ]);
         let batch = RecordBatch::try_new(
