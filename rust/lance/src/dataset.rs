@@ -916,7 +916,11 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((Arc::new(manifest), location))
+        let manifest_arc = Arc::new(manifest);
+        self.metadata_cache
+            .insert_with_key(&manifest_key, manifest_arc.clone())
+            .await;
+        Ok((manifest_arc, location))
     }
 
     /// Read the transaction file for this version of the dataset.
