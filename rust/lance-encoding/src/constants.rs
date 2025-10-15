@@ -19,6 +19,11 @@ pub const RLE_THRESHOLD_META_KEY: &str = "lance-encoding:rle-threshold";
 /// Set to a large value to discourage dictionary encoding
 /// Set to a small value to encourage dictionary encoding
 pub const DICT_DIVISOR_META_KEY: &str = "lance-encoding:dict-divisor";
+/// Metadata key for specifying dictionary encoding cardinality ratio threshold (0.0-1.0)
+/// If cardinality/num_values < ratio, use dictionary encoding.
+/// Example: 0.5 means use dict if unique values < 50% of total values
+/// Default: 0.5
+pub const DICT_RATIO_META_KEY: &str = "lance-encoding:dict-ratio";
 
 // NOTE: BLOB_META_KEY is defined in lance-core to avoid circular dependency
 

@@ -14,8 +14,8 @@ use std::{
 
 use crate::{
     constants::{
-        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+        DICT_DIVISOR_META_KEY, DICT_RATIO_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
+        STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
@@ -4127,21 +4127,49 @@ impl PrimitiveStructuralEncoder {
             return false;
         }
 
-        // Somewhat arbitrary threshold rule.  Apply dictionary encoding if the number of unique
-        // values is less than 1/2 the total number of values.
-        let divisor: u64 = field
+        let ratio_optional = field
+            .metadata
+            .get(DICT_RATIO_META_KEY)
+            .and_then(|val| val.parse::<f64>().ok())
+            .or_else(|| {
+                env::var("LANCE_ENCODING_DICT_RATIO")
+                    .ok()
+                    .and_then(|val| val.parse().ok())
+            });
+
+        let divisor_optional = field
             .metadata
             .get(DICT_DIVISOR_META_KEY)
-            .map(|val| val.parse().ok())
-            .unwrap_or_else(|| {
+            .and_then(|val| val.parse::<u64>().ok())
+            .or_else(|| {
                 env::var("LANCE_ENCODING_DICT_DIVISOR")
                     .ok()
                     .and_then(|val| val.parse().ok())
-            })
-            .unwrap_or(2);
+            });
 
-        // Cap on cardinality.  This should be pushed into the cardinality estimation to avoid
-        // spending too much time estimating cardinality.
+        // If both are configured, panic
+        if ratio_optional.is_some() && divisor_optional.is_some() {
+            panic!("Both dict-ratio and dict-divisor specified, and only one should be set.",);
+        }
+
+        let divisor: u64 = if let Some(div) = divisor_optional {
+            if div == 0 {
+                panic!("Invalid parameter: dict-divisor is 0.");
+            }
+            div
+        } else if let Some(ratio) = ratio_optional {
+            if ratio <= 0.0 || ratio > 1.0 {
+                panic!(
+                    "Invalid parameter: dict-ratio is {} which is not in the range (0, 1].",
+                    ratio
+                );
+            }
+            ((1.0 / ratio).round() as u64).max(1)
+        } else {
+            2 // Default: ratio=0.5 → divisor=2
+        };
+
+        // Cap on cardinality
         let max_cardinality = env::var("LANCE_ENCODING_DICT_MAX_CARDINALITY")
             .ok()
             .and_then(|val| val.parse().ok())
@@ -4400,7 +4428,14 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
+    use super::{
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
+        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
+        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
+        StructuralPageScheduler,
+    };
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
+    use crate::data::BlockInfo;
     use crate::decoder::PageEncoding;
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
@@ -4409,17 +4444,10 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
     use crate::version::LanceFileVersion;
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{ArrayRef, Int8Array, StringArray, UInt64Array};
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
-
-    use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
-        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
-        StructuralPageScheduler,
-    };
 
     #[test]
     fn test_is_narrow() {
@@ -5438,5 +5466,137 @@ mod tests {
             }));
 
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    // Dictionary encoding decision tests
+    /// Helper to create test data block with exact cardinality stat injected
+    /// to ensure consistent test behavior (avoids HLL estimation error)
+    fn create_test_data_block(num_values: u64, cardinality: u64) -> DataBlock {
+        use crate::statistics::Stat;
+
+        let block_info = BlockInfo::default();
+
+        // Manually inject exact cardinality stat for consistent test behavior
+        let cardinality_array = Arc::new(UInt64Array::from(vec![cardinality]));
+        block_info
+            .0
+            .write()
+            .unwrap()
+            .insert(Stat::Cardinality, cardinality_array);
+
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: crate::buffer::LanceBuffer::from(vec![0u8; (num_values * 4) as usize]),
+            num_values,
+            block_info,
+        })
+    }
+
+    #[test]
+    fn test_dict_default_ratio() {
+        use lance_core::datatypes::Field as LanceField;
+
+        // Default: ratio=0.5 (divisor=2)
+        let block = create_test_data_block(1000, 400); // 40% cardinality
+        let field = LanceField::try_from(&arrow_schema::Field::new("test", DataType::Int32, false))
+            .unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(result, "Should use dict: 400 < 1000/2=500");
+
+        let block = create_test_data_block(1000, 600); // 60% cardinality
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(!result, "Should not use dict: 600 > 1000/2=500");
+    }
+
+    #[test]
+    fn test_dict_ratio_parameter() {
+        use crate::constants::DICT_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_RATIO_META_KEY.to_string(), "0.25".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        // ratio=0.25 means use dict if cardinality < 25%
+        let block = create_test_data_block(1000, 200); // 20% cardinality
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(result, "Should use dict: 200 < 1000*0.25=250");
+
+        let block = create_test_data_block(1000, 300); // 30% cardinality
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(!result, "Should not use dict: 300 > 1000*0.25=250");
+    }
+
+    #[test]
+    fn test_dict_divisor_parameter() {
+        use crate::constants::DICT_DIVISOR_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "4".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        // divisor=4 means use dict if cardinality < num_values/4
+        let block = create_test_data_block(1000, 200); // 20% cardinality
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(result, "Should use dict: 200 < 1000/4=250");
+
+        let block = create_test_data_block(1000, 300); // 30% cardinality
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        assert!(!result, "Should not use dict: 300 > 1000/4=250");
+    }
+
+    #[test]
+    #[should_panic(expected = "Both dict-ratio and dict-divisor specified")]
+    fn test_dict_both_parameters_panic() {
+        use crate::constants::{DICT_DIVISOR_META_KEY, DICT_RATIO_META_KEY};
+        use lance_core::datatypes::Field as LanceField;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_RATIO_META_KEY.to_string(), "0.5".to_string());
+        metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "2".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let block = create_test_data_block(1000, 400);
+        PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid parameter: dict-ratio")]
+    fn test_dict_invalid_ratio_panic() {
+        use crate::constants::DICT_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_RATIO_META_KEY.to_string(), "1.5".to_string()); // > 1.0
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let block = create_test_data_block(1000, 400);
+        PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid parameter: dict-divisor is 0")]
+    fn test_dict_zero_divisor_panic() {
+        use crate::constants::DICT_DIVISOR_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "0".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let block = create_test_data_block(1000, 400);
+        PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
     }
 }
