@@ -33,6 +33,7 @@ pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
 pub mod flat;
+pub mod geoindex;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
@@ -61,6 +62,7 @@ pub enum BuiltinIndexType {
     ZoneMap,
     BloomFilter,
     Inverted,
+    Geo,
 }
 
 impl BuiltinIndexType {
@@ -73,6 +75,7 @@ impl BuiltinIndexType {
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
+            Self::Geo => "geo",
         }
     }
 }
@@ -89,6 +92,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
+            IndexType::Geo => Ok(Self::Geo),
             _ => Err(Error::Index {
                 message: "Invalid index type".to_string(),
                 location: location!(),
@@ -585,6 +589,45 @@ pub enum TokenQuery {
     /// Retrieve all row ids where the text contains all tokens parsed from given string. The tokens
     /// are separated by punctuations and white spaces.
     TokensContains(String),
+}
+
+/// A query that a GeoIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeoQuery {
+    /// Retrieve all row ids where the geometry intersects with the given bounding box
+    /// Format: (min_x, min_y, max_x, max_y)
+    Intersects(f64, f64, f64, f64),
+}
+
+impl AnyQuery for GeoQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::Intersects(min_x, min_y, max_x, max_y) => {
+                format!("st_intersects({}, bbox({}, {}, {}, {}))", col, min_x, min_y, max_x, max_y)
+            }
+        }
+    }
+
+    fn to_expr(&self, _col: String) -> Expr {
+        match self {
+            Self::Intersects(_min_x, _min_y, _max_x, _max_y) => {
+                // For now, return a placeholder expression
+                // This would need to be a proper st_intersects UDF call
+                Expr::Literal(ScalarValue::Boolean(Some(true)), None)
+            }
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
 }
 
 /// A query that a BloomFilter index can satisfy

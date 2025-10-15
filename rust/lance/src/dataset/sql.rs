@@ -65,6 +65,8 @@ impl SqlQueryBuilder {
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
         let ctx = SessionContext::new();
+        // Register Lance UDFs
+        lance_datafusion::udf::register_functions(&ctx);
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
         ctx.register_table(

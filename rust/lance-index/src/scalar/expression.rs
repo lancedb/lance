@@ -18,8 +18,8 @@ use datafusion_expr::{
 };
 
 use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, GeoQuery, LabelListQuery, MetricsCollector, SargableQuery,
+    ScalarIndex, SearchResult, TextQuery, TokenQuery,
 };
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
@@ -654,6 +654,122 @@ impl ScalarQueryParser for FtsQueryParser {
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
             if func.name() == "contains_tokens" {
                 let query = TokenQuery::TokensContains(scalar_str);
+                return Some(IndexedExpression::index_query(
+                    column.to_string(),
+                    self.index_name.clone(),
+                    Arc::new(query),
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// A parser for geo indices that handles spatial queries
+#[derive(Debug, Clone)]
+pub struct GeoQueryParser {
+    index_name: String,
+}
+
+impl GeoQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+
+    /// Extract bounding box coordinates from a bbox() function call
+    /// Expected format: bbox(min_x, min_y, max_x, max_y)
+    fn extract_bbox(&self, expr: &Expr) -> Option<(f64, f64, f64, f64)> {
+        match expr {
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                if func.name() == "bbox" && args.len() == 4 {
+                    // Extract the four coordinates
+                    let min_x = maybe_scalar(&args[0], &DataType::Float64)?;
+                    let min_y = maybe_scalar(&args[1], &DataType::Float64)?;
+                    let max_x = maybe_scalar(&args[2], &DataType::Float64)?;
+                    let max_y = maybe_scalar(&args[3], &DataType::Float64)?;
+
+                    // Convert to f64
+                    let min_x = match min_x {
+                        ScalarValue::Float64(Some(v)) => v,
+                        ScalarValue::Float32(Some(v)) => v as f64,
+                        ScalarValue::Int64(Some(v)) => v as f64,
+                        ScalarValue::Int32(Some(v)) => v as f64,
+                        _ => return None,
+                    };
+                    let min_y = match min_y {
+                        ScalarValue::Float64(Some(v)) => v,
+                        ScalarValue::Float32(Some(v)) => v as f64,
+                        ScalarValue::Int64(Some(v)) => v as f64,
+                        ScalarValue::Int32(Some(v)) => v as f64,
+                        _ => return None,
+                    };
+                    let max_x = match max_x {
+                        ScalarValue::Float64(Some(v)) => v,
+                        ScalarValue::Float32(Some(v)) => v as f64,
+                        ScalarValue::Int64(Some(v)) => v as f64,
+                        ScalarValue::Int32(Some(v)) => v as f64,
+                        _ => return None,
+                    };
+                    let max_y = match max_y {
+                        ScalarValue::Float64(Some(v)) => v,
+                        ScalarValue::Float32(Some(v)) => v as f64,
+                        ScalarValue::Int64(Some(v)) => v as f64,
+                        ScalarValue::Int32(Some(v)) => v as f64,
+                        _ => return None,
+                    };
+
+                    return Some((min_x, min_y, max_x, max_y));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ScalarQueryParser for GeoQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        // Handle st_intersects(geometry_column, bbox(...))
+        if func.name() == "st_intersects" && args.len() == 2 {
+            // The second argument should be a bbox() call
+            if let Some((min_x, min_y, max_x, max_y)) = self.extract_bbox(&args[1]) {
+                let query = GeoQuery::Intersects(min_x, min_y, max_x, max_y);
                 return Some(IndexedExpression::index_query(
                     column.to_string(),
                     self.index_name.clone(),

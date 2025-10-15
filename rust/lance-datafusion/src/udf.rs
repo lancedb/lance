@@ -26,7 +26,115 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
+
+    // GEO functions
+    ctx.register_udf(ST_INTERSECTS_UDF.clone());
+    ctx.register_udf(ST_WITHIN_UDF.clone());
+    ctx.register_udf(BBOX_UDF.clone());
 }
+
+static ST_WITHIN_UDF: LazyLock<ScalarUDF> = LazyLock::new(st_within);
+static BBOX_UDF: LazyLock<ScalarUDF> = LazyLock::new(bbox);
+static ST_INTERSECTS_UDF: LazyLock<ScalarUDF> = LazyLock::new(st_intersects);
+
+fn st_intersects() -> ScalarUDF {
+    let function = Arc::new(make_scalar_function(
+        |_args: &[ArrayRef]| {
+            // Throw an error indicating that a spatial index is required
+            Err(datafusion::error::DataFusionError::Execution(
+                "st_intersects requires a spatial index. Please create a spatial index on the geometry column using dataset.create_scalar_index(column='your_column', index_type='GEO') before running spatial queries.".to_string(),
+            ))
+        },
+        vec![],
+    ));
+
+    create_udf(
+        "st_intersects",
+        vec![
+            DataType::Struct(vec![
+                Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
+            ].into()),
+            DataType::Struct(vec![
+                Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+            ].into())
+        ], // GeoArrow Point struct, GeoArrow Box struct
+        DataType::Boolean,
+        Volatility::Immutable,
+        function,
+    )
+}
+
+
+fn st_within() -> ScalarUDF {
+    let function = Arc::new(make_scalar_function(
+        |_args: &[ArrayRef]| {
+            // Throw an error indicating that a spatial index is required
+            Err(datafusion::error::DataFusionError::Execution(
+                "st_within requires a spatial index. Please create a spatial index on the geometry column using dataset.create_scalar_index(column='your_column', index_type='RTREE') before running spatial queries.".to_string(),
+            ))
+        },
+        vec![],
+    ));
+
+    create_udf(
+        "st_within",
+        vec![
+            DataType::Struct(vec![
+                Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
+            ].into()),
+            DataType::Struct(vec![
+                Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+            ].into())
+        ], // GeoArrow Point struct, GeoArrow Box struct
+        DataType::Boolean,
+        Volatility::Immutable,
+        function,
+    )
+}
+
+
+/// BBOX function that creates a bounding box from four numeric arguments.
+/// This function is used internally by spatial queries and doesn't perform actual computation.
+/// It's intercepted by Lance's geo query parser for index optimization.
+///
+/// Usage in SQL:
+/// ```sql
+/// SELECT * FROM table WHERE ST_Intersects(geometry_column, BBOX(-180, -90, 180, 90))
+/// ```
+fn bbox() -> ScalarUDF {
+    let function = Arc::new(make_scalar_function(
+        |_args: &[ArrayRef]| {
+            // This UDF should never be called because BBOX functions are intercepted by the query parser
+            // If this executes, it means no spatial index exists
+            Err(datafusion::error::DataFusionError::Execution(
+                "BBOX function requires a spatial index. Please create a spatial index on the geometry column using dataset.create_scalar_index(column='your_column', index_type='RTREE') before running spatial queries.".to_string(),
+            ))
+        },
+        vec![],
+    ));
+
+    create_udf(
+        "bbox",
+        vec![DataType::Float64, DataType::Float64, DataType::Float64, DataType::Float64], // min_x, min_y, max_x, max_y
+        DataType::Struct(vec![
+            Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+            Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+            Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+            Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+        ].into()), // Returns a GeoArrow Box struct
+        Volatility::Immutable,
+        function,
+    )
+}
+
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by
 /// punctuations and white spaces.

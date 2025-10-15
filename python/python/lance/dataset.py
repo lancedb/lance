@@ -2345,6 +2345,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "LABEL_LIST",
                 "INVERTED",
                 "BLOOMFILTER",
+                "GEO"
             ]:
                 raise NotImplementedError(
                     (
@@ -2392,11 +2393,27 @@ class LanceDataset(pa.dataset.Dataset):
                         f"INVERTED index column {column} must be string, large string"
                         " or list of strings, but got {value_type}"
                     )
-
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
+            elif index_type == "GEO":
+                # Accept struct<x: double, y: double> for GeoArrow point data
+                if pa.types.is_struct(field_type):
+                    field_names = [field.name for field in field_type]
+                    if set(field_names) == {"x", "y"}:
+                        # This is geoarrow point data - allow it
+                        pass
+                    else:
+                        raise TypeError(
+                            f"GEO index column {column} must be a struct with x,y fields for point data. "
+                            f"Got struct with fields: {field_names}"
+                        )
+                else:
+                    raise TypeError(
+                        f"GEO index column {column} must be a struct<x: double, y: double> type. "
+                        f"Got field type: {field_type}"
+                    )
+                if pa.types.is_duration(field_type):
+                    raise TypeError(
+                        f"Scalar index column {column} cannot currently be a duration"
+                    )
         elif isinstance(index_type, IndexConfig):
             config = json.dumps(index_type.parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
