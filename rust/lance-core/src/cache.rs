@@ -350,14 +350,38 @@ pub struct WeakLanceCache {
     misses: Arc<AtomicU64>,
 }
 
-impl WeakLanceCache {
-    /// Create a weak reference from a strong LanceCache
-    pub fn from(cache: &LanceCache) -> Self {
+impl From<&LanceCache> for WeakLanceCache {
+    fn from(cache: &LanceCache) -> Self {
         Self {
             inner: Arc::downgrade(&cache.cache),
             prefix: cache.prefix.clone(),
             hits: cache.hits.clone(),
             misses: cache.misses.clone(),
+        }
+    }
+}
+
+impl From<LanceCache> for WeakLanceCache {
+    fn from(cache: LanceCache) -> Self {
+        Self {
+            inner: Arc::downgrade(&cache.cache),
+            prefix: cache.prefix,
+            hits: cache.hits,
+            misses: cache.misses,
+        }
+    }
+}
+
+impl WeakLanceCache {
+    pub fn upgrade(self) -> LanceCache {
+        let Some(cache) = self.inner.upgrade() else {
+            return LanceCache::no_cache();
+        };
+        LanceCache {
+            cache,
+            prefix: self.prefix,
+            hits: self.hits,
+            misses: self.misses,
         }
     }
 

@@ -4485,6 +4485,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
+ "deepsize",
  "fsst",
  "futures",
  "hex",

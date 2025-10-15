@@ -13,7 +13,6 @@
 
 use super::utils::AllocTracker;
 use arrow::datatypes::UInt8Type;
-use arrow_schema::{DataType, Field};
 use lance::dataset::InsertBuilder;
 use lance_core::cache::LanceCache;
 use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -75,7 +74,7 @@ async fn test_cache_accounting<F, Fut>(
             .saturating_sub(stats.total_bytes_allocated);
 
         let deviation = (expected_freed as isize - actual_freed).abs();
-        dbg!((expected_freed, actual_freed));
+        dbg!((type_name, expected_freed, actual_freed, deviation));
         assert!(
             deviation <= tolerance_per_entry as isize,
             "{}: Entry (key: {:?}, type: {}): Expected to free {} bytes, but actually freed {} bytes (deviation: {}, tolerance: {}). Stats: alloc={}, dealloc={}",
@@ -122,7 +121,7 @@ async fn test_label_list_index_cache_accounting() {
 
     // Create test data - list of uint8 values
     // Using larger dataset to get bigger cache entries: ~50MB
-    let batch_size = 1_000_000;
+    let batch_size = 100_000;
     let num_batches = BatchCount::from(50);
     let data = gen_batch()
         .col(
@@ -161,8 +160,7 @@ async fn test_label_list_index_cache_accounting() {
             drop(dataset);
         },
         "LabelListIndex",
-        // TODO: if we impl DeepSizeOf for FileReader, then we should be able to reduce this tolerance
-        60_000, // 60KB tolerance per entry - accounts for cache overhead
+        5_000, // 5KB tolerance per entry
     )
     .await;
 }

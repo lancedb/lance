@@ -31,7 +31,7 @@ use prost::{Message, Name};
 use snafu::location;
 
 use lance_core::{
-    cache::LanceCache,
+    cache::{LanceCache, WeakLanceCache},
     datatypes::{Field, Schema},
     Error, Result,
 };
@@ -154,7 +154,7 @@ impl CachedFileMetadata {
 ///
 /// If users are not using the table format then they will need to figure
 /// out some way to do this themselves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
     /// of the schema are arbitrary and ignored.
@@ -339,6 +339,12 @@ impl Default for FileReaderOptions {
     }
 }
 
+impl DeepSizeOf for FileReaderOptions {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
 #[derive(Debug)]
 pub struct FileReader {
     scheduler: Arc<dyn EncodingsIo>,
@@ -347,9 +353,18 @@ pub struct FileReader {
     num_rows: u64,
     metadata: Arc<CachedFileMetadata>,
     decoder_plugins: Arc<DecoderPlugins>,
-    cache: Arc<LanceCache>,
+    cache: WeakLanceCache,
     options: FileReaderOptions,
 }
+
+impl DeepSizeOf for FileReader {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // self.scheduler.deep_size_of_children(context)
+        self.base_projection.deep_size_of_children(context)
+            + self.options.deep_size_of_children(context)
+    }
+}
+
 #[derive(Debug)]
 struct Footer {
     #[allow(dead_code)]
@@ -812,7 +827,7 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
+        let cache = cache.with_key_prefix(path.as_ref()).into();
 
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;
@@ -905,7 +920,7 @@ impl FileReader {
         Self::do_read_range(
             self.collect_columns_from_projection(&projection)?,
             self.scheduler.clone(),
-            self.cache.clone(),
+            Arc::new(self.cache.clone().upgrade()),
             self.num_rows,
             self.decoder_plugins.clone(),
             range,
@@ -967,7 +982,7 @@ impl FileReader {
         Self::do_take_rows(
             self.collect_columns_from_projection(&projection)?,
             self.scheduler.clone(),
-            self.cache.clone(),
+            Arc::new(self.cache.clone().upgrade()),
             self.decoder_plugins.clone(),
             indices,
             batch_size,
@@ -1030,7 +1045,7 @@ impl FileReader {
         Self::do_read_ranges(
             self.collect_columns_from_projection(&projection)?,
             self.scheduler.clone(),
-            self.cache.clone(),
+            Arc::new(self.cache.clone().upgrade()),
             self.decoder_plugins.clone(),
             ranges,
             batch_size,
@@ -1186,7 +1201,7 @@ impl FileReader {
 
         let config = SchedulerDecoderConfig {
             batch_size,
-            cache: self.cache.clone(),
+            cache: Arc::new(self.cache.clone().upgrade()),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
@@ -1225,7 +1240,7 @@ impl FileReader {
 
         let config = SchedulerDecoderConfig {
             batch_size,
-            cache: self.cache.clone(),
+            cache: Arc::new(self.cache.clone().upgrade()),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
@@ -1264,7 +1279,7 @@ impl FileReader {
 
         let config = SchedulerDecoderConfig {
             batch_size,
-            cache: self.cache.clone(),
+            cache: Arc::new(self.cache.clone().upgrade()),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),

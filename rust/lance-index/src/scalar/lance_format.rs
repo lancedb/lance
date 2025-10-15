@@ -9,6 +9,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
+use lance_core::cache::WeakLanceCache;
 use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
@@ -35,7 +36,7 @@ use std::{any::Any, sync::Arc};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: Arc<LanceCache>,
+    metadata_cache: WeakLanceCache,
     scheduler: Arc<ScanScheduler>,
 }
 
@@ -43,7 +44,6 @@ impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
     }
 }
 
@@ -61,7 +61,7 @@ impl LanceIndexStore {
         Self {
             object_store,
             index_dir,
-            metadata_cache,
+            metadata_cache: metadata_cache.as_ref().into(),
             scheduler,
         }
     }
@@ -234,7 +234,7 @@ impl IndexStore for LanceIndexStore {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &self.metadata_cache,
+            &self.metadata_cache.clone().upgrade(),
             FileReaderOptions::default(),
         )
         .await
@@ -247,7 +247,7 @@ impl IndexStore for LanceIndexStore {
                     let file_reader = FileReader::try_new_self_described(
                         &self.object_store,
                         &path,
-                        Some(&self.metadata_cache),
+                        Some(&self.metadata_cache.clone().upgrade()),
                     )
                     .await?;
                     Ok(Arc::new(file_reader))
