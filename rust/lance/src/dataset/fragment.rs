@@ -25,7 +25,10 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
@@ -602,6 +605,10 @@ pub struct FragReadConfig {
     pub with_row_id: bool,
     // Add the row address column
     pub with_row_address: bool,
+    // Add the last updated at version column
+    pub with_row_last_updated_at_version: bool,
+    // Add the created at version column
+    pub with_row_created_at_version: bool,
     /// The scan scheduler to use for reading data files.
     ///
     /// This should be specified if multiple readers are being used in
@@ -627,6 +634,16 @@ impl FragReadConfig {
 
     pub fn with_row_address(mut self, value: bool) -> Self {
         self.with_row_address = value;
+        self
+    }
+
+    pub fn with_row_last_updated_at_version(mut self, value: bool) -> Self {
+        self.with_row_last_updated_at_version = value;
+        self
+    }
+
+    pub fn with_row_created_at_version(mut self, value: bool) -> Self {
+        self.with_row_created_at_version = value;
         self
     }
 
@@ -871,6 +888,7 @@ impl FileFragment {
             ArrowSchema::from(projection),
             self.count_rows(None).await?,
             num_physical_rows,
+            Arc::new(self.metadata.clone()),
         )?;
 
         if read_config.with_row_id {
@@ -878,6 +896,12 @@ impl FileFragment {
         }
         if read_config.with_row_address {
             reader.with_row_address();
+        }
+        if read_config.with_row_last_updated_at_version {
+            reader.with_row_last_updated_at_version();
+        }
+        if read_config.with_row_created_at_version {
+            reader.with_row_created_at_version();
         }
 
         Ok(reader)
@@ -1866,9 +1890,24 @@ pub struct FragmentReader {
     /// True if we should generate a row address column in output
     with_row_addr: bool,
 
+    /// True if we should generate a last updated at version column in output
+    with_row_last_updated_at_version: bool,
+
+    /// True if we should generate a created at version column in output
+    with_row_created_at_version: bool,
+
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
+
+    /// The fragment metadata (needed for version columns)
+    fragment: Arc<Fragment>,
+
+    /// The last_updated_at version sequence (loaded from fragment metadata)
+    last_updated_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+
+    /// The created_at version sequence (loaded from fragment metadata)
+    created_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
 
     // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,
@@ -1895,7 +1934,12 @@ impl Clone for FragmentReader {
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
             make_deletions_null: self.make_deletions_null,
+            fragment: self.fragment.clone(),
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
         }
@@ -1924,6 +1968,7 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
@@ -1932,6 +1977,7 @@ impl FragmentReader {
         output_schema: ArrowSchema,
         num_rows: usize,
         num_physical_rows: usize,
+        fragment: Arc<Fragment>,
     ) -> Result<Self> {
         if let Some(legacy_reader) = readers.first().and_then(|reader| reader.as_legacy_opt()) {
             let num_batches = legacy_reader.num_batches();
@@ -1960,7 +2006,12 @@ impl FragmentReader {
             fragment_id,
             with_row_id: false,
             with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             make_deletions_null: false,
+            fragment,
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
             num_rows,
             num_physical_rows,
         })
@@ -1986,6 +2037,50 @@ impl FragmentReader {
 
     pub(crate) fn with_make_deletions_null(&mut self) -> &mut Self {
         self.make_deletions_null = true;
+        self
+    }
+
+    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+        self.with_row_last_updated_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.last_updated_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.last_updated_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.last_updated_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_last_updated_at_version");
+
+        self
+    }
+
+    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+        self.with_row_created_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.created_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.created_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.created_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_created_at_version");
+
         self
     }
 
@@ -2156,6 +2251,10 @@ impl FragmentReader {
                 row_id_sequence: self.row_id_sequence.clone(),
                 with_row_id: self.with_row_id,
                 with_row_addr: self.with_row_addr,
+                with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+                with_row_created_at_version: self.with_row_created_at_version,
+                last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+                created_at_sequence: self.created_at_sequence.clone(),
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
@@ -2250,6 +2349,10 @@ impl FragmentReader {
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params,
             total_num_rows,
         };
@@ -2399,6 +2502,10 @@ impl FragmentReader {
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params: ReadBatchParams::Ranges(ranges),
             total_num_rows,
         };
