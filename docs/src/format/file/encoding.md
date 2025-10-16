@@ -548,6 +548,19 @@ options. However, they can also be set in the field metadata in the schema.
 
 ### Configuration Details
 
+#### Compression Scheme
+
+The `lance-encoding:compression` setting enables general-purpose compression algorithms to be applied. Available schemes:
+
+- **`lz4`**: Fast compression with good compression ratios. Default compression level is fast mode.
+- **`zstd`**: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.
+- **`none`**: No general compression applied (default).
+- **`fsst`**: Fast Static Symbol Table compression for string data.
+
+General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
+data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
+(≥32KiB), compression is automatically applied per-value.
+
 #### Compression Level
 
 The compression level is scheme dependent. Currently the following schemes support the following levels:
@@ -557,12 +570,27 @@ The compression level is scheme dependent. Currently the following schemes suppo
 | `zstd` | [`zstd`](https://crates.io/crates/zstd) | `0-22` | `crate dependent` (3 as of this writing)                                                                                                                                                                                          |
 | `lz4`  | [`lz4`](https://crates.io/crates/lz4)   | N/A    | The LZ4 crate has two modes (fast and high compression) and currently this is not exposed to configuration. The LZ4 crate wraps a C library and the default is dependent on the C library. The default as of this writing is fast |
 
-#### Run Length Encoding Threshold
+Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
+is typically less affected by the compression level.
+
+#### Run Length Encoding (RLE) Threshold
 
 The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
 calculated by dividing the number of runs by the number of values. If the ratio is less than the threshold then
 we apply run-length encoding. The default is 0.5 which means we apply run-length encoding if the number of runs
 is less than half the number of values.
+
+**Key points:**
+- RLE is automatically selected when data has sufficient repetition (run_count / num_values < threshold)
+- Supported types: All fixed-width primitives (u8, i8, u16, i16, u32, i32, f32, u64, i64, f64)
+- Maximum chunk size: 2048 values per mini-block
+- Setting threshold to `0.0` effectively disables RLE
+- Setting threshold to `1.0` makes RLE very aggressive (used whenever any runs exist)
+
+RLE is particularly effective for:
+- Sorted or partially sorted data
+- Columns with many repeated values (status codes, categories, etc.)
+- Low-cardinality columns
 
 #### Byte Stream Split (BSS)
 
@@ -570,7 +598,24 @@ The configuration variable for BSS is a simple enum. A value of `off` means to n
 means to always apply BSS, and a value of `auto` means to apply BSS based on an entropy calculation (see code for
 details).
 
-BSS is only applied when the `lance-encoding:compression` variable is also set (to a non-`none` value).
+**Important:** BSS is only applied when the `lance-encoding:compression` variable is also set (to a non-`none` value).
+BSS is a data transformation that makes floating-point data more compressible; it does not reduce size on its own.
+
+**Key points:**
+- Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
+- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
+- `on` mode: Always applies BSS for supported types
+- `off` mode: Never applies BSS
+
+BSS works by splitting multi-byte values by byte position, creating separate byte streams. This clusters similar
+bits together (especially mantissa bits in floating-point numbers), which general compression algorithms can then
+compress more effectively.
+
+BSS is particularly effective for:
+- Floating-point measurements with similar ranges
+- Time-series data with consistent precision
+- Scientific data with correlated mantissa patterns
 
 #### Dictionary Divisor
 
@@ -580,8 +625,282 @@ threshold. If the number of unique values is less than the threshold then we app
 configuration variable defines the divisor that we apply and it defaults to 2 which means we apply dictionary
 encoding if we estimate that less than half the values are unique.
 
+Dictionary encoding is effective for columns with low cardinality where the same values repeat many times.
+The dictionary is stored once per page and indices are stored in place of the actual values.
+
 This is likely to change in future versions.
 
 #### Packed Struct Encoding
 
-Packed struct encoding is a semi-structural transformation described above.
+Packed struct encoding is a semi-structural transformation described above. When enabled, struct values are stored
+in row-major format rather than the default columnar format. This reduces the number of I/O operations needed for
+random access but prevents reading individual fields independently.
+
+This is always opt-in and should only be used when all struct fields are typically accessed together.
+
+## Usage Examples
+
+Encoding configuration can be specified by setting metadata on Arrow schema fields. This allows fine-grained control
+over how each column is encoded and compressed.
+
+### Python
+
+In Python, field metadata is specified as a dictionary when creating Arrow fields:
+
+```python
+import pyarrow as pa
+import lance
+
+# Example 1: Enable compression for a string column
+schema = pa.schema([
+    pa.field("name", pa.string(), metadata={
+        "lance-encoding:compression": "zstd",
+        "lance-encoding:compression-level": "3"
+    }),
+])
+
+# Example 2: Configure RLE for a status column with many repeated values
+schema = pa.schema([
+    pa.field("status", pa.int32(), metadata={
+        "lance-encoding:rle-threshold": "0.7",
+        "lance-encoding:compression": "lz4"
+    }),
+])
+
+# Example 3: Enable BSS for floating-point sensor data
+schema = pa.schema([
+    pa.field("temperature", pa.float32(), metadata={
+        "lance-encoding:bss": "on",
+        "lance-encoding:compression": "zstd"
+    }),
+])
+
+# Example 4: Multiple columns with different configurations
+schema = pa.schema([
+    pa.field("id", pa.int64()),  # No special encoding
+    pa.field("category", pa.string(), metadata={
+        "lance-encoding:compression": "lz4"
+    }),
+    pa.field("score", pa.float64(), metadata={
+        "lance-encoding:bss": "auto",
+        "lance-encoding:compression": "zstd",
+        "lance-encoding:compression-level": "5"
+    }),
+    pa.field("count", pa.int32(), metadata={
+        "lance-encoding:rle-threshold": "0.3"
+    }),
+])
+
+# Create a table with the configured schema
+table = pa.table({
+    "id": [1, 2, 3],
+    "category": ["A", "B", "C"],
+    "score": [1.23, 4.56, 7.89],
+    "count": [100, 100, 200]
+}, schema=schema)
+
+# Write to Lance dataset
+lance.write_dataset(table, "my_dataset.lance")
+```
+
+### Rust
+
+In Rust, field metadata is set using a `HashMap` when building Arrow fields:
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+
+// Example 1: Enable compression for a string column
+let mut metadata = HashMap::new();
+metadata.insert(
+    "lance-encoding:compression".to_string(),
+    "zstd".to_string()
+);
+metadata.insert(
+    "lance-encoding:compression-level".to_string(),
+    "3".to_string()
+);
+
+let field = Field::new("name", DataType::Utf8, false)
+    .with_metadata(metadata);
+
+// Example 2: Configure RLE for repeated values
+let mut rle_metadata = HashMap::new();
+rle_metadata.insert(
+    "lance-encoding:rle-threshold".to_string(),
+    "0.7".to_string()
+);
+rle_metadata.insert(
+    "lance-encoding:compression".to_string(),
+    "lz4".to_string()
+);
+
+let status_field = Field::new("status", DataType::Int32, false)
+    .with_metadata(rle_metadata);
+
+// Example 3: Enable BSS for floating-point data
+let mut bss_metadata = HashMap::new();
+bss_metadata.insert(
+    "lance-encoding:bss".to_string(),
+    "on".to_string()
+);
+bss_metadata.insert(
+    "lance-encoding:compression".to_string(),
+    "zstd".to_string()
+);
+
+let temp_field = Field::new("temperature", DataType::Float32, false)
+    .with_metadata(bss_metadata);
+
+// Build schema with multiple configured fields
+let schema = Arc::new(Schema::new(vec![
+    Field::new("id", DataType::Int64, false),
+    field,
+    status_field,
+    temp_field,
+]));
+
+// Use schema when creating dataset...
+```
+
+### Configuration Patterns
+
+**Disable automatic encoding selection:**
+```python
+# Disable RLE even for repeated data
+pa.field("data", pa.int32(), metadata={
+    "lance-encoding:rle-threshold": "0.0"
+})
+
+# Disable BSS for floating-point data
+pa.field("values", pa.float32(), metadata={
+    "lance-encoding:bss": "off"
+})
+```
+
+**Aggressive compression for archival:**
+```python
+pa.field("archived_data", pa.binary(), metadata={
+    "lance-encoding:compression": "zstd",
+    "lance-encoding:compression-level": "15"
+})
+```
+
+**Optimize for read performance:**
+```python
+# Minimal compression for frequently accessed data
+pa.field("hot_data", pa.string(), metadata={
+    "lance-encoding:compression": "lz4"  # Fast decompression
+})
+```
+
+## Best Practices
+
+### Choosing Compression Schemes
+
+**For string/text data:**
+- Use `lz4` for fast compression/decompression with good ratios
+- Use `zstd` with level 3-5 for better compression when write/read speed is less critical
+- Consider `fsst` for string columns (automatically selected when appropriate)
+
+**For floating-point data:**
+- Enable BSS (`auto` or `on`) with `zstd` compression for time-series or scientific data
+- The combination of BSS + ZSTD can achieve 2-4x better compression than ZSTD alone
+- Use `bss: off` if floating-point values are truly random (e.g., cryptographic hashes)
+
+**For integer data:**
+- Let RLE automatically detect repeated values (default threshold: 0.5)
+- Lower the RLE threshold (e.g., 0.3) for status codes or categorical data
+- Use `lz4` or `zstd` compression for additional space savings
+
+### Encoding Selection Strategy
+
+The encoding selection happens in this order for fixed-width data:
+
+1. **BSS** (if enabled and data is 32/64-bit)
+2. **RLE** (if run_count < threshold)
+3. **Bitpacking** (if bit width savings available)
+4. **Value** (fallback, no compression)
+
+All encodings can be wrapped with general compression (LZ4/ZSTD) for additional compression.
+
+### Performance Considerations
+
+**Write performance:**
+- `lz4` is fastest for compression
+- `zstd` with higher levels can significantly slow down writes
+- RLE and BSS detection adds minimal overhead
+- Consider disabling compression for frequently updated columns
+
+**Read performance:**
+- `lz4` decompression is very fast (~GB/s)
+- `zstd` decompression is moderately fast
+- RLE can improve read performance for queries that filter on repeated values
+- BSS adds minimal decompression overhead
+
+**Storage optimization:**
+- `zstd` with level 5-9 provides best compression ratios
+- BSS + ZSTD combination is excellent for floating-point data
+- RLE is highly effective for sorted or low-cardinality data
+- Dictionary encoding (automatic) helps with categorical data
+
+### Common Patterns
+
+**Time-series sensor data:**
+```python
+schema = pa.schema([
+    pa.field("timestamp", pa.timestamp("us"), metadata={
+        "lance-encoding:compression": "lz4"
+    }),
+    pa.field("sensor_value", pa.float32(), metadata={
+        "lance-encoding:bss": "on",
+        "lance-encoding:compression": "zstd",
+        "lance-encoding:compression-level": "5"
+    }),
+])
+```
+
+**Log data with status codes:**
+```python
+schema = pa.schema([
+    pa.field("level", pa.int8(), metadata={
+        "lance-encoding:rle-threshold": "0.3",
+        "lance-encoding:compression": "lz4"
+    }),
+    pa.field("message", pa.string(), metadata={
+        "lance-encoding:compression": "zstd",
+        "lance-encoding:compression-level": "3"
+    }),
+])
+```
+
+**High-dimensional embeddings:**
+```python
+schema = pa.schema([
+    pa.field("embedding", pa.list_(pa.float32()), metadata={
+        "lance-encoding:bss": "on",
+        "lance-encoding:compression": "zstd",
+        "lance-encoding:compression-level": "5"
+    }),
+])
+```
+
+### Troubleshooting
+
+**Unexpected file sizes:**
+- Verify compression is enabled: check metadata has `lance-encoding:compression` set
+- For BSS: ensure compression is also enabled (BSS alone doesn't compress)
+- For RLE: check if threshold is too low (increase to be more selective)
+
+**Slow writes:**
+- Lower ZSTD compression level or switch to LZ4
+- Disable BSS if entropy analysis is expensive
+- Consider disabling automatic dictionary encoding for high-cardinality columns
+
+**Slow reads:**
+- Compression should rarely impact read performance significantly
+- If reads are slow, consider reducing compression level or using LZ4
+- Ensure search cache is properly configured (separate topic)
