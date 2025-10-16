@@ -19,7 +19,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Gauge, MetricsSet, Time};
 use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
 use futures::{future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -29,8 +29,9 @@ use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
-    ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    ExecutionPlanMetricsSetExt, FRAGMENTS_PLANNED_METRIC, FRAGMENTS_SCANNED_METRIC,
+    RANGES_PLANNED_METRIC, RANGES_SCANNED_METRIC, ROWS_PLANNED_METRIC, ROWS_SCANNED_METRIC,
+    TASK_WAIT_TIME_METRIC,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::utils::stream::ReadBatchFut;
@@ -889,9 +890,14 @@ impl<I: Iterator<Item = u64> + Send> Iterator for DvToValidRanges<I> {
 /// These represent work that is not divisible by partition and this work is always
 /// reported on partition 0
 pub struct FilteredReadGlobalMetrics {
+    // Execution metrics (incremented during scan)
     fragments_scanned: Count,
     ranges_scanned: Count,
     rows_scanned: Count,
+    // Planning metrics (set once at initialization)
+    fragments_planned: Gauge,
+    ranges_planned: Gauge,
+    rows_planned: Gauge,
     io_metrics: IoMetrics,
 }
 
@@ -901,6 +907,9 @@ impl FilteredReadGlobalMetrics {
             fragments_scanned: metrics.new_count(FRAGMENTS_SCANNED_METRIC, 0),
             ranges_scanned: metrics.new_count(RANGES_SCANNED_METRIC, 0),
             rows_scanned: metrics.new_count(ROWS_SCANNED_METRIC, 0),
+            fragments_planned: metrics.new_gauge(FRAGMENTS_PLANNED_METRIC, 0),
+            ranges_planned: metrics.new_gauge(RANGES_PLANNED_METRIC, 0),
+            rows_planned: metrics.new_gauge(ROWS_PLANNED_METRIC, 0),
             io_metrics: IoMetrics::new(metrics, 0),
         }
     }
@@ -1046,6 +1055,20 @@ impl FilteredReadStream {
         metrics: &ExecutionPlanMetricsSet,
     ) -> Self {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
+
+        // Set planning metrics based on planned_fragments
+        let fragments_planned = planned_fragments.len();
+        let ranges_planned: usize = planned_fragments.iter().map(|pf| pf.ranges.len()).sum();
+        let rows_planned: u64 = planned_fragments
+            .iter()
+            .flat_map(|pf| pf.ranges.iter())
+            .map(|r| r.end - r.start)
+            .sum();
+
+        global_metrics.fragments_planned.set(fragments_planned);
+        global_metrics.ranges_planned.set(ranges_planned);
+        global_metrics.rows_planned.set(rows_planned as usize);
+
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store().clone();
@@ -1629,5 +1652,251 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
         assert!(iops > 0, "Should have recorded IO operations");
+    }
+
+    #[tokio::test]
+    async fn test_planning_metrics_single_fragment() {
+        // Create dataset with 100 rows in one fragment
+        let tmp_path = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::rand_type(&DataType::Float32))
+            .into_dataset(
+                tmp_path.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Plan a full scan (no filters, no limits)
+        let fragments = dataset.fragments().as_ref().clone();
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let (planned_fragments, planned_options) =
+            FilteredReadUtils::plan_scan(&dataset, fragments, None, &options)
+                .await
+                .unwrap();
+
+        // Create and execute PlannedFilterReadExec
+        let planned_read = Arc::new(PlannedFilterReadExec::new(
+            dataset.clone(),
+            planned_fragments,
+            planned_options,
+        ));
+
+        let batches = planned_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 100);
+
+        // Verify planning metrics
+        let metrics = planned_read.metrics().unwrap();
+
+        let fragments_planned = metrics
+            .sum_by_name("fragments_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            fragments_planned, 1,
+            "Should have planned to scan 1 fragment"
+        );
+
+        let ranges_planned = metrics
+            .sum_by_name("ranges_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(ranges_planned, 1, "Should have planned 1 range");
+
+        let rows_planned = metrics
+            .sum_by_name("rows_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(rows_planned, 100, "Should have planned to read 100 rows");
+
+        // Verify execution metrics match planning metrics (full scan)
+        let fragments_scanned = metrics
+            .sum_by_name("fragments_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(fragments_scanned, fragments_planned);
+
+        let ranges_scanned = metrics
+            .sum_by_name("ranges_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(ranges_scanned, ranges_planned);
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(rows_scanned, rows_planned);
+    }
+
+    #[tokio::test]
+    async fn test_planning_metrics_multiple_fragments() {
+        // Create dataset with 300 rows across 3 fragments (100 each)
+        let tmp_path = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::rand_type(&DataType::Float32))
+            .into_dataset(
+                tmp_path.as_str(),
+                FragmentCount::from(3),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Plan a full scan
+        let fragments = dataset.fragments().as_ref().clone();
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let (planned_fragments, planned_options) =
+            FilteredReadUtils::plan_scan(&dataset, fragments, None, &options)
+                .await
+                .unwrap();
+
+        // Create and execute
+        let planned_read = Arc::new(PlannedFilterReadExec::new(
+            dataset.clone(),
+            planned_fragments,
+            planned_options,
+        ));
+
+        let batches = planned_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 300);
+
+        // Verify planning metrics
+        let metrics = planned_read.metrics().unwrap();
+
+        let fragments_planned = metrics
+            .sum_by_name("fragments_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            fragments_planned, 3,
+            "Should have planned to scan 3 fragments"
+        );
+
+        let ranges_planned = metrics
+            .sum_by_name("ranges_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(ranges_planned, 3, "Should have planned 3 ranges");
+
+        let rows_planned = metrics
+            .sum_by_name("rows_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(rows_planned, 300, "Should have planned to read 300 rows");
+    }
+
+    #[tokio::test]
+    async fn test_planning_metrics_with_limit() {
+        // Create dataset with 300 rows across 3 fragments
+        let tmp_path = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::rand_type(&DataType::Float32))
+            .into_dataset(
+                tmp_path.as_str(),
+                FragmentCount::from(3),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Plan a scan with a limit of 150 rows using scan_range_before_filter
+        // (scan_range_before_filter is for unfiltered scans, scan_range_after_filter requires a filter/index)
+        let fragments = dataset.fragments().as_ref().clone();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_scan_range_before_filter(0..150)
+            .unwrap();
+        let (planned_fragments, planned_options) =
+            FilteredReadUtils::plan_scan(&dataset, fragments, None, &options)
+                .await
+                .unwrap();
+
+        // Create and execute
+        let planned_read = Arc::new(PlannedFilterReadExec::new(
+            dataset.clone(),
+            planned_fragments,
+            planned_options,
+        ));
+
+        let batches = planned_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 150);
+
+        // Verify planning metrics
+        let metrics = planned_read.metrics().unwrap();
+
+        let fragments_planned = metrics
+            .sum_by_name("fragments_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        // With scan_range_before_filter, limit pushdown works and only 2 fragments are planned
+        assert_eq!(
+            fragments_planned, 2,
+            "Should have planned to scan 2 fragments (limit pushed down via scan_range_before_filter)"
+        );
+
+        let ranges_planned = metrics
+            .sum_by_name("ranges_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            ranges_planned, 2,
+            "Should have planned 2 ranges (one per fragment)"
+        );
+
+        let rows_planned = metrics
+            .sum_by_name("rows_planned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            rows_planned, 150,
+            "Should have planned to read exactly 150 rows (limit pushed down)"
+        );
+
+        // Verify execution metrics match planning (limit was successfully pushed down)
+        let fragments_scanned = metrics
+            .sum_by_name("fragments_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            fragments_scanned, fragments_planned,
+            "Execution should match planning when limit is pushed down"
+        );
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            rows_scanned, rows_planned,
+            "Execution should match planning when limit is pushed down"
+        );
     }
 }

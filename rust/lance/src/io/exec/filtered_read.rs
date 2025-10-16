@@ -2102,30 +2102,130 @@ mod tests {
         // Check metrics reflect partial fragment read
         let metrics = filtered_read.metrics().unwrap();
 
-        // Should show approximately 30 rows scanned (might be slightly more due to buffering)
-        // But should be significantly less than full fragment (100 rows)
+        // Test exact metric values
         let rows_scanned = metrics
             .sum_by_name("rows_scanned")
             .map(|v| v.as_usize())
             .unwrap_or(0);
-        assert!(
-            (30..100).contains(&rows_scanned),
-            "rows_scanned ({}) should be close to limit (30), not full fragment (100)",
-            rows_scanned
+        assert_eq!(
+            rows_scanned, 30,
+            "Should scan exactly 30 rows (3 batches × 10 rows/batch)"
         );
 
-        // Should show 1 fragment was accessed
         let fragments_scanned = metrics
             .sum_by_name("fragments_scanned")
             .map(|v| v.as_usize())
             .unwrap_or(0);
-        assert_eq!(fragments_scanned, 1);
+        assert_eq!(fragments_scanned, 1, "Should scan exactly 1 fragment");
 
         let ranges_scanned = metrics
             .sum_by_name("ranges_scanned")
             .map(|v| v.as_usize())
             .unwrap_or(0);
-        assert!(ranges_scanned > 0, "Should have scanned some ranges");
+        assert_eq!(
+            ranges_scanned, 1,
+            "Should scan exactly 1 range within the fragment"
+        );
+
+        // Note: The metric is stored as "OutputRows" (from the Metric enum variant name)
+        // but sum_by_name is case-insensitive, so we can check the raw metrics
+        let output_rows = metrics
+            .iter()
+            .find_map(|m| {
+                if format!("{:?}", m.value()).contains("OutputRows") {
+                    Some(m.value().as_usize())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(output_rows, 30, "Should output exactly 30 rows to the user");
+
+        // Should have some IO metrics (don't test exact values as these may vary)
+        let iops = metrics
+            .sum_by_name("iops")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(iops > 0, "Should have recorded IO operations");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_limit_multiple_fragments() {
+        let fixture = TestFixture::new().await;
+
+        // The test dataset has 3 fragments:
+        // Fragment 0: rows 0..100 (100 rows)
+        // Fragment 2: rows 250..300 (50 rows, due to deletion vector)
+        // Fragment 3: rows 300..400 (100 rows)
+        // Total: 250 rows across 3 fragments
+
+        // Test reading with a limit that spans multiple fragments
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_batch_size(10)
+            .with_scan_range_before_filter(0..175) // Read 175 rows across fragments
+            .unwrap();
+
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Fragment 0: 100 rows + Fragment 2: 50 rows + Fragment 3: 25 rows = 175 rows
+        assert_eq!(total_rows, 175);
+
+        // Check metrics reflect multiple fragment read
+        let metrics = filtered_read.metrics().unwrap();
+
+        // Test exact metric values
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            rows_scanned, 175,
+            "Should scan exactly 175 rows across multiple fragments"
+        );
+
+        let fragments_scanned = metrics
+            .sum_by_name("fragments_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(fragments_scanned, 3, "Should scan exactly 3 fragments");
+
+        let ranges_scanned = metrics
+            .sum_by_name("ranges_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        // Fragment 0: 1 range (0..100)
+        // Fragment 2: multiple ranges due to deletion vector (approximately 1-2)
+        // Fragment 3: 1 range (partial: 0..25)
+        // Total: at least 3 ranges
+        assert!(
+            ranges_scanned >= 3,
+            "Should scan at least 3 ranges across fragments, got {}",
+            ranges_scanned
+        );
+
+        let output_rows = metrics
+            .iter()
+            .find_map(|m| {
+                if format!("{:?}", m.value()).contains("OutputRows") {
+                    Some(m.value().as_usize())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            output_rows, 175,
+            "Should output exactly 175 rows to the user"
+        );
 
         // Should have some IO metrics
         let iops = metrics
