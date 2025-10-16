@@ -4223,10 +4223,7 @@ dependencies = [
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
- "reqwest",
- "serde_json",
  "snafu",
- "url",
 ]
 
 [[package]]
