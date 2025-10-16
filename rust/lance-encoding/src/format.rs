@@ -32,21 +32,6 @@ pub mod pb21 {
     include!(concat!(env!("OUT_DIR"), "/lance.encodings21.rs"));
 }
 
-/// Protobuf definitions for encodings22
-///
-/// These are the messages used for describing encoding in the 2.2 format.
-pub mod pb22 {
-    #![allow(clippy::all)]
-    #![allow(non_upper_case_globals)]
-    #![allow(non_camel_case_types)]
-    #![allow(non_snake_case)]
-    #![allow(unused)]
-    #![allow(improper_ctypes)]
-    #![allow(clippy::upper_case_acronyms)]
-    #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings22.rs"));
-}
-
 use pb::{
     array_encoding::ArrayEncoding as ArrayEncodingEnum,
     buffer::BufferType,
@@ -717,73 +702,41 @@ impl ProtobufUtils21 {
             ),
         }
     }
-}
 
-impl_common_protobuf_utils!(pb22, ProtobufUtils22);
-
-impl ProtobufUtils22 {
-    pub fn fixed_packed_struct(
-        values: crate::format::pb22::CompressiveEncoding,
-        bits_per_values: Vec<u64>,
-    ) -> crate::format::pb22::CompressiveEncoding {
-        crate::format::pb22::CompressiveEncoding {
+    pub fn packed_struct_variable(
+        fields: Vec<crate::format::pb21::variable_packed_struct::FieldEncoding>,
+    ) -> crate::format::pb21::CompressiveEncoding {
+        crate::format::pb21::CompressiveEncoding {
             compression: Some(
-                crate::format::pb22::compressive_encoding::Compression::PackedStruct(Box::new(
-                    crate::format::pb22::PackedStruct {
-                        variant: Some(crate::format::pb22::packed_struct::Variant::Fixed(
-                            Box::new(crate::format::pb22::FixedPackedStruct {
-                                bits_per_value: bits_per_values,
-                                values: Some(Box::new(values)),
-                            }),
-                        )),
-                    },
-                )),
+                crate::format::pb21::compressive_encoding::Compression::VariablePackedStruct(
+                    crate::format::pb21::VariablePackedStruct { fields },
+                ),
             ),
         }
     }
 
-    pub fn variable_packed_struct(
-        bits_per_offset: u64,
-        offsets: crate::format::pb22::CompressiveEncoding,
-        values: crate::format::pb22::CompressiveEncoding,
-        fields: Vec<crate::format::pb22::variable_packed_struct::FieldLayout>,
-    ) -> crate::format::pb22::CompressiveEncoding {
-        crate::format::pb22::CompressiveEncoding {
-            compression: Some(
-                crate::format::pb22::compressive_encoding::Compression::PackedStruct(Box::new(
-                    crate::format::pb22::PackedStruct {
-                        variant: Some(crate::format::pb22::packed_struct::Variant::Variable(
-                            Box::new(crate::format::pb22::VariablePackedStruct {
-                                bits_per_offset,
-                                offsets: Some(Box::new(offsets)),
-                                values: Some(Box::new(values)),
-                                fields,
-                            }),
-                        )),
-                    },
-                )),
-            ),
-        }
-    }
-
-    pub fn variable_packed_struct_field_fixed(
+    pub fn packed_struct_field_fixed(
+        value_encoding: crate::format::pb21::CompressiveEncoding,
         bits_per_value: u64,
-    ) -> crate::format::pb22::variable_packed_struct::FieldLayout {
-        crate::format::pb22::variable_packed_struct::FieldLayout {
-            details: Some(
-                crate::format::pb22::variable_packed_struct::field_layout::Details::BitsPerValue(
+    ) -> crate::format::pb21::variable_packed_struct::FieldEncoding {
+        crate::format::pb21::variable_packed_struct::FieldEncoding {
+            value: Some(value_encoding),
+            layout: Some(
+                crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerValue(
                     bits_per_value,
                 ),
             ),
         }
     }
 
-    pub fn variable_packed_struct_field_variable(
+    pub fn packed_struct_field_variable(
+        value_encoding: crate::format::pb21::CompressiveEncoding,
         bits_per_length: u64,
-    ) -> crate::format::pb22::variable_packed_struct::FieldLayout {
-        crate::format::pb22::variable_packed_struct::FieldLayout {
-            details: Some(
-                crate::format::pb22::variable_packed_struct::field_layout::Details::BitsPerLength(
+    ) -> crate::format::pb21::variable_packed_struct::FieldEncoding {
+        crate::format::pb21::variable_packed_struct::FieldEncoding {
+            value: Some(value_encoding),
+            layout: Some(
+                crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerLength(
                     bits_per_length,
                 ),
             ),

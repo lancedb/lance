@@ -31,7 +31,7 @@ use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
     pb21::{self, CompressiveEncoding},
-    pb22, ProtobufUtils21,
+    ProtobufUtils21,
 };
 use crate::{
     buffer::LanceBuffer,
@@ -76,36 +76,6 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
         match scheme {
             CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
             CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
-        }
-    }
-}
-
-impl TryFrom<CompressionScheme> for pb22::CompressionScheme {
-    type Error = Error;
-
-    fn try_from(scheme: CompressionScheme) -> Result<Self> {
-        match scheme {
-            CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
-            CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
-            _ => Err(Error::invalid_input(
-                format!("Unsupported compression scheme: {:?}", scheme),
-                location!(),
-            )),
-        }
-    }
-}
-
-impl TryFrom<pb22::CompressionScheme> for CompressionScheme {
-    type Error = Error;
-
-    fn try_from(scheme: pb22::CompressionScheme) -> Result<Self> {
-        match scheme {
-            pb22::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
-            pb22::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
             _ => Err(Error::invalid_input(
                 format!("Unsupported compression scheme: {:?}", scheme),
                 location!(),
