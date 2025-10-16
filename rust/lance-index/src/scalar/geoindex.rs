@@ -33,7 +33,7 @@ use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::{ROW_ADDR, ROW_ID};
 use serde::{Deserialize, Serialize};
 
-use arrow_array::{Array, ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt8Array};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt64Array, UInt8Array};
 use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
@@ -50,14 +50,19 @@ use lance_core::{utils::mask::RowIdTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
 
-const BKD_TREE_FILENAME: &str = "bkd_tree.lance";
-const LEAF_FILENAME_PREFIX: &str = "leaf_";
+const BKD_TREE_INNER_FILENAME: &str = "bkd_tree_inner.lance";
+const BKD_TREE_LEAF_FILENAME: &str = "bkd_tree_leaf.lance";
+const LEAF_GROUP_PREFIX: &str = "leaf_group_";
+const DEFAULT_BATCHES_PER_LEAF_FILE: u32 = 5; // Default number of leaf batches per file
 const GEO_INDEX_VERSION: u32 = 0;
 const LEAF_SIZE_META_KEY: &str = "leaf_size";
-const DEFAULT_LEAF_SIZE: u32 = 100;
+const BATCHES_PER_FILE_META_KEY: &str = "batches_per_file";
+const DEFAULT_LEAF_SIZE: u32 = 100; // for test
+// const DEFAULT_LEAF_SIZE: u32 = 1024; // for production
 
-fn leaf_filename(leaf_id: u32) -> String {
-    format!("{}{}.lance", LEAF_FILENAME_PREFIX, leaf_id)
+/// Get the file name for a leaf group
+fn leaf_group_filename(group_id: u32) -> String {
+    format!("{}{}.lance", LEAF_GROUP_PREFIX, group_id)
 }
 
 /// Lazy reader for BKD leaf file
@@ -161,17 +166,23 @@ impl GeoIndex {
     where
         Self: Sized,
     {
-        // Load BKD tree structure (inner nodes)
-        let tree_file = store.open_index_file(BKD_TREE_FILENAME).await?;
-        let tree_data = tree_file
-            .read_range(0..tree_file.num_rows(), None)
+        // Load inner nodes
+        let inner_file = store.open_index_file(BKD_TREE_INNER_FILENAME).await?;
+        let inner_data = inner_file
+            .read_range(0..inner_file.num_rows(), None)
             .await?;
 
-        // Deserialize tree structure
-        let bkd_tree = BKDTreeLookup::from_record_batch(tree_data)?;
+        // Load leaf metadata
+        let leaf_file = store.open_index_file(BKD_TREE_LEAF_FILENAME).await?;
+        let leaf_data = leaf_file
+            .read_range(0..leaf_file.num_rows(), None)
+            .await?;
 
-        // Extract metadata
-        let schema = tree_file.schema();
+        // Deserialize tree structure from both files
+        let bkd_tree = BKDTreeLookup::from_record_batches(inner_data, leaf_data)?;
+
+        // Extract metadata from inner file
+        let schema = inner_file.schema();
         let leaf_size = schema
             .metadata
             .get(LEAF_SIZE_META_KEY)
@@ -191,25 +202,35 @@ impl GeoIndex {
         }))
     }
 
-    /// Load a specific leaf from storage (from leaf_{id}.lance file)
+    /// Load a specific leaf from storage
     async fn load_leaf(
         &self,
-        leaf_id: u32,
+        leaf: &crate::scalar::bkd::BKDLeafNode,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        // Check cache first
-        let cache_key = BKDLeafKey { leaf_id };
+        let file_id = leaf.file_id;
+        let row_offset = leaf.row_offset;
+        let num_rows = leaf.num_rows;
+        
+        // Use (file_id, row_offset) as cache key
+        // Combine file_id and row_offset into a single u32 (file_id should be small)
+        let cache_key = BKDLeafKey { leaf_id: file_id * 100_000 + (row_offset as u32) };
         let store = self.store.clone();
 
         let cached = self
             .index_cache
             .get_or_insert_with_key(cache_key, move || async move {
                 metrics.record_part_load();
-                let filename = leaf_filename(leaf_id);
+                
+                let filename = leaf_group_filename(file_id);
+                
+                // Open the leaf group file and read the specific row range
                 let reader = store.open_index_file(&filename).await?;
-                // Read the entire leaf file
-                let num_rows = reader.num_rows();
-                let batch = reader.read_range(0..num_rows, None).await?;
+                let batch = reader.read_range(
+                    row_offset as usize..(row_offset + num_rows) as usize,
+                    None
+                ).await?;
+                
                 Ok(CachedLeafData::new(batch))
             })
             .await?;
@@ -220,15 +241,21 @@ impl GeoIndex {
     /// Search a specific leaf for points within the query bbox
     async fn search_leaf(
         &self,
-        leaf_id: u32,
+        leaf: &crate::scalar::bkd::BKDLeafNode,
         query_bbox: [f64; 4],
         metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
-        let leaf_data = self.load_leaf(leaf_id, metrics).await?;
+        let leaf_data = self.load_leaf(leaf, metrics).await?;
 
+        let file_id = leaf.file_id;
+        let row_offset = leaf.row_offset;
+        let num_rows = leaf.num_rows;
+        
         println!(
-            "🔍 Searching leaf {} with {} points, query_bbox: {:?}",
-            leaf_id,
+            "🔍 Searching leaf (file={}, offset={}, rows={}) with {} points, query_bbox: {:?}",
+            file_id,
+            row_offset,
+            num_rows,
             leaf_data.num_rows(),
             query_bbox
         );
@@ -246,15 +273,26 @@ impl GeoIndex {
             .as_primitive::<arrow_array::types::UInt64Type>();
 
         let mut matched_count = 0;
+        
+        // Debug: Check if SF (row_id=0) is in this leaf's actual data
+        let contains_sf = (0..leaf_data.num_rows()).any(|i| row_id_array.value(i) == 0);
+        if contains_sf {
+            println!("  🔎 Leaf (file={}, offset={}) contains SF (row_id=0)!", file_id, row_offset);
+            for i in 0..leaf_data.num_rows() {
+                if row_id_array.value(i) == 0 {
+                    let x = x_array.value(i);
+                    let y = y_array.value(i);
+                    println!("  🎯 Found SF at index {}: ({}, {}) row_id=0", i, x, y);
+                    println!("  🎯 point_in_bbox result: {}", point_in_bbox(x, y, &query_bbox));
+                    break;
+                }
+            }
+        }
+        
         for i in 0..leaf_data.num_rows() {
             let x = x_array.value(i);
             let y = y_array.value(i);
             let row_id = row_id_array.value(i);
-
-            // Debug: dump all points in leaf 16 to find San Francisco
-            if leaf_id == 16 && i < 10 {
-                println!("  🔎 Leaf 16 point {}: ({}, {}) row_id={}", i, x, y, row_id);
-            }
 
             if point_in_bbox(x, y, &query_bbox) {
                 row_ids.insert(row_id);
@@ -271,8 +309,9 @@ impl GeoIndex {
         }
 
         println!(
-            "📊 Leaf {} matched {} out of {} points",
-            leaf_id,
+            "📊 Leaf (file={}, offset={}) matched {} out of {} points",
+            file_id,
+            row_offset,
             matched_count,
             leaf_data.num_rows()
         );
@@ -341,20 +380,20 @@ impl ScalarIndex for GeoIndex {
                 );
 
                 // Step 1: Find intersecting leaves using in-memory tree traversal
-                let leaf_ids = self.bkd_tree.find_intersecting_leaves(query_bbox);
+                let leaves = self.bkd_tree.find_intersecting_leaves(query_bbox)?;
 
                 println!(
                     "📊 BKD tree traversal found {} intersecting leaves out of {} total leaves",
-                    leaf_ids.len(),
+                    leaves.len(),
                     self.bkd_tree.num_leaves
                 );
 
                 // Step 2: Lazy-load and filter each leaf
                 let mut all_row_ids = RowIdTreeMap::new();
 
-                for leaf_id in &leaf_ids {
+                for leaf_node in &leaves {
                     let leaf_row_ids = self
-                        .search_leaf(*leaf_id, query_bbox, metrics)
+                        .search_leaf(leaf_node, query_bbox, metrics)
                         .await?;
                     // Collect row IDs from the leaf and add them to the result set
                     let row_ids: Option<Vec<u64>> = leaf_row_ids.row_ids()
@@ -366,7 +405,7 @@ impl ScalarIndex for GeoIndex {
 
                 println!(
                     "✅ Geo index searched {} leaves and returning {} row IDs\n",
-                    leaf_ids.len(),
+                    leaves.len(),
                     all_row_ids.len().unwrap_or(0)
                 );
 
@@ -510,37 +549,63 @@ impl GeoIndexBuilder {
         // Build BKD tree
         let (tree_nodes, leaf_batches) = self.build_bkd_tree()?;
 
-        // Write tree structure
-        let tree_batch = self.serialize_tree_nodes(&tree_nodes)?;
-        let mut tree_file = index_store
-            .new_index_file(BKD_TREE_FILENAME, tree_batch.schema())
+        // Write tree structure to separate inner and leaf files
+        let (inner_batch, leaf_metadata_batch) = self.serialize_tree_nodes(&tree_nodes)?;
+        
+        // Write inner nodes
+        let mut inner_file = index_store
+            .new_index_file(BKD_TREE_INNER_FILENAME, inner_batch.schema())
             .await?;
-        tree_file.write_record_batch(tree_batch).await?;
-        tree_file
+        inner_file.write_record_batch(inner_batch).await?;
+        inner_file
             .finish_with_metadata(HashMap::from([(
                 LEAF_SIZE_META_KEY.to_string(),
                 self.options.leaf_size.to_string(),
             )]))
             .await?;
 
-        // Write each leaf to a separate file
+        // Write leaf metadata
+        let mut leaf_meta_file = index_store
+            .new_index_file(BKD_TREE_LEAF_FILENAME, leaf_metadata_batch.schema())
+            .await?;
+        leaf_meta_file.write_record_batch(leaf_metadata_batch).await?;
+        leaf_meta_file.finish().await?;
+
+        // Write actual leaf data grouped into files (multiple batches per file)
         let leaf_schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Float64, false),
             Field::new("y", DataType::Float64, false),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         
-        println!("📝 Writing {} leaf files", leaf_batches.len());
-        for (leaf_id, leaf_batch) in leaf_batches.iter().enumerate() {
-            let filename = leaf_filename(leaf_id as u32);
-            println!("  Writing {}: {} rows", filename, leaf_batch.num_rows());
+        let num_groups = (leaf_batches.len() as u32 + DEFAULT_BATCHES_PER_LEAF_FILE - 1) / DEFAULT_BATCHES_PER_LEAF_FILE;
+        println!("📝 Writing {} leaf batches into {} group files ({} batches per file)", 
+                 leaf_batches.len(), num_groups, DEFAULT_BATCHES_PER_LEAF_FILE);
+        
+        for group_id in 0..num_groups {
+            let start_idx = (group_id * DEFAULT_BATCHES_PER_LEAF_FILE) as usize;
+            let end_idx = ((group_id + 1) * DEFAULT_BATCHES_PER_LEAF_FILE).min(leaf_batches.len() as u32) as usize;
+            let group_batches = &leaf_batches[start_idx..end_idx];
+            
+            let filename = leaf_group_filename(group_id);
+            println!("  Writing {}: {} batches ({} rows total)", 
+                     filename, 
+                     group_batches.len(),
+                     group_batches.iter().map(|b| b.num_rows()).sum::<usize>());
+            
             let mut leaf_file = index_store
                 .new_index_file(&filename, leaf_schema.clone())
                 .await?;
-            leaf_file.write_record_batch(leaf_batch.clone()).await?;
+                
+            for (batch_idx, leaf_batch) in group_batches.iter().enumerate() {
+                let batch_id = leaf_file.write_record_batch(leaf_batch.clone()).await?;
+                println!("    Batch {}: {} rows (batch_id={})", 
+                         start_idx + batch_idx, leaf_batch.num_rows(), batch_id);
+            }
+            
             leaf_file.finish().await?;
         }
-        println!("✅ Finished writing {} leaf files\n", leaf_batches.len());
+        println!("✅ Finished writing {} group files\n", num_groups);
 
         log::debug!(
             "Wrote BKD tree with {} nodes",
@@ -551,32 +616,57 @@ impl GeoIndexBuilder {
     }
 
     async fn write_empty_index(&self, index_store: &dyn IndexStore) -> Result<()> {
-        // Write empty tree file
-        let tree_schema = Arc::new(Schema::new(vec![
-            Field::new("min_x", DataType::Float64, false),
-            Field::new("min_y", DataType::Float64, false),
-            Field::new("max_x", DataType::Float64, false),
-            Field::new("max_y", DataType::Float64, false),
-            Field::new("split_dim", DataType::UInt8, false),
-            Field::new("split_value", DataType::Float64, false),
-            Field::new("left_child", DataType::UInt32, true),
-            Field::new("right_child", DataType::UInt32, true),
-            Field::new("leaf_id", DataType::UInt32, true),
-        ]));
-
-        let empty_batch = RecordBatch::new_empty(tree_schema);
-        let mut tree_file = index_store
-            .new_index_file(BKD_TREE_FILENAME, empty_batch.schema())
+        // Write empty inner node file
+        let inner_schema = crate::scalar::bkd::inner_node_schema();
+        let empty_inner = RecordBatch::new_empty(inner_schema);
+        let mut inner_file = index_store
+            .new_index_file(BKD_TREE_INNER_FILENAME, empty_inner.schema())
             .await?;
-        tree_file.write_record_batch(empty_batch).await?;
-        tree_file.finish().await?;
+        inner_file.write_record_batch(empty_inner).await?;
+        inner_file.finish().await?;
 
-        // No leaf files needed for empty index
+        // Write empty leaf metadata file
+        let leaf_schema = crate::scalar::bkd::leaf_node_schema();
+        let empty_leaf = RecordBatch::new_empty(leaf_schema);
+        let mut leaf_file = index_store
+            .new_index_file(BKD_TREE_LEAF_FILENAME, empty_leaf.schema())
+            .await?;
+        leaf_file.write_record_batch(empty_leaf).await?;
+        leaf_file.finish().await?;
+
+        // No actual leaf data files needed for empty index
 
         Ok(())
     }
 
-    fn serialize_tree_nodes(&self, nodes: &[crate::scalar::bkd::BKDNode]) -> Result<RecordBatch> {
+    // Serialize tree nodes to separate inner and leaf RecordBatches
+    fn serialize_tree_nodes(&self, nodes: &[crate::scalar::bkd::BKDNode]) -> Result<(RecordBatch, RecordBatch)> {
+        use crate::scalar::bkd::BKDNode;
+        
+        // Separate inner and leaf nodes with their indices
+        let mut inner_nodes = Vec::new();
+        let mut leaf_nodes = Vec::new();
+        
+        for (idx, node) in nodes.iter().enumerate() {
+            match node {
+                BKDNode::Inner(_) => inner_nodes.push((idx as u32, node)),
+                BKDNode::Leaf(_) => leaf_nodes.push((idx as u32, node)),
+            }
+        }
+        
+        // Serialize inner nodes
+        let inner_batch = Self::serialize_inner_nodes(&inner_nodes)?;
+        
+        // Serialize leaf nodes
+        let leaf_batch = Self::serialize_leaf_nodes(&leaf_nodes)?;
+        
+        Ok((inner_batch, leaf_batch))
+    }
+    
+    fn serialize_inner_nodes(nodes: &[(u32, &crate::scalar::bkd::BKDNode)]) -> Result<RecordBatch> {
+        use crate::scalar::bkd::BKDNode;
+        
+        let mut node_id_vals = Vec::with_capacity(nodes.len());
         let mut min_x_vals = Vec::with_capacity(nodes.len());
         let mut min_y_vals = Vec::with_capacity(nodes.len());
         let mut max_x_vals = Vec::with_capacity(nodes.len());
@@ -585,33 +675,25 @@ impl GeoIndexBuilder {
         let mut split_value_vals = Vec::with_capacity(nodes.len());
         let mut left_child_vals = Vec::with_capacity(nodes.len());
         let mut right_child_vals = Vec::with_capacity(nodes.len());
-        let mut leaf_id_vals = Vec::with_capacity(nodes.len());
 
-        for node in nodes {
-            min_x_vals.push(node.bounds[0]);
-            min_y_vals.push(node.bounds[1]);
-            max_x_vals.push(node.bounds[2]);
-            max_y_vals.push(node.bounds[3]);
-            split_dim_vals.push(node.split_dim);
-            split_value_vals.push(node.split_value);
-            left_child_vals.push(node.left_child);
-            right_child_vals.push(node.right_child);
-            leaf_id_vals.push(node.leaf_id);
+        for (idx, node) in nodes {
+            if let BKDNode::Inner(inner) = node {
+                node_id_vals.push(*idx);
+                min_x_vals.push(inner.bounds[0]);
+                min_y_vals.push(inner.bounds[1]);
+                max_x_vals.push(inner.bounds[2]);
+                max_y_vals.push(inner.bounds[3]);
+                split_dim_vals.push(inner.split_dim);
+                split_value_vals.push(inner.split_value);
+                left_child_vals.push(inner.left_child);
+                right_child_vals.push(inner.right_child);
+            }
         }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("min_x", DataType::Float64, false),
-            Field::new("min_y", DataType::Float64, false),
-            Field::new("max_x", DataType::Float64, false),
-            Field::new("max_y", DataType::Float64, false),
-            Field::new("split_dim", DataType::UInt8, false),
-            Field::new("split_value", DataType::Float64, false),
-            Field::new("left_child", DataType::UInt32, true),
-            Field::new("right_child", DataType::UInt32, true),
-            Field::new("leaf_id", DataType::UInt32, true),
-        ]));
+        let schema = crate::scalar::bkd::inner_node_schema();
 
         let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(node_id_vals)),
             Arc::new(Float64Array::from(min_x_vals)),
             Arc::new(Float64Array::from(min_y_vals)),
             Arc::new(Float64Array::from(max_x_vals)),
@@ -620,7 +702,48 @@ impl GeoIndexBuilder {
             Arc::new(Float64Array::from(split_value_vals)),
             Arc::new(UInt32Array::from(left_child_vals)),
             Arc::new(UInt32Array::from(right_child_vals)),
-            Arc::new(UInt32Array::from(leaf_id_vals)),
+        ];
+
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+    
+    fn serialize_leaf_nodes(nodes: &[(u32, &crate::scalar::bkd::BKDNode)]) -> Result<RecordBatch> {
+        use crate::scalar::bkd::BKDNode;
+        use arrow_array::UInt64Array;
+        
+        let mut node_id_vals = Vec::with_capacity(nodes.len());
+        let mut min_x_vals = Vec::with_capacity(nodes.len());
+        let mut min_y_vals = Vec::with_capacity(nodes.len());
+        let mut max_x_vals = Vec::with_capacity(nodes.len());
+        let mut max_y_vals = Vec::with_capacity(nodes.len());
+        let mut file_id_vals = Vec::with_capacity(nodes.len());
+        let mut row_offset_vals = Vec::with_capacity(nodes.len());
+        let mut num_rows_vals = Vec::with_capacity(nodes.len());
+
+        for (idx, node) in nodes {
+            if let BKDNode::Leaf(leaf) = node {
+                node_id_vals.push(*idx);
+                min_x_vals.push(leaf.bounds[0]);
+                min_y_vals.push(leaf.bounds[1]);
+                max_x_vals.push(leaf.bounds[2]);
+                max_y_vals.push(leaf.bounds[3]);
+                file_id_vals.push(leaf.file_id);
+                row_offset_vals.push(leaf.row_offset);
+                num_rows_vals.push(leaf.num_rows);
+            }
+        }
+
+        let schema = crate::scalar::bkd::leaf_node_schema();
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(node_id_vals)),
+            Arc::new(Float64Array::from(min_x_vals)),
+            Arc::new(Float64Array::from(min_y_vals)),
+            Arc::new(Float64Array::from(max_x_vals)),
+            Arc::new(Float64Array::from(max_y_vals)),
+            Arc::new(UInt32Array::from(file_id_vals)),
+            Arc::new(UInt64Array::from(row_offset_vals)),
+            Arc::new(UInt64Array::from(num_rows_vals)),
         ];
 
         Ok(RecordBatch::try_new(schema, columns)?)
@@ -629,7 +752,7 @@ impl GeoIndexBuilder {
     // Build BKD tree using the BKDTreeBuilder
     fn build_bkd_tree(&mut self) -> Result<(Vec<crate::scalar::bkd::BKDNode>, Vec<RecordBatch>)> {
         let builder = BKDTreeBuilder::new(self.options.leaf_size as usize);
-        builder.build(&mut self.points)
+        builder.build(&mut self.points, DEFAULT_BATCHES_PER_LEAF_FILE)
     }
 }
 
