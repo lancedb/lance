@@ -17,9 +17,7 @@ bytes.workspace = true
 arrow.workspace = true
 lance-core.workspace = true
 snafu.workspace = true
-
-# Use models from the reqwest client
-lance-namespace-reqwest-client = "0.0.16"
+lance-namespace-reqwest-client.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
