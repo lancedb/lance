@@ -1616,7 +1616,10 @@ impl FileFragment {
             OnMissing::Error,
             OnTypeMismatch::Error,
         )?;
-        let read_columns = right_schema.field_names();
+        // Prepare the read projection: align with the right stream's columns and append the left join key.
+        let mut read_columns: Vec<String> =
+            write_schema.fields.iter().map(|f| f.name.clone()).collect();
+        read_columns.push(left_on.to_string());
         let mut updater = self
             .updater(
                 Some(&read_columns),
@@ -2585,7 +2588,9 @@ impl FragmentReader {
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
@@ -2771,50 +2776,130 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_update() {
-        let test_dir1 = TempStrDir::default();
-        let test_uri1 = &test_dir1;
-        let mut dataset1 = create_dataset_v2(test_uri1).await;
-        let _ = dataset1
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset_v2(test_uri).await;
+        let _ = dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
                 None,
                 None,
             )
             .await;
-        let mut fragment1 = dataset1.get_fragment(0).unwrap();
-        let test_dir2 = TempStrDir::default();
-        let test_uri2 = &test_dir2;
-        let mut dataset2 = create_dataset_v2(test_uri2).await;
-        let _ = dataset2
-            .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("col1".into(), "2".into())]),
-                None,
-                None,
-            )
-            .await;
-        let fragment2 = dataset2.get_fragment(0).unwrap();
-        let fragment2 = fragment2
-            .delete("_rowid=0 OR _rowid=3")
+        let mut fragment1 = dataset.get_fragment(0).unwrap();
+
+        let schema1 = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_rowid", DataType::UInt64, false),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch1 = RecordBatch::try_new(
+            schema1.clone(),
+            vec![
+                Arc::new(UInt64Array::from(
+                    (0..40).filter(|&v| v != 0 && v != 3).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vec![2; 38])),
+            ],
+        )
+        .unwrap();
+        let right_stream1: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch1)].into_iter(),
+            schema1,
+        ));
+        let (updated_fragment1, fields_modified1) = fragment1
+            .update_columns(right_stream1, ROW_ID, ROW_ID)
             .await
-            .unwrap()
             .unwrap();
-        let batches = fragment2
-            .scan()
-            .with_row_id()
-            .batch_size(10)
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated_fragment1],
+            new_fragments: vec![],
+            fields_modified: fields_modified1,
+            mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+        };
+        let mut dataset1 = Dataset::commit(
+            test_uri,
+            op,
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset1.get_fragments().len(), 5);
+        let scanner1 = dataset1.get_fragment(0).unwrap().scan();
+        let batches1 = scanner1
             .try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let schema = batches[0].schema_ref().clone();
+        assert_eq!(batches1.len(), 1);
+        let mut expected_col1 = vec![2; 40];
+        expected_col1[0] = -1;
+        expected_col1[3] = -1;
+        assert_eq!(
+            batches1[0].column_by_name("col1").unwrap().as_ref(),
+            &Int64Array::from(expected_col1)
+        );
+
+        let _ = dataset1
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col2".into(), "col1 > 0".into())]),
+                None,
+                None,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_fragment_update_with_user_specified_join_key() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset_v2(test_uri).await;
+        let _ = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
+                None,
+                None,
+            )
+            .await;
+        let _ = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col2".into(), "col1 > 0".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment1 = dataset.get_fragment(0).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i1", DataType::Int32, true),
+            ArrowField::new("col2", DataType::Boolean, true),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    (0..40).filter(|&v| v != 0 && v != 3).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(vec![true; 38])),
+                Arc::new(Int64Array::from(vec![2; 38])),
+            ],
+        )
+        .unwrap();
         let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
+            vec![Ok(update_batch)].into_iter(),
             schema,
         ));
         let (updated_fragment, fields_modified) = fragment1
-            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .update_columns(right_stream, "i", "i1")
             .await
             .unwrap();
         let op = Operation::Update {
@@ -2827,9 +2912,9 @@ mod tests {
             update_mode: Some(UpdateMode::RewriteColumns),
         };
         let new_dataset = Dataset::commit(
-            test_uri1,
+            test_uri,
             op,
-            Some(dataset1.version().version),
+            Some(dataset.version().version),
             None,
             None,
             Default::default(),
@@ -2838,26 +2923,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(new_dataset.get_fragments().len(), 5);
-        let mut scanner = new_dataset.get_fragment(0).unwrap().scan();
+        let scanner = new_dataset.get_fragment(0).unwrap().scan();
         let batches = scanner
-            .batch_size(10)
             .try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.len(), 4);
-        let binding = batches[0].column_by_name("col1").unwrap().clone();
-        let _vector = binding.as_any().downcast_ref::<Int64Array>().unwrap();
-        let actual_values = _vector.values();
-        let mut expected_values = vec![2; actual_values.len()];
-        expected_values[0] = -1;
-        expected_values[3] = -1;
+        assert_eq!(batches.len(), 1);
+
+        let mut expected_col1 = vec![2; 40];
+        expected_col1[0] = -1;
+        expected_col1[3] = -1;
         assert_eq!(
-            actual_values,
-            &expected_values[..],
-            "The vector content did not match the expected values."
+            batches[0].column_by_name("col1").unwrap().as_ref(),
+            &Int64Array::from(expected_col1)
+        );
+        let mut expected_col2 = vec![true; 40];
+        expected_col2[0] = false;
+        expected_col2[3] = false;
+        assert_eq!(
+            batches[0].column_by_name("col2").unwrap().as_ref(),
+            &BooleanArray::from(expected_col2)
         );
     }
 
