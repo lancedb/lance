@@ -1517,7 +1517,6 @@ mod tests {
         // Verify that all centroids are valid (not zero or NaN)
         // Without the fix, they would all be zero due to underflow
         let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
-        println!("centroids: {:?}", centroids);
         for &val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
             assert!(val != f16::ZERO);
