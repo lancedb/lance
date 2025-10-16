@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use lance_namespace::apis::{configuration::Configuration, namespace_api, table_api, transaction_api};
+use lance_namespace::apis::{
+    configuration::Configuration, namespace_api, table_api, transaction_api,
+};
 use lance_namespace::models::{
     AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -591,8 +593,8 @@ impl LanceNamespace for RestNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_namespace::models::{create_table_request, insert_into_table_request};
     use bytes::Bytes;
+    use lance_namespace::models::{create_table_request, insert_into_table_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
