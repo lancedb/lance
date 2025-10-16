@@ -557,365 +557,325 @@ fn create_leaf_batch(points: &[(f64, f64, u64)]) -> Result<RecordBatch> {
     Ok(batch)
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use arrow_array::{UInt32Array, UInt8Array};
 
-//     /// Helper to serialize nodes (mirrors logic from geoindex.rs)
-//     fn serialize_nodes(nodes: &[BKDNode]) -> Result<RecordBatch> {
-//         let mut min_x_vals = Vec::with_capacity(nodes.len());
-//         let mut min_y_vals = Vec::with_capacity(nodes.len());
-//         let mut max_x_vals = Vec::with_capacity(nodes.len());
-//         let mut max_y_vals = Vec::with_capacity(nodes.len());
-//         let mut split_dim_vals = Vec::with_capacity(nodes.len());
-//         let mut split_value_vals = Vec::with_capacity(nodes.len());
-//         let mut left_child_vals = Vec::with_capacity(nodes.len());
-//         let mut right_child_vals = Vec::with_capacity(nodes.len());
-//         let mut leaf_id_vals = Vec::with_capacity(nodes.len());
 
-//         for node in nodes {
-//             min_x_vals.push(node.bounds[0]);
-//             min_y_vals.push(node.bounds[1]);
-//             max_x_vals.push(node.bounds[2]);
-//             max_y_vals.push(node.bounds[3]);
-//             split_dim_vals.push(node.split_dim);
-//             split_value_vals.push(node.split_value);
-//             left_child_vals.push(node.left_child);
-//             right_child_vals.push(node.right_child);
-//             leaf_id_vals.push(node.leaf_id);
-//         }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Float64Array, UInt32Array, UInt64Array, UInt8Array};
 
-//         let schema = Arc::new(Schema::new(vec![
-//             Field::new("min_x", DataType::Float64, false),
-//             Field::new("min_y", DataType::Float64, false),
-//             Field::new("max_x", DataType::Float64, false),
-//             Field::new("max_y", DataType::Float64, false),
-//             Field::new("split_dim", DataType::UInt8, false),
-//             Field::new("split_value", DataType::Float64, false),
-//             Field::new("left_child", DataType::UInt32, true),
-//             Field::new("right_child", DataType::UInt32, true),
-//             Field::new("leaf_id", DataType::UInt32, true),
-//         ]));
+    /// Test serialization and deserialization of a simple BKD tree
+    #[test]
+    fn test_serialize_deserialize_simple_tree() {
+        // Create a simple tree: 1 inner node with 2 leaf children
+        let nodes = vec![
+            BKDNode::Inner(BKDInnerNode {
+                bounds: [-10.0, -10.0, 10.0, 10.0],
+                split_dim: 0,
+                split_value: 0.0,
+                left_child: 1,
+                right_child: 2,
+            }),
+            BKDNode::Leaf(BKDLeafNode {
+                bounds: [-10.0, -10.0, 0.0, 10.0],
+                file_id: 0,
+                row_offset: 0,
+                num_rows: 100,
+            }),
+            BKDNode::Leaf(BKDLeafNode {
+                bounds: [0.0, -10.0, 10.0, 10.0],
+                file_id: 0,
+                row_offset: 100,
+                num_rows: 100,
+            }),
+        ];
 
-//         let columns: Vec<ArrayRef> = vec![
-//             Arc::new(Float64Array::from(min_x_vals)),
-//             Arc::new(Float64Array::from(min_y_vals)),
-//             Arc::new(Float64Array::from(max_x_vals)),
-//             Arc::new(Float64Array::from(max_y_vals)),
-//             Arc::new(UInt8Array::from(split_dim_vals)),
-//             Arc::new(Float64Array::from(split_value_vals)),
-//             Arc::new(UInt32Array::from(left_child_vals)),
-//             Arc::new(UInt32Array::from(right_child_vals)),
-//             Arc::new(UInt32Array::from(leaf_id_vals)),
-//         ];
+        // Separate inner and leaf nodes
+        let inner_nodes: Vec<(u32, &BKDNode)> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, BKDNode::Inner(_)))
+            .map(|(i, n)| (i as u32, n))
+            .collect();
 
-//         Ok(RecordBatch::try_new(schema, columns)?)
-//     }
+        let leaf_nodes: Vec<(u32, &BKDNode)> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, BKDNode::Leaf(_)))
+            .map(|(i, n)| (i as u32, n))
+            .collect();
 
-//     #[test]
-//     fn test_empty_tree_roundtrip() {
-//         // Create empty tree
-//         let tree = BKDTreeLookup::new(vec![], 0, 0);
-        
-//         // Serialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-//         assert_eq!(batch.num_rows(), 0);
-        
-//         // Deserialize
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Verify
-//         assert_eq!(deserialized.nodes.len(), 0);
-//         assert_eq!(deserialized.num_leaves, 0);
-//         assert_eq!(deserialized.root_id, 0);
-//     }
+        // Serialize inner nodes
+        let mut inner_node_ids = Vec::new();
+        let mut inner_min_x = Vec::new();
+        let mut inner_min_y = Vec::new();
+        let mut inner_max_x = Vec::new();
+        let mut inner_max_y = Vec::new();
+        let mut inner_split_dim = Vec::new();
+        let mut inner_split_value = Vec::new();
+        let mut inner_left_child = Vec::new();
+        let mut inner_right_child = Vec::new();
 
-//     #[test]
-//     fn test_single_leaf_roundtrip() {
-//         // Create single leaf node
-//         let nodes = vec![BKDNode {
-//             bounds: [1.0, 2.0, 3.0, 4.0],
-//             split_dim: 0,
-//             split_value: 0.0,
-//             left_child: None,
-//             right_child: None,
-//             leaf_id: Some(0),
-//         }];
-        
-//         let tree = BKDTreeLookup::new(nodes.clone(), 0, 1);
-        
-//         // Serialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-//         assert_eq!(batch.num_rows(), 1);
-        
-//         // Deserialize
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Verify structure
-//         assert_eq!(deserialized.nodes.len(), 1);
-//         assert_eq!(deserialized.num_leaves, 1);
-//         assert_eq!(deserialized.root_id, 0);
-        
-//         // Verify node fields
-//         let node = &deserialized.nodes[0];
-//         assert_eq!(node.bounds, [1.0, 2.0, 3.0, 4.0]);
-//         assert_eq!(node.split_dim, 0);
-//         assert_eq!(node.split_value, 0.0);
-//         assert_eq!(node.left_child, None);
-//         assert_eq!(node.right_child, None);
-//         assert_eq!(node.leaf_id, Some(0));
-//     }
+        for (idx, node) in &inner_nodes {
+            if let BKDNode::Inner(inner) = node {
+                inner_node_ids.push(*idx);
+                inner_min_x.push(inner.bounds[0]);
+                inner_min_y.push(inner.bounds[1]);
+                inner_max_x.push(inner.bounds[2]);
+                inner_max_y.push(inner.bounds[3]);
+                inner_split_dim.push(inner.split_dim);
+                inner_split_value.push(inner.split_value);
+                inner_left_child.push(inner.left_child);
+                inner_right_child.push(inner.right_child);
+            }
+        }
 
-//     #[test]
-//     fn test_simple_tree_roundtrip() {
-//         // Create tree: 1 root (inner) + 2 leaves
-//         let nodes = vec![
-//             // Node 0: Root (inner node)
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 10.0, 10.0],
-//                 split_dim: 0, // Split on X
-//                 split_value: 5.0,
-//                 left_child: Some(1),
-//                 right_child: Some(2),
-//                 leaf_id: None,
-//             },
-//             // Node 1: Left leaf
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 5.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 0.0,
-//                 left_child: None,
-//                 right_child: None,
-//                 leaf_id: Some(0),
-//             },
-//             // Node 2: Right leaf
-//             BKDNode {
-//                 bounds: [5.0, 0.0, 10.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 0.0,
-//                 left_child: None,
-//                 right_child: None,
-//                 leaf_id: Some(1),
-//             },
-//         ];
-        
-//         let tree = BKDTreeLookup::new(nodes.clone(), 0, 2);
-        
-//         // Serialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-//         assert_eq!(batch.num_rows(), 3);
-        
-//         // Deserialize
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Verify structure
-//         assert_eq!(deserialized.nodes.len(), 3);
-//         assert_eq!(deserialized.num_leaves, 2);
-//         assert_eq!(deserialized.root_id, 0);
-        
-//         // Verify root node (inner)
-//         let root = &deserialized.nodes[0];
-//         assert_eq!(root.bounds, [0.0, 0.0, 10.0, 10.0]);
-//         assert_eq!(root.split_dim, 0);
-//         assert_eq!(root.split_value, 5.0);
-//         assert_eq!(root.left_child, Some(1));
-//         assert_eq!(root.right_child, Some(2));
-//         assert_eq!(root.leaf_id, None);
-        
-//         // Verify left leaf
-//         let left = &deserialized.nodes[1];
-//         assert_eq!(left.bounds, [0.0, 0.0, 5.0, 10.0]);
-//         assert_eq!(left.leaf_id, Some(0));
-//         assert_eq!(left.left_child, None);
-//         assert_eq!(left.right_child, None);
-        
-//         // Verify right leaf
-//         let right = &deserialized.nodes[2];
-//         assert_eq!(right.bounds, [5.0, 0.0, 10.0, 10.0]);
-//         assert_eq!(right.leaf_id, Some(1));
-//         assert_eq!(right.left_child, None);
-//         assert_eq!(right.right_child, None);
-//     }
+        let inner_batch = RecordBatch::try_new(
+            inner_node_schema(),
+            vec![
+                Arc::new(UInt32Array::from(inner_node_ids)),
+                Arc::new(Float64Array::from(inner_min_x)),
+                Arc::new(Float64Array::from(inner_min_y)),
+                Arc::new(Float64Array::from(inner_max_x)),
+                Arc::new(Float64Array::from(inner_max_y)),
+                Arc::new(UInt8Array::from(inner_split_dim)),
+                Arc::new(Float64Array::from(inner_split_value)),
+                Arc::new(UInt32Array::from(inner_left_child)),
+                Arc::new(UInt32Array::from(inner_right_child)),
+            ],
+        )
+        .unwrap();
 
-//     #[test]
-//     fn test_multi_level_tree_roundtrip() {
-//         // Build a real tree from points
-//         let mut points = vec![
-//             (1.0, 1.0, 0),
-//             (2.0, 2.0, 1),
-//             (3.0, 3.0, 2),
-//             (4.0, 4.0, 3),
-//             (5.0, 5.0, 4),
-//             (6.0, 6.0, 5),
-//             (7.0, 7.0, 6),
-//             (8.0, 8.0, 7),
-//             (9.0, 9.0, 8),
-//             (10.0, 10.0, 9),
-//         ];
-        
-//         let builder = BKDTreeBuilder::new(3); // leaf_size = 3
-//         let (nodes, _leaf_batches) = builder.build(&mut points).unwrap();
-        
-//         let original_tree = BKDTreeLookup::new(nodes.clone(), 0, 4);
-        
-//         // Serialize
-//         let batch = serialize_nodes(&original_tree.nodes).unwrap();
-        
-//         // Deserialize
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Verify counts
-//         assert_eq!(deserialized.nodes.len(), original_tree.nodes.len());
-//         assert_eq!(deserialized.num_leaves, original_tree.num_leaves);
-//         assert_eq!(deserialized.root_id, 0);
-        
-//         // Verify each node
-//         for (i, (orig, deser)) in original_tree.nodes.iter().zip(deserialized.nodes.iter()).enumerate() {
-//             assert_eq!(deser.bounds, orig.bounds, "Node {} bounds mismatch", i);
-//             assert_eq!(deser.split_dim, orig.split_dim, "Node {} split_dim mismatch", i);
-//             assert_eq!(deser.split_value, orig.split_value, "Node {} split_value mismatch", i);
-//             assert_eq!(deser.left_child, orig.left_child, "Node {} left_child mismatch", i);
-//             assert_eq!(deser.right_child, orig.right_child, "Node {} right_child mismatch", i);
-//             assert_eq!(deser.leaf_id, orig.leaf_id, "Node {} leaf_id mismatch", i);
-//         }
-//     }
+        // Serialize leaf nodes
+        let mut leaf_node_ids = Vec::new();
+        let mut leaf_min_x = Vec::new();
+        let mut leaf_min_y = Vec::new();
+        let mut leaf_max_x = Vec::new();
+        let mut leaf_max_y = Vec::new();
+        let mut leaf_file_ids = Vec::new();
+        let mut leaf_row_offsets = Vec::new();
+        let mut leaf_num_rows = Vec::new();
 
-//     #[test]
-//     fn test_field_precision() {
-//         // Test edge values and precision
-//         let nodes = vec![
-//             BKDNode {
-//                 bounds: [f64::MIN, f64::MAX, -1e-10, 1e10],
-//                 split_dim: 1,
-//                 split_value: std::f64::consts::PI,
-//                 left_child: None,
-//                 right_child: None,
-//                 leaf_id: Some(42),
-//             },
-//         ];
-        
-//         let tree = BKDTreeLookup::new(nodes.clone(), 0, 1);
-        
-//         // Serialize and deserialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Verify exact values (no precision loss)
-//         let node = &deserialized.nodes[0];
-//         assert_eq!(node.bounds[0], f64::MIN);
-//         assert_eq!(node.bounds[1], f64::MAX);
-//         assert_eq!(node.bounds[2], -1e-10);
-//         assert_eq!(node.bounds[3], 1e10);
-//         assert_eq!(node.split_value, std::f64::consts::PI);
-//         assert_eq!(node.leaf_id, Some(42));
-//     }
+        for (idx, node) in &leaf_nodes {
+            if let BKDNode::Leaf(leaf) = node {
+                leaf_node_ids.push(*idx);
+                leaf_min_x.push(leaf.bounds[0]);
+                leaf_min_y.push(leaf.bounds[1]);
+                leaf_max_x.push(leaf.bounds[2]);
+                leaf_max_y.push(leaf.bounds[3]);
+                leaf_file_ids.push(leaf.file_id);
+                leaf_row_offsets.push(leaf.row_offset);
+                leaf_num_rows.push(leaf.num_rows);
+            }
+        }
 
-//     #[test]
-//     fn test_tree_structure_validation() {
-//         // Create tree with invalid structure (child pointer out of bounds)
-//         // This should be caught during traversal, not deserialization
-//         let nodes = vec![
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 10.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 5.0,
-//                 left_child: Some(1),
-//                 right_child: Some(2),
-//                 leaf_id: None,
-//             },
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 5.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 0.0,
-//                 left_child: None,
-//                 right_child: None,
-//                 leaf_id: Some(0),
-//             },
-//         ];
-        
-//         let tree = BKDTreeLookup::new(nodes.clone(), 0, 1);
-        
-//         // Serialize and deserialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         // Deserialization succeeds
-//         assert_eq!(deserialized.nodes.len(), 2);
-        
-//         // But traversal would fail because right_child=2 is out of bounds
-//         // This is expected - validation happens at query time
-//         let query_bbox = [0.0, 0.0, 10.0, 10.0];
-//         let leaves = deserialized.find_intersecting_leaves(query_bbox);
-        
-//         // Should only find the valid left leaf
-//         assert_eq!(leaves.len(), 1);
-//         assert_eq!(leaves[0], 0);
-//     }
+        let leaf_batch = RecordBatch::try_new(
+            leaf_node_schema(),
+            vec![
+                Arc::new(UInt32Array::from(leaf_node_ids)),
+                Arc::new(Float64Array::from(leaf_min_x)),
+                Arc::new(Float64Array::from(leaf_min_y)),
+                Arc::new(Float64Array::from(leaf_max_x)),
+                Arc::new(Float64Array::from(leaf_max_y)),
+                Arc::new(UInt32Array::from(leaf_file_ids)),
+                Arc::new(UInt64Array::from(leaf_row_offsets)),
+                Arc::new(UInt64Array::from(leaf_num_rows)),
+            ],
+        )
+        .unwrap();
 
-//     #[test]
-//     fn test_nullable_fields() {
-//         // Test that nullable fields work correctly
-//         let nodes = vec![
-//             // Inner node: has children, no leaf_id
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 10.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 5.0,
-//                 left_child: Some(1),
-//                 right_child: Some(2),
-//                 leaf_id: None, // NULL
-//             },
-//             // Leaf node: has leaf_id, no children
-//             BKDNode {
-//                 bounds: [0.0, 0.0, 5.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 0.0,
-//                 left_child: None, // NULL
-//                 right_child: None, // NULL
-//                 leaf_id: Some(0),
-//             },
-//             // Another leaf
-//             BKDNode {
-//                 bounds: [5.0, 0.0, 10.0, 10.0],
-//                 split_dim: 0,
-//                 split_value: 0.0,
-//                 left_child: None,
-//                 right_child: None,
-//                 leaf_id: Some(1),
-//             },
-//         ];
-        
-//         let tree = BKDTreeLookup::new(nodes.clone(), 0, 2);
-        
-//         // Serialize
-//         let batch = serialize_nodes(&tree.nodes).unwrap();
-        
-//         // Check that nulls are properly represented
-//         let left_child_col = batch.column(6).as_primitive::<arrow_array::types::UInt32Type>();
-//         let right_child_col = batch.column(7).as_primitive::<arrow_array::types::UInt32Type>();
-//         let leaf_id_col = batch.column(8).as_primitive::<arrow_array::types::UInt32Type>();
-        
-//         // Row 0 (inner): children NOT null, leaf_id IS null
-//         assert!(!left_child_col.is_null(0));
-//         assert!(!right_child_col.is_null(0));
-//         assert!(leaf_id_col.is_null(0));
-        
-//         // Row 1 (leaf): children ARE null, leaf_id NOT null
-//         assert!(left_child_col.is_null(1));
-//         assert!(right_child_col.is_null(1));
-//         assert!(!leaf_id_col.is_null(1));
-        
-//         // Deserialize and verify
-//         let deserialized = BKDTreeLookup::from_record_batch(batch).unwrap();
-        
-//         assert_eq!(deserialized.nodes[0].left_child, Some(1));
-//         assert_eq!(deserialized.nodes[0].right_child, Some(2));
-//         assert_eq!(deserialized.nodes[0].leaf_id, None);
-        
-//         assert_eq!(deserialized.nodes[1].left_child, None);
-//         assert_eq!(deserialized.nodes[1].right_child, None);
-//         assert_eq!(deserialized.nodes[1].leaf_id, Some(0));
-//     }
-// }
+        // Deserialize
+        let tree = BKDTreeLookup::from_record_batches(inner_batch, leaf_batch).unwrap();
+
+        // Verify structure
+        assert_eq!(tree.nodes.len(), 3);
+        assert_eq!(tree.root_id, 0);
+        assert_eq!(tree.num_leaves, 2);
+
+        // Verify root (inner node)
+        match &tree.nodes[0] {
+            BKDNode::Inner(inner) => {
+                assert_eq!(inner.bounds, [-10.0, -10.0, 10.0, 10.0]);
+                assert_eq!(inner.split_dim, 0);
+                assert_eq!(inner.split_value, 0.0);
+                assert_eq!(inner.left_child, 1);
+                assert_eq!(inner.right_child, 2);
+            }
+            _ => panic!("Expected inner node at index 0"),
+        }
+
+        // Verify left leaf
+        match &tree.nodes[1] {
+            BKDNode::Leaf(leaf) => {
+                assert_eq!(leaf.bounds, [-10.0, -10.0, 0.0, 10.0]);
+                assert_eq!(leaf.file_id, 0);
+                assert_eq!(leaf.row_offset, 0);
+                assert_eq!(leaf.num_rows, 100);
+            }
+            _ => panic!("Expected leaf node at index 1"),
+        }
+
+        // Verify right leaf
+        match &tree.nodes[2] {
+            BKDNode::Leaf(leaf) => {
+                assert_eq!(leaf.bounds, [0.0, -10.0, 10.0, 10.0]);
+                assert_eq!(leaf.file_id, 0);
+                assert_eq!(leaf.row_offset, 100);
+                assert_eq!(leaf.num_rows, 100);
+            }
+            _ => panic!("Expected leaf node at index 2"),
+        }
+    }
+
+    /// Test serialization of empty tree
+    #[test]
+    fn test_serialize_deserialize_empty_tree() {
+        let inner_batch = RecordBatch::new_empty(inner_node_schema());
+        let leaf_batch = RecordBatch::new_empty(leaf_node_schema());
+
+        let tree = BKDTreeLookup::from_record_batches(inner_batch, leaf_batch).unwrap();
+
+        assert_eq!(tree.nodes.len(), 0);
+        assert_eq!(tree.num_leaves, 0);
+    }
+
+    /// Test bbox intersection logic
+    #[test]
+    fn test_bboxes_intersect() {
+        // Overlapping boxes
+        assert!(bboxes_intersect(
+            &[0.0, 0.0, 10.0, 10.0],
+            &[5.0, 5.0, 15.0, 15.0]
+        ));
+
+        // Touching boxes
+        assert!(bboxes_intersect(
+            &[0.0, 0.0, 10.0, 10.0],
+            &[10.0, 0.0, 20.0, 10.0]
+        ));
+
+        // Fully contained
+        assert!(bboxes_intersect(
+            &[0.0, 0.0, 10.0, 10.0],
+            &[2.0, 2.0, 8.0, 8.0]
+        ));
+
+        // Non-overlapping (left)
+        assert!(!bboxes_intersect(
+            &[0.0, 0.0, 10.0, 10.0],
+            &[-20.0, 0.0, -10.0, 10.0]
+        ));
+
+        // Non-overlapping (above)
+        assert!(!bboxes_intersect(
+            &[0.0, 0.0, 10.0, 10.0],
+            &[0.0, 20.0, 10.0, 30.0]
+        ));
+    }
+
+    /// Test point in bbox logic
+    #[test]
+    fn test_point_in_bbox() {
+        let bbox = [0.0, 0.0, 10.0, 10.0];
+
+        // Inside
+        assert!(point_in_bbox(5.0, 5.0, &bbox));
+
+        // On boundary
+        assert!(point_in_bbox(0.0, 0.0, &bbox));
+        assert!(point_in_bbox(10.0, 10.0, &bbox));
+
+        // Outside
+        assert!(!point_in_bbox(-1.0, 5.0, &bbox));
+        assert!(!point_in_bbox(11.0, 5.0, &bbox));
+        assert!(!point_in_bbox(5.0, -1.0, &bbox));
+        assert!(!point_in_bbox(5.0, 11.0, &bbox));
+    }
+
+    /// Test find_intersecting_leaves with simple tree
+    #[test]
+    fn test_find_intersecting_leaves() {
+        // Create a simple tree: 1 inner node with 2 leaf children
+        let nodes = vec![
+            BKDNode::Inner(BKDInnerNode {
+                bounds: [-10.0, -10.0, 10.0, 10.0],
+                split_dim: 0,
+                split_value: 0.0,
+                left_child: 1,
+                right_child: 2,
+            }),
+            BKDNode::Leaf(BKDLeafNode {
+                bounds: [-10.0, -10.0, 0.0, 10.0],
+                file_id: 0,
+                row_offset: 0,
+                num_rows: 100,
+            }),
+            BKDNode::Leaf(BKDLeafNode {
+                bounds: [0.0, -10.0, 10.0, 10.0],
+                file_id: 0,
+                row_offset: 100,
+                num_rows: 100,
+            }),
+        ];
+
+        let tree = BKDTreeLookup::new(nodes, 0, 2);
+
+        // Query that intersects only left leaf
+        let leaves = tree
+            .find_intersecting_leaves([-10.0, -10.0, -5.0, 10.0])
+            .unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].file_id, 0);
+        assert_eq!(leaves[0].row_offset, 0);
+
+        // Query that intersects only right leaf
+        let leaves = tree
+            .find_intersecting_leaves([5.0, -10.0, 10.0, 10.0])
+            .unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].file_id, 0);
+        assert_eq!(leaves[0].row_offset, 100);
+
+        // Query that intersects both leaves
+        let leaves = tree
+            .find_intersecting_leaves([-5.0, -10.0, 5.0, 10.0])
+            .unwrap();
+        assert_eq!(leaves.len(), 2);
+
+        // Query that intersects no leaves
+        let leaves = tree
+            .find_intersecting_leaves([20.0, 20.0, 30.0, 30.0])
+            .unwrap();
+        assert_eq!(leaves.len(), 0);
+    }
+
+    /// Test tree building with small dataset
+    #[test]
+    fn test_build_tree_small() {
+        let mut points = vec![
+            (-5.0, -5.0, 0),
+            (-4.0, -4.0, 1),
+            (4.0, 4.0, 2),
+            (5.0, 5.0, 3),
+        ];
+
+        let builder = BKDTreeBuilder::new(2); // leaf_size = 2
+        let (nodes, batches) = builder.build(&mut points, 5).unwrap();
+
+        // Should have: 1 root + 2 leaves = 3 nodes
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(batches.len(), 2);
+
+        // Verify root is inner node
+        assert!(matches!(nodes[0], BKDNode::Inner(_)));
+
+        // Verify we have 2 leaf nodes
+        let leaf_count = nodes.iter().filter(|n| n.is_leaf()).count();
+        assert_eq!(leaf_count, 2);
+
+        // Verify each batch has correct size
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[1].num_rows(), 2);
+    }
+}
 

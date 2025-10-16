@@ -15,7 +15,7 @@ use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        expression::ScalarQueryParser, geoindex::GeoIndexPlugin, inverted::InvertedIndexPlugin,
+        expression::ScalarQueryParser, geo::GeoIndexPlugin, inverted::InvertedIndexPlugin,
         json::JsonIndexPlugin, label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin,
         zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore, ScalarIndex,
     },

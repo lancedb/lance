@@ -28,13 +28,12 @@ use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
 
-pub mod bkd;
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
 pub mod flat;
-pub mod geoindex;
+pub mod geo;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
