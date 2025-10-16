@@ -2043,14 +2043,13 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
                 self.projection_plan
                     .physical_projection
                     .with_row_created_at_version,
-                projection.with_row_addr,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -3169,7 +3168,6 @@ impl Scanner {
             let new_data_scan = self.scan_fragments(
                 self.projection_plan.physical_projection.with_row_id,
                 true,
-                self.projection_plan.physical_projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
