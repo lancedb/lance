@@ -395,7 +395,7 @@ impl JNIEnvExt for JNIEnv<'_> {
                 .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
                 .l()?;
             let inner_value = self
-                .call_method(&inner_jobj, "longValue", "()I", &[])?
+                .call_method(&inner_jobj, "longValue", "()J", &[])?
                 .j()?;
             Some(T::try_from(inner_value).map_err(|e| {
                 Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
