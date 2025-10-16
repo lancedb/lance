@@ -636,11 +636,21 @@ impl WriterVersion {
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
-        let mut parts = self.version.split('.');
+        // First split by '-' to separate the version from the pre-release tag
+        let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
+            (
+                &self.version[..dash_idx],
+                Some(&self.version[dash_idx + 1..]),
+            )
+        } else {
+            (self.version.as_str(), None)
+        };
+
+        let mut parts = version_part.split('.');
         let major = parts.next().unwrap_or("0").parse().ok()?;
         let minor = parts.next().unwrap_or("0").parse().ok()?;
         let patch = parts.next().unwrap_or("0").parse().ok()?;
-        let tag = parts.next();
+
         Some((major, minor, patch, tag))
     }
 
@@ -664,7 +674,7 @@ impl WriterVersion {
             VersionPart::Patch => (parts.0, parts.1, parts.2 + 1, tag),
         };
         let new_version = if let Some(tag) = tag {
-            format!("{}.{}.{}.{}", new_parts.0, new_parts.1, new_parts.2, tag)
+            format!("{}.{}.{}-{}", new_parts.0, new_parts.1, new_parts.2, tag)
         } else {
             format!("{}.{}.{}", new_parts.0, new_parts.1, new_parts.2)
         };
@@ -944,6 +954,15 @@ mod tests {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
         let parts = wv.semver().unwrap();
+
+        // Parse the actual cargo version to check if it has a pre-release tag
+        let cargo_version = env!("CARGO_PKG_VERSION");
+        let expected_tag = if cargo_version.contains('-') {
+            Some(cargo_version.split('-').nth(1).unwrap())
+        } else {
+            None
+        };
+
         assert_eq!(
             parts,
             (
@@ -951,13 +970,17 @@ mod tests {
                 env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
                 // Unit tests run against (major,minor,patch + 1)
                 env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap() + 1,
-                None
+                expected_tag
             )
         );
+
+        // Verify the base version (without tag) matches CARGO_PKG_VERSION
+        let base_version = cargo_version.split('-').next().unwrap();
         assert_eq!(
             format!("{}.{}.{}", parts.0, parts.1, parts.2 - 1),
-            env!("CARGO_PKG_VERSION")
+            base_version
         );
+
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
             let bumped = wv.bump(*part, false);
             let bumped_parts = bumped.semver_or_panic();
