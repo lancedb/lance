@@ -4128,6 +4128,22 @@ def test_commit_message_and_get_properties(tmp_path):
     # The latest transaction from delete should have no properties.
     assert transactions[0].transaction_properties == {}
 
+    # 4. Test case: Commit using the commit method instead of write_dataset
+    frags = lance.fragment.write_fragments(pa.table({"a": [5]}), dataset.uri)
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Append(frags),
+        read_version=dataset.version,
+        commit_message="Use Dataset.commit",
+    )
+
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 4
+    assert (
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "Use Dataset.commit"
+    )
+
 
 def test_diff_meta(tmp_path: Path):
     table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})

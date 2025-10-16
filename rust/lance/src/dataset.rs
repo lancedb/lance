@@ -63,7 +63,7 @@ mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
-mod delta;
+pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -92,7 +92,6 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -792,26 +791,31 @@ impl Dataset {
         Ok(())
     }
 
-    async fn build_dataset_delta(&self, compared_version: u64) -> Result<DatasetDelta> {
-        let current_version = self.version().version;
-
-        let (begin_version, end_version) = if current_version > compared_version {
-            (compared_version, current_version)
-        } else {
-            (current_version, compared_version)
-        };
-
-        Ok(DatasetDelta {
-            begin_version,
-            end_version,
-            base_dataset: self.clone(),
-        })
+    /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let delta = dataset.delta()
+    ///     .compared_against_version(5)
+    ///     .build()?;
+    /// let inserted = delta.get_inserted_rows().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn delta(&self) -> delta::DatasetDeltaBuilder {
+        delta::DatasetDeltaBuilder::new(self.clone())
     }
 
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
     pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
         self.validate_compared_version(compared_version).await?;
-        let ds_delta = self.build_dataset_delta(compared_version).await?;
+        let ds_delta = self
+            .delta()
+            .compared_against_version(compared_version)
+            .build()?;
         ds_delta.list_transactions().await
     }
 
@@ -6804,7 +6808,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -7877,6 +7881,82 @@ mod tests {
             read_inner_struct.null_count(),
             "Null count should be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn test_issue_4902_packed_struct_v2_1_read_error() {
+        use std::collections::HashMap;
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray, UInt32Array};
+        use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
+
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::UInt32, false),
+            ArrowField::new("y", DataType::UInt32, false),
+        ]);
+        let mut packed_metadata = HashMap::new();
+        packed_metadata.insert("packed".to_string(), "true".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("int_col", DataType::Int32, false),
+            ArrowField::new("struct_col", DataType::Struct(struct_fields.clone()), false)
+                .with_metadata(packed_metadata),
+        ]));
+
+        let int_values = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let x_values = Arc::new(UInt32Array::from(vec![1, 4, 7, 10, 13, 16, 19, 22]));
+        let y_values = Arc::new(UInt32Array::from(vec![2, 5, 8, 11, 14, 17, 20, 23]));
+        let struct_array = Arc::new(StructArray::new(
+            struct_fields,
+            vec![x_values.clone() as ArrayRef, y_values.clone() as ArrayRef],
+            None,
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                int_values.clone() as ArrayRef,
+                struct_array.clone() as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let test_uri = TempStrDir::default();
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, &test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+
+        let result_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(result_batches, vec![batch.clone()]);
+
+        let struct_batches = dataset
+            .scan()
+            .project(&["struct_col"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(struct_batches.len(), 1);
+        let read_struct = struct_batches[0].column(0).as_struct();
+        assert_eq!(read_struct, struct_array.as_ref());
     }
 
     #[tokio::test]
