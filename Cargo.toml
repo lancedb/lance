@@ -178,6 +178,7 @@ tokio-util = { version = "0.7.10" }
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
+wiremock = "0.6"
 pretty_assertions = "1.4.0"
 
 [profile.bench]

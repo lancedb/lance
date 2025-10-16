@@ -47,7 +47,7 @@ snafu.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
-wiremock = "0.6"
+wiremock.workspace = true
 
 [lints]
 workspace = true
