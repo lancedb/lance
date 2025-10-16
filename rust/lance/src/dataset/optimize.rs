@@ -772,11 +772,26 @@ async fn rewrite_files(
             ra.row_offset()
         ));
     }
-    log::info!(
-        "Compaction task {}: reserving fragment ids and transposing row addrs",
-        task_id
-    );
-    reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+    // log::info!(
+    //     "Compaction task {}: reserving fragment ids and transposing row addrs",
+    //     task_id
+    // );
+    // reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+    if dataset.manifest.uses_stable_row_ids() {
+        log::info!(
+            "Compaction task {}: stable mode; deferring fragment id reservation",
+            task_id
+        );
+        for frag in new_fragments.iter_mut() {
+            frag.id = 0;
+        }
+    } else {
+        log::info!(
+            "Compaction task {}: reserving fragment ids and transposing row addrs",
+            task_id
+        );
+        reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+    }
 
     // Maintain stable row id metadata if enabled
     if dataset.manifest.uses_stable_row_ids() {
@@ -1099,9 +1114,19 @@ pub async fn commit_compaction(
                 new_index_version: rewritten.index_version,
             })
             .collect()
-    } else if !options.defer_index_remap {
-        // We need to reserve fragment ids here so that the fragment bitmap
-        // can be updated for each index.
+    } else if dataset.manifest.uses_stable_row_ids() {
+        // Stable mode: aggregate all new fragments with placeholder ids and reserve once.
+        let unassigned = rewrite_groups
+            .iter_mut()
+            .flat_map(|group| group.new_fragments.iter_mut())
+            .filter(|frag| frag.id == 0)
+            .collect::<Vec<_>>();
+        if !unassigned.is_empty() {
+            reserve_fragment_ids(dataset, unassigned.into_iter()).await?;
+        }
+        Vec::new()
+    } else if !options.defer_index_remap && !dataset.manifest.uses_stable_row_ids() {
+        // Non-stable mode: immediate index bitmap updates require fragment ids.
         let new_fragments = rewrite_groups
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
