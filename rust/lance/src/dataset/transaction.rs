@@ -291,6 +291,12 @@ pub enum Operation {
         ref_path: String,
         branch_name: Option<String>,
     },
+
+    // Update base paths in the dataset (currently only supports adding new bases).
+    UpdateBases {
+        /// The new base paths to add to the manifest.
+        new_bases: Vec<BasePath>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -323,6 +329,7 @@ impl std::fmt::Display for Operation {
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
+            Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
     }
 }
@@ -1069,6 +1076,96 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+
+            (Self::UpdateBases { new_bases: a }, Self::UpdateBases { new_bases: b }) => {
+                compare_vec(a, b)
+            }
+
+            (Self::UpdateBases { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Append { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -1218,6 +1315,7 @@ impl Operation {
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
+            Self::UpdateBases { .. } => "UpdateBases",
         }
     }
 }
@@ -1592,6 +1690,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
             }
@@ -1621,16 +1727,33 @@ impl Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
             } => {
-                final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
-                    if removed_fragment_ids.contains(&f.id) {
-                        return None;
-                    }
-                    if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
-                        Some(updated.clone())
-                    } else {
-                        Some(f.clone())
-                    }
-                }));
+                // Extract existing fragments once for reuse
+                let existing_fragments = maybe_existing_fragments?;
+
+                // Apply updates to existing fragments
+                let updated_frags: Vec<Fragment> = existing_fragments
+                    .iter()
+                    .filter_map(|f| {
+                        if removed_fragment_ids.contains(&f.id) {
+                            return None;
+                        }
+                        if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                            Some(updated.clone())
+                        } else {
+                            Some(f.clone())
+                        }
+                    })
+                    .collect();
+
+                // Update version metadata for updated fragments if stable row IDs are enabled
+                // Note: We don't update version metadata for fragments with deletion vectors
+                // because the version sequences are indexed by physical row position, not logical position.
+                // Version metadata for deleted rows will be filtered out during scan using the deletion vector.
+                if next_row_id.is_some() {
+                    // Version metadata will be properly set during compaction when deletions are materialized
+                }
+
+                final_fragments.extend(updated_frags);
 
                 // If we updated any fields, remove those fragments from indices covering those fields
                 Self::prune_updated_fields_from_indices(
@@ -1642,6 +1765,140 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+
+                // Assign row IDs to any fragments that don't have them yet
+                // (e.g., inserted rows from merge_insert operations)
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+
+                // Set version metadata for newly created fragments (updated rows)
+                // Preserve created_at from original fragments, set last_updated to new version
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+
+                    // Build a map of original fragment ID -> original fragment for lookup
+                    let original_frags_map: std::collections::HashMap<u64, &Fragment> =
+                        existing_fragments.iter().map(|f| (f.id, f)).collect();
+
+                    for fragment in new_fragments.iter_mut() {
+                        // For update operations with RewriteRows mode:
+                        // - Rows are deleted from old fragments and rewritten to new fragments
+                        // - last_updated_at should be the current version (when update happened)
+                        // - created_at should be preserved from the original fragment
+
+                        // Read row IDs from this fragment to find original fragments
+                        let row_ids = if let Some(row_id_meta) = &fragment.row_id_meta {
+                            match row_id_meta {
+                                lance_table::format::RowIdMeta::Inline(data) => {
+                                    lance_table::rowids::read_row_ids(data).ok()
+                                }
+                                lance_table::format::RowIdMeta::External(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(row_ids) = row_ids {
+                            // Extract created_at version for each row from original fragments
+                            let physical_rows = fragment.physical_rows.unwrap_or(0);
+                            let mut created_at_versions = Vec::with_capacity(physical_rows);
+
+                            for row_id in row_ids.iter() {
+                                // Row ID format: upper 32 bits = fragment ID, lower 32 bits = row offset
+                                let orig_frag_id = row_id >> 32;
+                                let row_offset = (row_id & 0xFFFFFFFF) as usize;
+
+                                // Look up the original fragment
+                                if let Some(orig_frag) = original_frags_map.get(&orig_frag_id) {
+                                    // Get created_at version from original fragment's metadata
+                                    let created_version = if let Some(created_meta) =
+                                        &orig_frag.created_at_version_meta
+                                    {
+                                        // Load and index into the version sequence
+                                        match created_meta.load_sequence() {
+                                            Ok(seq) => {
+                                                let versions: Vec<u64> = seq.versions().collect();
+                                                versions.get(row_offset).copied().unwrap_or(1)
+                                            }
+                                            Err(_e) => {
+                                                1 // Default to version 1 on error
+                                            }
+                                        }
+                                    } else {
+                                        // No metadata on original fragment, default to version 1
+                                        1
+                                    };
+                                    created_at_versions.push(created_version);
+                                } else {
+                                    // Original fragment not found, default to version 1
+                                    created_at_versions.push(1);
+                                }
+                            }
+
+                            // Build version metadata from the collected versions
+                            // Compress into runs: consecutive identical versions become one run
+                            let mut runs = Vec::new();
+                            if !created_at_versions.is_empty() {
+                                let mut current_version = created_at_versions[0];
+                                let mut run_start = 0u64;
+
+                                for (i, &version) in created_at_versions.iter().enumerate().skip(1)
+                                {
+                                    if version != current_version {
+                                        // End current run, start new one
+                                        runs.push(lance_table::format::RowDatasetVersionRun {
+                                            span: lance_table::rowids::segment::U64Segment::Range(
+                                                run_start..i as u64,
+                                            ),
+                                            version: current_version,
+                                        });
+                                        current_version = version;
+                                        run_start = i as u64;
+                                    }
+                                }
+                                // Add final run
+                                runs.push(lance_table::format::RowDatasetVersionRun {
+                                    span: lance_table::rowids::segment::U64Segment::Range(
+                                        run_start..created_at_versions.len() as u64,
+                                    ),
+                                    version: current_version,
+                                });
+                            }
+
+                            let created_at_seq =
+                                lance_table::format::RowDatasetVersionSequence { runs };
+                            fragment.created_at_version_meta = Some(
+                                lance_table::format::RowDatasetVersionMeta::from_sequence(
+                                    &created_at_seq,
+                                )
+                                .map_err(|e| Error::Internal {
+                                    message: format!(
+                                        "Failed to create created_at version metadata: {}",
+                                        e
+                                    ),
+                                    location: location!(),
+                                })?,
+                            );
+
+                            // Set last_updated_at to the new version for all rows
+                            let last_updated_meta =
+                                lance_table::rowids::version::build_version_meta(
+                                    fragment,
+                                    new_version,
+                                );
+                            fragment.last_updated_at_version_meta = last_updated_meta;
+                        } else {
+                            // Fallback: can't read row IDs, set both to new version
+                            let version_meta = lance_table::rowids::version::build_version_meta(
+                                fragment,
+                                new_version,
+                            );
+                            fragment.last_updated_at_version_meta = version_meta.clone();
+                            fragment.created_at_version_meta = version_meta;
+                        }
+                    }
+                }
 
                 if config.use_stable_row_ids
                     && update_mode.is_some()
@@ -1667,7 +1924,13 @@ impl Transaction {
 
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Note: Version metadata is already set above (lines 1627-1755)
+                    // for Update operations, preserving created_at from original fragments.
+                    // Don't overwrite it here.
                 }
+                // Identify fragments that were updated or newly created in this update
+                let mut target_ids: HashSet<u64> = HashSet::new();
+                target_ids.extend(new_fragments.iter().map(|f| f.id));
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
@@ -1691,6 +1954,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
@@ -1707,6 +1978,7 @@ impl Transaction {
                     groups,
                     &mut fragment_id,
                     current_version,
+                    next_row_id.as_ref(),
                 )?;
 
                 if next_row_id.is_some() {
@@ -1896,6 +2168,11 @@ impl Transaction {
                     removed.clone(),
                 )?;
             }
+            Operation::UpdateBases { .. } => {
+                // UpdateBases operation doesn't modify fragments or indices
+                // Base paths are handled in the manifest creation section below
+                final_fragments.extend(maybe_existing_fragments?.clone());
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -1992,6 +2269,41 @@ impl Transaction {
                 }
             }
             _ => {}
+        }
+
+        // Handle UpdateBases operation to update manifest base_paths
+        if let Operation::UpdateBases { new_bases } = &self.operation {
+            // Validate and add new base paths to the manifest
+            for new_base in new_bases {
+                // Check for conflicts with existing base paths
+                if let Some(existing_base) = manifest
+                    .base_paths
+                    .values()
+                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
+                {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
+                            new_base.name, new_base.path, existing_base.name, existing_base.path
+                        ),
+                        location!(),
+                    ));
+                }
+
+                // Assign a new ID if not already assigned
+                let mut base_to_add = new_base.clone();
+                if base_to_add.id == 0 {
+                    let next_id = manifest
+                        .base_paths
+                        .keys()
+                        .max()
+                        .map(|&id| id + 1)
+                        .unwrap_or(1);
+                    base_to_add.id = next_id;
+                }
+
+                manifest.base_paths.insert(base_to_add.id, base_to_add);
+            }
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
@@ -2272,6 +2584,7 @@ impl Transaction {
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
         version: u64,
+        _next_row_id: Option<&u64>,
     ) -> Result<()> {
         for group in groups {
             // If the old fragments are contiguous, find the range
@@ -2293,7 +2606,13 @@ impl Transaction {
                 }
             };
 
-            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id);
+            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
+                .collect::<Vec<_>>();
+
+            // Version metadata for rewritten fragments is handled by the compaction code
+            // (recalc_versions_for_rewritten_fragments) which preserves version information
+            // from the original fragments. We don't modify it here.
+
             if let Some(replace_range) = replace_range {
                 // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
@@ -2715,6 +3034,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(|m| MemWal::try_from(m).unwrap())
                     .collect(),
             },
+            Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
+                new_bases,
+            })) => Operation::UpdateBases {
+                new_bases: new_bases.into_iter().map(BasePath::from).collect(),
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -3024,6 +3348,15 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<_>>(),
                 })
             }
+            Operation::UpdateBases { new_bases } => {
+                pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
+                    new_bases: new_bases
+                        .iter()
+                        .cloned()
+                        .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                        .collect::<Vec<pb::BasePath>>(),
+                })
+            }
         };
 
         let blob_operation = value.blobs_op.as_ref().map(|op| match op {
@@ -3311,6 +3644,7 @@ mod tests {
             &rewrite_groups,
             &mut fragment_id,
             version,
+            None,
         )
         .unwrap();
 
@@ -3478,6 +3812,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3508,6 +3844,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3538,6 +3876,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3571,6 +3911,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3597,6 +3939,8 @@ mod tests {
                 row_id_meta: None,
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3604,6 +3948,8 @@ mod tests {
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3646,6 +3992,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 

@@ -26,7 +26,9 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance_table::format::{
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
@@ -593,6 +595,9 @@ impl PyDeletionFile {
 #[pyclass(name = "RowIdMeta", module = "lance.fragment")]
 pub struct PyRowIdMeta(pub RowIdMeta);
 
+#[pyclass(name = "RowDatasetVersionMeta", module = "lance.fragment")]
+pub struct PyRowDatasetVersionMeta(pub RowDatasetVersionMeta);
+
 #[pymethods]
 impl PyRowIdMeta {
     fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
@@ -639,6 +644,55 @@ impl PyRowIdMeta {
     }
 }
 
+#[pymethods]
+impl PyRowDatasetVersionMeta {
+    fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
+        Err(PyNotImplementedError::new_err(
+            "PyRowDatasetVersionMeta.asdict is not yet supported.",
+        ))
+    }
+
+    pub fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.0).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not serialize RowDatasetVersionMeta due to error: {}",
+                err
+            ))
+        })
+    }
+
+    #[staticmethod]
+    pub fn from_json(json: String) -> PyResult<Self> {
+        let dataset_version_meta = serde_json::from_str(&json).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not load RowDatasetVersionMeta due to error: {}",
+                err
+            ))
+        })?;
+        Ok(Self(dataset_version_meta))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+        let state = self.json()?;
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
+            .getattr("RowDatasetVersionMeta")?
+            .getattr("from_json")?
+            .extract()?;
+        Ok((from_json, state))
+    }
+
+    pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for RowDatasetVersionMeta",
+            )),
+        }
+    }
+}
+
 #[pyclass(name = "FragmentSession", module = "_lib", subclass)]
 #[derive(Clone)]
 pub struct FragmentSession {
@@ -670,6 +724,12 @@ impl FromPyObject<'_> for PyLance<Fragment> {
 
         let row_id_meta: Option<PyRef<PyRowIdMeta>> = ob.getattr("row_id_meta")?.extract()?;
         let row_id_meta = row_id_meta.map(|r| r.0.clone());
+        let last_updated_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
+            ob.getattr("last_updated_at_version_meta")?.extract()?;
+        let last_updated_at_version_meta = last_updated_at_version_meta.map(|r| r.0.clone());
+        let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
+            ob.getattr("created_at_version_meta")?.extract()?;
+        let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -677,6 +737,8 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             deletion_file,
             physical_rows: ob.getattr("physical_rows")?.extract()?,
             row_id_meta,
+            last_updated_at_version_meta,
+            created_at_version_meta,
         }))
     }
 }
@@ -699,6 +761,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .as_ref()
             .map(|f| PyDeletionFile(f.clone()));
         let row_id_meta = self.0.row_id_meta.as_ref().map(|r| PyRowIdMeta(r.clone()));
+        let last_updated_at_version_meta = self
+            .0
+            .last_updated_at_version_meta
+            .as_ref()
+            .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let created_at_version_meta = self
+            .0
+            .created_at_version_meta
+            .as_ref()
+            .map(|r| PyRowDatasetVersionMeta(r.clone()));
 
         cls.call1((
             self.0.id,
@@ -706,6 +778,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             self.0.physical_rows,
             deletion_file,
             row_id_meta,
+            created_at_version_meta,
+            last_updated_at_version_meta,
         ))
     }
 }

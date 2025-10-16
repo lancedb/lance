@@ -89,6 +89,35 @@ Lance is designed to be memory efficient. Operations should stream data from dis
 loading the entire dataset into memory. However, there are a few components of Lance that can use
 a lot of memory.
 
+### Metadata Cache
+
+Lance uses a metadata cache to speed up operations. This cache holds various pieces of metadata such
+as file metadata, dataset manifests, etc. This cache is an LRU cache that is sized by bytes. The default
+size is 1 GiB.
+
+The metadata cache is not shared between tables by default. For best performance you should create a
+single table and share it across your application. Alternatively, you can create a single session
+and specify it when you open tables.
+
+Keys are often a composite of multiple fields and all keys are scoped to the dataset URI. The following items are stored in the metadata cache:
+
+| Item              | Key                                              | What is stored                      |
+| ----------------- | ------------------------------------------------ | ----------------------------------- |
+| Dataset Manifests | Dataset URI, version, and etag                   | The manifest for the dataset        |
+| Transactions      | Dataset URI, version                             | The transaction for the dataset     |
+| Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
+| Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
+| Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
+| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
+| Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
+| File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |
+| File Column Meta  | Dataset URI, file path, column index             | The search cache for a column       |
+
+Notes:
+
+1. This is only stored for very old indexes which don't store their details in the manifest.
+
 ### Index Cache
 
 Lance uses an index cache to speed up queries. This caches vector and scalar indices in memory. The

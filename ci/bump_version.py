@@ -35,26 +35,40 @@ def get_current_version() -> str:
     raise ValueError("Could not find version in Cargo.toml")
 
 
-def parse_version(version: str) -> Tuple[int, int, int]:
-    """Parse a version string into major, minor, patch components."""
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+def parse_version(version: str) -> Tuple[int, int, int, Optional[str]]:
+    """Parse a version string into major, minor, patch, and optional prerelease components."""
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", version)
     if not match:
         raise ValueError(f"Invalid version format: {version}")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
 
 
-def bump_version(current: str, bump_type: str) -> str:
-    """Calculate the new version based on bump type."""
-    major, minor, patch = parse_version(current)
-    
+def bump_version(current: str, bump_type: str, prerelease: Optional[str] = None) -> str:
+    """Calculate the new version based on bump type.
+
+    Args:
+        current: Current version string
+        bump_type: Type of bump (major, minor, patch)
+        prerelease: Optional prerelease suffix (e.g., "beta.1")
+
+    Returns:
+        New version string
+    """
+    major, minor, patch, _ = parse_version(current)
+
     if bump_type == "major":
-        return f"{major + 1}.0.0"
+        new_version = f"{major + 1}.0.0"
     elif bump_type == "minor":
-        return f"{major}.{minor + 1}.0"
+        new_version = f"{major}.{minor + 1}.0"
     elif bump_type == "patch":
-        return f"{major}.{minor}.{patch + 1}"
+        new_version = f"{major}.{minor}.{patch + 1}"
     else:
         raise ValueError(f"Invalid bump type: {bump_type}")
+
+    if prerelease:
+        new_version = f"{new_version}-{prerelease}"
+
+    return new_version
 
 
 def update_cargo_lock_files():
@@ -105,7 +119,20 @@ def main():
     parser.add_argument(
         "bump_type",
         choices=["major", "minor", "patch"],
-        help="Type of version bump to perform"
+        nargs='?',
+        help="Type of version bump to perform (not needed with --new-version)"
+    )
+    parser.add_argument(
+        "--new-version",
+        type=str,
+        default=None,
+        help="Set exact new version (e.g., '0.38.3' or '0.38.3-beta.1')"
+    )
+    parser.add_argument(
+        "--prerelease",
+        type=str,
+        default=None,
+        help="Prerelease suffix (e.g., 'beta.1')"
     )
     parser.add_argument(
         "--dry-run",
@@ -117,12 +144,20 @@ def main():
         action="store_true",
         help="Skip version consistency validation"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Get current version
     current_version = get_current_version()
-    new_version = bump_version(current_version, args.bump_type)
+
+    if args.new_version:
+        # Use exact version provided
+        new_version = args.new_version
+    else:
+        # Calculate new version from bump type
+        if not args.bump_type:
+            parser.error("Either bump_type or --new-version must be provided")
+        new_version = bump_version(current_version, args.bump_type, args.prerelease)
     
     print(f"Current version: {current_version}")
     print(f"New version: {new_version}")

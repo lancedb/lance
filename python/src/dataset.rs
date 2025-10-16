@@ -104,6 +104,7 @@ pub mod optimize;
 pub mod stats;
 
 const DEFAULT_NPROBS: usize = 20;
+const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -1372,6 +1373,25 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    #[pyo3(signature=(new_bases, transaction_properties=None))]
+    fn add_bases(
+        &mut self,
+        new_bases: Vec<DatasetBasePath>,
+        transaction_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
+        use lance_table::format::BasePath;
+        let rust_bases: Vec<BasePath> = new_bases.into_iter().map(BasePath::from).collect();
+        let new_dataset = rt()
+            .block_on(None, self.ds.add_bases(rust_bases, transaction_properties))?
+            .map_err(|err| match err {
+                lance::Error::InvalidInput { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+
+        self.ds = Arc::new(new_dataset);
+        Ok(())
+    }
+
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let versions = self_.list_versions()?;
         Python::with_gil(|py| {
@@ -1665,6 +1685,9 @@ impl Dataset {
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
+                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(stop_words_file.extract()?);
+                    }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
                     }
@@ -1882,7 +1905,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -1893,13 +1916,21 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        commit_message: Option<String>,
     ) -> PyResult<Self> {
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             read_version.unwrap_or_default(),
             operation.0,
             blobs_op.map(|op| op.0),
             None,
         );
+
+        if let Some(commit_message) = commit_message {
+            transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+                LANCE_COMMIT_MESSAGE_KEY.to_string(),
+                commit_message,
+            )])));
+        }
 
         Self::commit_transaction(
             dest,

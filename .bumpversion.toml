@@ -1,7 +1,10 @@
 [tool.bumpversion]
 current_version = "0.32.1"
-parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
-serialize = ["{major}.{minor}.{patch}"]
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>.+))?"
+serialize = [
+    "{major}.{minor}.{patch}-{prerelease}",
+    "{major}.{minor}.{patch}"
+]
 search = "{current_version}"
 replace = "{new_version}"
 regex = false
