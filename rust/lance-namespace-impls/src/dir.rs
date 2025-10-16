@@ -31,11 +31,8 @@ use lance_namespace::LanceNamespace;
 ///
 /// This is a convenience wrapper around DirectoryNamespace::new that returns
 /// the same type as connect for API consistency.
-pub async fn connect_dir(
-    properties: HashMap<String, String>,
-) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties)
-        .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+pub async fn connect_dir(properties: HashMap<String, String>) -> Result<Arc<dyn LanceNamespace>> {
+    DirectoryNamespace::new(properties).map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
 }
 
 /// Configuration for DirectoryNamespace.
@@ -119,10 +116,11 @@ impl DirectoryNamespace {
         let (scheme, opendal_config) = Self::parse_storage_path(root, storage_options)?;
 
         // Create the operator with the determined scheme and configuration
-        let operator = Operator::via_iter(scheme, opendal_config).map_err(|e| Error::Namespace {
-            source: format!("Failed to create operator: {}", e).into(),
-            location: snafu::location!(),
-        })?;
+        let operator =
+            Operator::via_iter(scheme, opendal_config).map_err(|e| Error::Namespace {
+                source: format!("Failed to create operator: {}", e).into(),
+                location: snafu::location!(),
+            })?;
 
         Ok(operator)
     }
@@ -237,7 +235,8 @@ impl DirectoryNamespace {
                 source: format!(
                     "Directory namespace only supports single-level table IDs, but got: {:?}",
                     id
-                ).into(),
+                )
+                .into(),
                 location: snafu::location!(),
             });
         }
@@ -494,7 +493,8 @@ impl LanceNamespace for DirectoryNamespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
                         table_name, location, table_path
-                    ).into(),
+                    )
+                    .into(),
                     location: snafu::location!(),
                 });
             }
@@ -571,7 +571,8 @@ impl LanceNamespace for DirectoryNamespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
                         table_name, location, table_path
-                    ).into(),
+                    )
+                    .into(),
                     location: snafu::location!(),
                 });
             }
@@ -586,7 +587,8 @@ impl LanceNamespace for DirectoryNamespace {
                 source: format!(
                     "Failed to create .lance-reserved file for table {}: {}",
                     table_name, e
-                ).into(),
+                )
+                .into(),
                 location: snafu::location!(),
             })?;
 
@@ -603,10 +605,13 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Remove the entire table directory
         let table_dir = format!("{}.lance/", table_name);
-        self.operator.remove_all(&table_dir).await.map_err(|e| Error::Namespace {
-            source: format!("Failed to drop table {}: {}", table_name, e).into(),
-            location: snafu::location!(),
-        })?;
+        self.operator
+            .remove_all(&table_dir)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to drop table {}: {}", table_name, e).into(),
+                location: snafu::location!(),
+            })?;
 
         Ok(DropTableResponse {
             id: request.id,

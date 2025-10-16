@@ -74,7 +74,8 @@ pub async fn connect(
         }
         #[cfg(not(feature = "dir"))]
         "dir" => Err(Error::Namespace {
-            source: "Directory namespace implementation requires 'dir' feature to be enabled".into(),
+            source: "Directory namespace implementation requires 'dir' feature to be enabled"
+                .into(),
             location: Location::new(file!(), line!(), column!()),
         }),
         _ => Err(Error::Namespace {
@@ -82,7 +83,8 @@ pub async fn connect(
                 "Implementation '{}' is not available. Supported: rest{}",
                 impl_name,
                 if cfg!(feature = "dir") { ", dir" } else { "" }
-            ).into(),
+            )
+            .into(),
             location: Location::new(file!(), line!(), column!()),
         }),
     }
