@@ -24,9 +24,8 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 
-use lance_namespace::{LanceNamespace, NamespaceError, Result};
-
-use crate::ConnectError;
+use lance_core::{box_error, Error, Result};
+use lance_namespace::LanceNamespace;
 
 /// Connect to a directory-based namespace implementation.
 ///
@@ -34,10 +33,9 @@ use crate::ConnectError;
 /// the same type as connect for API consistency.
 pub async fn connect_dir(
     properties: HashMap<String, String>,
-) -> std::result::Result<Arc<dyn LanceNamespace>, ConnectError> {
+) -> Result<Arc<dyn LanceNamespace>> {
     DirectoryNamespace::new(properties)
         .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
-        .map_err(|e| ConnectError::ConstructionError(e.to_string()))
 }
 
 /// Configuration for DirectoryNamespace.
@@ -121,8 +119,10 @@ impl DirectoryNamespace {
         let (scheme, opendal_config) = Self::parse_storage_path(root, storage_options)?;
 
         // Create the operator with the determined scheme and configuration
-        let operator = Operator::via_iter(scheme, opendal_config)
-            .map_err(|e| NamespaceError::Other(format!("Failed to create operator: {}", e)))?;
+        let operator = Operator::via_iter(scheme, opendal_config).map_err(|e| Error::Namespace {
+            source: format!("Failed to create operator: {}", e).into(),
+            location: snafu::location!(),
+        })?;
 
         Ok(operator)
     }
@@ -186,8 +186,9 @@ impl DirectoryNamespace {
                 if !authority.is_empty() {
                     config.insert("bucket".to_string(), authority);
                 }
-                opendal::Scheme::from_str(&scheme).map_err(|_| {
-                    NamespaceError::Other(format!("Unsupported storage scheme: {}", scheme))
+                opendal::Scheme::from_str(&scheme).map_err(|_| Error::Namespace {
+                    source: format!("Unsupported storage scheme: {}", scheme).into(),
+                    location: snafu::location!(),
                 })?
             }
         };
@@ -212,10 +213,13 @@ impl DirectoryNamespace {
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
         if let Some(id) = id {
             if !id.is_empty() {
-                return Err(NamespaceError::Other(format!(
-                    "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
-                    id
-                )));
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
+                        id
+                    ).into(),
+                    location: snafu::location!(),
+                });
             }
         }
         Ok(())
@@ -223,15 +227,19 @@ impl DirectoryNamespace {
 
     /// Extract table name from table ID
     fn table_name_from_id(id: &Option<Vec<String>>) -> Result<String> {
-        let id = id.as_ref().ok_or_else(|| {
-            NamespaceError::Other("Directory namespace table ID cannot be empty".to_string())
+        let id = id.as_ref().ok_or_else(|| Error::Namespace {
+            source: "Directory namespace table ID cannot be empty".into(),
+            location: snafu::location!(),
         })?;
 
         if id.len() != 1 {
-            return Err(NamespaceError::Other(format!(
-                "Directory namespace only supports single-level table IDs, but got: {:?}",
-                id
-            )));
+            return Err(Error::Namespace {
+                source: format!(
+                    "Directory namespace only supports single-level table IDs, but got: {:?}",
+                    id
+                ).into(),
+                location: snafu::location!(),
+            });
         }
 
         Ok(id[0].clone())
@@ -280,29 +288,33 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateNamespaceResponse> {
         // Root namespace always exists and cannot be created
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(NamespaceError::Other(
-                "Root namespace already exists and cannot be created".to_string(),
-            ));
+            return Err(Error::Namespace {
+                source: "Root namespace already exists and cannot be created".into(),
+                location: snafu::location!(),
+            });
         }
 
         // Non-root namespaces are not supported
-        Err(NamespaceError::NotSupported(
-            "Directory namespace only supports the root namespace".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "Directory namespace only supports the root namespace".into(),
+            location: snafu::location!(),
+        })
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
         // Root namespace always exists and cannot be dropped
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(NamespaceError::Other(
-                "Root namespace cannot be dropped".to_string(),
-            ));
+            return Err(Error::Namespace {
+                source: "Root namespace cannot be dropped".into(),
+                location: snafu::location!(),
+            });
         }
 
         // Non-root namespaces are not supported
-        Err(NamespaceError::NotSupported(
-            "Directory namespace only supports the root namespace".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "Directory namespace only supports the root namespace".into(),
+            location: snafu::location!(),
+        })
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
@@ -312,9 +324,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Non-root namespaces don't exist
-        Err(NamespaceError::Other(
-            "Only root namespace exists in directory namespace".to_string(),
-        ))
+        Err(Error::Namespace {
+            source: "Only root namespace exists in directory namespace".into(),
+            location: snafu::location!(),
+        })
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -323,11 +336,12 @@ impl LanceNamespace for DirectoryNamespace {
         let mut tables = Vec::new();
 
         // Use non-recursive listing to avoid issues with object stores that don't have directory concept
-        let entries = self.operator.list("").await.map_err(|e| {
-            NamespaceError::Io(std::io::Error::other(format!(
+        let entries = self.operator.list("").await.map_err(|e| Error::IO {
+            source: box_error(std::io::Error::other(format!(
                 "Failed to list directory: {}",
                 e
-            )))
+            ))),
+            location: snafu::location!(),
         })?;
 
         for entry in entries {
@@ -404,10 +418,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if !table_exists {
-            return Err(NamespaceError::Other(format!(
-                "Table does not exist: {}",
-                table_name
-            )));
+            return Err(Error::Namespace {
+                source: format!("Table does not exist: {}", table_name).into(),
+                location: snafu::location!(),
+            });
         }
 
         Ok(DescribeTableResponse {
@@ -447,10 +461,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if !table_exists {
-            return Err(NamespaceError::Other(format!(
-                "Table does not exist: {}",
-                table_name
-            )));
+            return Err(Error::Namespace {
+                source: format!("Table does not exist: {}", table_name).into(),
+                location: snafu::location!(),
+            });
         }
 
         Ok(())
@@ -466,19 +480,23 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Validate that request_data is provided and is a valid Arrow IPC stream
         if request_data.is_empty() {
-            return Err(NamespaceError::Other(
-                "Request data (Arrow IPC stream) is required for create_table".to_string(),
-            ));
+            return Err(Error::Namespace {
+                source: "Request data (Arrow IPC stream) is required for create_table".into(),
+                location: snafu::location!(),
+            });
         }
 
         // Validate location if provided
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
             if location != table_path {
-                return Err(NamespaceError::Other(format!(
-                    "Cannot create table {} at location {}, must be at location {}",
-                    table_name, location, table_path
-                )));
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Cannot create table {} at location {}, must be at location {}",
+                        table_name, location, table_path
+                    ).into(),
+                    location: snafu::location!(),
+                });
             }
         }
 
@@ -487,8 +505,10 @@ impl LanceNamespace for DirectoryNamespace {
         use std::io::Cursor;
 
         let cursor = Cursor::new(request_data.to_vec());
-        let stream_reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| NamespaceError::Other(format!("Invalid Arrow IPC stream: {}", e)))?;
+        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| Error::Namespace {
+            source: format!("Invalid Arrow IPC stream: {}", e).into(),
+            location: snafu::location!(),
+        })?;
 
         // Extract schema from the IPC stream
         let arrow_schema = stream_reader.schema();
@@ -496,8 +516,9 @@ impl LanceNamespace for DirectoryNamespace {
         // Collect all batches from the stream
         let mut batches = Vec::new();
         for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| {
-                NamespaceError::Other(format!("Failed to read batch from IPC stream: {}", e))
+            batches.push(batch_result.map_err(|e| Error::Namespace {
+                source: format!("Failed to read batch from IPC stream: {}", e).into(),
+                location: snafu::location!(),
             })?);
         }
 
@@ -522,7 +543,10 @@ impl LanceNamespace for DirectoryNamespace {
         // Create the Lance dataset using the actual Lance API
         Dataset::write(reader, &table_path, Some(write_params))
             .await
-            .map_err(|e| NamespaceError::Other(format!("Failed to create Lance dataset: {}", e)))?;
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to create Lance dataset: {}", e).into(),
+                location: snafu::location!(),
+            })?;
 
         Ok(CreateTableResponse {
             version: Some(1),
@@ -543,10 +567,13 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
             if location != table_path {
-                return Err(NamespaceError::Other(format!(
-                    "Cannot create table {} at location {}, must be at location {}",
-                    table_name, location, table_path
-                )));
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Cannot create table {} at location {}, must be at location {}",
+                        table_name, location, table_path
+                    ).into(),
+                    location: snafu::location!(),
+                });
             }
         }
 
@@ -555,11 +582,12 @@ impl LanceNamespace for DirectoryNamespace {
         self.operator
             .write(&reserved_file_path, Vec::<u8>::new())
             .await
-            .map_err(|e| {
-                NamespaceError::Other(format!(
+            .map_err(|e| Error::Namespace {
+                source: format!(
                     "Failed to create .lance-reserved file for table {}: {}",
                     table_name, e
-                ))
+                ).into(),
+                location: snafu::location!(),
             })?;
 
         Ok(CreateEmptyTableResponse {
@@ -575,8 +603,9 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Remove the entire table directory
         let table_dir = format!("{}.lance/", table_name);
-        self.operator.remove_all(&table_dir).await.map_err(|e| {
-            NamespaceError::Other(format!("Failed to drop table {}: {}", table_name, e))
+        self.operator.remove_all(&table_dir).await.map_err(|e| Error::Namespace {
+            source: format!("Failed to drop table {}: {}", table_name, e).into(),
+            location: snafu::location!(),
         })?;
 
         Ok(DropTableResponse {
@@ -952,7 +981,7 @@ mod tests {
         let mut request = CreateNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.create_namespace(request).await;
-        assert!(matches!(result, Err(NamespaceError::NotSupported(_))));
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
 
         // Test namespace_exists for non-root - should not exist
         let mut request = NamespaceExistsRequest::new();
@@ -968,7 +997,7 @@ mod tests {
         let mut request = DropNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.drop_namespace(request).await;
-        assert!(matches!(result, Err(NamespaceError::NotSupported(_))));
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
     }
 
     #[tokio::test]

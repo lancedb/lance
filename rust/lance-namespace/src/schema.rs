@@ -7,9 +7,9 @@
 //! and Arrow schema types.
 
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use lance_core::{Error, Result};
 use lance_namespace_reqwest_client::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
-
-use crate::namespace::{NamespaceError, Result};
+use snafu::Location;
 
 /// Convert JsonArrowSchema to Arrow Schema
 pub fn convert_json_arrow_schema(json_schema: &JsonArrowSchema) -> Result<ArrowSchema> {
@@ -51,10 +51,10 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
         "float64" => Ok(DataType::Float64),
         "utf8" => Ok(DataType::Utf8),
         "binary" => Ok(DataType::Binary),
-        _ => Err(NamespaceError::Other(format!(
-            "Unsupported Arrow type: {}",
-            type_name
-        ))),
+        _ => Err(Error::Namespace {
+            source: format!("Unsupported Arrow type: {}", type_name).into(),
+            location: Location::new(file!(), line!(), column!()),
+        }),
     }
 }
 

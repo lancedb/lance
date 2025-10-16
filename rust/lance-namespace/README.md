@@ -1,11 +1,47 @@
-# Lance Namespace
+# lance-namespace
 
-**Lance Namespace** is an open specification on top of the storage-based Lance data format
-to standardize access to a collection of Lance tables (a.k.a. Lance datasets).
-It describes how a metadata service like Apache Hive MetaStore (HMS),
-Apache Gravitino, Unity Catalog, etc. should store and use Lance tables, 
-as well as how ML/AI tools and analytics compute engines should integrate with Lance tables.
+Lance Namespace Core APIs for managing namespaces and tables.
 
-For more details, please visit the [documentation website](https://lancedb.github.io/lance/format/namespace).
+## Overview
 
-For development setup and contribution guidelines, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+This crate provides the core APIs for Lance namespaces, including:
+
+- `LanceNamespace` trait - The main interface for namespace operations
+- `RestNamespace` - REST API implementation of the namespace trait
+- Schema conversion utilities for Arrow schemas
+- Models and APIs for namespace operations
+
+## Features
+
+The namespace API supports:
+
+- Creating and managing namespaces
+- Creating and managing tables within namespaces
+- Listing namespaces and tables
+- Schema management
+- Multiple backend implementations (REST, directory-based, etc.)
+
+## Usage
+
+```rust
+use lance_namespace::{LanceNamespace, RestNamespace};
+use std::collections::HashMap;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a REST namespace client
+    let mut properties = HashMap::new();
+    properties.insert("uri".to_string(), "http://localhost:8080".to_string());
+
+    let namespace = RestNamespace::new(properties);
+
+    // List tables in the namespace
+    let tables = namespace.list_tables(Default::default()).await?;
+
+    Ok(())
+}
+```
+
+## Documentation
+
+For more information about Lance and its namespace system, see the [Lance Namespace documentation](https://lancedb.github.io/lance/format/namespace).

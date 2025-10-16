@@ -11,7 +11,8 @@ pub mod rest;
 pub mod schema;
 
 // Re-export the trait at the crate root
-pub use namespace::{LanceNamespace, NamespaceError, Result};
+pub use lance_core::{Error, Result};
+pub use namespace::LanceNamespace;
 pub use rest::RestNamespace;
 
 // Re-export reqwest client for convenience

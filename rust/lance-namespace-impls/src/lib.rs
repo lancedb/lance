@@ -14,8 +14,8 @@ pub mod connect;
 #[cfg(feature = "dir")]
 pub mod dir;
 
-// Re-export connect function and error type
-pub use connect::{connect, ConnectError};
+// Re-export connect function
+pub use connect::connect;
 
 // Re-export RestNamespace from lance-namespace for convenience
 pub use lance_namespace::RestNamespace;

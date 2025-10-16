@@ -1,12 +1,12 @@
 [package]
 name = "lance-namespace-impls"
+description = "Lance Namespace Implementations"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "README.md"
-description = "Lance Namespace implementations"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,7 @@ dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-sche
 
 [dependencies]
 lance-namespace.workspace = true
+lance-core.workspace = true
 
 # Directory implementation dependencies (optional, enabled by "dir" feature)
 lance = { workspace = true, optional = true }
@@ -29,7 +30,7 @@ url = { workspace = true, optional = true }
 # Common dependencies
 async-trait.workspace = true
 bytes.workspace = true
-thiserror.workspace = true
+snafu.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

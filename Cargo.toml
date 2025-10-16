@@ -167,7 +167,6 @@ lindera = { version = "0.44.0" }
 lindera-tantivy = { version = "0.44.0" }
 tempfile = "3"
 test-log = { version = "0.2.15" }
-thiserror = "1.0"
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
     "macros",

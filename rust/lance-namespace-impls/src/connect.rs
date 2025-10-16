@@ -6,23 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use lance_core::{Error, Result};
 use lance_namespace::{LanceNamespace, RestNamespace};
-
-/// Error type for connection-related operations
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectError {
-    #[error("Unknown implementation: {0}")]
-    UnknownImpl(String),
-
-    #[error("Failed to construct implementation: {0}")]
-    ConstructionError(String),
-
-    #[error("Missing required property: {0}")]
-    MissingProperty(String),
-
-    #[error("Other error: {0}")]
-    Other(String),
-}
+use snafu::Location;
 
 /// Connect to a Lance namespace implementation.
 ///
@@ -75,7 +61,7 @@ pub enum ConnectError {
 pub async fn connect(
     impl_name: &str,
     properties: HashMap<String, String>,
-) -> Result<Arc<dyn LanceNamespace>, ConnectError> {
+) -> Result<Arc<dyn LanceNamespace>> {
     match impl_name {
         "rest" => {
             // Create REST implementation
@@ -87,13 +73,17 @@ pub async fn connect(
             crate::dir::connect_dir(properties).await
         }
         #[cfg(not(feature = "dir"))]
-        "dir" => Err(ConnectError::Other(
-            "Directory namespace implementation requires 'dir' feature to be enabled".to_string(),
-        )),
-        _ => Err(ConnectError::UnknownImpl(format!(
-            "Implementation '{}' is not available. Supported: rest{}",
-            impl_name,
-            if cfg!(feature = "dir") { ", dir" } else { "" }
-        ))),
+        "dir" => Err(Error::Namespace {
+            source: "Directory namespace implementation requires 'dir' feature to be enabled".into(),
+            location: Location::new(file!(), line!(), column!()),
+        }),
+        _ => Err(Error::Namespace {
+            source: format!(
+                "Implementation '{}' is not available. Supported: rest{}",
+                impl_name,
+                if cfg!(feature = "dir") { ", dir" } else { "" }
+            ).into(),
+            location: Location::new(file!(), line!(), column!()),
+        }),
     }
 }

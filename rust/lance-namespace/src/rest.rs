@@ -25,7 +25,10 @@ use crate::models::{
     UpdateTableRequest, UpdateTableResponse,
 };
 
-use crate::namespace::{LanceNamespace, NamespaceError, Result};
+use lance_core::{box_error, Error, Result};
+use snafu::Location;
+
+use crate::namespace::LanceNamespace;
 
 /// Configuration for REST namespace
 #[derive(Debug, Clone)]
@@ -89,18 +92,33 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
     match id {
         Some(id_parts) if !id_parts.is_empty() => Ok(id_parts.join(delimiter)),
         Some(_) => Ok(delimiter.to_string()),
-        None => Err(NamespaceError::Other("Object ID is required".to_string())),
+        None => Err(Error::Namespace {
+            source: "Object ID is required".into(),
+            location: Location::new(file!(), line!(), column!()),
+        }),
     }
 }
 
-/// Convert API error to namespace error
-fn convert_api_error<T: std::fmt::Debug>(err: crate::apis::Error<T>) -> NamespaceError {
-    use crate::apis::Error;
+/// Convert API error to lance core error
+fn convert_api_error<T: std::fmt::Debug>(err: crate::apis::Error<T>) -> Error {
+    use crate::apis::Error as ApiError;
     match err {
-        Error::Reqwest(e) => NamespaceError::Io(std::io::Error::other(e.to_string())),
-        Error::Serde(e) => NamespaceError::Other(format!("Serialization error: {}", e)),
-        Error::Io(e) => NamespaceError::Io(e),
-        Error::ResponseError(e) => NamespaceError::Other(format!("Response error: {:?}", e)),
+        ApiError::Reqwest(e) => Error::IO {
+            source: box_error(e),
+            location: Location::new(file!(), line!(), column!()),
+        },
+        ApiError::Serde(e) => Error::Namespace {
+            source: format!("Serialization error: {}", e).into(),
+            location: Location::new(file!(), line!(), column!()),
+        },
+        ApiError::Io(e) => Error::IO {
+            source: box_error(e),
+            location: Location::new(file!(), line!(), column!()),
+        },
+        ApiError::ResponseError(e) => Error::Namespace {
+            source: format!("Response error: {:?}", e).into(),
+            location: Location::new(file!(), line!(), column!()),
+        },
     }
 }
 
@@ -414,8 +432,9 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<MergeInsertIntoTableResponse> {
         let id = object_id_str(&request.id, self.config.delimiter())?;
 
-        let on = request.on.as_deref().ok_or_else(|| {
-            NamespaceError::Other("'on' field is required for merge insert".to_string())
+        let on = request.on.as_deref().ok_or_else(|| Error::Namespace {
+            source: "'on' field is required for merge insert".into(),
+            location: Location::new(file!(), line!(), column!()),
         })?;
 
         table_api::merge_insert_into_table(
@@ -476,10 +495,10 @@ impl LanceNamespace for RestNamespace {
         .map_err(convert_api_error)?;
 
         // Convert response to bytes
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| NamespaceError::Io(std::io::Error::other(e.to_string())))?;
+        let bytes = response.bytes().await.map_err(|e| Error::IO {
+            source: box_error(e),
+            location: Location::new(file!(), line!(), column!()),
+        })?;
 
         Ok(bytes)
     }
