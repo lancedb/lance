@@ -3184,7 +3184,7 @@ class LanceDataset(pa.dataset.Dataset):
     def shallow_clone(
         self,
         target_path: Union[str, Path],
-        version: Union[int, str],
+        version: Union[int, str, Tuple[int, str]],
         storage_options: Optional[Dict[str, str]] = None,
     ) -> "LanceDataset":
         """
@@ -3214,7 +3214,6 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
-        # Delegate to the Rust-backed implementation via the extension module
         new_inner = self._ds.shallow_clone(target_uri, version, storage_options)
 
         ds = LanceDataset.__new__(LanceDataset)

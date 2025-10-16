@@ -21,7 +21,7 @@ use lance_index::vector::bq::RQBuildParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
@@ -1447,9 +1447,47 @@ impl Dataset {
                 None,
                 new_self.shallow_clone(&target_path, tag, store_params),
             )?
+        } else if let Ok(tuple) = version.downcast_bound::<PyTuple>(py) {
+            let len = tuple.len()?;
+            if len == 1 {
+                let elem = tuple.get_item(0)?;
+                if let Ok(version_number) = elem.extract::<u64>() {
+                    rt().block_on(
+                        None,
+                        new_self.shallow_clone(&target_path, version_number, store_params),
+                    )?
+                } else if let Ok(branch_name) = elem.extract::<String>() {
+                    rt().block_on(
+                        None,
+                        new_self.shallow_clone(
+                            &target_path,
+                            Ref::Version(Some(branch_name), None),
+                            store_params,
+                        ),
+                    )?
+                } else {
+                    return Err(PyValueError::new_err(
+                        "Single-element tuple must contain integer or string",
+                    ));
+                }
+            } else if len == 2 {
+                let (version_number, branch_name) = tuple.extract::<(u64, String)>()?;
+                rt().block_on(
+                    None,
+                    new_self.shallow_clone(
+                        &target_path,
+                        Ref::Version(Some(branch_name), Some(version_number)),
+                        store_params,
+                    ),
+                )?
+            } else {
+                return Err(PyValueError::new_err(
+                    "Version tuple must have 1 or 2 elements",
+                ));
+            }
         } else {
             return Err(PyValueError::new_err(
-                "version must be an integer or a string.",
+                "version must be an int, a str or a (int, str) tuple.",
             ));
         }
         .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;

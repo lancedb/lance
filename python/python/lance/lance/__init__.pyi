@@ -277,7 +277,7 @@ class _Dataset:
     def shallow_clone(
         self,
         target_path: str,
-        version: int | str,
+        version: int | str | Tuple[int, str],
         storage_options: Optional[Dict[str, str]] = None,
     ) -> _Dataset: ...
     def restore(self): ...
