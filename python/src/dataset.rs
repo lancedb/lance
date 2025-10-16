@@ -1468,7 +1468,7 @@ impl Dataset {
                 new_self.shallow_clone(&target_path, tag, store_params),
             )?
         } else if let Ok(tuple) = version.downcast_bound::<PyTuple>(py) {
-            let len = tuple.len()?;
+            let len = tuple.len();
             if len == 1 {
                 let elem = tuple.get_item(0)?;
                 if let Ok(version_number) = elem.extract::<u64>() {
