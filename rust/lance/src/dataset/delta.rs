@@ -300,9 +300,9 @@ mod tests {
     #[tokio::test]
     async fn test_list_no_transaction() {
         let ds = create_test_dataset().await;
-        let delta_struct = ds.delta().compared_against_version(1).build().unwrap();
-        let result = delta_struct.list_transactions().await;
-        assert!(result.is_err());
+        let delta = ds.delta().compared_against_version(1).build().unwrap();
+        let result = delta.list_transactions().await;
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[tokio::test]
