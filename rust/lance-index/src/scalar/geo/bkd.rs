@@ -15,7 +15,7 @@
 //! - Groups points into leaves of configurable size
 //! - Stores tree structure separately from leaf data for lazy loading
 
-use arrow_array::{Array, ArrayRef, Float64Array, RecordBatch, UInt64Array, UInt32Array, UInt8Array};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt64Array};
 use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Field, Schema};
 use deepsize::DeepSizeOf;
@@ -180,12 +180,6 @@ impl BKDTreeLookup {
             }
         }
 
-        println!(
-            "🌲 Tree traversal: visited {} nodes, found {} intersecting leaves",
-            nodes_visited,
-            leaves.len()
-        );
-
         Ok(leaves)
     }
 
@@ -332,18 +326,6 @@ impl BKDTreeBuilder {
             return Ok((vec![], vec![]));
         }
 
-        println!(
-            "\n🏗️  Building BKD tree for {} points with leaf size {}",
-            points.len(),
-            self.leaf_size
-        );
-
-        // Log first few points for debugging
-        println!("📍 First 5 points:");
-        for i in 0..std::cmp::min(5, points.len()) {
-            println!("  Point {}: x={}, y={}, row_id={}", i, points[i].0, points[i].1, points[i].2);
-        }
-
         let mut leaf_counter = 0u32;
         let mut all_nodes = Vec::new();
         let mut all_leaf_batches = Vec::new();
@@ -390,12 +372,6 @@ impl BKDTreeBuilder {
             }
         }
 
-        println!(
-            "✅ Built BKD tree: {} nodes ({} leaves)\n",
-            all_nodes.len(),
-            leaf_counter
-        );
-
         Ok((all_nodes, all_leaf_batches))
     }
 
@@ -431,12 +407,6 @@ impl BKDTreeBuilder {
                 num_rows,
             }));
 
-            // Debug: Check if SF (row_id=0) is in this leaf
-            if points.iter().any(|(_, _, rid)| *rid == 0) {
-                println!("🎯 SF (row_id=0) in leaf node_id={}, leaf_id={}, num_rows={}, bounds=[{}, {}, {}, {}]",
-                         node_id, leaf_id, num_rows, min_x, min_y, max_x, max_y);
-            }
-
             return Ok(node_id);
         }
 
@@ -466,15 +436,6 @@ impl BKDTreeBuilder {
         // Calculate bounds for this node (before splitting the slice)
         let (min_x, min_y, max_x, max_y) = calculate_bounds(points);
         
-        // Debug: Log first inner node to verify bounds
-        if all_nodes.is_empty() {
-            println!("🔍 Root node bounds: [{}, {}, {}, {}]", min_x, min_y, max_x, max_y);
-            println!("   Split on dim {} at value {}", split_dim, split_value);
-            println!("   Contains SF (-122.4194, 37.7749)? x_ok={}, y_ok={}", 
-                     min_x <= -122.4194 && -122.4194 <= max_x,
-                     min_y <= 37.7749 && 37.7749 <= max_y);
-        }
-
         // Reserve space for this inner node (placeholder - we'll update it after building children)
         let node_id = all_nodes.len() as u32;
         all_nodes.push(BKDNode::Inner(BKDInnerNode {

@@ -158,7 +158,7 @@ impl DeepSizeOf for GeoIndex {
 
 impl GeoIndex {
     /// Load the geo index from storage
-    async fn load(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
@@ -238,6 +238,34 @@ impl GeoIndex {
         Ok(cached.as_ref().clone().into_inner())
     }
 
+    /// Get the number of leaves in the BKD tree (useful for benchmarking)
+    pub fn num_leaves(&self) -> usize {
+        self.bkd_tree.num_leaves as usize
+    }
+
+    /// Search all leaves without using BKD tree pruning (useful for benchmarking)
+    pub async fn search_all_leaves(
+        &self,
+        query_bbox: [f64; 4],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        let mut all_row_ids = RowIdTreeMap::new();
+        
+        // Iterate through all nodes and search every leaf
+        for node in self.bkd_tree.nodes.iter() {
+            if let BKDNode::Leaf(leaf) = node {
+                let leaf_row_ids = self.search_leaf(leaf, query_bbox, metrics).await?;
+                let row_ids: Option<Vec<u64>> = leaf_row_ids.row_ids()
+                    .map(|iter| iter.map(|row_addr| u64::from(row_addr)).collect());
+                if let Some(row_ids) = row_ids {
+                    all_row_ids.extend(row_ids);
+                }
+            }
+        }
+        
+        Ok(all_row_ids)
+    }
+
     /// Search a specific leaf for points within the query bbox
     async fn search_leaf(
         &self,
@@ -246,10 +274,6 @@ impl GeoIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
         let leaf_data = self.load_leaf(leaf, metrics).await?;
-
-        let file_id = leaf.file_id;
-        let row_offset = leaf.row_offset;
-        let num_rows = leaf.num_rows;
 
         // Filter points within this leaf
         let mut row_ids = RowIdTreeMap::new();
@@ -295,6 +319,7 @@ impl Index for GeoIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
+        // No-op: geo index uses lazy loading
         Ok(())
     }
 
@@ -436,7 +461,7 @@ pub struct GeoIndexBuilder {
     options: GeoIndexBuilderParams,
     items_type: DataType,
     // Accumulated points: (x, y, row_id)
-    points: Vec<(f64, f64, u64)>,
+    pub points: Vec<(f64, f64, u64)>,
 }
 
 impl GeoIndexBuilder {
@@ -808,14 +833,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow_array::RecordBatch;
-    use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::stream;
+    use arrow_schema::{DataType, Field};
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::ROW_ADDR;
     use lance_io::object_store::ObjectStore;
 
     use crate::scalar::lance_format::LanceIndexStore;
@@ -891,7 +911,7 @@ mod tests {
         visited: &mut Vec<bool>,
         leaf_count: &mut u32,
         parent_bounds: Option<[f64; 4]>,
-        parent_split: Option<(u8, f64, bool)>, // (split_dim, split_value, is_left_child) from parent
+        _parent_split: Option<(u8, f64, bool)>, // (split_dim, split_value, is_left_child) from parent
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let node_idx = node_id as usize;
@@ -1036,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_geo_index_with_custom_max_points_per_leaf() {
+    async fn test_geo_intersects_with_custom_max_points_per_leaf() {
         use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
         
@@ -1115,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_geo_index_query_correctness_various_configs() {
+    async fn test_geo_intersects_query_correctness_various_configs() {
         use crate::metrics::NoOpMetricsCollector;
         
         // Test query correctness with different configurations
@@ -1183,7 +1203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_geo_index_single_leaf() {
+    async fn test_geo_intersects_single_leaf() {
         // Edge case: all points fit in single leaf
         let test_store = create_test_store();
         
@@ -1225,7 +1245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_geo_index_many_small_leaves() {
+    async fn test_geo_intersects_many_small_leaves() {
         // Stress test: many small leaves, test file grouping
         let test_store = create_test_store();
         
@@ -1429,10 +1449,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_geo_index_lazy_loading() {
+    async fn test_geo_intersects_lazy_loading() {
         use crate::metrics::NoOpMetricsCollector;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
         
         // Test that leaves are loaded lazily (not all at once)
         let test_store = create_test_store();
@@ -1524,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Expensive test - run with: cargo test -- --ignored
-    async fn test_geo_index_large_scale_lazy_loading() {
+    async fn test_geo_intersects_large_scale_lazy_loading() {
         use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1568,7 +1586,6 @@ mod tests {
 
         // Run 100 random queries with load tracking
         let metrics = LoadTracker { part_loads: AtomicUsize::new(0) };
-        let mut total_results = 0;
         let mut total_leaves_touched = 0;
         
         for _i in 0..100 {
@@ -1588,15 +1605,7 @@ mod tests {
             total_leaves_touched += intersecting_leaves.len();
             
             // Execute query
-            let result = index.search(&query, &metrics).await.unwrap();
-            
-            match result {
-                crate::scalar::SearchResult::Exact(row_ids) => {
-                    let count = row_ids.len().unwrap_or(0);
-                    total_results += count;
-                }
-                _ => panic!("Expected Exact search result"),
-            }
+            let _result = index.search(&query, &metrics).await.unwrap();
         }
         
         let total_io_ops = metrics.part_loads.load(Ordering::Relaxed);
@@ -1672,6 +1681,360 @@ mod tests {
                        y, leaf.bounds[1], leaf.bounds[3]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_geo_index_duplicate_coordinates_different_row_ids() {
+        // Test that duplicate coordinates with different row_ids are all stored correctly
+        use crate::metrics::NoOpMetricsCollector;
+        
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 3,
+        };
+
+        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+            .unwrap();
+
+        // Create multiple points at the same coordinates with different row_ids
+        // This simulates real-world scenarios where multiple records have the same location
+        for i in 0..20 {
+            // 5 points at location (10.0, 10.0) with different row_ids
+            builder.points.push((10.0, 10.0, i as u64));
+        }
+        
+        // Add some other points at different locations
+        for i in 20..50 {
+            builder.points.push((i as f64, i as f64, i as u64));
+        }
+
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Query the region containing the duplicates
+        let query = GeoQuery::Intersects(9.0, 9.0, 11.0, 11.0);
+        let metrics = NoOpMetricsCollector {};
+        let result = index.search(&query, &metrics).await.unwrap();
+        
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                // Should find all 20 points at (10.0, 10.0)
+                assert_eq!(row_ids.len().unwrap_or(0), 20,
+                          "Expected 20 duplicate coordinate entries");
+                
+                // Verify all row_ids 0..19 are present
+                for i in 0..20 {
+                    assert!(row_ids.contains(i as u64),
+                           "Missing row_id {} for duplicate coordinate", i);
+                }
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Verify data integrity: all 50 points should be stored
+        let mut all_row_ids = Vec::new();
+        for leaf in index.bkd_tree.nodes.iter().filter_map(|n| n.as_leaf()) {
+            let leaf_data = index.load_leaf(leaf, &metrics).await.unwrap();
+            let row_id_array = leaf_data
+                .column(2)
+                .as_primitive::<arrow_array::types::UInt64Type>();
+
+            for i in 0..leaf_data.num_rows() {
+                all_row_ids.push(row_id_array.value(i));
+            }
+        }
+
+        assert_eq!(all_row_ids.len(), 50, "Should store all 50 points including duplicates");
+        
+        let unique_row_ids: std::collections::HashSet<u64> = all_row_ids.iter().copied().collect();
+        assert_eq!(unique_row_ids.len(), 50, "All 50 row_ids should be unique");
+    }
+
+    #[tokio::test]
+    async fn test_geo_index_many_duplicates_at_same_location() {
+        // Test with many duplicate coordinates to ensure they don't cause issues
+        use crate::metrics::NoOpMetricsCollector;
+        
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 20,
+            batches_per_file: 5,
+        };
+
+        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+            .unwrap();
+
+        // Create 100 points all at the exact same location
+        for i in 0..100 {
+            builder.points.push((50.0, 50.0, i as u64));
+        }
+
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Validate tree structure
+        validate_bkd_tree(&index).await
+            .expect("BKD tree validation failed with many duplicates");
+
+        // Query should return all 100 points
+        let query = GeoQuery::Intersects(49.0, 49.0, 51.0, 51.0);
+        let metrics = NoOpMetricsCollector {};
+        let result = index.search(&query, &metrics).await.unwrap();
+        
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                assert_eq!(row_ids.len().unwrap_or(0), 100,
+                          "Expected all 100 duplicate coordinate entries");
+                
+                // Verify all row_ids are present
+                for i in 0..100 {
+                    assert!(row_ids.contains(i as u64),
+                           "Missing row_id {} in duplicate set", i);
+                }
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geo_index_duplicates_across_multiple_locations() {
+        // Test duplicates at multiple different locations
+        use crate::metrics::NoOpMetricsCollector;
+        
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 15,
+            batches_per_file: 3,
+        };
+
+        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+            .unwrap();
+
+        // Create clusters of duplicates at different locations
+        let locations = vec![
+            (10.0, 10.0),
+            (20.0, 20.0),
+            (30.0, 30.0),
+            (40.0, 40.0),
+        ];
+
+        let mut row_id = 0u64;
+        for (x, y) in &locations {
+            // 10 duplicates at each location
+            for _ in 0..10 {
+                builder.points.push((*x, *y, row_id));
+                row_id += 1;
+            }
+        }
+
+        // Add some unique points
+        for i in 0..20 {
+            builder.points.push((i as f64, i as f64 + 50.0, row_id));
+            row_id += 1;
+        }
+
+        let total_points = row_id;
+
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Validate tree structure
+        validate_bkd_tree(&index).await
+            .expect("BKD tree validation failed with duplicates at multiple locations");
+
+        let metrics = NoOpMetricsCollector {};
+
+        // Query each location cluster
+        for (i, (x, y)) in locations.iter().enumerate() {
+            let query = GeoQuery::Intersects(x - 1.0, y - 1.0, x + 1.0, y + 1.0);
+            let result = index.search(&query, &metrics).await.unwrap();
+            
+            match result {
+                crate::scalar::SearchResult::Exact(row_ids) => {
+                    assert_eq!(row_ids.len().unwrap_or(0), 10,
+                              "Expected 10 duplicates at location {}", i);
+                    
+                    // Verify the correct row_ids for this cluster
+                    let expected_start = (i * 10) as u64;
+                    let expected_end = expected_start + 10;
+                    for expected_id in expected_start..expected_end {
+                        assert!(row_ids.contains(expected_id),
+                               "Missing row_id {} in cluster at ({}, {})", expected_id, x, y);
+                    }
+                }
+                _ => panic!("Expected Exact search result"),
+            }
+        }
+
+        // Verify total count
+        let mut all_row_ids = Vec::new();
+        for leaf in index.bkd_tree.nodes.iter().filter_map(|n| n.as_leaf()) {
+            let leaf_data = index.load_leaf(leaf, &metrics).await.unwrap();
+            let row_id_array = leaf_data
+                .column(2)
+                .as_primitive::<arrow_array::types::UInt64Type>();
+
+            for i in 0..leaf_data.num_rows() {
+                all_row_ids.push(row_id_array.value(i));
+            }
+        }
+
+        assert_eq!(all_row_ids.len(), total_points as usize,
+                  "Should store all {} points including duplicates", total_points);
+    }
+
+    #[tokio::test]
+    async fn test_geo_index_duplicate_handling_with_leaf_splits() {
+        // Test that duplicates are handled correctly when they cause leaf splits
+        use crate::metrics::NoOpMetricsCollector;
+        
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,  // Small leaf size to force splits
+            batches_per_file: 3,
+        };
+
+        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+            .unwrap();
+
+        // Create 50 points at the same location - should span multiple leaves
+        for i in 0..50 {
+            builder.points.push((25.0, 25.0, i as u64));
+        }
+
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Validate tree structure
+        validate_bkd_tree(&index).await
+            .expect("BKD tree validation failed with duplicate-induced splits");
+
+        // Query should return all 50 points
+        let query = GeoQuery::Intersects(24.0, 24.0, 26.0, 26.0);
+        let metrics = NoOpMetricsCollector {};
+        let result = index.search(&query, &metrics).await.unwrap();
+        
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                assert_eq!(row_ids.len().unwrap_or(0), 50,
+                          "Expected all 50 duplicate entries after leaf splits");
+                
+                // Verify all row_ids are present
+                for i in 0..50 {
+                    assert!(row_ids.contains(i as u64),
+                           "Missing row_id {} after leaf split", i);
+                }
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geo_index_mixed_duplicates_and_unique_points() {
+        // Realistic test: mix of unique points and duplicates
+        use crate::metrics::NoOpMetricsCollector;
+        use rand::{Rng, SeedableRng};
+        use rand::rngs::StdRng;
+        
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 20,
+            batches_per_file: 5,
+        };
+
+        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+            .unwrap();
+
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut row_id = 0u64;
+
+        // Add 100 random unique points
+        for _ in 0..100 {
+            let x = rng.random_range(0.0..100.0);
+            let y = rng.random_range(0.0..100.0);
+            builder.points.push((x, y, row_id));
+            row_id += 1;
+        }
+
+        // Add 20 duplicates at a specific location
+        for _ in 0..20 {
+            builder.points.push((50.0, 50.0, row_id));
+            row_id += 1;
+        }
+
+        // Add 50 more random unique points
+        for _ in 0..50 {
+            let x = rng.random_range(0.0..100.0);
+            let y = rng.random_range(0.0..100.0);
+            builder.points.push((x, y, row_id));
+            row_id += 1;
+        }
+
+        let total_points = 170;
+
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Validate tree structure
+        validate_bkd_tree(&index).await
+            .expect("BKD tree validation failed with mixed duplicates and unique points");
+
+        let metrics = NoOpMetricsCollector {};
+
+        // Query the duplicate cluster
+        let query = GeoQuery::Intersects(49.0, 49.0, 51.0, 51.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                assert_eq!(row_ids.len().unwrap_or(0), 20,
+                          "Expected 20 duplicate entries at (50, 50)");
+                
+                // Verify the duplicate row_ids (100..119)
+                for expected_id in 100..120 {
+                    assert!(row_ids.contains(expected_id as u64),
+                           "Missing row_id {} in duplicate cluster", expected_id);
+                }
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Verify total count
+        let mut all_row_ids = Vec::new();
+        for leaf in index.bkd_tree.nodes.iter().filter_map(|n| n.as_leaf()) {
+            let leaf_data = index.load_leaf(leaf, &metrics).await.unwrap();
+            let row_id_array = leaf_data
+                .column(2)
+                .as_primitive::<arrow_array::types::UInt64Type>();
+
+            for i in 0..leaf_data.num_rows() {
+                all_row_ids.push(row_id_array.value(i));
+            }
+        }
+
+        assert_eq!(all_row_ids.len(), total_points,
+                  "Should store all {} points", total_points);
+        
+        // Verify all row_ids are unique (no double-counting)
+        let unique_row_ids: std::collections::HashSet<u64> = all_row_ids.iter().copied().collect();
+        assert_eq!(unique_row_ids.len(), total_points,
+                  "All row_ids should be unique");
     }
 }
 
