@@ -39,7 +39,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::scalar::{AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
+use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
@@ -63,33 +63,6 @@ const DEFAULT_MAX_POINTS_PER_LEAF: u32 = 100; // for test
 /// Get the file name for a leaf group
 fn leaf_group_filename(group_id: u32) -> String {
     format!("{}{}.lance", LEAF_GROUP_PREFIX, group_id)
-}
-
-/// Lazy reader for BKD leaf file
-#[derive(Clone)]
-struct LazyIndexReader {
-    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
-    store: Arc<dyn IndexStore>,
-    filename: String,
-}
-
-impl LazyIndexReader {
-    fn new(store: Arc<dyn IndexStore>, filename: &str) -> Self {
-        Self {
-            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
-            store,
-            filename: filename.to_string(),
-        }
-    }
-
-    async fn get(&self) -> Result<Arc<dyn IndexReader>> {
-        let mut reader = self.index_reader.lock().await;
-        if reader.is_none() {
-            let r = self.store.open_index_file(&self.filename).await?;
-            *reader = Some(r);
-        }
-        Ok(reader.as_ref().unwrap().clone())
-    }
 }
 
 /// Cache key for BKD leaf nodes
@@ -243,7 +216,7 @@ impl GeoIndex {
         self.bkd_tree.num_leaves as usize
     }
 
-    /// Search all leaves without using BKD tree pruning (useful for benchmarking)
+    /// Search all leaves without using BKD tree pruning (only useful for benchmarking)
     pub async fn search_all_leaves(
         &self,
         query_bbox: [f64; 4],
@@ -275,29 +248,28 @@ impl GeoIndex {
     ) -> Result<RowIdTreeMap> {
         let leaf_data = self.load_leaf(leaf, metrics).await?;
 
-        // Filter points within this leaf
-        let mut row_ids = RowIdTreeMap::new();
-        let x_array = leaf_data
-            .column(0)
-            .as_primitive::<arrow_array::types::Float64Type>();
-        let y_array = leaf_data
-            .column(1)
-            .as_primitive::<arrow_array::types::Float64Type>();
-        let row_id_array = leaf_data
-            .column(2)
-            .as_primitive::<arrow_array::types::UInt64Type>();
+        // Filter points within this leaf using iterators
+        let x_array = leaf_data.column(0).as_primitive::<arrow_array::types::Float64Type>();
+        let y_array = leaf_data.column(1).as_primitive::<arrow_array::types::Float64Type>();
+        let row_id_array = leaf_data.column(2).as_primitive::<arrow_array::types::UInt64Type>();
 
-        for i in 0..leaf_data.num_rows() {
-            let x = x_array.value(i);
-            let y = y_array.value(i);
-            let row_id = row_id_array.value(i);
+        let row_ids: Vec<u64> = x_array
+            .iter()
+            .zip(y_array.iter())
+            .zip(row_id_array.iter())
+            .filter_map(|((x_opt, y_opt), row_id_opt)| {
+                match (x_opt, y_opt, row_id_opt) {
+                    (Some(x), Some(y), Some(row_id)) if point_in_bbox(x, y, &query_bbox) => {
+                        Some(row_id)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
 
-            if point_in_bbox(x, y, &query_bbox) {
-                row_ids.insert(row_id);
-            }
-        }
-
-        Ok(row_ids)
+        let mut row_id_map = RowIdTreeMap::new();
+        row_id_map.extend(row_ids);
+        Ok(row_id_map)
     }
 }
 
@@ -459,7 +431,7 @@ impl GeoIndexBuilderParams {
 // A builder for geo index
 pub struct GeoIndexBuilder {
     options: GeoIndexBuilderParams,
-    items_type: DataType,
+    _items_type: DataType,
     // Accumulated points: (x, y, row_id)
     pub points: Vec<(f64, f64, u64)>,
 }
@@ -468,7 +440,7 @@ impl GeoIndexBuilder {
     pub fn try_new(options: GeoIndexBuilderParams, items_type: DataType) -> Result<Self> {
         Ok(Self {
             options,
-            items_type,
+            _items_type: items_type,
             points: Vec::new(),
         })
     }
@@ -514,6 +486,22 @@ impl GeoIndexBuilder {
     pub async fn write_index(mut self, index_store: &dyn IndexStore) -> Result<()> {
         if self.points.is_empty() {
             return Ok(());
+        }
+
+        // Validate coordinates (reject NaN and Infinity like Lucene does)
+        for (x, y, row_id) in &self.points {
+            if x.is_nan() || y.is_nan() {
+                return Err(Error::InvalidInput {
+                    source: format!("Cannot index NaN coordinates (row_id={})", row_id).into(),
+                    location: location!(),
+                });
+            }
+            if x.is_infinite() || y.is_infinite() {
+                return Err(Error::InvalidInput {
+                    source: format!("Cannot index Infinite coordinates (row_id={})", row_id).into(),
+                    location: location!(),
+                });
+            }
         }
 
         // Build BKD tree
@@ -1541,7 +1529,302 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Expensive test - run with: cargo test -- --ignored
+    async fn test_geo_intersects_invalid_coordinates() {
+        // Test that NaN and infinity coordinates are rejected (like Lucene does)
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 5,
+        };
+        
+        // Test NaN in X coordinate
+        let mut builder = GeoIndexBuilder::try_new(
+            params.clone(),
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        builder.points.push((10.0, 10.0, 1));
+        builder.points.push((f64::NAN, 20.0, 2));
+        let result = builder.write_index(test_store.as_ref()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("NaN"));
+        
+        // Test NaN in Y coordinate
+        let mut builder = GeoIndexBuilder::try_new(
+            params.clone(),
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        builder.points.push((10.0, 10.0, 1));
+        builder.points.push((20.0, f64::NAN, 2));
+        let result = builder.write_index(test_store.as_ref()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("NaN"));
+        
+        // Test Infinity in X coordinate
+        let mut builder = GeoIndexBuilder::try_new(
+            params.clone(),
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        builder.points.push((10.0, 10.0, 1));
+        builder.points.push((f64::INFINITY, 20.0, 2));
+        let result = builder.write_index(test_store.as_ref()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Infinite"));
+        
+        // Test Negative Infinity in Y coordinate
+        let mut builder = GeoIndexBuilder::try_new(
+            params.clone(),
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        builder.points.push((10.0, 10.0, 1));
+        builder.points.push((20.0, f64::NEG_INFINITY, 2));
+        let result = builder.write_index(test_store.as_ref()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Infinite"));
+    }
+
+    #[tokio::test]
+    async fn test_geo_intersects_out_of_bounds_queries() {
+        use crate::metrics::NoOpMetricsCollector;
+        
+        // Test queries completely outside the data bounds
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 5,
+        };
+        
+        let mut builder = GeoIndexBuilder::try_new(
+            params,
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        
+        // Add points in region 0-100, 0-100
+        for i in 0..50 {
+            builder.points.push((i as f64, i as f64, i as u64));
+        }
+        
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        
+        let metrics = NoOpMetricsCollector {};
+        
+        // Query completely out of bounds (far away)
+        let query = GeoQuery::Intersects(1000.0, 1000.0, 2000.0, 2000.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let count = row_ids.len().unwrap_or(0) as usize;
+                assert_eq!(count, 0);
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+        
+        // Query in negative space (if data is all positive)
+        let query = GeoQuery::Intersects(-500.0, -500.0, -100.0, -100.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let count = row_ids.len().unwrap_or(0) as usize;
+                assert_eq!(count, 0);
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geo_intersects_extreme_coordinates() {
+        use crate::metrics::NoOpMetricsCollector;
+        
+        // Test with extremely large and small (but valid) coordinates
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 5,
+        };
+        
+        let mut builder = GeoIndexBuilder::try_new(
+            params,
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        
+        // Add points with extreme coordinates
+        builder.points.push((1e10, 1e10, 1));
+        builder.points.push((-1e10, -1e10, 2));
+        builder.points.push((1e-10, 1e-10, 3));
+        builder.points.push((-1e-10, -1e-10, 4));
+        builder.points.push((f64::MAX / 2.0, f64::MAX / 2.0, 5));
+        builder.points.push((f64::MIN / 2.0, f64::MIN / 2.0, 6));
+        
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        
+        let metrics = NoOpMetricsCollector {};
+        
+        // Query for large positive values
+        let query = GeoQuery::Intersects(1e10 - 1.0, 1e10 - 1.0, 1e10 + 1.0, 1e10 + 1.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let actual_ids: Vec<u64> = row_ids.row_ids()
+                    .map(|iter| iter.map(|addr| u64::from(addr)).collect())
+                    .unwrap_or_default();
+                assert!(actual_ids.contains(&1));
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+        
+        // Query for large negative values
+        let query = GeoQuery::Intersects(-1e10 - 1.0, -1e10 - 1.0, -1e10 + 1.0, -1e10 + 1.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let actual_ids: Vec<u64> = row_ids.row_ids()
+                    .map(|iter| iter.map(|addr| u64::from(addr)).collect())
+                    .unwrap_or_default();
+                assert!(actual_ids.contains(&2));
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geo_intersects_huge_query_bbox() {
+        use crate::metrics::NoOpMetricsCollector;
+        
+        // Test query larger than all data bounds
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 5,
+        };
+        
+        let mut builder = GeoIndexBuilder::try_new(
+            params,
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        
+        // Add points in small region
+        for i in 0..20 {
+            builder.points.push((i as f64, i as f64, i as u64));
+        }
+        
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        
+        let metrics = NoOpMetricsCollector {};
+        
+        // Query that encompasses ALL data
+        let query = GeoQuery::Intersects(-1000.0, -1000.0, 1000.0, 1000.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let count = row_ids.len().unwrap_or(0) as usize;
+                // Should find all 20 points
+                assert_eq!(count, 20);
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geo_intersects_zero_size_query() {
+        use crate::metrics::NoOpMetricsCollector;
+        
+        // Test query box with zero width/height (point query)
+        let test_store = create_test_store();
+        
+        let params = GeoIndexBuilderParams {
+            max_points_per_leaf: 10,
+            batches_per_file: 5,
+        };
+        
+        let mut builder = GeoIndexBuilder::try_new(
+            params,
+            DataType::Struct(Vec::<Field>::new().into()),
+        )
+        .unwrap();
+        
+        // Add some points
+        builder.points.push((10.0, 10.0, 1));
+        builder.points.push((10.0, 10.0, 2)); // Duplicate at same location
+        builder.points.push((20.0, 20.0, 3));
+        builder.points.push((30.0, 30.0, 4));
+        
+        builder.write_index(test_store.as_ref()).await.unwrap();
+        
+        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        
+        let metrics = NoOpMetricsCollector {};
+        
+        // Zero-width query (line)
+        let query = GeoQuery::Intersects(10.0, 10.0, 10.0, 20.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let actual_ids: Vec<u64> = row_ids.row_ids()
+                    .map(|iter| iter.map(|addr| u64::from(addr)).collect())
+                    .unwrap_or_default();
+                // Should find points at (10, 10)
+                assert!(actual_ids.contains(&1));
+                assert!(actual_ids.contains(&2));
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+        
+        // Zero-height query (line)
+        let query = GeoQuery::Intersects(10.0, 10.0, 20.0, 10.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let actual_ids: Vec<u64> = row_ids.row_ids()
+                    .map(|iter| iter.map(|addr| u64::from(addr)).collect())
+                    .unwrap_or_default();
+                // Should find points at (10, 10)
+                assert!(actual_ids.contains(&1));
+                assert!(actual_ids.contains(&2));
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+        
+        // Point query (zero width and height)
+        let query = GeoQuery::Intersects(20.0, 20.0, 20.0, 20.0);
+        let result = index.search(&query, &metrics).await.unwrap();
+        match result {
+            crate::scalar::SearchResult::Exact(row_ids) => {
+                let actual_ids: Vec<u64> = row_ids.row_ids()
+                    .map(|iter| iter.map(|addr| u64::from(addr)).collect())
+                    .unwrap_or_default();
+                // Should find point at (20, 20)
+                assert_eq!(actual_ids.len(), 1);
+                assert!(actual_ids.contains(&3));
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_geo_intersects_large_scale_lazy_loading() {
         use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;

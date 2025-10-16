@@ -151,7 +151,7 @@ impl BKDTreeLookup {
     pub fn find_intersecting_leaves(&self, query_bbox: [f64; 4]) -> Result<Vec<&BKDLeafNode>> {
         let mut leaves = Vec::new();
         let mut stack = vec![self.root_id];
-        let mut nodes_visited = 0;
+        let mut _nodes_visited = 0;
 
         while let Some(node_id) = stack.pop() {
             if node_id as usize >= self.nodes.len() {
@@ -159,7 +159,7 @@ impl BKDTreeLookup {
             }
 
             let node = &self.nodes[node_id as usize];
-            nodes_visited += 1;
+            _nodes_visited += 1;
 
             // Check if node's bounding box intersects with query bbox
             let intersects = bboxes_intersect(&node.bounds(), &query_bbox);
@@ -388,7 +388,7 @@ impl BKDTreeBuilder {
         // Base case: create leaf node
         if points.len() <= self.leaf_size {
             let node_id = all_nodes.len() as u32;
-            let leaf_id = *leaf_counter;
+            let _leaf_id = *leaf_counter;
             *leaf_counter += 1;
 
             // Calculate bounding box for this leaf
