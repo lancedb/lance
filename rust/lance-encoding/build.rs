@@ -15,7 +15,9 @@ fn main() -> Result<()> {
     prost_build.enable_type_names();
     prost_build.bytes(["."]); // Enable Bytes type for all messages to avoid Vec clones.
 
-    // Implement DeepSizeOf so we can keep metadata in cache
+    // Implement DeepSizeOf so we can keep metadata in cache.
+    // Once https://github.com/nhtyy/deepsize2/pull/2 is merged and released,
+    // we can use that and just implement DeepSizeOf for `.`
     for path in &[
         "lance.encodings.ColumnEncoding",
         "lance.encodings.Blob",
