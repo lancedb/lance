@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_namespace::{LanceNamespace, RestNamespace};
-use snafu::Location;
+use lance_namespace::LanceNamespace;
 
 /// Connect to a Lance namespace implementation.
 ///
@@ -18,7 +17,7 @@ use snafu::Location;
 /// # Arguments
 ///
 /// * `impl_name` - Implementation identifier. Supported values:
-///   - "rest": REST API implementation
+///   - "rest": REST API implementation (requires "rest" feature)
 ///   - "dir": Directory-based implementation (requires "dir" feature)
 ///
 /// * `properties` - Configuration properties specific to the implementation.
@@ -63,10 +62,16 @@ pub async fn connect(
     properties: HashMap<String, String>,
 ) -> Result<Arc<dyn LanceNamespace>> {
     match impl_name {
+        #[cfg(feature = "rest")]
         "rest" => {
             // Create REST implementation
-            Ok(Arc::new(RestNamespace::new(properties)))
+            Ok(Arc::new(crate::rest::RestNamespace::new(properties)))
         }
+        #[cfg(not(feature = "rest"))]
+        "rest" => Err(Error::Namespace {
+            source: "REST namespace implementation requires 'rest' feature to be enabled".into(),
+            location: snafu::location!(),
+        }),
         #[cfg(feature = "dir")]
         "dir" => {
             // Create directory implementation
@@ -76,16 +81,25 @@ pub async fn connect(
         "dir" => Err(Error::Namespace {
             source: "Directory namespace implementation requires 'dir' feature to be enabled"
                 .into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         }),
         _ => Err(Error::Namespace {
             source: format!(
-                "Implementation '{}' is not available. Supported: rest{}",
+                "Implementation '{}' is not available. Supported: {}{}",
                 impl_name,
-                if cfg!(feature = "dir") { ", dir" } else { "" }
+                if cfg!(feature = "rest") { "rest" } else { "" },
+                if cfg!(feature = "dir") {
+                    if cfg!(feature = "rest") {
+                        ", dir"
+                    } else {
+                        "dir"
+                    }
+                } else {
+                    ""
+                }
             )
             .into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         }),
     }
 }

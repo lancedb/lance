@@ -4797,13 +4797,9 @@ dependencies = [
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
- "reqwest",
- "serde_json",
  "snafu",
  "tempfile",
  "tokio",
- "url",
- "wiremock",
 ]
 
 [[package]]
@@ -4819,10 +4815,13 @@ dependencies = [
  "lance-core",
  "lance-namespace",
  "opendal",
+ "reqwest",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",
  "url",
+ "wiremock",
 ]
 
 [[package]]

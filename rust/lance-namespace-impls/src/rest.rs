@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::apis::{configuration::Configuration, namespace_api, table_api, transaction_api};
-use crate::models::{
+use lance_namespace::apis::{configuration::Configuration, namespace_api, table_api, transaction_api};
+use lance_namespace::models::{
     AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
@@ -26,9 +26,8 @@ use crate::models::{
 };
 
 use lance_core::{box_error, Error, Result};
-use snafu::Location;
 
-use crate::namespace::LanceNamespace;
+use lance_namespace::LanceNamespace;
 
 /// Configuration for REST namespace
 #[derive(Debug, Clone)]
@@ -94,30 +93,30 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
         Some(_) => Ok(delimiter.to_string()),
         None => Err(Error::Namespace {
             source: "Object ID is required".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         }),
     }
 }
 
 /// Convert API error to lance core error
-fn convert_api_error<T: std::fmt::Debug>(err: crate::apis::Error<T>) -> Error {
-    use crate::apis::Error as ApiError;
+fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -> Error {
+    use lance_namespace::apis::Error as ApiError;
     match err {
         ApiError::Reqwest(e) => Error::IO {
             source: box_error(e),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         },
         ApiError::Serde(e) => Error::Namespace {
             source: format!("Serialization error: {}", e).into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         },
         ApiError::Io(e) => Error::IO {
             source: box_error(e),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         },
         ApiError::ResponseError(e) => Error::Namespace {
             source: format!("Response error: {:?}", e).into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         },
     }
 }
@@ -365,7 +364,7 @@ impl LanceNamespace for RestNamespace {
             .as_ref()
             .map(|props| serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string()));
 
-        use crate::models::create_table_request::Mode;
+        use lance_namespace::models::create_table_request::Mode;
         let mode = request.mode.as_ref().map(|m| match m {
             Mode::Create => "create",
             Mode::ExistOk => "exist_ok",
@@ -408,7 +407,7 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<InsertIntoTableResponse> {
         let id = object_id_str(&request.id, self.config.delimiter())?;
 
-        use crate::models::insert_into_table_request::Mode;
+        use lance_namespace::models::insert_into_table_request::Mode;
         let mode = request.mode.as_ref().map(|m| match m {
             Mode::Append => "append",
             Mode::Overwrite => "overwrite",
@@ -434,7 +433,7 @@ impl LanceNamespace for RestNamespace {
 
         let on = request.on.as_deref().ok_or_else(|| Error::Namespace {
             source: "'on' field is required for merge insert".into(),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         })?;
 
         table_api::merge_insert_into_table(
@@ -497,7 +496,7 @@ impl LanceNamespace for RestNamespace {
         // Convert response to bytes
         let bytes = response.bytes().await.map_err(|e| Error::IO {
             source: box_error(e),
-            location: Location::new(file!(), line!(), column!()),
+            location: snafu::location!(),
         })?;
 
         Ok(bytes)
@@ -592,7 +591,7 @@ impl LanceNamespace for RestNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{create_table_request, insert_into_table_request};
+    use lance_namespace::models::{create_table_request, insert_into_table_request};
     use bytes::Bytes;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

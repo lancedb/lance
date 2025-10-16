@@ -11,14 +11,17 @@
 
 pub mod connect;
 
+#[cfg(feature = "rest")]
+pub mod rest;
+
 #[cfg(feature = "dir")]
 pub mod dir;
 
 // Re-export connect function
 pub use connect::connect;
 
-// Re-export RestNamespace from lance-namespace for convenience
-pub use lance_namespace::RestNamespace;
+#[cfg(feature = "rest")]
+pub use rest::RestNamespace;
 
 #[cfg(feature = "dir")]
 pub use dir::{connect_dir, DirectoryNamespace, DirectoryNamespaceConfig};

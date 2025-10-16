@@ -4,12 +4,13 @@ Lance Namespace Core APIs for managing namespaces and tables.
 
 ## Overview
 
-This crate provides the core APIs for Lance namespaces, including:
+This crate provides the core APIs and trait definitions for Lance namespaces, including:
 
 - `LanceNamespace` trait - The main interface for namespace operations
-- `RestNamespace` - REST API implementation of the namespace trait
 - Schema conversion utilities for Arrow schemas
-- Models and APIs for namespace operations
+- Models and APIs for namespace operations (via lance-namespace-reqwest-client)
+
+**Note**: For actual namespace implementations (REST, Directory, etc.), see the `lance-namespace-impls` crate.
 
 ## Features
 
@@ -24,21 +25,17 @@ The namespace API supports:
 ## Usage
 
 ```rust
-use lance_namespace::{LanceNamespace, RestNamespace};
-use std::collections::HashMap;
+use lance_namespace::LanceNamespace;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a REST namespace client
-    let mut properties = HashMap::new();
-    properties.insert("uri".to_string(), "http://localhost:8080".to_string());
+// For implementations, use lance-namespace-impls:
+// use lance_namespace_impls::connect;
+// let namespace = connect("rest", properties).await?;
+// let namespace = connect("dir", properties).await?;
 
-    let namespace = RestNamespace::new(properties);
-
+// Then use the trait methods:
+async fn example(namespace: &dyn LanceNamespace) {
     // List tables in the namespace
-    let tables = namespace.list_tables(Default::default()).await?;
-
-    Ok(())
+    let tables = namespace.list_tables(Default::default()).await;
 }
 ```
 

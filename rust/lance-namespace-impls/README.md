@@ -7,9 +7,14 @@ Lance Namespace implementation backends.
 This crate provides concrete implementations of the Lance namespace trait:
 
 - Unified connection interface for all implementations
-- **Directory Namespace** - File system-based namespace that stores tables as Lance datasets
+- **REST Namespace** - REST API client for remote Lance namespace servers (feature: `rest`)
+- **Directory Namespace** - File system-based namespace that stores tables as Lance datasets (feature: `dir`)
 
 ## Features
+
+### REST Namespace (feature: `rest`)
+
+The REST namespace implementation provides a client for connecting to remote Lance namespace servers via REST API.
 
 ### Directory Namespace (feature: `dir`)
 

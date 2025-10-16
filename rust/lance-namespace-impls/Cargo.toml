@@ -13,11 +13,23 @@ rust-version.workspace = true
 
 [features]
 default = []
+rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
 dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
 
 [dependencies]
 lance-namespace.workspace = true
 lance-core.workspace = true
+
+# REST implementation dependencies (optional, enabled by "rest" feature)
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "charset",
+    "gzip",
+    "http2",
+    "stream",
+    "rustls-tls-native-roots"
+] }
+serde_json = { workspace = true, optional = true }
 
 # Directory implementation dependencies (optional, enabled by "dir" feature)
 lance = { workspace = true, optional = true }
@@ -35,6 +47,7 @@ snafu.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
+wiremock = "0.6"
 
 [lints]
 workspace = true

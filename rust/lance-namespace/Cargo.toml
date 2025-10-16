@@ -14,16 +14,6 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "charset",
-    "gzip",
-    "http2",
-    "stream",
-    "rustls-tls-native-roots"
-] }
-serde_json.workspace = true
-url.workspace = true
 arrow.workspace = true
 lance-core.workspace = true
 snafu.workspace = true
@@ -33,7 +23,6 @@ lance-namespace-reqwest-client = "0.0.16"
 
 [dev-dependencies]
 tokio.workspace = true
-wiremock = "0.6"
 tempfile.workspace = true
 
 [lints]
