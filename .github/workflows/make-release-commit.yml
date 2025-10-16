@@ -81,30 +81,44 @@ jobs:
       run: |
         CURRENT="${{ steps.current_version.outputs.version }}"
         TYPE="${{ inputs.release_type }}"
-        
-        IFS='.' read -r major minor patch <<< "$CURRENT"
-        
-        case "$TYPE" in
-          major)
-            NEW_VERSION="$((major + 1)).0.0"
-            ;;
-          minor)
-            NEW_VERSION="${major}.$((minor + 1)).0"
-            ;;
-          patch)
-            NEW_VERSION="${major}.${minor}.$((patch + 1))"
-            ;;
-        esac
-        
+        CHANNEL="${{ inputs.release_channel }}"
+
+        # Strip any prerelease suffix to get base version
+        BASE_VERSION=$(echo "$CURRENT" | sed 's/-.*$//')
+        IFS='.' read -r major minor patch <<< "$BASE_VERSION"
+
+        # Determine if we need to bump the base version
+        if [[ "$CHANNEL" == "stable" && "$CURRENT" =~ -beta\. ]]; then
+          # Stable release from beta: use base version without bumping
+          NEW_VERSION="$BASE_VERSION"
+        elif [[ "$CHANNEL" == "preview" && "$CURRENT" =~ -beta\. ]]; then
+          # Preview from preview: keep the same base version, only beta number changes
+          NEW_VERSION="$BASE_VERSION"
+        else
+          # All other cases: bump according to type
+          case "$TYPE" in
+            major)
+              NEW_VERSION="$((major + 1)).0.0"
+              ;;
+            minor)
+              NEW_VERSION="${major}.$((minor + 1)).0"
+              ;;
+            patch)
+              NEW_VERSION="${major}.${minor}.$((patch + 1))"
+              ;;
+          esac
+        fi
+
         echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
         echo "New version will be: $NEW_VERSION"
     
-    - name: Determine tag name
+    - name: Determine tag name and prerelease suffix
       id: tag_name
       run: |
         if [ "${{ inputs.release_channel }}" == "stable" ]; then
           VERSION="${{ steps.new_version.outputs.version }}"
           TAG="v${VERSION}"
+          PRERELEASE=""
         else
           # For preview releases, base the beta tag on the next release version
           VERSION="${{ steps.new_version.outputs.version }}"
@@ -118,26 +132,34 @@ jobs:
             BETA_NUM=$((LAST_NUM + 1))
           fi
           TAG="v${VERSION}-beta.${BETA_NUM}"
+          PRERELEASE="beta.${BETA_NUM}"
         fi
-        
+
         echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
         echo "Tag will be: $TAG"
-    
-    - name: Update version (stable releases only)
-      if: inputs.release_channel == 'stable'
+
+    - name: Update version
       run: |
-        python ci/bump_version.py ${{ inputs.release_type }}
+        if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          python ci/bump_version.py --new-version "${{ steps.new_version.outputs.version }}"
+        else
+          python ci/bump_version.py --new-version "${{ steps.new_version.outputs.version }}-${{ steps.tag_name.outputs.prerelease }}"
+        fi
     
     - name: Configure git identity
       run: |
         git config user.name 'Lance Release Bot'
         git config user.email 'lance-dev@lancedb.com'
-    
-    - name: Create release commit (stable releases only)
-      if: inputs.release_channel == 'stable'
+
+    - name: Create release commit
       run: |
         git add -A
-        git commit -m "chore: release version ${{ steps.new_version.outputs.version }}"
+        if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          git commit -m "chore: release version ${{ steps.new_version.outputs.version }}"
+        else
+          git commit -m "chore: release version ${{ steps.tag_name.outputs.tag }}"
+        fi
     
     - name: Create tag
       run: |
@@ -146,11 +168,9 @@ jobs:
     - name: Push changes (if not dry run)
       if: ${{ !inputs.dry_run }}
       run: |
-        if [ "${{ inputs.release_channel }}" == "stable" ]; then
-          # Push the commit for stable releases
-          git push origin main
-        fi
-        # Always push the tag
+        # Push the commit to main
+        git push origin main
+        # Push the tag
         git push origin "${{ steps.tag_name.outputs.tag }}"
     
     - name: Create GitHub Release (if not dry run)
@@ -164,12 +184,14 @@ jobs:
         generate_release_notes: true
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
     
-    - name: Prepare for next development cycle (stable releases only)
-      if: inputs.release_channel == 'stable' && !inputs.dry_run
+    - name: Next steps
+      if: ${{ !inputs.dry_run }}
       run: |
-        # After a stable release, bump to the next patch version with -dev suffix
-        # This will be handled in a follow-up PR
-        echo "Next steps: Create a PR to bump version for next development cycle"
+        if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          echo "Stable release complete. Version bumped to ${{ steps.new_version.outputs.version }}"
+        else
+          echo "Preview release complete. Version bumped to ${{ steps.new_version.outputs.version }}-${{ steps.tag_name.outputs.prerelease }}"
+        fi
     
     - name: Summary
       run: |
