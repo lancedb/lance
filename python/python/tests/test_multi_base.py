@@ -292,9 +292,9 @@ class TestMultiBase:
                 if base_path and base_path.name == "path1":
                     path1_fragments += 1
 
-        assert (
-            path1_fragments == 2
-        ), f"Expected 2 fragments in path1, got {path1_fragments}"
+        assert path1_fragments == 2, (
+            f"Expected 2 fragments in path1, got {path1_fragments}"
+        )
         assert primary_path_fragments >= 3, (
             f"Expected at least 3 fragments in primary path, "
             f"got {primary_path_fragments}"
@@ -334,12 +334,12 @@ class TestMultiBase:
         assert path2_base is not None, "path2 base not found"
 
         # Verify is_dataset_root flags
-        assert (
-            path1_base.is_dataset_root is True
-        ), f"Expected path1.is_dataset_root=True, got {path1_base.is_dataset_root}"
-        assert (
-            path2_base.is_dataset_root is False
-        ), f"Expected path2.is_dataset_root=False, got {path2_base.is_dataset_root}"
+        assert path1_base.is_dataset_root is True, (
+            f"Expected path1.is_dataset_root=True, got {path1_base.is_dataset_root}"
+        )
+        assert path2_base.is_dataset_root is False, (
+            f"Expected path2.is_dataset_root=False, got {path2_base.is_dataset_root}"
+        )
 
         # Verify data is readable
         result = dataset.to_table().to_pandas()
@@ -408,12 +408,12 @@ class TestMultiBase:
                 elif base_path and base_path.name == "path2":
                     path2_fragments += 1
 
-        assert (
-            path1_fragments == 2
-        ), f"Expected 2 fragments in path1, got {path1_fragments}"
-        assert (
-            path2_fragments == 2
-        ), f"Expected 2 fragments in path2, got {path2_fragments}"
+        assert path1_fragments == 2, (
+            f"Expected 2 fragments in path1, got {path1_fragments}"
+        )
+        assert path2_fragments == 2, (
+            f"Expected 2 fragments in path2, got {path2_fragments}"
+        )
 
     def test_validation_errors(self):
         """Test validation errors for invalid multi-base configurations."""

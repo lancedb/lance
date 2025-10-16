@@ -110,9 +110,9 @@ def test_lance_log_file(tmp_path):
     # Check that stderr is empty or minimal (logs should go to file, not stderr)
     stderr_content = result.stderr.decode().strip()
     # Allow for some minimal output but no actual log messages
-    assert (
-        "DEBUG" not in stderr_content
-    ), "Debug logs should not appear in stderr when file logging is enabled"
+    assert "DEBUG" not in stderr_content, (
+        "Debug logs should not appear in stderr when file logging is enabled"
+    )
 
 
 @pytest.mark.skipif(
@@ -170,9 +170,9 @@ def test_lance_log_file_invalid_path():
     )
 
     # The command should still succeed (fallback to stderr)
-    assert (
-        result.returncode == 0
-    ), f"Command should succeed even with invalid log path: {result.stderr.decode()}"
+    assert result.returncode == 0, (
+        f"Command should succeed even with invalid log path: {result.stderr.decode()}"
+    )
     assert not Path(invalid_path).exists(), "Log file should not be created"
 
     # Should contain an error message about the invalid path
