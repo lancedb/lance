@@ -772,25 +772,6 @@ impl Dataset {
         &self.manifest_location
     }
 
-    async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
-        if compared_version < 1 {
-            return Err(Error::invalid_input(
-                format!("Compared version must be > 0 (got {})", compared_version),
-                Default::default(),
-            ));
-        }
-
-        let current = self.version().version;
-        if current == compared_version {
-            return Err(Error::invalid_input(
-                "Compared version cannot equal to the current version",
-                Default::default(),
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
     ///
     /// # Example
@@ -807,16 +788,6 @@ impl Dataset {
     /// ```
     pub fn delta(&self) -> delta::DatasetDeltaBuilder {
         delta::DatasetDeltaBuilder::new(self.clone())
-    }
-
-    /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
-    pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
-        self.validate_compared_version(compared_version).await?;
-        let ds_delta = self
-            .delta()
-            .compared_against_version(compared_version)
-            .build()?;
-        ds_delta.list_transactions().await
     }
 
     // TODO: Cache this
