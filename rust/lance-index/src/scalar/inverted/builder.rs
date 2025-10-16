@@ -584,8 +584,7 @@ impl IndexWorker {
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text) as usize;
+                    let token_id = self.builder.tokens.add(&token.text) as usize;
                     token_occurrences
                         .entry(token_id as u32)
                         .or_insert_with(|| PositionRecorder::new(with_position))

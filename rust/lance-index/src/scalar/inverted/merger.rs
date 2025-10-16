@@ -126,7 +126,7 @@ impl Merger for SizeBasedMerger<'_> {
             let mut inv_token = HashMap::with_capacity(part.tokens.len());
             // merge token set
             for (token, token_id) in part.tokens.iter() {
-                self.builder.tokens.add(token.clone());
+                self.builder.tokens.add(&token);
                 inv_token.insert(token_id, token);
             }
             // merge doc set

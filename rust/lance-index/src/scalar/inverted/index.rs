@@ -1073,21 +1073,21 @@ impl TokenSet {
         })
     }
 
-    pub fn add(&mut self, token: String) -> u32 {
-        let next_id = self.next_id();
-        let len = token.len();
-        let token_id = match self.tokens {
-            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
-            _ => unreachable!("tokens must be HashMap while indexing"),
+    pub fn add(&mut self, token: &str) -> u32 {
+        // TODO: What if we had something more efficient than HashMap here?
+        let map = match self.tokens {
+            TokenMap::HashMap(ref mut map) => map,
+            _ => panic!("tokens must be HashMap while indexing"),
         };
-
-        // add token if it doesn't exist
-        if token_id == next_id {
+        if let Some(&id) = map.get(token) {
+            id
+        } else {
+            let id = self.next_id;
+            map.insert(token.to_string(), id);
             self.next_id += 1;
-            self.total_length += len;
+            self.total_length += token.len();
+            id
         }
-
-        token_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -2539,8 +2539,8 @@ mod tests {
         // 0: lance
         // 1: lake lake
         // 2: lake lake lake
-        builder.tokens.add("lance".to_owned());
-        builder.tokens.add("lake".to_owned());
+        builder.tokens.add("lance");
+        builder.tokens.add("lake");
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -2598,7 +2598,7 @@ mod tests {
 
         // Create first partition with one token and posting list length 1
         let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
-        builder1.tokens.add("test".to_owned());
+        builder1.tokens.add("test");
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
         builder1.docs.append(100, 1); // row_id=100, num_tokens=1
@@ -2606,7 +2606,7 @@ mod tests {
 
         // Create second partition with one token and posting list length 4
         let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
-        builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+        builder2.tokens.add("test"); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
         builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
         builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
