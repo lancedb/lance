@@ -16,7 +16,7 @@ default = []
 dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
 
 [dependencies]
-lance-namespace = { workspace = true }
+lance-namespace.workspace = true
 
 # Directory implementation dependencies (optional, enabled by "dir" feature)
 lance = { workspace = true, optional = true }
@@ -27,13 +27,13 @@ arrow-schema = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
 # Common dependencies
-async-trait = { workspace = true }
-bytes = { workspace = true }
-thiserror = "1.0"
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-tempfile = { workspace = true }
+tempfile.workspace = true
 
 [lints]
 workspace = true
