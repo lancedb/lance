@@ -6,8 +6,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::{Error, Result};
-use lance_namespace::LanceNamespace;
+use lance_namespace::{LanceNamespace, RestNamespace};
+
+/// Error type for connection-related operations
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("Unknown implementation: {0}")]
+    UnknownImpl(String),
+
+    #[error("Failed to construct implementation: {0}")]
+    ConstructionError(String),
+
+    #[error("Missing required property: {0}")]
+    MissingProperty(String),
+
+    #[error("Other error: {0}")]
+    Other(String),
+}
 
 /// Connect to a Lance namespace implementation.
 ///
@@ -17,7 +32,7 @@ use lance_namespace::LanceNamespace;
 /// # Arguments
 ///
 /// * `impl_name` - Implementation identifier. Supported values:
-///   - "rest": REST API implementation (requires "rest" feature)
+///   - "rest": REST API implementation
 ///   - "dir": Directory-based implementation (requires "dir" feature)
 ///
 /// * `properties` - Configuration properties specific to the implementation.
@@ -60,46 +75,25 @@ use lance_namespace::LanceNamespace;
 pub async fn connect(
     impl_name: &str,
     properties: HashMap<String, String>,
-) -> Result<Arc<dyn LanceNamespace>> {
+) -> Result<Arc<dyn LanceNamespace>, ConnectError> {
     match impl_name {
-        #[cfg(feature = "rest")]
         "rest" => {
             // Create REST implementation
-            Ok(Arc::new(crate::rest::RestNamespace::new(properties)))
+            Ok(Arc::new(RestNamespace::new(properties)))
         }
-        #[cfg(not(feature = "rest"))]
-        "rest" => Err(Error::Namespace {
-            source: "REST namespace implementation requires 'rest' feature to be enabled".into(),
-            location: snafu::location!(),
-        }),
         #[cfg(feature = "dir")]
         "dir" => {
             // Create directory implementation
             crate::dir::connect_dir(properties).await
         }
         #[cfg(not(feature = "dir"))]
-        "dir" => Err(Error::Namespace {
-            source: "Directory namespace implementation requires 'dir' feature to be enabled"
-                .into(),
-            location: snafu::location!(),
-        }),
-        _ => Err(Error::Namespace {
-            source: format!(
-                "Implementation '{}' is not available. Supported: {}{}",
-                impl_name,
-                if cfg!(feature = "rest") { "rest" } else { "" },
-                if cfg!(feature = "dir") {
-                    if cfg!(feature = "rest") {
-                        ", dir"
-                    } else {
-                        "dir"
-                    }
-                } else {
-                    ""
-                }
-            )
-            .into(),
-            location: snafu::location!(),
-        }),
+        "dir" => Err(ConnectError::Other(
+            "Directory namespace implementation requires 'dir' feature to be enabled".to_string(),
+        )),
+        _ => Err(ConnectError::UnknownImpl(format!(
+            "Implementation '{}' is not available. Supported: rest{}",
+            impl_name,
+            if cfg!(feature = "dir") { ", dir" } else { "" }
+        ))),
     }
 }

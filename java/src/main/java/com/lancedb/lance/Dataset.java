@@ -16,11 +16,16 @@ package com.lancedb.lance;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.io.CredentialVendor;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.merge.MergeInsertParams;
 import com.lancedb.lance.merge.MergeInsertResult;
+import com.lancedb.lance.namespace.LanceNamespace;
+import com.lancedb.lance.namespace.LanceNamespaceCredentialVendor;
+import com.lancedb.lance.namespace.model.DescribeTableRequest;
+import com.lancedb.lance.namespace.model.DescribeTableResponse;
 import com.lancedb.lance.operation.UpdateConfig;
 import com.lancedb.lance.operation.UpdateMap;
 import com.lancedb.lance.schema.ColumnAlteration;
@@ -157,6 +162,122 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions);
 
   /**
+   * Create a dataset in a LanceNamespace using a schema.
+   *
+   * <p>This automatically fetches the table location and credentials from the namespace via
+   * describe_table(). Credentials will be automatically refreshed before they expire.
+   *
+   * @param allocator buffer allocator
+   * @param namespace The namespace implementation to fetch table info from
+   * @param tableId The table identifier (e.g., Arrays.asList("my_table"))
+   * @param schema dataset schema
+   * @param params write parameters
+   * @return Dataset
+   */
+  public static Dataset createInNamespace(
+      BufferAllocator allocator,
+      LanceNamespace namespace,
+      List<String> tableId,
+      Schema schema,
+      WriteParams params) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(namespace);
+    Preconditions.checkNotNull(tableId);
+    Preconditions.checkNotNull(schema);
+    Preconditions.checkNotNull(params);
+
+    // Call describe_table to get location and credentials
+    DescribeTableRequest request = new DescribeTableRequest();
+    request.setId(tableId);
+
+    DescribeTableResponse response = namespace.describeTable(request);
+
+    // Extract location
+    String location = response.getLocation();
+    if (location == null || location.isEmpty()) {
+      throw new IllegalArgumentException("Namespace did not return a table location");
+    }
+
+    // Merge initial storage options from describe_table with user-provided options
+    Map<String, String> storageOptions = new HashMap<>(params.getStorageOptions());
+    if (response.getStorageOptions() != null) {
+      storageOptions.putAll(response.getStorageOptions());
+    }
+
+    // Create new WriteParams with merged storage options
+    WriteParams.Builder paramsBuilder =
+        new WriteParams.Builder().withStorageOptions(storageOptions);
+
+    // Copy optional values from original params
+    params.getMaxRowsPerFile().ifPresent(paramsBuilder::withMaxRowsPerFile);
+    params.getMaxRowsPerGroup().ifPresent(paramsBuilder::withMaxRowsPerGroup);
+    params.getMaxBytesPerFile().ifPresent(paramsBuilder::withMaxBytesPerFile);
+    params.getMode().ifPresent(mode -> paramsBuilder.withMode(WriteParams.WriteMode.valueOf(mode)));
+    params.getEnableStableRowIds().ifPresent(paramsBuilder::withEnableStableRowIds);
+
+    // Use regular create method with the fetched location
+    return create(allocator, location, schema, paramsBuilder.build());
+  }
+
+  /**
+   * Create a dataset in a LanceNamespace using an ArrowArrayStream.
+   *
+   * <p>This automatically fetches the table location and credentials from the namespace via
+   * describe_table(). Credentials will be automatically refreshed before they expire.
+   *
+   * @param allocator buffer allocator
+   * @param namespace The namespace implementation to fetch table info from
+   * @param tableId The table identifier (e.g., Arrays.asList("my_table"))
+   * @param stream arrow stream
+   * @param params write parameters
+   * @return Dataset
+   */
+  public static Dataset createInNamespace(
+      BufferAllocator allocator,
+      LanceNamespace namespace,
+      List<String> tableId,
+      ArrowArrayStream stream,
+      WriteParams params) {
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(namespace);
+    Preconditions.checkNotNull(tableId);
+    Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(params);
+
+    // Call describe_table to get location and credentials
+    DescribeTableRequest request = new DescribeTableRequest();
+    request.setId(tableId);
+
+    DescribeTableResponse response = namespace.describeTable(request);
+
+    // Extract location
+    String location = response.getLocation();
+    if (location == null || location.isEmpty()) {
+      throw new IllegalArgumentException("Namespace did not return a table location");
+    }
+
+    // Merge initial storage options from describe_table with user-provided options
+    Map<String, String> storageOptions = new HashMap<>(params.getStorageOptions());
+    if (response.getStorageOptions() != null) {
+      storageOptions.putAll(response.getStorageOptions());
+    }
+
+    // Create new WriteParams with merged storage options
+    WriteParams.Builder paramsBuilder =
+        new WriteParams.Builder().withStorageOptions(storageOptions);
+
+    // Copy optional values from original params
+    params.getMaxRowsPerFile().ifPresent(paramsBuilder::withMaxRowsPerFile);
+    params.getMaxRowsPerGroup().ifPresent(paramsBuilder::withMaxRowsPerGroup);
+    params.getMaxBytesPerFile().ifPresent(paramsBuilder::withMaxBytesPerFile);
+    params.getMode().ifPresent(mode -> paramsBuilder.withMode(WriteParams.WriteMode.valueOf(mode)));
+    params.getEnableStableRowIds().ifPresent(paramsBuilder::withEnableStableRowIds);
+
+    // Use regular create method with the fetched location
+    return create(allocator, stream, location, paramsBuilder.build());
+  }
+
+  /**
    * Open a dataset from the specified path.
    *
    * @param path file path
@@ -220,7 +341,8 @@ public class Dataset implements Closeable {
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
-            options.getSerializedManifest());
+            options.getSerializedManifest(),
+            options.getCredentialVendor());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -233,7 +355,109 @@ public class Dataset implements Closeable {
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
-      Optional<ByteBuffer> serializedManifest);
+      Optional<ByteBuffer> serializedManifest,
+      Optional<CredentialVendor> credentialVendor);
+
+  /**
+   * Open a dataset from a LanceNamespace.
+   *
+   * <p>This automatically fetches the table location and credentials from the namespace via
+   * describe_table(). Credentials will be automatically refreshed before they expire.
+   *
+   * @param namespace The namespace implementation to fetch table info from
+   * @param tableId The table identifier (e.g., Arrays.asList("my_table"))
+   * @return Dataset
+   */
+  public static Dataset openFromNamespace(LanceNamespace namespace, List<String> tableId) {
+    return openFromNamespace(
+        new RootAllocator(Long.MAX_VALUE),
+        true,
+        namespace,
+        tableId,
+        new ReadOptions.Builder().build());
+  }
+
+  /**
+   * Open a dataset from a LanceNamespace with options.
+   *
+   * @param namespace The namespace implementation
+   * @param tableId The table identifier
+   * @param options Read options
+   * @return Dataset
+   */
+  public static Dataset openFromNamespace(
+      LanceNamespace namespace, List<String> tableId, ReadOptions options) {
+    return openFromNamespace(new RootAllocator(Long.MAX_VALUE), true, namespace, tableId, options);
+  }
+
+  /**
+   * Open a dataset from a LanceNamespace with allocator and options.
+   *
+   * @param allocator Arrow buffer allocator
+   * @param namespace The namespace implementation
+   * @param tableId The table identifier
+   * @param options Read options
+   * @return Dataset
+   */
+  public static Dataset openFromNamespace(
+      BufferAllocator allocator,
+      LanceNamespace namespace,
+      List<String> tableId,
+      ReadOptions options) {
+    return openFromNamespace(allocator, false, namespace, tableId, options);
+  }
+
+  private static Dataset openFromNamespace(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      LanceNamespace namespace,
+      List<String> tableId,
+      ReadOptions options) {
+    Preconditions.checkNotNull(namespace);
+    Preconditions.checkNotNull(tableId);
+    Preconditions.checkNotNull(allocator);
+    Preconditions.checkNotNull(options);
+
+    // Call describe_table to get location and credentials
+    DescribeTableRequest request = new DescribeTableRequest();
+    request.setId(tableId);
+    // Only set version if present
+    options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
+
+    DescribeTableResponse response = namespace.describeTable(request);
+
+    // Extract location
+    String location = response.getLocation();
+    if (location == null || location.isEmpty()) {
+      throw new IllegalArgumentException("Namespace did not return a table location");
+    }
+
+    // Create credential vendor from namespace
+    LanceNamespaceCredentialVendor credentialVendor =
+        new LanceNamespaceCredentialVendor(namespace, tableId);
+
+    // Build new ReadOptions with credential vendor and initial storage options
+    ReadOptions.Builder optionsBuilder =
+        new ReadOptions.Builder()
+            .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
+            .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes())
+            .setCredentialVendor(credentialVendor);
+
+    // Set optional fields only if present
+    options.getVersion().ifPresent(optionsBuilder::setVersion);
+    options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
+    options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
+
+    // Add initial storage options from describe_table response if present
+    Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
+    if (response.getStorageOptions() != null) {
+      storageOptions.putAll(response.getStorageOptions());
+    }
+    optionsBuilder.setStorageOptions(storageOptions);
+
+    // Open dataset with regular open method
+    return open(allocator, selfManagedAllocator, location, optionsBuilder.build());
+  }
 
   /**
    * Create a new version of dataset. Use {@link Transaction} instead

@@ -8,7 +8,7 @@ import os
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
-from . import log
+from . import io, log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
@@ -25,13 +25,16 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
+from .io import CredentialVendor, StaticCredentialVendor
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
+    connect_namespace,
     iops_counter,
 )
+from .namespace import LanceNamespaceCredentialVendor
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -48,6 +51,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "CredentialVendor",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -55,26 +59,30 @@ __all__ = [
     "Index",
     "LanceDataset",
     "LanceFragment",
+    "LanceNamespaceCredentialVendor",
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
     "ScanStatistics",
+    "StaticCredentialVendor",
     "Transaction",
     "__version__",
-    "bytes_read_counter",
-    "iops_counter",
-    "write_dataset",
-    "schema_to_json",
-    "json_to_schema",
-    "dataset",
     "batch_udf",
+    "bytes_read_counter",
+    "connect_namespace",
+    "dataset",
+    "io",
+    "iops_counter",
+    "json_to_schema",
+    "schema_to_json",
     "set_logger",
+    "write_dataset",
     "FFILanceTableProvider",
 ]
 
 
 def dataset(
-    uri: Union[str, Path],
+    uri: Optional[Union[str, Path]] = None,
     version: Optional[int | str] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
@@ -86,15 +94,19 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
+    credential_vendor: Optional[CredentialVendor] = None,
+    namespace: Optional[any] = None,
+    table_id: Optional[list] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
 
     Parameters
     ----------
-    uri : str
+    uri : str, optional
         Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
         or a cloud object store URI, i.e., `s3://bucket/data.lance`.
+        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -143,7 +155,72 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
+    credential_vendor : optional, lance.CredentialVendor
+        A credential vendor to use for this dataset. This is used to provide
+        dynamic credentials for cloud storage access. If not specified, static
+        credentials from storage_options will be used.
+    namespace : optional, lance._lib._Namespace
+        A namespace instance from which to fetch table location and credentials.
+        Must be provided together with `table_id`. Cannot be used with `uri`.
+        When provided, the table location will be fetched automatically from the
+        namespace via describe_table(). Credentials will be automatically refreshed
+        before they expire.
+    table_id : optional, list of str
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace`. Cannot be used with `uri`.
+
+    Notes
+    -----
+    When using `namespace` and `table_id`:
+    - The `uri` parameter is optional and will be fetched from the namespace
+    - A `LanceNamespaceCredentialVendor` will be created automatically
+    - Initial storage credentials from describe_table() will be merged with
+      any provided `storage_options`
     """
+    # Validate that user provides either uri OR (namespace + table_id), not both
+    has_uri = uri is not None
+    has_namespace = namespace is not None or table_id is not None
+
+    if has_uri and has_namespace:
+        raise ValueError(
+            "Cannot specify both 'uri' and 'namespace/table_id'. "
+            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+        )
+    elif not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+        )
+
+    # Handle namespace-based dataset opening
+    if namespace is not None:
+        if table_id is None:
+            raise ValueError(
+                "Both 'namespace' and 'table_id' must be provided together."
+            )
+
+        # Call describe_table to get location and credentials
+        table_info = namespace.describe_table(table_id=table_id, version=version)
+
+        # Extract location from namespace response
+        uri = table_info.get("location")
+        if not uri:
+            raise ValueError("Namespace did not return a table location")
+
+        # Create credential vendor from namespace
+        if credential_vendor is None:
+            credential_vendor = LanceNamespaceCredentialVendor(namespace, table_id)
+
+        # Merge initial storage options from describe_table with user-provided options
+        namespace_storage_options = table_info.get("storage_options", {})
+        if storage_options:
+            # User-provided options take precedence
+            merged_storage_options = {**namespace_storage_options, **storage_options}
+        else:
+            merged_storage_options = namespace_storage_options
+        storage_options = merged_storage_options
+    elif table_id is not None:
+        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+
     ds = LanceDataset(
         uri,
         version,
@@ -156,6 +233,7 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
+        credential_vendor=credential_vendor,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -179,6 +257,7 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
+                credential_vendor=credential_vendor,
             )
     else:
         return ds

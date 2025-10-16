@@ -1,44 +1,11 @@
-# lance-namespace
+# Lance Namespace
 
-Lance Namespace Core APIs for managing namespaces and tables.
+**Lance Namespace** is an open specification on top of the storage-based Lance data format
+to standardize access to a collection of Lance tables (a.k.a. Lance datasets).
+It describes how a metadata service like Apache Hive MetaStore (HMS),
+Apache Gravitino, Unity Catalog, etc. should store and use Lance tables, 
+as well as how ML/AI tools and analytics compute engines should integrate with Lance tables.
 
-## Overview
+For more details, please visit the [documentation website](https://lancedb.github.io/lance/format/namespace).
 
-This crate provides the core APIs and trait definitions for Lance namespaces, including:
-
-- `LanceNamespace` trait - The main interface for namespace operations
-- Schema conversion utilities for Arrow schemas
-- Models and APIs for namespace operations (via lance-namespace-reqwest-client)
-
-**Note**: For actual namespace implementations (REST, Directory, etc.), see the `lance-namespace-impls` crate.
-
-## Features
-
-The namespace API supports:
-
-- Creating and managing namespaces
-- Creating and managing tables within namespaces
-- Listing namespaces and tables
-- Schema management
-- Multiple backend implementations (REST, directory-based, etc.)
-
-## Usage
-
-```rust
-use lance_namespace::LanceNamespace;
-
-// For implementations, use lance-namespace-impls:
-// use lance_namespace_impls::connect;
-// let namespace = connect("rest", properties).await?;
-// let namespace = connect("dir", properties).await?;
-
-// Then use the trait methods:
-async fn example(namespace: &dyn LanceNamespace) {
-    // List tables in the namespace
-    let tables = namespace.list_tables(Default::default()).await;
-}
-```
-
-## Documentation
-
-For more information about Lance and its namespace system, see the [Lance Namespace documentation](https://lancedb.github.io/lance/format/namespace).
+For development setup and contribution guidelines, please see [CONTRIBUTING.md](CONTRIBUTING.md).
