@@ -1411,7 +1411,10 @@ public class DatasetTest {
         long srcRowCount = src.countRows();
         Schema srcSchema = src.getSchema();
 
-        try (Dataset clone = src.shallowClone(dstPathByVersion, src.version(), Optional.empty())) {
+        // shallow clone by version
+        try (Dataset clone =
+            src.shallowClone(
+                dstPathByVersion, Reference.builder().versionNumber(src.version()).build())) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());
@@ -1429,9 +1432,8 @@ public class DatasetTest {
 
         // shallow clone by tag
         src.tags().create("tag", src.version());
-
-        Optional<Map<String, String>> storageOptions = Optional.empty();
-        try (Dataset clone = src.shallowClone(dstPathByTag, "tag", storageOptions)) {
+        try (Dataset clone =
+            src.shallowClone(dstPathByTag, Reference.builder().tagName("tag").build())) {
           // Validate the tag cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByTag, clone.uri());

@@ -24,7 +24,7 @@ use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
-use lance::dataset::refs::TagContents;
+use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
@@ -1009,30 +1009,30 @@ fn inner_restore(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeShallowCloneVersion<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeShallowClone<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     target_path: JString,
-    version: jlong,
+    reference: JObject,
     storage_options: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_shallow_clone_version(
+        inner_shallow_clone(
             &mut env,
             java_dataset,
             target_path,
-            version,
+            reference,
             storage_options
         )
     )
 }
 
-fn inner_shallow_clone_version<'local>(
+fn inner_shallow_clone<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     target_path: JString,
-    version: jlong,
+    reference: JObject,
     storage_options: JObject,
 ) -> Result<JObject<'local>> {
     let target_path_str = target_path.extract(env)?;
@@ -1041,63 +1041,31 @@ fn inner_shallow_clone_version<'local>(
         to_rust_map(env, &jmap)
     })?;
 
-    let new_ds = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(
-            dataset_guard.inner.shallow_clone(
-                &target_path_str,
-                version as u64,
-                storage_options
-                    .map(|options| {
-                        Some(ObjectStoreParams {
-                            storage_options: Some(options),
-                            ..Default::default()
-                        })
-                    })
-                    .unwrap_or(None),
-            ),
-        )?
+    let reference = {
+        let version_number = env.get_optional_u64_from_method(&reference, "getVersionNumber")?;
+        let tag_name = env.get_optional_string_from_method(&reference, "getTagName")?;
+        let branch_name = env.get_optional_string_from_method(&reference, "getBranchName")?;
+        match (version_number, branch_name, tag_name) {
+            (Some(version_number), branch_name, None) => {
+                Ref::Version(branch_name, Some(version_number))
+            }
+            (None, None, Some(tag_name)) => Ref::Tag(tag_name),
+            _ => {
+                return Err(Error::input_error(
+                    "One of (optional branch, version_number) and tag must be specified"
+                        .to_string(),
+                ))
+            }
+        }
     };
 
-    BlockingDataset { inner: new_ds }.into_java(env)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeShallowCloneTag<'local>(
-    mut env: JNIEnv<'local>,
-    java_dataset: JObject,
-    target_path: JString,
-    tag: JString,
-    storage_options: JObject,
-) -> JObject<'local> {
-    ok_or_throw!(
-        env,
-        inner_shallow_clone_tag(&mut env, java_dataset, target_path, tag, storage_options)
-    )
-}
-
-fn inner_shallow_clone_tag<'local>(
-    env: &mut JNIEnv<'local>,
-    java_dataset: JObject,
-    target_path: JString,
-    tag: JString,
-    storage_options: JObject, // Optional<Map<String, String>>
-) -> Result<JObject<'local>> {
-    let target_path_str = target_path.extract(env)?;
-    let tag_str = tag.extract(env)?;
-    let storage_options = env.get_optional(&storage_options, |env, map_obj| {
-        let jmap = JMap::from_env(env, map_obj)?;
-        to_rust_map(env, &jmap)
-    })?;
-
     let new_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         RT.block_on(
             dataset_guard.inner.shallow_clone(
                 &target_path_str,
-                tag_str.as_str(),
+                reference,
                 storage_options
                     .map(|options| {
                         Some(ObjectStoreParams {
