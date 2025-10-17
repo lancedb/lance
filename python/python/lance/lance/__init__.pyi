@@ -527,10 +527,17 @@ class PyFullTextQuery:
     ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
+    """Statistics about a scan operation."""
+
     iops: int
+    requests: int
     bytes_read: int
     indices_loaded: int
     parts_loaded: int
+    index_comparisons: int
+    all_counts: Dict[
+        str, int
+    ]  # Additional metrics for debugging purposes. Subject to change.
 
 __version__: str
 language_model_home: Callable[[], str]
