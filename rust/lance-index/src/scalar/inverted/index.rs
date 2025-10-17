@@ -34,7 +34,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use fst::{Automaton, IntoStreamer, Streamer};
+use fst::{Automaton, Streamer};
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
@@ -954,21 +954,6 @@ impl TokenSet {
         Ok(batch)
     }
 
-    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Vec<u8>>> {
-        let mut entries: Vec<_> = map.into_iter().collect();
-        entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-        let mut builder = fst::MapBuilder::memory();
-        for (token, token_id) in entries {
-            builder
-                .insert(&token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
-                    location: location!(),
-                })?;
-        }
-        Ok(builder.into_map())
-    }
-
     pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
         match format {
             TokenSetFormat::Arrow => Self::load_arrow(reader).await,
@@ -1062,15 +1047,28 @@ impl TokenSet {
     }
 
     pub fn add(&mut self, token: &str) -> u32 {
-        match self.tokens {
-            TokenMap::Appendable(ref mut map) => map.add(token),
-            _ => panic!("tokens must be HashMap while indexing"),
+        let map = match self.tokens {
+            TokenMap::Appendable(ref mut map) => map,
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        };
+
+        if let Some(token_id) = map.get(token) {
+            token_id
+        } else {
+            let token_id = self.next_id;
+            // Safety: we just verified the key doesn't exist, and have exclusive access to the map
+            unsafe {
+                map.insert_unchecked(token, token_id);
+            }
+            self.next_id += 1;
+            self.total_length += token.len();
+            token_id
         }
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
         match self.tokens {
-            TokenMap::Appendable(ref map) => map.get(token).copied(),
+            TokenMap::Appendable(ref map) => map.get(token),
             TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
         }
     }
@@ -1083,17 +1081,23 @@ impl TokenSet {
 
         let expected_len = self.len() - removed_token_ids.len();
 
-        let map = self
-            .iter()
+        let mut new_map = AppendableTokenSet::with_capacity(expected_len);
+        self.iter()
             .filter(
                 |(_, token_id)| match removed_token_ids.binary_search(token_id) {
                     Ok(_) => false,
                     Err(_) => true,
                 },
             )
-            .collect::<AppendableTokenSet>();
+            .for_each(|(token, token_id)| {
+                // Safety: we are only removing tokens, so there should be no duplicates
+                // and we have exclusive access to the map.
+                unsafe {
+                    new_map.insert_unchecked(&token, token_id);
+                }
+            });
 
-        self.tokens = TokenMap::HashMap(map);
+        self.tokens = TokenMap::Appendable(new_map);
     }
 
     pub fn next_id(&self) -> u32 {
