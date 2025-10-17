@@ -145,12 +145,12 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     .unwrap()
 }
 
-/// Create duplicate rows error via extracting "on" column values from the given RecordBatch.
-fn create_duplicate_row_error(
+/// Format key values for error messages via extracting "on" column values from the given RecordBatch.
+fn format_key_values_on_columns(
     batch: &RecordBatch,
     row_idx: usize,
     on_columns: &[String],
-) -> DataFusionError {
+) -> String {
     let mut on_values = Vec::new();
 
     for col_name in on_columns {
@@ -174,17 +174,24 @@ fn create_duplicate_row_error(
         }
     }
 
-    let on_values_str = if on_values.is_empty() {
+    if on_values.is_empty() {
         "<unable to extract on column values>".to_string()
     } else {
         on_values.join(", ")
-    };
+    }
+}
 
+/// Create duplicate rows error via extracting "on" column values from the given RecordBatch.
+fn create_duplicate_row_error(
+    batch: &RecordBatch,
+    row_idx: usize,
+    on_columns: &[String],
+) -> DataFusionError {
     DataFusionError::Execution(
         format!(
             "Ambiguous merge insert: multiple source rows match the same target row on ({}). \
                                 This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
-            on_values_str
+            format_key_values_on_columns(batch, row_idx, on_columns)
         )
     )
 }
@@ -244,6 +251,10 @@ pub enum WhenMatched {
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
     UpdateIf(String),
+    /// Fail the operation if a match is found
+    ///
+    /// This can be used to ensure that no existing rows are overwritten or modified after inserted.
+    Fail,
 }
 
 impl WhenMatched {
@@ -1374,7 +1385,7 @@ impl MergeInsertJob {
     /// Check if the merge insert operation can use the fast path (create_plan).
     ///
     /// The fast path is only available for specific conditions:
-    /// - when_matched is UpdateAll or UpdateIf
+    /// - when_matched is UpdateAll or UpdateIf or Fail
     /// - Either use_index is false OR there's no scalar index on join key
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep
@@ -1394,7 +1405,7 @@ impl MergeInsertJob {
 
         Ok(matches!(
             self.params.when_matched,
-            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
+            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::Fail
         ) && (!self.params.use_index || !has_scalar_index)
             && is_full_schema
             && matches!(
@@ -4836,5 +4847,91 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert_eq!(value_bitmap.len(), 2);
         assert!(value_bitmap.contains(0));
         assert!(value_bitmap.contains(1));
+    }
+
+    #[tokio::test]
+    async fn test_when_matched_fail() {
+        let dataset = create_test_dataset("memory://test_fail", LanceFileVersion::V2_0, true).await;
+
+        // Create new data with some existing keys (should fail)
+        let new_data = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 10, 11])), // Keys: 1,2 exist, 10,11 are new
+                Arc::new(UInt32Array::from(vec![100, 200, 1000, 1100])),
+                Arc::new(StringArray::from(vec!["X", "Y", "Z", "W"])),
+            ],
+        )
+        .unwrap();
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(new_data.clone())],
+            new_data.schema(),
+        ));
+        let new_stream = reader_to_stream(reader);
+
+        let result = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::Fail)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(new_stream)
+            .await;
+
+        // Should fail because keys 1 and 2 already exist
+        match result {
+            Ok((_dataset, stats)) => {
+                panic!(
+                    "Expected merge insert to fail, but it succeeded. Stats: {:?}",
+                    stats
+                );
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                assert!(error_msg.contains("Merge insert failed"));
+                assert!(error_msg.contains("found matching row"));
+            }
+        }
+
+        // Create new data with only new keys (should succeed)
+        let new_data = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(UInt32Array::from(vec![10, 11, 12])), // All new keys
+                Arc::new(UInt32Array::from(vec![1000, 1100, 1200])),
+                Arc::new(StringArray::from(vec!["X", "Y", "Z"])),
+            ],
+        )
+        .unwrap();
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(new_data.clone())],
+            new_data.schema(),
+        ));
+        let new_stream = reader_to_stream(reader);
+
+        let (updated_dataset, stats) =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Fail)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute(new_stream)
+                .await
+                .unwrap();
+
+        // Should succeed with 3 new rows inserted
+        assert_eq!(stats.num_inserted_rows, 3);
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_deleted_rows, 0);
+
+        // Verify the data was inserted correctly
+        let count = updated_dataset
+            .count_rows(Some("key >= 10".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
     }
 }

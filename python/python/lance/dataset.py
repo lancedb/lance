@@ -159,6 +159,17 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
+    def when_matched_fail(self) -> "MergeInsertBuilder":
+        """
+        Configure the operation to fail if any rows match
+
+        After this method is called, when the merge insert operation executes,
+        if there are any rows that match between the source table and the target table,
+        the entire operation will fail with an exception.
+        This is useful for ensuring that no existing rows are overwritten or modified.
+        """
+        return super(MergeInsertBuilder, self).when_matched_fail()
+
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows

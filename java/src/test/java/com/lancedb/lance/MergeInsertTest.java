@@ -39,6 +39,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
 
@@ -155,6 +156,65 @@ public class MergeInsertTest {
         Assertions.assertEquals(
             "{0=Person 0, 1=Person 1, 2=Person 2, 4=Person 4}",
             readAll(result.dataset()).toString());
+      }
+    }
+  }
+
+  @Test
+  public void testWhenMatchedFailWithMatches() throws Exception {
+    // Test fail when there are matched rows
+
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Assertions.assertThrows(
+            Exception.class,
+            () ->
+                dataset.mergeInsert(
+                    new MergeInsertParams(Collections.singletonList("id")).withMatchedFail(),
+                    sourceStream));
+
+        // Verify dataset remains unchanged
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after failed mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testWhenMatchedFailWithoutMatches() throws Exception {
+    // Test success when there are no matched rows
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(testDataset.getSchema(), allocator)) {
+      root.allocateNew();
+
+      IntVector idVector = (IntVector) root.getVector("id");
+      VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+      List<Integer> sourceIds = Arrays.asList(100, 101, 102);
+      for (int i = 0; i < sourceIds.size(); i++) {
+        idVector.setSafe(i, sourceIds.get(i));
+        String name = "New Data " + sourceIds.get(i);
+        nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+      }
+
+      root.setRowCount(sourceIds.size());
+
+      try (ArrowArrayStream sourceStream = convertToStream(root, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id")).withMatchedFail(),
+                sourceStream);
+
+        // Verify new data is inserted
+        Map<Integer, String> resultMap = readAll(result.dataset());
+        for (int id : sourceIds) {
+          Assertions.assertTrue(resultMap.containsKey(id));
+          Assertions.assertEquals("New Data " + id, resultMap.get(id));
+        }
       }
     }
   }
