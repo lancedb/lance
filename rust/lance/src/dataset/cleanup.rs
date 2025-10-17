@@ -117,20 +117,40 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<RemovalStats> {
-        // First we process all manifest files in parallel to figure
+        let mut final_stats = RemovalStats::default();
+        // First check if we need to clean referenced branches
+        // For cases that referenced branches never clean and the current cleanup cannot clean anything
+        // This must happen before cleaning the current branch if the setting is enabled.
+
+        let referenced_branches = self.find_referenced_branches().await?;
+        if self.policy.clean_referenced_branches {
+            self.clean_referenced_branches(&referenced_branches).await?;
+        }
+
+        // we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
 
         // get protected manifests first, and include those in process_manifests
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
-
         let tags = self.dataset.tags().list().await?;
+        let current_branch = &self.dataset.manifest.branch;
         let tagged_versions: HashSet<u64> = tags
             .values()
+            .filter(|tag| match (tag.branch.as_ref(), current_branch.as_ref()) {
+                (Some(tag_branch), Some(current_branch)) => {
+                    tag_branch == current_branch || referenced_branches.contains(tag_branch)
+                }
+                (Some(tag_branch), None) => referenced_branches.contains(tag_branch),
+                (None, Some(_)) => false,
+                (None, None) => true,
+            })
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let inspection = self.process_manifests(&tagged_versions).await?;
+        let inspection = self
+            .process_manifests(&tagged_versions, &referenced_branches)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -139,49 +159,133 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
-        self.delete_unreferenced_files(inspection).await
+        let stats = self.delete_unreferenced_files(inspection).await?;
+        final_stats.bytes_removed += stats.bytes_removed;
+        final_stats.old_versions += stats.old_versions;
+        Ok(final_stats)
+    }
+
+    async fn find_referenced_branches(&self) -> Result<HashSet<String>> {
+        let current_branch = self.dataset.manifest.branch.clone();
+        let descendants_branches = self
+            .dataset
+            .branches()
+            .list_all_descendants(current_branch)
+            .await?;
+
+        let mut referenced_branches = HashSet::new();
+        for (branch_name, version_number) in descendants_branches {
+            let manifest_location = self
+                .dataset
+                .commit_handler
+                .resolve_version_location(
+                    &self.dataset.base,
+                    version_number,
+                    &self.dataset.object_store.inner,
+                )
+                .await?;
+            let manifest = read_manifest(
+                &self.dataset.object_store,
+                &manifest_location.path,
+                manifest_location.size,
+            )
+            .await?;
+
+            if !self.policy.should_clean(&manifest) {
+                referenced_branches.insert(branch_name);
+            }
+        }
+
+        Ok(referenced_branches)
+    }
+
+    async fn clean_referenced_branches(
+        &self,
+        referenced_branches: &HashSet<String>,
+    ) -> Result<RemovalStats> {
+        let mut final_stats = RemovalStats::default();
+        for branch in referenced_branches {
+            let branch_dataset = self.dataset.checkout_branch(branch.as_str()).await?;
+            if let Some(stats) =
+                auto_cleanup_hook(&branch_dataset, branch_dataset.manifest.as_ref()).await?
+            {
+                final_stats.bytes_removed += stats.bytes_removed;
+                final_stats.old_versions += stats.old_versions;
+            }
+        }
+        Ok(final_stats)
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
+        referenced_branches: &HashSet<String>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(
+                    self.dataset,
+                    location,
+                    &inspection,
+                    tagged_versions,
+                    referenced_branches,
+                )
             })
             .await?;
+
+        // Directly use the object_store in original dataset to avoid checkout_branch
+        for branch in referenced_branches {
+            let branch = self.dataset.checkout_branch(branch.as_str()).await?;
+            branch
+                .commit_handler
+                .list_manifest_locations(&branch.base, &self.dataset.object_store, false)
+                .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                    self.process_manifest_file(
+                        &branch,
+                        location,
+                        &inspection,
+                        tagged_versions,
+                        referenced_branches,
+                    )
+                })
+                .await?;
+        }
         Ok(inspection.into_inner().unwrap())
     }
 
     async fn process_manifest_file(
         &self,
+        dataset: &Dataset,
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
+        referenced_branches: &HashSet<String>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
         // to ignore a manifest error because if it is a temporary I/O error and we
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
-
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
-        let dataset_version = self.dataset.version().version;
+        let manifest = read_manifest(&dataset.object_store, &location.path, location.size).await?;
+        let dataset_version = dataset.version().version;
+        let branch_name = manifest.branch.clone();
 
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
+        let is_referenced_branch = !referenced_branches.is_empty()
+            && branch_name
+                .map(|name| referenced_branches.contains(name.as_str()))
+                .unwrap_or(false);
         let is_latest = dataset_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let in_working_set =
+            is_tagged || is_referenced_branch || is_latest || !self.policy.should_clean(&manifest);
+        let indexes = read_manifest_indexes(&dataset.object_store, &location, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -191,7 +295,13 @@ impl<'a> CleanupTask<'a> {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
-        self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        Self::process_manifest(
+            dataset,
+            &manifest,
+            &indexes,
+            in_working_set,
+            &mut inspection,
+        )?;
         if !in_working_set {
             inspection.old_manifests.push(location.path.clone());
         } else {
@@ -208,7 +318,7 @@ impl<'a> CleanupTask<'a> {
     }
 
     fn process_manifest(
-        &self,
+        dataset: &Dataset,
         manifest: &Manifest,
         indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
@@ -224,16 +334,16 @@ impl<'a> CleanupTask<'a> {
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
-                let full_data_path = self.dataset.data_dir().child(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                let full_data_path = dataset.data_dir().child(file.path.as_str());
+                let relative_data_path = remove_prefix(&full_data_path, &dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
             }
             let delpath = fragment
                 .deletion_file
                 .as_ref()
-                .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
+                .map(|delfile| deletion_file_path(&dataset.base, fragment.id, delfile));
             if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, &self.dataset.base);
+                let relative_path = remove_prefix(&delpath, &dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
@@ -453,6 +563,8 @@ pub struct CleanupPolicy {
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
     pub error_if_tagged_old_versions: bool,
+    /// If clean the referenced branches
+    pub clean_referenced_branches: bool,
 }
 
 impl CleanupPolicy {
@@ -475,6 +587,7 @@ impl Default for CleanupPolicy {
             before_version: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
+            clean_referenced_branches: true,
         }
     }
 }
@@ -564,7 +677,7 @@ pub async fn auto_cleanup_hook(
                         "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
                         e
                     ),
-                })
+                });
             }
         };
 
@@ -582,10 +695,10 @@ pub async fn auto_cleanup_hook(
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                    "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
-                    e
-                ),
-                })
+                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
+                        e
+                    ),
+                });
             }
         };
         let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
@@ -597,10 +710,10 @@ pub async fn auto_cleanup_hook(
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                    "Error encountered while parsing lance.auto_cleanup.retain_versions as u64: {}",
-                    e
-                ),
-                })
+                        "Error encountered while parsing lance.auto_cleanup.retain_versions as u64: {}",
+                        e
+                    ),
+                });
             }
         };
         builder = builder.retain_n_versions(dataset, retain_versions).await?;
@@ -1049,7 +1162,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+        assert_contains!(
+            cleanup_error.to_string(),
+            "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:"
+        );
 
         dataset.tags().delete("old-tag").await.unwrap();
 
@@ -1058,7 +1174,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+        assert_contains!(
+            cleanup_error.to_string(),
+            "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:"
+        );
 
         dataset.tags().delete("another-old-tag").await.unwrap();
 
@@ -1614,5 +1733,196 @@ mod tests {
         );
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+    }
+
+    // Lineage overview (versions shown as @vX):
+    // main@v1 ─▶ branch1@v2 ─▶ dev/branch2@v3 ─▶ feature/nathan/branch3@v3
+    //        └─▶ stale/old@v1' (unreferenced branch derived from main@v1)
+    //
+    // Properties:
+    // - Referenced chain retained by cleanup policy (branch1 -> dev/branch2 -> feature/nathan/branch3)
+    // - Unreferenced stale/old remains unaffected under current policy (manifests not scanned)
+    //
+    // Integration: Build a dataset with branches and lineage, then run cleanup with before_version=v2
+    // to validate retained vs. cleaned behavior without altering production logic.
+    #[tokio::test]
+    async fn cleanup_respects_referenced_branch_lineage() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let tmpdir = TempStrDir::default();
+        let test_uri = format!("{}/branch_cleanup_integ", tmpdir.as_str());
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        // Create the main dataset v1
+        let mut main = Dataset::write(
+            data_gen.batch(5),
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let v1 = main.version().version;
+        assert_eq!(v1, 1);
+
+        // Derive branch1 from v1 and append to form v2
+        let mut branch1 = main.create_branch("branch1", v1, None).await.unwrap();
+        branch1
+            .append(
+                data_gen.batch(5),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        branch1.checkout_latest().await.unwrap();
+        let v2 = branch1.version().version;
+
+        // Derive dev/branch2 from branch1@v2 and append to form v3
+        let mut branch2 = branch1
+            .create_branch("dev/branch2", ("branch1", v2), None)
+            .await
+            .unwrap();
+        branch2
+            .append(
+                data_gen.batch(5),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        branch2.checkout_latest().await.unwrap();
+        let v3 = branch2.version().version;
+
+        // Deeper descendant: feature/nathan/branch3 originates from dev/branch2@v3
+        let _branch3 = branch2
+            .create_branch("feature/nathan/branch3", ("dev/branch2", v3), None)
+            .await
+            .unwrap();
+
+        // Unreferenced legacy branch: stale/old derived from v1 (should be cleaned under policy before_version = v2)
+        let _stale = main.create_branch("stale/old", v1, None).await.unwrap();
+
+        // Pre-cleanup statistics (global manifest and data file counts)
+        let before_counts = {
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let (os, path) = ObjectStore::from_uri_and_params(
+                registry,
+                &test_uri,
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+            let mut s = os.read_dir_all(&path, None);
+            let mut manifests = 0usize;
+            let mut data_files = 0usize;
+            while let Some(meta) = s.try_next().await.unwrap() {
+                match meta.location.extension() {
+                    Some("manifest") => manifests += 1,
+                    Some("lance") => data_files += 1,
+                    _ => {}
+                }
+            }
+            (manifests, data_files)
+        };
+
+        // Pre-cleanup count for stale/old branch manifests
+        let stale_loc = branch1.find_branch_location("stale/old").unwrap();
+        let mut s_before = branch1.commit_handler.list_manifest_locations(
+            &stale_loc.path,
+            &branch1.object_store,
+            false,
+        );
+        let mut stale_count_before = 0usize;
+        while s_before.try_next().await.unwrap().is_some() {
+            stale_count_before += 1;
+        }
+
+        // Run cleanup with before_version = v2: treat v1 and older as eligible; descendants referenced by v2/v3 should be retained
+        let policy = CleanupPolicy {
+            before_version: Some(v2),
+            before_timestamp: None,
+            delete_unverified: false,
+            error_if_tagged_old_versions: true,
+            clean_referenced_branches: true,
+        };
+        let removed = cleanup_old_versions(&branch1, policy).await.unwrap();
+        assert!(removed.old_versions >= 1);
+
+        // Post-cleanup statistics
+        let after_counts = {
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let (os, path) = ObjectStore::from_uri_and_params(
+                registry,
+                &test_uri,
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+            let mut s = os.read_dir_all(&path, None);
+            let mut manifests = 0usize;
+            let mut data_files = 0usize;
+            while let Some(meta) = s.try_next().await.unwrap() {
+                match meta.location.extension() {
+                    Some("manifest") => manifests += 1,
+                    Some("lance") => data_files += 1,
+                    _ => {}
+                }
+            }
+            (manifests, data_files)
+        };
+
+        // Manifest count decreases, indicating old versions are cleaned
+        assert!(after_counts.0 < before_counts.0);
+
+        // After cleanup, verify stale/old branch manifests remain unchanged under current policy
+        let mut s_after = branch1.commit_handler.list_manifest_locations(
+            &stale_loc.path,
+            &branch1.object_store,
+            false,
+        );
+        let mut stale_count_after = 0usize;
+        while s_after.try_next().await.unwrap().is_some() {
+            stale_count_after += 1;
+        }
+        assert_eq!(
+            stale_count_after, stale_count_before,
+            "stale branch manifests should remain unchanged under current policy"
+        );
+
+        // Verify manifests of referenced descendant branches (dev/branch2 and feature/nathan/branch3) were not cleaned
+        let branch2_loc = branch1.find_branch_location("dev/branch2").unwrap();
+        let mut s2 = branch1.commit_handler.list_manifest_locations(
+            &branch2_loc.path,
+            &branch1.object_store,
+            false,
+        );
+        let mut b2_count = 0usize;
+        while s2.try_next().await.unwrap().is_some() {
+            b2_count += 1;
+        }
+        assert!(b2_count > 0);
+
+        let b3_loc = branch1
+            .find_branch_location("feature/nathan/branch3")
+            .unwrap();
+        let mut s3 = branch1.commit_handler.list_manifest_locations(
+            &b3_loc.path,
+            &branch1.object_store,
+            false,
+        );
+        let mut b3_count = 0usize;
+        while s3.try_next().await.unwrap().is_some() {
+            b3_count += 1;
+        }
+        assert!(b3_count > 0);
     }
 }
