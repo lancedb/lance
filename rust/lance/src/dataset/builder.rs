@@ -300,13 +300,14 @@ impl DatasetBuilder {
     #[instrument(skip_all)]
     pub async fn load(self) -> Result<Dataset> {
         let uri = self.table_uri.clone();
+        let target_ref = self.version.clone();
         match self.load_impl().await {
             Ok(dataset) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, version=dataset.manifest.version, status="success");
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
                 Ok(dataset)
             }
             Err(e) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, status="error");
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
                 Err(e)
             }
         }
