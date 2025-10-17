@@ -354,7 +354,7 @@ class _Dataset:
     def read_transaction(self, version: int) -> Optional[Transaction]: ...
     def get_transactions(
         self, recent_transactions=10
-    ) -> Optional[List[Transaction]]: ...
+    ) -> List[Optional[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -527,10 +527,17 @@ class PyFullTextQuery:
     ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
+    """Statistics about a scan operation."""
+
     iops: int
+    requests: int
     bytes_read: int
     indices_loaded: int
     parts_loaded: int
+    index_comparisons: int
+    all_counts: Dict[
+        str, int
+    ]  # Additional metrics for debugging purposes. Subject to change.
 
 __version__: str
 language_model_home: Callable[[], str]

@@ -3650,3 +3650,43 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
         f"Limited WAND scores differ from full WAND scores.\n"
         f"limited scores={limited_wand_scores}\nfull scores={full_wand_scores}"
     )
+
+
+def test_scan_statistics_callback(tmp_path):
+    """Test that scan_stats_callback receives all expected fields."""
+    # Create a simple dataset
+    table = pa.table(
+        {
+            "id": range(100),
+            "value": np.random.randn(100),
+        }
+    )
+
+    dataset = lance.write_dataset(table, tmp_path / "test_stats.lance")
+
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    result = dataset.scanner(scan_stats_callback=scan_stats_callback).to_table()
+    assert result.num_rows == 100
+    assert scan_stats is not None, "Callback should have been called"
+    assert isinstance(scan_stats.iops, int)
+    assert isinstance(scan_stats.requests, int)
+    assert isinstance(scan_stats.bytes_read, int)
+    assert isinstance(scan_stats.indices_loaded, int)
+    assert isinstance(scan_stats.parts_loaded, int)
+    assert isinstance(scan_stats.index_comparisons, int)
+    assert isinstance(scan_stats.all_counts, dict)
+
+    # Verify we got some I/O activity
+    assert scan_stats.iops > 0, "Expected some I/O operations"
+    assert scan_stats.bytes_read > 0, "Expected some bytes read"
+
+    # Verify all_counts contains the standard metrics
+    assert isinstance(scan_stats.all_counts, dict)
+    for key, value in scan_stats.all_counts.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)

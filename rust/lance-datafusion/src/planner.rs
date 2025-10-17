@@ -52,6 +52,7 @@ use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 use snafu::location;
 
+use chrono::Utc;
 use lance_core::{Error, Result};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -909,7 +910,7 @@ impl Planner {
 
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::default();
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
         let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
