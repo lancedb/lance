@@ -298,8 +298,21 @@ impl DatasetBuilder {
     }
 
     #[instrument(skip_all)]
-    pub async fn load(mut self) -> Result<Dataset> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
+    pub async fn load(self) -> Result<Dataset> {
+        let uri = self.table_uri.clone();
+        match self.load_impl().await {
+            Ok(dataset) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, version=dataset.manifest.version, status="success");
+                Ok(dataset)
+            }
+            Err(e) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, status="error");
+                Err(e)
+            }
+        }
+    }
+
+    async fn load_impl(mut self) -> Result<Dataset> {
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
