@@ -2556,7 +2556,7 @@ mod tests {
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::as_string_array,
-        types::{Float32Type, Float64Type, Int32Type},
+        types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
         Int8DictionaryArray, ListArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
@@ -9439,6 +9439,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "geo")]
     async fn test_geo_types() {
         use geo_types::{coord, line_string, Rect};
         use geoarrow_array::{
@@ -9516,7 +9517,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "geo")]
     async fn test_geo_sql() {
+        use arrow_array::types::Float64Type;
         use geo_types::line_string;
         use geoarrow_array::{
             builder::{LineStringBuilder, PointBuilder},

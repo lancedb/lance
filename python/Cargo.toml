@@ -33,6 +33,7 @@ lance = { path = "../rust/lance", features = [
     "tensorflow",
     "dynamodb",
     "substrait",
+    "geo",
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }

@@ -27,9 +27,9 @@ jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
 lance-datagen.workspace = true
+lance-geo = {workspace = true, optional = true}
 chrono.workspace = true
 log.workspace = true
-geodatafusion.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 snafu.workspace = true
@@ -42,6 +42,7 @@ substrait-expr = {version = "0.2.3"}
 
 [features]
 substrait = ["dep:datafusion-substrait"]
+geo = ["dep:lance-geo"]
 
 [lints]
 workspace = true

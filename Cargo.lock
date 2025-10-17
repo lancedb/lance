@@ -4601,6 +4601,7 @@ dependencies = [
  "lance-datagen",
  "lance-encoding",
  "lance-file",
+ "lance-geo",
  "lance-index",
  "lance-io",
  "lance-linalg",
@@ -4651,8 +4652,6 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "bytes",
- "geoarrow-array",
- "geoarrow-schema",
  "getrandom 0.2.16",
  "half",
  "jsonb",
@@ -4725,11 +4724,11 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-substrait",
  "futures",
- "geodatafusion",
  "jsonb",
  "lance-arrow",
  "lance-core",
  "lance-datagen",
+ "lance-geo",
  "log",
  "pin-project",
  "prost 0.13.5",
@@ -4872,6 +4871,17 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "lance-geo"
+version = "0.38.3-beta.4"
+dependencies = [
+ "datafusion",
+ "geo-types",
+ "geoarrow-array",
+ "geoarrow-schema",
+ "geodatafusion",
 ]
 
 [[package]]
