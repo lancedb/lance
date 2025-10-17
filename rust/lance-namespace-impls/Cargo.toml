@@ -15,6 +15,7 @@ rust-version.workspace = true
 default = []
 rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
 dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
+rest-server = ["dep:axum", "dep:tokio", "dep:tower", "dep:tower-http", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -39,6 +40,13 @@ arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
+# REST server implementation dependencies (optional, enabled by "rest-server" feature)
+axum = { version = "0.7", optional = true }
+tokio = { workspace = true, optional = true, features = ["full"] }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.5", optional = true, features = ["trace", "cors"] }
+serde = { workspace = true, optional = true }
+
 # Common dependencies
 async-trait.workspace = true
 bytes.workspace = true
@@ -48,6 +56,8 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 wiremock.workspace = true
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
 
 [lints]
 workspace = true
