@@ -402,6 +402,7 @@ impl IoMetrics {
     }
 }
 
+#[derive(Debug)]
 pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,

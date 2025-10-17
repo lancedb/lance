@@ -815,7 +815,11 @@ impl ANNIvfSubIndexExec {
                                 ))
                             })
                             .await?;
+                        println!("+++++++++++++++ late search");
                         metrics.baseline_metrics.record_output(batch.num_rows());
+                        println!("The base line metrics is : {:?}", metrics.baseline_metrics);
+                        println!("the index_metrics is : {:?}", metrics.index_metrics);
+                        println!("The partitions_searched is : {:?}", metrics.partitions_searched);
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
                     }
@@ -869,7 +873,11 @@ impl ANNIvfSubIndexExec {
                             DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
                         })
                         .await?;
+                    println!("-----------> initial serarch...");
                     metrics.baseline_metrics.record_output(batch.num_rows());
+                    println!("The base line metrics is : {:?}", metrics.baseline_metrics);
+                    println!("the index_metrics is : {:?}", metrics.index_metrics);
+                    println!("The partitions_searched is : {:?}", metrics.partitions_searched);
                     state.record_batch(&batch);
                     Ok(batch)
                 }
