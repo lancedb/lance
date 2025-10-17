@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{borrow::Cow, collections::hash_map};
+use std::borrow::Cow;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
 use fst::Streamer;
-use lance_table::format::pb::transaction::Append;
 
 use crate::scalar::inverted::token_set::AppendableTokenSetIterator;
 
