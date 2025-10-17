@@ -543,6 +543,63 @@ pub fn pack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     FixedSizeListArray::try_new_from_values(UInt8Array::from(blocks), code_len as i32).unwrap()
 }
 
+// Inverse of pack_codes
+pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
+    let code_len = codes.value_length() as usize;
+    let num_vectors = codes.len();
+
+    // Calculate number of complete batches
+    let num_blocks = num_vectors / BATCH_SIZE;
+    let num_packed_vectors = num_blocks * BATCH_SIZE;
+
+    let mut unpacked = vec![0u8; codes.values().len()];
+
+    let codes_values = codes.values().as_primitive::<UInt8Type>().values();
+
+    // Unpack complete batches
+    for batch_idx in 0..num_blocks {
+        let block_start = batch_idx * code_len * BATCH_SIZE;
+
+        for i in 0..code_len {
+            let block_offset = block_start + i * BATCH_SIZE;
+            let block = &codes_values[block_offset..block_offset + BATCH_SIZE];
+
+            // Reverse the permutation
+            for j in 0..16 {
+                let val0 = block[j];
+                let val1 = block[j + 16];
+
+                let low_0 = val0 & 0xF;
+                let high_0 = val0 >> 4;
+                let low_1 = val1 & 0xF;
+                let high_1 = val1 >> 4;
+
+                let vec_idx_0 = batch_idx * BATCH_SIZE + PERM0[j];
+                let vec_idx_1 = batch_idx * BATCH_SIZE + PERM0[j] + 16;
+
+                unpacked[vec_idx_0 * code_len + i] = low_0 | (low_1 << 4);
+                unpacked[vec_idx_1 * code_len + i] = high_0 | (high_1 << 4);
+            }
+        }
+    }
+
+    // Transpose back the remainder
+    if num_packed_vectors < num_vectors {
+        let remainder = num_vectors - num_packed_vectors;
+        let offset = num_packed_vectors * code_len;
+        let transposed_data = &codes_values[offset..];
+
+        // Transpose from column-major back to row-major
+        for row in 0..remainder {
+            for col in 0..code_len {
+                unpacked[offset + row * code_len + col] = transposed_data[col * remainder + row];
+            }
+        }
+    }
+
+    FixedSizeListArray::try_new_from_values(UInt8Array::from(unpacked), code_len as i32).unwrap()
+}
+
 #[async_trait]
 impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
@@ -727,5 +784,44 @@ mod tests {
         let mut dist_table = vec![0.0; SEGMENT_NUM_CODES];
         build_dist_table_for_subvec::<Float32Type>(&sub_vec, &mut dist_table);
         assert_eq!(dist_table, expected);
+    }
+
+    #[test]
+    fn test_pack_unpack_codes() {
+        // Test with multiple batch sizes to cover both packed and transposed sections
+        for num_vectors in [10, 32, 50, 64, 100] {
+            let code_len = 8;
+
+            // Create test data with known pattern
+            let mut codes_data = Vec::new();
+            for i in 0..num_vectors {
+                for j in 0..code_len {
+                    codes_data.push((i * code_len + j) as u8);
+                }
+            }
+
+            let original_codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(codes_data.clone()),
+                code_len,
+            )
+            .unwrap();
+
+            // Pack and then unpack
+            let packed = pack_codes(&original_codes);
+            let unpacked = unpack_codes(&packed);
+
+            // Verify they match
+            assert_eq!(original_codes.len(), unpacked.len());
+            assert_eq!(original_codes.value_length(), unpacked.value_length());
+
+            let original_values = original_codes.values().as_primitive::<UInt8Type>().values();
+            let unpacked_values = unpacked.values().as_primitive::<UInt8Type>().values();
+
+            assert_eq!(
+                original_values, unpacked_values,
+                "Mismatch for num_vectors={}",
+                num_vectors
+            );
+        }
     }
 }

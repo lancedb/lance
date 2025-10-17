@@ -190,7 +190,6 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
-                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -282,7 +281,7 @@ impl ShuffleReader for IvfShufflerReader {
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
-        Ok(self.partition_sizes[partition_id])
+        Ok(self.partition_sizes.get(partition_id).copied().unwrap_or(0))
     }
 
     fn total_loss(&self) -> Option<f64> {
