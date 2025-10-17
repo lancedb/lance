@@ -29,8 +29,10 @@ use std::str::FromStr;
 
 use crate::compression::{BlockCompressor, BlockDecompressor};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
-use crate::format::pb21::{self, CompressiveEncoding};
-use crate::format::ProtobufUtils21;
+use crate::format::{
+    pb21::{self, CompressiveEncoding},
+    ProtobufUtils21,
+};
 use crate::{
     buffer::LanceBuffer,
     compression::VariablePerValueDecompressor,

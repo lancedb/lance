@@ -526,6 +526,7 @@ fn tag(e: &Compression) -> &'static str {
         General(_) => "general",
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
+        VariablePackedStruct(_) => "variable_packed_struct",
     }
 }
 
@@ -573,6 +574,18 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
             Some(children)
         }
         FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        VariablePackedStruct(v) => {
+            let nested: Vec<&CompressiveEncoding> = v
+                .fields
+                .iter()
+                .filter_map(|field| field.value.as_ref())
+                .collect();
+            if nested.is_empty() {
+                None
+            } else {
+                Some(nested)
+            }
+        }
         _ => None,
     }
 }
