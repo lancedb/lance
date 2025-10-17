@@ -1,12 +1,12 @@
 [package]
 name = "lance-namespace-impls"
+description = "Lance Namespace Implementations"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "README.md"
-description = "Lance Namespace Implementations"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true

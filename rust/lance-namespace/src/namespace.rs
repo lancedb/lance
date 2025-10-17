@@ -5,7 +5,8 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use thiserror::Error;
+use lance_core::{Error, Result};
+use snafu::Location;
 
 use lance_namespace_reqwest_client::models::{
     AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
@@ -23,22 +24,6 @@ use lance_namespace_reqwest_client::models::{
     UpdateTableRequest, UpdateTableResponse,
 };
 
-/// Error type for namespace operations
-#[derive(Debug, Error)]
-pub enum NamespaceError {
-    #[error("Operation not supported: {0}")]
-    NotSupported(String),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Other error: {0}")]
-    Other(String),
-}
-
-/// Result type for namespace operations
-pub type Result<T> = std::result::Result<T, NamespaceError>;
-
 /// Base trait for Lance Namespace implementations.
 ///
 /// This trait defines the interface that all Lance namespace implementations
@@ -51,7 +36,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        Err(NamespaceError::NotSupported("list_namespaces".to_string()))
+        Err(Error::NotSupported {
+            source: "list_namespaces not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Describe a namespace.
@@ -59,9 +47,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        Err(NamespaceError::NotSupported(
-            "describe_namespace".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "describe_namespace not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Create a new namespace.
@@ -69,7 +58,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        Err(NamespaceError::NotSupported("create_namespace".to_string()))
+        Err(Error::NotSupported {
+            source: "create_namespace not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Drop a namespace.
@@ -77,17 +69,26 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DropNamespaceRequest,
     ) -> Result<DropNamespaceResponse> {
-        Err(NamespaceError::NotSupported("drop_namespace".to_string()))
+        Err(Error::NotSupported {
+            source: "drop_namespace not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Check if a namespace exists.
     async fn namespace_exists(&self, _request: NamespaceExistsRequest) -> Result<()> {
-        Err(NamespaceError::NotSupported("namespace_exists".to_string()))
+        Err(Error::NotSupported {
+            source: "namespace_exists not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// List tables in a namespace.
     async fn list_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
-        Err(NamespaceError::NotSupported("list_tables".to_string()))
+        Err(Error::NotSupported {
+            source: "list_tables not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Describe a table.
@@ -95,7 +96,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
-        Err(NamespaceError::NotSupported("describe_table".to_string()))
+        Err(Error::NotSupported {
+            source: "describe_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Register a table.
@@ -103,17 +107,26 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: RegisterTableRequest,
     ) -> Result<RegisterTableResponse> {
-        Err(NamespaceError::NotSupported("register_table".to_string()))
+        Err(Error::NotSupported {
+            source: "register_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Check if a table exists.
     async fn table_exists(&self, _request: TableExistsRequest) -> Result<()> {
-        Err(NamespaceError::NotSupported("table_exists".to_string()))
+        Err(Error::NotSupported {
+            source: "table_exists not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Drop a table.
     async fn drop_table(&self, _request: DropTableRequest) -> Result<DropTableResponse> {
-        Err(NamespaceError::NotSupported("drop_table".to_string()))
+        Err(Error::NotSupported {
+            source: "drop_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Deregister a table.
@@ -121,12 +134,18 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
-        Err(NamespaceError::NotSupported("deregister_table".to_string()))
+        Err(Error::NotSupported {
+            source: "deregister_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Count rows in a table.
     async fn count_table_rows(&self, _request: CountTableRowsRequest) -> Result<i64> {
-        Err(NamespaceError::NotSupported("count_table_rows".to_string()))
+        Err(Error::NotSupported {
+            source: "count_table_rows not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Create a new table with data from Arrow IPC stream.
@@ -135,7 +154,10 @@ pub trait LanceNamespace: Send + Sync {
         _request: CreateTableRequest,
         _request_data: Bytes,
     ) -> Result<CreateTableResponse> {
-        Err(NamespaceError::NotSupported("create_table".to_string()))
+        Err(Error::NotSupported {
+            source: "create_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Create an empty table (metadata only operation).
@@ -143,9 +165,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
-        Err(NamespaceError::NotSupported(
-            "create_empty_table".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "create_empty_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Insert data into a table.
@@ -154,9 +177,10 @@ pub trait LanceNamespace: Send + Sync {
         _request: InsertIntoTableRequest,
         _request_data: Bytes,
     ) -> Result<InsertIntoTableResponse> {
-        Err(NamespaceError::NotSupported(
-            "insert_into_table".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "insert_into_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Merge insert data into a table.
@@ -165,14 +189,18 @@ pub trait LanceNamespace: Send + Sync {
         _request: MergeInsertIntoTableRequest,
         _request_data: Bytes,
     ) -> Result<MergeInsertIntoTableResponse> {
-        Err(NamespaceError::NotSupported(
-            "merge_insert_into_table".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "merge_insert_into_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Update a table.
     async fn update_table(&self, _request: UpdateTableRequest) -> Result<UpdateTableResponse> {
-        Err(NamespaceError::NotSupported("update_table".to_string()))
+        Err(Error::NotSupported {
+            source: "update_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Delete from a table.
@@ -180,14 +208,18 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DeleteFromTableRequest,
     ) -> Result<DeleteFromTableResponse> {
-        Err(NamespaceError::NotSupported(
-            "delete_from_table".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "delete_from_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Query a table.
     async fn query_table(&self, _request: QueryTableRequest) -> Result<Bytes> {
-        Err(NamespaceError::NotSupported("query_table".to_string()))
+        Err(Error::NotSupported {
+            source: "query_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Create a table index.
@@ -195,9 +227,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
-        Err(NamespaceError::NotSupported(
-            "create_table_index".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "create_table_index not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// List table indices.
@@ -205,9 +238,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: ListTableIndicesRequest,
     ) -> Result<ListTableIndicesResponse> {
-        Err(NamespaceError::NotSupported(
-            "list_table_indices".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "list_table_indices not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Describe table index statistics.
@@ -215,9 +249,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DescribeTableIndexStatsRequest,
     ) -> Result<DescribeTableIndexStatsResponse> {
-        Err(NamespaceError::NotSupported(
-            "describe_table_index_stats".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "describe_table_index_stats not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Describe a transaction.
@@ -225,9 +260,10 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
-        Err(NamespaceError::NotSupported(
-            "describe_transaction".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "describe_transaction not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Alter a transaction.
@@ -235,8 +271,9 @@ pub trait LanceNamespace: Send + Sync {
         &self,
         _request: AlterTransactionRequest,
     ) -> Result<AlterTransactionResponse> {
-        Err(NamespaceError::NotSupported(
-            "alter_transaction".to_string(),
-        ))
+        Err(Error::NotSupported {
+            source: "alter_transaction not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
     }
 }

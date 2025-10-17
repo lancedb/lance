@@ -7,12 +7,11 @@
 //! for managing namespaces and tables across different backend implementations.
 
 pub mod namespace;
-pub mod rest;
 pub mod schema;
 
 // Re-export the trait at the crate root
-pub use namespace::{LanceNamespace, NamespaceError, Result};
-pub use rest::RestNamespace;
+pub use lance_core::{Error, Result};
+pub use namespace::LanceNamespace;
 
 // Re-export reqwest client for convenience
 pub use lance_namespace_reqwest_client as reqwest_client;
