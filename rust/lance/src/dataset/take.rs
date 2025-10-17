@@ -345,6 +345,17 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
+    if with_row_addr_in_projection && batch.num_rows() != row_addrs.len() {
+        return Err(Error::NotSupported  {
+            source: format!(
+                "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
+                row_addrs.len(),
+                batch.num_rows()
+            ).into(),
+            location: location!(),
+            });
+    }
+
     projection.project_batch(batch).await
 }
 
@@ -1001,7 +1012,7 @@ mod test {
 
         assert_eq!(
             RecordBatch::try_new(
-                expected_schema.clone(),
+                expected_schema,
                 vec![
                     Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
                     Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
