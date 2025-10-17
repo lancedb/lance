@@ -2779,6 +2779,8 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
         let mut dataset = create_dataset_v2(test_uri).await;
+
+        // Test update with _rowid
         let _ = dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
@@ -2787,9 +2789,9 @@ mod tests {
             )
             .await;
         let mut fragment1 = dataset.get_fragment(0).unwrap();
-
+        // Update col1 to 3 while keeping col1[0] and col1[3] as -1
         let schema1 = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("_rowid", DataType::UInt64, false),
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
             ArrowField::new("col1", DataType::Int64, true),
         ]));
         let update_batch1 = RecordBatch::try_new(
@@ -2810,7 +2812,7 @@ mod tests {
             .update_columns(right_stream1, ROW_ID, ROW_ID)
             .await
             .unwrap();
-        let op = Operation::Update {
+        let op1 = Operation::Update {
             removed_fragment_ids: vec![],
             updated_fragments: vec![updated_fragment1],
             new_fragments: vec![],
@@ -2821,7 +2823,7 @@ mod tests {
         };
         let mut dataset1 = Dataset::commit(
             test_uri,
-            op,
+            op1,
             Some(dataset.version().version),
             None,
             None,
@@ -2848,73 +2850,54 @@ mod tests {
             &Int64Array::from(expected_col1)
         );
 
+        // Test update with user specified keys
         let _ = dataset1
             .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("col2".into(), "col1 > 0".into())]),
+                NewColumnTransform::SqlExpressions(vec![("col2".into(), "false".into())]),
                 None,
                 None,
             )
             .await;
-    }
-
-    #[tokio::test]
-    async fn test_fragment_update_with_user_specified_join_key() {
-        let test_dir = TempStrDir::default();
-        let test_uri = &test_dir;
-        let mut dataset = create_dataset_v2(test_uri).await;
-        let _ = dataset
-            .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
-                None,
-                None,
-            )
-            .await;
-        let _ = dataset
-            .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("col2".into(), "col1 > 0".into())]),
-                None,
-                None,
-            )
-            .await;
-        let mut fragment1 = dataset.get_fragment(0).unwrap();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
+        let mut fragment2 = dataset1.get_fragment(0).unwrap();
+        // Update col1 to 3 while keeping col1[0] and col1[3] as -1
+        // Update col2 to true while keeping col2[0] and col2[3] as false
+        let schema2 = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i1", DataType::Int32, true),
             ArrowField::new("col2", DataType::Boolean, true),
             ArrowField::new("col1", DataType::Int64, true),
         ]));
-        let update_batch = RecordBatch::try_new(
-            schema.clone(),
+        let update_batch2 = RecordBatch::try_new(
+            schema2.clone(),
             vec![
                 Arc::new(Int32Array::from(
                     (0..40).filter(|&v| v != 0 && v != 3).collect::<Vec<_>>(),
                 )),
                 Arc::new(BooleanArray::from(vec![true; 38])),
-                Arc::new(Int64Array::from(vec![2; 38])),
+                Arc::new(Int64Array::from(vec![3; 38])),
             ],
         )
         .unwrap();
-        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
-            vec![Ok(update_batch)].into_iter(),
-            schema,
+        let right_stream2: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch2)].into_iter(),
+            schema2,
         ));
-        let (updated_fragment, fields_modified) = fragment1
-            .update_columns(right_stream, "i", "i1")
+        let (updated_fragment2, fields_modified2) = fragment2
+            .update_columns(right_stream2, "i", "i1")
             .await
             .unwrap();
         let op = Operation::Update {
             removed_fragment_ids: vec![],
-            updated_fragments: vec![updated_fragment],
+            updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
-            fields_modified,
+            fields_modified: fields_modified2,
             mem_wal_to_merge: None,
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
         };
-        let new_dataset = Dataset::commit(
+        let dataset2 = Dataset::commit(
             test_uri,
             op,
-            Some(dataset.version().version),
+            Some(dataset1.version().version),
             None,
             None,
             Default::default(),
@@ -2922,29 +2905,29 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(new_dataset.get_fragments().len(), 5);
-        let scanner = new_dataset.get_fragment(0).unwrap().scan();
-        let batches = scanner
+        assert_eq!(dataset2.get_fragments().len(), 5);
+        let scanner2 = dataset2.get_fragment(0).unwrap().scan();
+        let batches2 = scanner2
             .try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.len(), 1);
+        assert_eq!(batches2.len(), 1);
 
-        let mut expected_col1 = vec![2; 40];
+        expected_col1 = vec![3; 40];
         expected_col1[0] = -1;
         expected_col1[3] = -1;
         assert_eq!(
-            batches[0].column_by_name("col1").unwrap().as_ref(),
+            batches2[0].column_by_name("col1").unwrap().as_ref(),
             &Int64Array::from(expected_col1)
         );
         let mut expected_col2 = vec![true; 40];
         expected_col2[0] = false;
         expected_col2[3] = false;
         assert_eq!(
-            batches[0].column_by_name("col2").unwrap().as_ref(),
+            batches2[0].column_by_name("col2").unwrap().as_ref(),
             &BooleanArray::from(expected_col2)
         );
     }
