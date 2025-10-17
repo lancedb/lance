@@ -2859,8 +2859,8 @@ mod tests {
             )
             .await;
         let mut fragment2 = dataset1.get_fragment(0).unwrap();
-        // Update col1 to 3 while keeping col1[0] and col1[3] as -1
-        // Update col2 to true while keeping col2[0] and col2[3] as false
+        // Test a partial update: Create a payload that modifies most rows,
+        // but excludes keys 0 and 3 to ensure they remain unchanged after the join.
         let schema2 = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i1", DataType::Int32, true),
             ArrowField::new("col2", DataType::Boolean, true),
