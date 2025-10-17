@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::{DistanceType, Dot};
 use lance_linalg::simd::dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE};
@@ -553,7 +553,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
@@ -637,7 +637,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             let codes = Arc::new(pack_codes(&new_codes));
             self.batch
                 .take(&UInt32Array::from(indices))?
-                .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
+                .replace_column_by_name(ROW_ADDR, Arc::new(new_row_ids.clone()))?
                 .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
         };
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();

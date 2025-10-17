@@ -134,7 +134,7 @@ pub async fn load_precomputed_partitions(
     let partition_lookup = stream
         .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
             let row_ids: &UInt64Array = batch
-                .column_by_name("row_id")
+                .column_by_name("row_addr")
                 .expect("malformed partition file: missing row_id column")
                 .as_primitive();
             let partitions: &UInt32Array = batch

@@ -37,6 +37,8 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
+use crate::index::DatasetIndexInternalExt;
+use lance_index::metrics::NoOpMetricsCollector;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -101,11 +103,11 @@ impl TakeStream {
 
     async fn do_open_reader(&self, fragment_id: u32) -> DataFusionResult<Arc<FragmentReader>> {
         let fragment = self
-        .dataset
-        .get_fragment(fragment_id as usize)
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!("The input to a take operation specified fragment id {} but this fragment does not exist in the dataset", fragment_id))
-        })?;
+            .dataset
+            .get_fragment(fragment_id as usize)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("The input to a take operation specified fragment id {} but this fragment does not exist in the dataset", fragment_id))
+            })?;
 
         let reader = Arc::new(
             fragment
@@ -157,10 +159,85 @@ impl TakeStream {
 
     async fn map_batch(
         self: Arc<Self>,
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         batch_number: u32,
     ) -> DataFusionResult<RecordBatch> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
+        // Debug: input batch schema and row count
+        let has_row_addr = batch.schema().index_of(ROW_ADDR).is_ok();
+
+        // If the upstream batch contains row addresses, try to remap them using the Fragment Reuse Index.
+        if has_row_addr {
+            // Capture a few sample addresses before remap
+            let mut pre_samples = Vec::new();
+            if let Some(arr) = batch.column_by_name(ROW_ADDR) {
+                let arr = arr.as_primitive::<UInt64Type>();
+                let n = arr.len().min(5);
+                for i in 0..n {
+                    let ra = RowAddress::new_from_u64(arr.value(i));
+                    pre_samples.push(format!(
+                        "{}(frag={},off={})",
+                        arr.value(i),
+                        ra.fragment_id(),
+                        ra.row_offset()
+                    ));
+                }
+            }
+
+            let fri = self
+                .dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await?;
+            if let Some(fri) = fri {
+                let row_addr_idx = batch.schema().index_of(ROW_ADDR).unwrap();
+                batch = fri
+                    .remap_row_addrs_record_batch(batch, row_addr_idx)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                // Capture post-remap samples
+                let mut post_samples = Vec::new();
+                if let Some(arr2) = batch.column_by_name(ROW_ADDR) {
+                    let arr2 = arr2.as_primitive::<UInt64Type>();
+                    let n2 = arr2.len().min(5);
+                    for i in 0..n2 {
+                        let ra = RowAddress::new_from_u64(arr2.value(i));
+                        post_samples.push(format!(
+                            "{}(frag={},off={})",
+                            arr2.value(i),
+                            ra.fragment_id(),
+                            ra.row_offset()
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Fallback validity check: filter out any rows that reference non-existent fragments
+        let mut valid_frag_ids = std::collections::HashSet::new();
+        for f in self.dataset.fragments().iter() {
+            valid_frag_ids.insert(f.id as u32);
+        }
+        if batch.schema().index_of(ROW_ADDR).is_ok() {
+            let arr = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let mut keep_indices = Vec::new();
+            let mut invalid = std::collections::HashSet::new();
+            for i in 0..arr.len() {
+                let ra = RowAddress::new_from_u64(arr.value(i));
+                let fid = ra.fragment_id();
+                if valid_frag_ids.contains(&fid) {
+                    keep_indices.push(i as u32);
+                } else {
+                    invalid.insert(fid);
+                }
+            }
+            if !invalid.is_empty() {
+                let indices = UInt32Array::from(keep_indices);
+                batch = arrow_select::take::take_record_batch(&batch, &indices).unwrap();
+            }
+        }
+
         let row_addrs_arr = self.get_row_addrs(&batch).await?;
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
@@ -195,6 +272,17 @@ impl TakeStream {
                 Some(UInt32Array::from(inverse_permutation)),
             )
         };
+
+        // Debug: list of fragment ids to open
+        let mut to_open = Vec::new();
+        let mut last: Option<u32> = None;
+        for val in sorted_addrs.values() {
+            let addr = RowAddress::new_from_u64(*val);
+            if Some(addr.fragment_id()) != last {
+                to_open.push(addr.fragment_id());
+                last = Some(addr.fragment_id());
+            }
+        }
 
         let mut futures = FuturesOrdered::new();
         let mut current_offsets = Vec::new();

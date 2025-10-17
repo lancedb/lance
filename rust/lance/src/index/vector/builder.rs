@@ -17,8 +17,8 @@ use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::ROW_ID;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -387,7 +387,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .map(|(field_idx, field)| {
                     if field_idx == row_id_idx {
                         arrow_schema::Field::new(
-                            ROW_ID,
+                            ROW_ADDR,
                             field.data_type().clone(),
                             field.is_nullable(),
                         )
@@ -433,7 +433,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 builder
                     .batch_readahead(get_num_compute_intensive_cpus())
                     .project(&[self.column.as_str()])?
-                    .with_row_id();
+                    .with_row_address();
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
                 let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
@@ -444,10 +444,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
-        if let Some((row_id_idx, _)) = stream.schema().column_with_name("row_id") {
-            // When using precomputed shuffle buffers we can't use the column name _rowid
+        if let Some((row_id_idx, _)) = stream.schema().column_with_name("row_addr") {
+            // When using precomputed shuffle buffers we can't use the column name _rowaddr
             // since it is reserved.  So we tolerate `row_id` as well here (and rename it
-            // to _rowid to match the non-precomputed path)
+            // to _rowaddr to match the non-precomputed path)
             self.shuffle_data(Some(Self::rename_row_id(stream, row_id_idx)))
                 .await?;
         } else {
@@ -518,7 +518,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 tokio::spawn(async move {
                     let mut batch = batch?;
                     if !partition_map.is_empty() {
-                        let row_ids = &batch[ROW_ID];
+                        let row_ids = &batch[ROW_ADDR];
                         let part_ids = UInt32Array::from_iter(
                             row_ids
                                 .as_primitive::<UInt64Type>()
@@ -781,7 +781,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
 
-        let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
+        let mut fields = vec![ROW_ADDR_FIELD.clone(), quantizer.field()];
         fields.extend(quantizer.extra_fields());
         let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
         let mut storage_writer = FileWriter::try_new(
@@ -924,7 +924,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
                 .await?;
             let batch = batch.try_with_column(
-                ROW_ID_FIELD.clone(),
+                ROW_ADDR_FIELD.clone(),
                 Arc::new(UInt64Array::from(chunk.to_vec())),
             )?;
             batches.push(batch);
