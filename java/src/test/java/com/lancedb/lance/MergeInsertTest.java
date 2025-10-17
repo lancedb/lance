@@ -121,6 +121,24 @@ public class MergeInsertTest {
   }
 
   @Test
+  public void testWhenMatchedDelete() throws Exception {
+    // Test delete matched target rows if expression is true
+
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedDelete()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing),
+                sourceStream);
+
+        Assertions.assertEquals("{3=Person 3, 4=Person 4}", readAll(result.dataset()).toString());
+      }
+    }
+  }
+
+  @Test
   public void testWhenNotMatchedBySourceDelete() throws Exception {
     // Test delete target rows which are not matched with source.
 

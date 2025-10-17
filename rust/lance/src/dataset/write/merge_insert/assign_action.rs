@@ -117,6 +117,9 @@ pub fn merge_insert_action(
             }
         }
         WhenMatched::DoNothing => {}
+        WhenMatched::Delete => {
+            cases.push((matched, Action::Delete.as_literal_expr()));
+        }
     }
 
     match &params.delete_not_matched_by_source {
