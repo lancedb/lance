@@ -11,6 +11,7 @@ use snafu::location;
 
 use lance_core::{Error, Result};
 
+pub mod aimd;
 pub mod encodings;
 pub mod ffi;
 pub mod local;
