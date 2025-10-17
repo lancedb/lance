@@ -11,6 +11,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
+use chrono::Utc;
 use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
@@ -264,12 +265,13 @@ impl LanceFilter {
                     });
                 }
 
-                planner.optimize_expr(filter).map_err(|e| {
+                let optimized = planner.optimize_expr(filter).map_err(|e| {
                     Error::invalid_input(
                         format!("Error optimizing sql filter: {sql} ({e})"),
                         location!(),
                     )
-                })
+                })?;
+                Ok(optimized)
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
@@ -428,6 +430,10 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
+    /// Whether the user wants the row last updated at version column on top of the projection
+    legacy_with_row_last_updated_at_version: bool,
+    /// Whether the user wants the row created at version column on top of the projection
+    legacy_with_row_created_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -623,6 +629,8 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
+            legacy_with_row_last_updated_at_version: false,
+            legacy_with_row_created_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -707,6 +715,12 @@ impl Scanner {
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
+        }
+        if self.legacy_with_row_last_updated_at_version {
+            self.projection_plan.include_row_last_updated_at_version();
+        }
+        if self.legacy_with_row_created_at_version {
+            self.projection_plan.include_row_created_at_version();
         }
         Ok(self)
     }
@@ -1215,6 +1229,24 @@ impl Scanner {
         self
     }
 
+    /// Instruct the scanner to return row last updated at version column from the dataset.
+    ///
+    /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
+    pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+        self.legacy_with_row_last_updated_at_version = true;
+        self.projection_plan.include_row_last_updated_at_version();
+        self
+    }
+
+    /// Instruct the scanner to return row created at version column from the dataset.
+    ///
+    /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
+    pub fn with_row_created_at_version(&mut self) -> &mut Self {
+        self.legacy_with_row_created_at_version = true;
+        self.projection_plan.include_row_created_at_version();
+        self
+    }
+
     /// Instruct the scanner to disable automatic projection of scoring columns
     ///
     /// In the future, this will be the default behavior.  This method is useful for
@@ -1275,7 +1307,7 @@ impl Scanner {
 
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
-            let execution_props = ExecutionProps::default();
+            let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
             create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
                 message: format!(
                     "Failed to create physical expression for nested field '{}': {}",
@@ -1340,6 +1372,8 @@ impl Scanner {
         let base_schema = Projection::full(self.dataset.clone())
             .with_row_id()
             .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
             .to_schema();
 
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
@@ -1407,6 +1441,28 @@ impl Scanner {
                 let row_addr_expr = output_expr.remove(row_addr_pos);
                 output_expr.push(row_addr_expr);
             }
+        }
+
+        if self.legacy_with_row_last_updated_at_version
+            && !output_expr
+                .iter()
+                .any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
+        {
+            return Err(Error::Internal {
+                message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
+                location: location!(),
+            });
+        }
+
+        if self.legacy_with_row_created_at_version
+            && !output_expr
+                .iter()
+                .any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION)
+        {
+            return Err(Error::Internal {
+                message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
+                location: location!(),
+            });
         }
 
         Ok(output_expr)
@@ -1904,6 +1960,21 @@ impl Scanner {
         Ok(plan)
     }
 
+    // Check if a filter plan references version columns
+    fn filter_references_version_columns(&self, filter_plan: &FilterPlan) -> bool {
+        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+
+        if let Some(refine_expr) = &filter_plan.refine_expr {
+            let column_names = Planner::column_names_in_expr(refine_expr);
+            for col_name in column_names {
+                if col_name == ROW_CREATED_AT_VERSION || col_name == ROW_LAST_UPDATED_AT_VERSION {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -1934,6 +2005,7 @@ impl Scanner {
             && filter_plan.has_refine()
             && self.batch_size.is_none()
             && self.use_stats
+            && !self.filter_references_version_columns(filter_plan)
         {
             filter_pushed_down = true;
             self.pushdown_scan(false, filter_plan)
@@ -1941,6 +2013,12 @@ impl Scanner {
             let ordered = if self.ordering.is_some() || self.nearest.is_some() {
                 // If we are sorting the results there is no need to scan in order
                 false
+            } else if projection.with_row_last_updated_at_version
+                || projection.with_row_created_at_version
+            {
+                // Version columns require ordered scanning because version metadata
+                // is indexed by position within each fragment
+                true
             } else {
                 self.ordered
             };
@@ -1966,6 +2044,12 @@ impl Scanner {
             let scan = self.scan_fragments(
                 projection.with_row_id,
                 self.projection_plan.physical_projection.with_row_addr,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_last_updated_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_created_at_version,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -2048,6 +2132,7 @@ impl Scanner {
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
     ) -> Result<PlannedFilteredScan> {
+        // Use legacy path if dataset uses legacy storage format
         if self.dataset.is_legacy_storage() {
             self.legacy_filtered_read(
                 filter_plan,
@@ -2710,6 +2795,8 @@ impl Scanner {
             true,
             false,
             false,
+            false,
+            false,
             flat_fts_scan_schema,
             Arc::new(fragments),
             None,
@@ -2875,6 +2962,8 @@ impl Scanner {
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
                 true,
+                false,
+                false,
                 false,
                 false,
                 vector_scan_projection,
@@ -3069,6 +3158,12 @@ impl Scanner {
             let new_data_scan = self.scan_fragments(
                 true,
                 self.projection_plan.physical_projection.with_row_addr,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_last_updated_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_created_at_version,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -3104,10 +3199,13 @@ impl Scanner {
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
     /// column as a selection vector. Read more in [crate::io::FileReader].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_last_updated_at_version: bool,
+        with_row_created_at_version: bool,
         with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
@@ -3126,6 +3224,8 @@ impl Scanner {
         self.scan_fragments(
             with_row_id,
             with_row_address,
+            with_row_last_updated_at_version,
+            with_row_created_at_version,
             with_make_deletions_null,
             projection,
             fragments,
@@ -3139,6 +3239,8 @@ impl Scanner {
         &self,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_last_updated_at_version: bool,
+        with_row_created_at_version: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
@@ -3153,6 +3255,8 @@ impl Scanner {
             io_buffer_size: self.get_io_buffer_size(),
             with_row_id,
             with_row_address,
+            with_row_last_updated_at_version,
+            with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
         };
@@ -7999,5 +8103,100 @@ mod test {
         assert_eq!(unsorted_values[0], 50);
         assert_eq!(unsorted_values[1], 20);
         assert_eq!(unsorted_values[2], 80);
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_version_columns() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        // Create a simple dataset
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version();
+
+        // Check that the schema includes version columns
+        let output_schema = scanner.schema().await.unwrap();
+        assert!(
+            output_schema
+                .column_with_name("_row_last_updated_at_version")
+                .is_some(),
+            "Schema should include _row_last_updated_at_version"
+        );
+        assert!(
+            output_schema
+                .column_with_name("_row_created_at_version")
+                .is_some(),
+            "Schema should include _row_created_at_version"
+        );
+
+        // Actually read the data to ensure version columns are materialized
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        // Verify version columns exist in the output
+        let last_updated = batch
+            .column_by_name("_row_last_updated_at_version")
+            .expect("Should have _row_last_updated_at_version column");
+        let created_at = batch
+            .column_by_name("_row_created_at_version")
+            .expect("Should have _row_created_at_version column");
+
+        // Verify they have the correct values (all rows created in version 1)
+        let last_updated_array = last_updated
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let created_at_array = created_at
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            assert_eq!(
+                last_updated_array.value(i),
+                1,
+                "All rows last updated at version 1"
+            );
+            assert_eq!(
+                created_at_array.value(i),
+                1,
+                "All rows created at version 1"
+            );
+        }
     }
 }

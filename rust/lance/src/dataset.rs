@@ -63,7 +63,7 @@ mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
-mod delta;
+pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -88,11 +88,10 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction, UpdateMapEntry};
+use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -773,46 +772,22 @@ impl Dataset {
         &self.manifest_location
     }
 
-    async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
-        if compared_version < 1 {
-            return Err(Error::invalid_input(
-                format!("Compared version must be > 0 (got {})", compared_version),
-                Default::default(),
-            ));
-        }
-
-        let current = self.version().version;
-        if current == compared_version {
-            return Err(Error::invalid_input(
-                "Compared version cannot equal to the current version",
-                Default::default(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    async fn build_dataset_delta(&self, compared_version: u64) -> Result<DatasetDelta> {
-        let current_version = self.version().version;
-
-        let (begin_version, end_version) = if current_version > compared_version {
-            (compared_version, current_version)
-        } else {
-            (current_version, compared_version)
-        };
-
-        Ok(DatasetDelta {
-            begin_version,
-            end_version,
-            base_dataset: self.clone(),
-        })
-    }
-
-    /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
-    pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
-        self.validate_compared_version(compared_version).await?;
-        let ds_delta = self.build_dataset_delta(compared_version).await?;
-        ds_delta.list_transactions().await
+    /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let delta = dataset.delta()
+    ///     .compared_against_version(5)
+    ///     .build()?;
+    /// let inserted = delta.get_inserted_rows().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn delta(&self) -> delta::DatasetDeltaBuilder {
+        delta::DatasetDeltaBuilder::new(self.clone())
     }
 
     // TODO: Cache this
@@ -1339,6 +1314,39 @@ impl Dataset {
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
+    }
+
+    /// Add new base paths to the dataset.
+    ///
+    /// This method allows you to register additional storage locations (buckets)
+    /// that can be used for future data writes. The base paths are added to the
+    /// dataset's manifest and can be referenced by name in subsequent write operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_bases` - A vector of `lance_table::format::BasePath` objects representing the new storage
+    ///   locations to add. Each base path should have a unique name and path.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Dataset` instance with the updated manifest containing the
+    /// new base paths.
+    pub async fn add_bases(
+        self: &Arc<Self>,
+        new_bases: Vec<lance_table::format::BasePath>,
+        transaction_properties: Option<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let operation = Operation::UpdateBases { new_bases };
+
+        let transaction = TransactionBuilder::new(self.manifest.version, operation)
+            .transaction_properties(transaction_properties.map(Arc::new))
+            .build();
+
+        let new_dataset = CommitBuilder::new(self.clone())
+            .execute(transaction)
+            .await?;
+
+        Ok(new_dataset)
     }
 
     pub async fn count_deleted_rows(&self) -> Result<usize> {
@@ -6771,7 +6779,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -7844,6 +7852,82 @@ mod tests {
             read_inner_struct.null_count(),
             "Null count should be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn test_issue_4902_packed_struct_v2_1_read_error() {
+        use std::collections::HashMap;
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray, UInt32Array};
+        use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
+
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::UInt32, false),
+            ArrowField::new("y", DataType::UInt32, false),
+        ]);
+        let mut packed_metadata = HashMap::new();
+        packed_metadata.insert("packed".to_string(), "true".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("int_col", DataType::Int32, false),
+            ArrowField::new("struct_col", DataType::Struct(struct_fields.clone()), false)
+                .with_metadata(packed_metadata),
+        ]));
+
+        let int_values = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let x_values = Arc::new(UInt32Array::from(vec![1, 4, 7, 10, 13, 16, 19, 22]));
+        let y_values = Arc::new(UInt32Array::from(vec![2, 5, 8, 11, 14, 17, 20, 23]));
+        let struct_array = Arc::new(StructArray::new(
+            struct_fields,
+            vec![x_values.clone() as ArrayRef, y_values.clone() as ArrayRef],
+            None,
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                int_values.clone() as ArrayRef,
+                struct_array.clone() as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let test_uri = TempStrDir::default();
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, &test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+
+        let result_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(result_batches, vec![batch.clone()]);
+
+        let struct_batches = dataset
+            .scan()
+            .project(&["struct_col"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(struct_batches.len(), 1);
+        let read_struct = struct_batches[0].column(0).as_struct();
+        assert_eq!(read_struct, struct_array.as_ref());
     }
 
     #[tokio::test]
@@ -9014,5 +9098,343 @@ mod tests {
             .await
             .unwrap();
         assert!(branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_bases() {
+        use lance_table::format::BasePath;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+        use std::sync::Arc;
+
+        // Create a test dataset
+        let test_uri = "memory://add_bases_test";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset = Arc::new(dataset);
+
+        // Test adding new base paths
+        let new_bases = vec![
+            BasePath::new(
+                0,
+                "memory://bucket1".to_string(),
+                Some("bucket1".to_string()),
+                false,
+            ),
+            BasePath::new(
+                0,
+                "memory://bucket2".to_string(),
+                Some("bucket2".to_string()),
+                true,
+            ),
+        ];
+
+        let updated_dataset = dataset.add_bases(new_bases, None).await.unwrap();
+
+        // Verify the base paths were added
+        assert_eq!(updated_dataset.manifest.base_paths.len(), 2);
+
+        let bucket1 = updated_dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("bucket1".to_string()))
+            .expect("bucket1 not found");
+        let bucket2 = updated_dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("bucket2".to_string()))
+            .expect("bucket2 not found");
+
+        assert_eq!(bucket1.path, "memory://bucket1");
+        assert!(!bucket1.is_dataset_root);
+        assert_eq!(bucket2.path, "memory://bucket2");
+        assert!(bucket2.is_dataset_root);
+
+        let updated_dataset = Arc::new(updated_dataset);
+
+        // Test conflict detection - try to add a base with the same name
+        let conflicting_bases = vec![BasePath::new(
+            0,
+            "memory://bucket3".to_string(),
+            Some("bucket1".to_string()),
+            false,
+        )];
+
+        let result = updated_dataset.add_bases(conflicting_bases, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected"));
+
+        // Test conflict detection - try to add a base with the same path
+        let conflicting_bases = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("bucket3".to_string()),
+            false,
+        )];
+
+        let result = updated_dataset.add_bases(conflicting_bases, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Conflict detected"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_bases_conflict() {
+        use lance_table::format::BasePath;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+        use std::sync::Arc;
+
+        // Create a test dataset
+        let test_uri = "memory://concurrent_add_bases_test";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Clone the dataset to simulate concurrent access
+        let dataset = Arc::new(dataset);
+        let dataset_clone = Arc::new(dataset.clone());
+
+        // First transaction adds base1
+        let new_bases1 = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("base1".to_string()),
+            false,
+        )];
+
+        let updated_dataset = dataset.add_bases(new_bases1, None).await.unwrap();
+
+        // Second transaction tries to add a different base (base2)
+        // This should succeed as there's no conflict
+        let new_bases2 = vec![BasePath::new(
+            0,
+            "memory://bucket2".to_string(),
+            Some("base2".to_string()),
+            false,
+        )];
+
+        let result = dataset_clone.add_bases(new_bases2, None).await;
+        assert!(result.is_ok());
+
+        // Verify both bases are present after conflict resolution
+        let mut final_dataset = updated_dataset;
+        final_dataset.checkout_latest().await.unwrap();
+        assert_eq!(final_dataset.manifest.base_paths.len(), 2);
+
+        let base1 = final_dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("base1".to_string()));
+        let base2 = final_dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("base2".to_string()));
+
+        assert!(base1.is_some());
+        assert!(base2.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_bases_name_conflict() {
+        use lance_table::format::BasePath;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+        use std::sync::Arc;
+
+        // Create a test dataset
+        let test_uri = "memory://concurrent_name_conflict_test";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Clone the dataset to simulate concurrent access
+        let dataset_clone = dataset.clone();
+        let dataset = Arc::new(dataset);
+        let dataset_clone = Arc::new(dataset_clone);
+
+        // First transaction adds base with name "shared_base"
+        let new_bases1 = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("shared_base".to_string()),
+            false,
+        )];
+
+        let _updated_dataset = dataset.add_bases(new_bases1, None).await.unwrap();
+
+        // Second transaction tries to add a different base with same name
+        // This should fail due to name conflict
+        let new_bases2 = vec![BasePath::new(
+            0,
+            "memory://bucket2".to_string(),
+            Some("shared_base".to_string()),
+            false,
+        )];
+
+        let result = dataset_clone.add_bases(new_bases2, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible with concurrent transaction"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_bases_path_conflict() {
+        use lance_table::format::BasePath;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+        use std::sync::Arc;
+
+        // Create a test dataset
+        let test_uri = "memory://concurrent_path_conflict_test";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Clone the dataset to simulate concurrent access
+        let dataset_clone = dataset.clone();
+        let dataset = Arc::new(dataset);
+        let dataset_clone = Arc::new(dataset_clone);
+
+        // First transaction adds base with path "memory://shared_path"
+        let new_bases1 = vec![BasePath::new(
+            0,
+            "memory://shared_path".to_string(),
+            Some("base1".to_string()),
+            false,
+        )];
+
+        let _updated_dataset = dataset.add_bases(new_bases1, None).await.unwrap();
+
+        // Second transaction tries to add a different base with same path
+        // This should fail due to path conflict
+        let new_bases2 = vec![BasePath::new(
+            0,
+            "memory://shared_path".to_string(),
+            Some("base2".to_string()),
+            false,
+        )];
+
+        let result = dataset_clone.add_bases(new_bases2, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible with concurrent transaction"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_bases_with_data_write() {
+        use lance_table::format::BasePath;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+        use std::sync::Arc;
+
+        // Create a test dataset
+        let test_uri = "memory://concurrent_write_test";
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Clone the dataset to simulate concurrent access
+        let dataset_clone = dataset.clone();
+        let dataset = Arc::new(dataset);
+
+        // First transaction adds a new base
+        let new_bases = vec![BasePath::new(
+            0,
+            "memory://bucket1".to_string(),
+            Some("base1".to_string()),
+            false,
+        )];
+
+        let updated_dataset = dataset.add_bases(new_bases, None).await.unwrap();
+
+        // Concurrent transaction appends data
+        // This should succeed as add_bases doesn't conflict with data writes
+        let result = Dataset::write(
+            data_gen.batch(5),
+            WriteDestination::Dataset(Arc::new(dataset_clone)),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Verify both operations are reflected
+        let mut final_dataset = updated_dataset;
+        final_dataset.checkout_latest().await.unwrap();
+
+        // Should have the new base
+        assert_eq!(final_dataset.manifest.base_paths.len(), 1);
+        assert!(final_dataset
+            .manifest
+            .base_paths
+            .values()
+            .any(|bp| bp.name == Some("base1".to_string())));
+
+        // Should have both data writes (10 rows total)
+        assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
     }
 }

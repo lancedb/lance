@@ -2056,6 +2056,32 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
+    def add_bases(
+        self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
+    ):
+        """
+        Add new base paths to the dataset for multi-base storage.
+
+        This method allows you to register additional storage locations (bases)
+        that can be used for future data writes. The base paths are added to the
+        dataset's manifest and can be referenced by name in subsequent write operations.
+
+        Parameters
+        ----------
+        new_bases : list[DatasetBasePath]
+            A list of DatasetBasePath objects representing the new storage locations
+            to add. Each base path should have a unique name and path.
+        transaction_properties : Optional[Dict[str, str]]
+            Optional key-value pairs for audit metadata.
+
+        Returns
+        -------
+        LanceDataset
+            Returns self to allow method chaining.
+        """
+        self._ds.add_bases(new_bases, transaction_properties)
+        return self
+
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
@@ -2937,6 +2963,8 @@ class LanceDataset(pa.dataset.Dataset):
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
+        *,
+        commit_message: Optional[str] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -2993,6 +3021,9 @@ class LanceDataset(pa.dataset.Dataset):
             the future.
         max_retries : int
             The maximum number of retries to perform when committing the dataset.
+        commit_message: str, optional
+            A message to associate with this commit. This message will be stored in the
+            dataset's metadata and can be retrieved using read_transaction().
 
         Returns
         -------
@@ -3047,6 +3078,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "Overwrite and Restore"
             )
         if isinstance(operation, Transaction):
+            if commit_message is not None:
+                raise ValueError(
+                    "commit_message is not supported when calling commit with "
+                    "a Transaction.  Set the message on the transaction properties "
+                    "instead."
+                )
             new_ds = _Dataset.commit_transaction(
                 base_uri,
                 operation,
@@ -3067,6 +3104,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
+                commit_message=commit_message,
             )
         else:
             raise TypeError(
@@ -3262,7 +3300,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.read_transaction(version)
 
-    def get_transactions(self, recent_transactions=10) -> Optional[List[Transaction]]:
+    def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
     def sql(self, sql: str) -> "SqlQueryBuilder":
@@ -3290,26 +3328,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         return SqlQueryBuilder(self._ds.sql(sql))
-
-    def diff_meta(self, compared_version: int) -> List[Transaction]:
-        """
-        Get the transaction list between current version and compared version
-        as metadata differences.
-
-        Parameters
-        ----------
-        compared_version : int
-            The version to compare against, the compared_version must be greater than 0
-            and less than the current version.
-            Note that the compared_version may not exist in the dataset due to
-            clean-up action, in which case it would throw a `VersionNotFound` error.
-
-        Returns
-        -------
-        List[Transaction]
-            List of transactions representing the differences
-        """
-        return self._ds.diff_meta(compared_version)
 
     @property
     def optimize(self) -> "DatasetOptimizer":
