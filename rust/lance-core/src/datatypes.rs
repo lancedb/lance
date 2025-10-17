@@ -37,6 +37,18 @@ pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 pub static BLOB_DESC_TYPE: LazyLock<DataType> =
     LazyLock::new(|| DataType::Struct(BLOB_DESC_FIELDS.clone()));
 
+pub static BLOB_DESC_V2_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+        ArrowField::new("blob_id", DataType::UInt32, true),
+        ArrowField::new("blob_uri", DataType::Utf8, true),
+    ])
+});
+
+pub static BLOB_DESC_V2_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_DESC_V2_FIELDS.clone()));
+
 pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
     ArrowField::new("description", BLOB_DESC_TYPE.clone(), true).with_metadata(HashMap::from([(
         lance_arrow::BLOB_META_KEY.to_string(),

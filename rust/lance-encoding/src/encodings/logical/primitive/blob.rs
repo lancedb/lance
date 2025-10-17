@@ -9,17 +9,18 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{cast::AsArray, make_array, Array, UInt64Array};
+use arrow_buffer::Buffer;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use snafu::location;
 
 use lance_core::{
-    cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt, Error, Result,
+    cache::DeepSizeOf, datatypes::BLOB_DESC_V2_TYPE, error::LanceOptionExt, Error, Result,
 };
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, VariableWidthBlock},
+    data::{AllNullDataBlock, BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
     encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
     repdef::{DefinitionInterpretation, RepDefUnraveler},
@@ -303,7 +304,46 @@ impl StructuralPageScheduler for BlobPageScheduler {
 
             let descs = desc_decoder.drain(desc_decoder_task.num_rows)?;
             let descs = descs.decode()?;
-            let descs = make_array(descs.data.into_arrow(BLOB_DESC_TYPE.clone(), true)?);
+
+            let desc_block = match descs.data {
+                DataBlock::Struct(mut block) => {
+                    if block.children.len() == 2 {
+                        let num_values = match &block.children[0] {
+                            DataBlock::FixedWidth(b) => b.num_values,
+                            _ => {
+                                return Err(Error::Internal {
+                                    message: "Expected fixed width data block for blob positions"
+                                        .into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+                        let blob_ids = DataBlock::FixedWidth(FixedWidthDataBlock {
+                            data: LanceBuffer::from(Buffer::from_vec(vec![
+                                0u32;
+                                num_values as usize
+                            ])),
+                            bits_per_value: 32,
+                            num_values,
+                            block_info: BlockInfo::new(),
+                        });
+                        let blob_uri = DataBlock::AllNull(AllNullDataBlock { num_values });
+                        block.children.push(blob_ids);
+                        block.children.push(blob_uri);
+                    }
+                    block
+                }
+                _ => {
+                    return Err(Error::Internal {
+                        message: "Expected struct data block for blob descriptions".into(),
+                        location: location!(),
+                    })
+                }
+            };
+
+            let descs = make_array(
+                DataBlock::Struct(desc_block).into_arrow(BLOB_DESC_V2_TYPE.clone(), true)?,
+            );
             let descs = descs.as_struct();
             let positions = Arc::new(
                 descs

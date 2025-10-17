@@ -278,7 +278,10 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
         LanceFileVersion::V2_0 => Box::new(
             crate::previous::encoder::CoreFieldEncodingStrategy::new(version),
         ),
-        _ => Box::new(StructuralEncodingStrategy::default()),
+        _ => Box::new(StructuralEncodingStrategy {
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
+            version: version.resolve(),
+        }),
     }
 }
 
@@ -296,7 +299,7 @@ pub fn default_encoding_strategy_with_params(
             let compression_strategy = Arc::new(DefaultCompressionStrategy::with_params(params));
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
-                version,
+                version: version.resolve(),
             }))
         }
     }
@@ -375,6 +378,7 @@ impl StructuralEncodingStrategy {
                         column_index.next_column_index(field.id as u32),
                         options,
                         self.compression_strategy.clone(),
+                        self.version,
                     )?));
                 }
                 _ => {
