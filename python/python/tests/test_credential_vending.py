@@ -133,16 +133,15 @@ def test_credential_vendor_validation(tmp_path):
 
 def test_namespace_credential_vendor(tmp_path):
     """
-    Test LanceNamespaceCredentialVendor with directory namespace.
+    Test LanceNamespaceCredentialVendor with a mock namespace.
+    This demonstrates how to use lance_namespace package.
     """
     import time
 
     from lance import LanceNamespaceCredentialVendor
 
-    # Note: In a real scenario, you would connect to a real namespace
-    # For this test, we create a mock namespace that returns credentials
-
     # Create a custom mock namespace that returns credentials
+    # In production, you would use: import lance_namespace; ns = lance_namespace.connect(...)
     class MockNamespace:
         def describe_table(self, table_id, version):
             return {

@@ -31,7 +31,6 @@ from .lance import (
     FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
-    connect_namespace,
     iops_counter,
 )
 from .namespace import LanceNamespaceCredentialVendor
@@ -69,7 +68,6 @@ __all__ = [
     "__version__",
     "batch_udf",
     "bytes_read_counter",
-    "connect_namespace",
     "dataset",
     "io",
     "iops_counter",
@@ -159,8 +157,11 @@ def dataset(
         A credential vendor to use for this dataset. This is used to provide
         dynamic credentials for cloud storage access. If not specified, static
         credentials from storage_options will be used.
-    namespace : optional, lance._lib._Namespace
+    namespace : optional
         A namespace instance from which to fetch table location and credentials.
+        This can be any object with a describe_table(table_id, version) method
+        that returns a dict with 'location' and 'storage_options' keys.
+        For example, use lance_namespace.connect() from the lance_namespace package.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table(). Credentials will be automatically refreshed

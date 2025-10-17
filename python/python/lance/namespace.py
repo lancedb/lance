@@ -24,8 +24,11 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
 
     Parameters
     ----------
-    namespace : lance._lib._Namespace
-        The namespace instance to fetch credentials from
+    namespace : any
+        The namespace instance to fetch credentials from. This can be any object
+        with a describe_table(table_id, version) method that returns a dict with
+        'location' and 'storage_options' keys. For example, use lance_namespace.connect()
+        from the lance_namespace PyPI package.
     table_id : List[str]
         The table identifier (e.g., ["workspace", "table_name"])
 
@@ -36,9 +39,10 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
     .. code-block:: python
 
         import lance
+        import lance_namespace
 
         # Connect to a namespace (e.g., LanceDB Cloud)
-        namespace = lance.connect_namespace("rest", {
+        namespace = lance_namespace.connect("rest", {
             "url": "https://api.lancedb.com",
             "api_key": "your-api-key"
         })
@@ -61,8 +65,8 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
 
         Parameters
         ----------
-        namespace : lance._lib._Namespace
-            The namespace instance
+        namespace : any
+            The namespace instance with a describe_table() method
         table_id : List[str]
             The table identifier
         """

@@ -73,7 +73,6 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
-pub(crate) mod namespace;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -85,7 +84,6 @@ pub(crate) mod utils;
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
-use crate::namespace::{connect_namespace, PyNamespace};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
@@ -260,7 +258,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
-    m.add_class::<PyNamespace>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;
@@ -290,7 +287,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
-    m.add_wrapped(wrap_pyfunction!(connect_namespace))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
