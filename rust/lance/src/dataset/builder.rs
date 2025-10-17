@@ -10,6 +10,7 @@ use crate::{
     session::Session,
     Dataset,
 };
+use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
@@ -301,7 +302,7 @@ impl DatasetBuilder {
     pub async fn load(self) -> Result<Dataset> {
         let uri = self.table_uri.clone();
         let target_ref = self.version.clone();
-        match self.load_impl().await {
+        match self.load_impl().boxed().await {
             Ok(dataset) => {
                 info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
                 Ok(dataset)
