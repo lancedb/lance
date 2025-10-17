@@ -589,7 +589,7 @@ impl FilteredReadStream {
                         options.full_filter.clone()
                     };
 
-                    println!(
+                    log::trace!(
                         "Planning {} ranges ({} rows) from fragment {} with filter: {:?}",
                         to_read.len(),
                         to_read.iter().map(|r| r.end - r.start).sum::<u64>(),
@@ -608,7 +608,7 @@ impl FilteredReadStream {
                         scan_scheduler: scan_scheduler.clone(),
                     });
                 } else {
-                    println!(
+                    log::trace!(
                         "Skipping fragment {} because it was outside the scan range",
                         fragment.fragment.id()
                     );

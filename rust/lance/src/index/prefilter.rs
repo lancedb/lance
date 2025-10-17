@@ -6,7 +6,6 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
-use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +30,7 @@ use tracing::instrument;
 use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::rowids::load_row_id_sequence;
+use crate::dataset::rowids::{get_row_id_index, load_row_id_sequence};
 use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
@@ -146,26 +145,34 @@ impl DatasetPreFilter {
             .as_ref()
             .get_or_insert_with_key(key, move || {
                 async move {
+                    // Build row-id -> address index for stable row-id mode
+                    let row_id_index = get_row_id_index(&dataset_clone)
+                        .await?
+                        .expect("stable row id mode should have a RowIdIndex");
                     let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
+
                     let allow_list = spawn_cpu(move || {
-                        Ok(row_ids_and_deletions.into_iter().fold(
-                            RowIdTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.iter()).unwrap();
-                                    Cow::Owned(row_ids)
-                                } else {
-                                    Cow::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowIdTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
+                        // Build allow_list in ROW_ADDR domain by mapping each stable row id via RowIdIndex
+                        let mut allow_list = RowIdTreeMap::new();
+                        let mut sample_pairs: Vec<(u64, u64)> = Vec::new();
+                        // Limit for instrumentation sample output
+                        let sample_limit = 8usize;
+                        for (row_ids, _deletion_vector) in row_ids_and_deletions.into_iter() {
+                            // We rely on RowIdIndex::get to ignore tombstoned rows.
+                            for rid in row_ids.iter() {
+                                if let Some(addr) = row_id_index.get(rid) {
+                                    let u = u64::from(addr);
+                                    allow_list.insert(u);
+                                    if sample_pairs.len() < sample_limit {
+                                        sample_pairs.push((rid, u));
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, crate::Error>(allow_list)
                     })
                     .await?;
 
