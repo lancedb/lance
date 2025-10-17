@@ -21,7 +21,7 @@ use lance_core::{
         address::RowAddress,
         futures::{Capacity, SharedStreamExt},
     },
-    Error, Result,
+    Error, Result, ROW_ADDR,
 };
 use lance_io::traits::Reader;
 
@@ -186,7 +186,7 @@ pub(super) async fn take_blobs(
     row_ids: &[u64],
     column: &str,
 ) -> Result<Vec<BlobFile>> {
-    let projection = dataset.schema().project(&[column])?;
+    let projection = dataset.schema().project(&[column, ROW_ADDR])?;
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
     if blob_field.data_type() != DataType::LargeBinary || !projection.fields[0].is_blob() {
@@ -195,11 +195,7 @@ pub(super) async fn take_blobs(
             source: format!("the column '{}' is not a blob column", column).into(),
         });
     }
-    let description_and_addr = dataset
-        .take_builder(row_ids, projection)?
-        .with_row_address(true)
-        .execute()
-        .await?;
+    let description_and_addr = dataset.take_builder(row_ids, projection)?.execute().await?;
     let descriptions = description_and_addr.column(0).as_struct();
     let positions = descriptions.column(0).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(1).as_primitive::<UInt64Type>();
