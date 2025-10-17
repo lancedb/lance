@@ -30,6 +30,7 @@ deepsize.workspace = true
 dirs.workspace = true
 fst.workspace = true
 futures.workspace = true
+hashbrown.workspace = true
 half.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }

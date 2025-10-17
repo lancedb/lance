@@ -6,6 +6,9 @@ use std::{borrow::Cow, collections::hash_map};
 use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
 use fst::Streamer;
+use lance_table::format::pb::transaction::Append;
+
+use crate::scalar::inverted::token_set::AppendableTokenSetIterator;
 
 use super::{
     builder::BLOCK_SIZE,
@@ -14,7 +17,7 @@ use super::{
 };
 
 pub enum TokenSource<'a> {
-    HashMap(hash_map::Iter<'a, String, u32>),
+    Appendable(AppendableTokenSetIterator<'a>),
     Fst(fst::map::Stream<'a>),
 }
 
@@ -33,9 +36,9 @@ impl<'a> Iterator for TokenIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.source {
-            TokenSource::HashMap(iter) => iter
+            TokenSource::Appendable(iter) => iter
                 .next()
-                .map(|(token, token_id)| (Cow::Borrowed(token.as_str()), *token_id)),
+                .map(|(token, token_id)| (Cow::Borrowed(token), token_id)),
             TokenSource::Fst(iter) => iter.next().map(|(token, token_id)| {
                 // FST tokens are &[u8], so we must allocate a String.
                 // TODO: we should be able to avoid this allocation
