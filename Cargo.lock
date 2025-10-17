@@ -4804,12 +4804,16 @@ dependencies = [
  "async-trait",
  "bytes",
  "lance",
+ "lance-core",
  "lance-namespace",
  "opendal",
+ "reqwest",
+ "serde_json",
+ "snafu",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "url",
+ "wiremock",
 ]
 
 [[package]]
