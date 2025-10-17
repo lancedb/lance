@@ -151,6 +151,14 @@ message FullZipLayout {
 message AllNullLayout {
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
   repeated RepDefLayer layers = 5;
+  // The compression algorithm that encodes the repetition buffer
+  CompressiveEncoding rep_compression = 6;
+  // The compression algorithm that encodes the definition buffer
+  CompressiveEncoding def_compression = 7;
+  // Number of values in the repetition buffer
+  uint64 num_rep_values = 8;
+  // Number of values in the definition buffer
+  uint64 num_def_values = 9;
 }
 
 // A layout where large binary data is encoded externally and only

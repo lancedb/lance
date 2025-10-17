@@ -592,7 +592,13 @@ impl ProtobufUtils21 {
         }
     }
 
-    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> pb21::PageLayout {
+    pub fn all_null_layout(
+        def_meaning: &[DefinitionInterpretation],
+        rep_compression: Option<pb21::CompressiveEncoding>,
+        def_compression: Option<pb21::CompressiveEncoding>,
+        num_rep_values: u64,
+        num_def_values: u64,
+    ) -> pb21::PageLayout {
         pb21::PageLayout {
             layout: Some(pb21::page_layout::Layout::AllNullLayout(
                 pb21::AllNullLayout {
@@ -600,12 +606,16 @@ impl ProtobufUtils21 {
                         .iter()
                         .map(|&def| Self::def_inter_to_repdef_layer(def))
                         .collect(),
+                    rep_compression,
+                    def_compression,
+                    num_rep_values,
+                    num_def_values,
                 },
             )),
         }
     }
 
     pub fn simple_all_null_layout() -> pb21::PageLayout {
-        Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
+        Self::all_null_layout(&[DefinitionInterpretation::NullableItem], None, None, 0, 0)
     }
 }

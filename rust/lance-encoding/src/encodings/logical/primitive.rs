@@ -27,6 +27,7 @@ use crate::{
 use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
+use bytes::Bytes;
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -720,12 +721,20 @@ pub struct ComplexAllNullScheduler {
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
     max_visible_level: u16,
+    rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
+    def_decompressor: Option<Arc<dyn BlockDecompressor>>,
+    num_rep_values: u64,
+    num_def_values: u64,
 }
 
 impl ComplexAllNullScheduler {
     pub fn new(
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
+        rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        def_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        num_rep_values: u64,
+        num_def_values: u64,
     ) -> Self {
         let max_visible_level = def_meaning
             .iter()
@@ -737,6 +746,10 @@ impl ComplexAllNullScheduler {
             def_meaning,
             repdef: None,
             max_visible_level,
+            rep_decompressor,
+            def_decompressor,
+            num_rep_values,
+            num_def_values,
         }
     }
 }
@@ -762,24 +775,59 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
         let data = io.submit_request(reads, 0);
 
+        let rep_decompressor = self.rep_decompressor.clone();
+        let def_decompressor = self.def_decompressor.clone();
+        let num_rep_values = self.num_rep_values;
+        let num_def_values = self.num_def_values;
         async move {
             let data = data.await?;
             let mut data_iter = data.into_iter();
 
+            // Helper function to decompress rep/def levels
+            let decompress_levels = |compressed_bytes: Bytes,
+                                     decompressor: &Arc<dyn BlockDecompressor>,
+                                     num_values: u64,
+                                     level_type: &str|
+             -> Result<ScalarBuffer<u16>> {
+                let compressed_buffer = LanceBuffer::from_bytes(compressed_bytes, 1);
+                let decompressed = decompressor.decompress(compressed_buffer, num_values)?;
+                match decompressed {
+                    DataBlock::FixedWidth(block) => {
+                        assert_eq!(block.num_values, num_values);
+                        assert_eq!(block.bits_per_value, 16);
+                        Ok(block.data.borrow_to_typed_slice::<u16>())
+                    }
+                    _ => Err(Error::InvalidInput {
+                        source: format!(
+                            "Expected fixed-width data block for {} levels",
+                            level_type
+                        )
+                        .into(),
+                        location: location!(),
+                    }),
+                }
+            };
+
             let rep = if has_rep {
-                let rep = data_iter.next().unwrap();
-                let rep = LanceBuffer::from_bytes(rep, 2);
-                let rep = rep.borrow_to_typed_slice::<u16>();
-                Some(rep)
+                let compressed_bytes = data_iter.next().unwrap();
+                Some(decompress_levels(
+                    compressed_bytes,
+                    rep_decompressor.as_ref().unwrap(),
+                    num_rep_values,
+                    "repetition",
+                )?)
             } else {
                 None
             };
 
             let def = if has_def {
-                let def = data_iter.next().unwrap();
-                let def = LanceBuffer::from_bytes(def, 2);
-                let def = def.borrow_to_typed_slice::<u16>();
-                Some(def)
+                let compressed_bytes = data_iter.next().unwrap();
+                Some(decompress_levels(
+                    compressed_bytes,
+                    def_decompressor.as_ref().unwrap(),
+                    num_def_values,
+                    "definition",
+                )?)
             } else {
                 None
             };
@@ -2954,9 +3002,28 @@ impl StructuralPrimitiveFieldScheduler {
                 {
                     Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
                 } else {
+                    // Create decompressors for rep and def buffers
+                    let rep_decompressor = all_null
+                        .rep_compression
+                        .as_ref()
+                        .map(|encoding| decompressors.create_block_decompressor(encoding))
+                        .transpose()?
+                        .map(Arc::from);
+
+                    let def_decompressor = all_null
+                        .def_compression
+                        .as_ref()
+                        .map(|encoding| decompressors.create_block_decompressor(encoding))
+                        .transpose()?
+                        .map(Arc::from);
+
                     Box::new(ComplexAllNullScheduler::new(
                         page_info.buffer_offsets_and_sizes.clone(),
                         def_meaning.into(),
+                        rep_decompressor,
+                        def_decompressor,
+                        all_null.num_rep_values,
+                        all_null.num_def_values,
                     )) as Box<dyn StructuralPageScheduler>
                 }
             }
@@ -3671,6 +3738,27 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    fn encode_complex_all_null_vals(
+        data: &Arc<[u16]>,
+        compression_strategy: &dyn CompressionStrategy,
+    ) -> Result<(LanceBuffer, pb21::CompressiveEncoding)> {
+        let buffer = LanceBuffer::reinterpret_slice(data.clone());
+        let mut fixed_width_block = FixedWidthDataBlock {
+            data: buffer,
+            bits_per_value: 16,
+            num_values: data.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+        fixed_width_block.compute_stat();
+
+        let levels_block = DataBlock::FixedWidth(fixed_width_block);
+        let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
+        let (compressor, encoding) =
+            compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
+        let compressed_buffer = compressor.compress(levels_block)?;
+        Ok((compressed_buffer, encoding))
+    }
+
     // Encodes a page where all values are null but we have rep/def
     // information that we need to store (e.g. to distinguish between
     // different kinds of null)
@@ -3679,23 +3767,37 @@ impl PrimitiveStructuralEncoder {
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
         num_rows: u64,
+        compression_strategy: &dyn CompressionStrategy,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
-        // TODO: Actually compress repdef
-        let rep_bytes = if let Some(rep) = repdef.repetition_levels.as_ref() {
-            LanceBuffer::reinterpret_slice(rep.clone())
+        let (rep_bytes, rep_encoding, num_rep_values) = if let Some(rep) =
+            repdef.repetition_levels.as_ref()
+        {
+            let num_values = rep.len() as u64;
+            let (buffer, encoding) = Self::encode_complex_all_null_vals(rep, compression_strategy)?;
+            (buffer, Some(encoding), num_values)
         } else {
-            LanceBuffer::empty()
+            (LanceBuffer::empty(), None, 0)
         };
 
-        let def_bytes = if let Some(def) = repdef.definition_levels.as_ref() {
-            LanceBuffer::reinterpret_slice(def.clone())
+        let (def_bytes, def_encoding, num_def_values) = if let Some(def) =
+            repdef.definition_levels.as_ref()
+        {
+            let num_values = def.len() as u64;
+            let (buffer, encoding) = Self::encode_complex_all_null_vals(def, compression_strategy)?;
+            (buffer, Some(encoding), num_values)
         } else {
-            LanceBuffer::empty()
+            (LanceBuffer::empty(), None, 0)
         };
 
-        let description = ProtobufUtils21::all_null_layout(&repdef.def_meaning);
+        let description = ProtobufUtils21::all_null_layout(
+            &repdef.def_meaning,
+            rep_encoding,
+            def_encoding,
+            num_rep_values,
+            num_def_values,
+        );
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
@@ -4178,7 +4280,7 @@ impl PrimitiveStructuralEncoder {
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
                 log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
-                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
+                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows, compression_strategy.as_ref());
             }
             let num_nulls = arrays
                 .iter()
@@ -4203,7 +4305,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows
                     );
                     // If we get here then we have definition levels and we need to store those
-                    Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
+                    Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows, compression_strategy.as_ref())
                 };
             }
 
@@ -4400,6 +4502,13 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
+    use super::{
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
+        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
+        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
+        StructuralPageScheduler,
+    };
+    use crate::compression::DecompressionStrategy;
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::decoder::PageEncoding;
     use crate::encodings::logical::primitive::{
@@ -4413,13 +4522,6 @@ mod tests {
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
-
-    use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
-        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
-        StructuralPageScheduler,
-    };
 
     #[test]
     fn test_is_narrow() {
@@ -5438,5 +5540,146 @@ mod tests {
             }));
 
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test]
+    fn test_encode_decode_complex_all_null_vals_simple() {
+        use crate::compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy};
+        let values: Arc<[u16]> = Arc::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+
+        // Create compression and decompression strategies
+        let compression_strategy = DefaultCompressionStrategy::default();
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+
+        // Encode
+        let (compressed_buf, encoding) = PrimitiveStructuralEncoder::encode_complex_all_null_vals(
+            &values,
+            &compression_strategy,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(encoding.compression, Some(Compression::Flat(..))),
+            "Expected flat encoding"
+        );
+
+        // Create decompressors from the encodings
+        let decompressor = decompression_strategy
+            .create_block_decompressor(&encoding)
+            .unwrap();
+
+        // Decompress the rep values
+        let decompressed = decompressor
+            .decompress(compressed_buf, values.len() as u64)
+            .unwrap();
+        let decompressed_fix_width = decompressed.as_fixed_width().unwrap();
+        assert_eq!(decompressed_fix_width.num_values, values.len() as u64);
+        assert_eq!(decompressed_fix_width.bits_per_value, 16);
+        let rep_result = decompressed_fix_width.data.borrow_to_typed_slice::<u16>();
+        assert_eq!(rep_result.as_ref(), values.as_ref());
+    }
+
+    #[test]
+    fn test_encode_decode_complex_all_null_vals_less_than_1024() {
+        use crate::compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy};
+
+        let values: Arc<[u16]> = Arc::from((0..1000).map(|i| (i % 3) as u16).collect::<Vec<u16>>());
+
+        // Create compression and decompression strategies
+        let compression_strategy = DefaultCompressionStrategy::default();
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+
+        // Encode
+        let (compressed_buf, encoding) = PrimitiveStructuralEncoder::encode_complex_all_null_vals(
+            &values,
+            &compression_strategy,
+        )
+        .unwrap();
+
+        // should run InLineBitpacking as it is <= 1024
+        assert!(
+            matches!(encoding.compression, Some(Compression::InlineBitpacking(_))),
+            "Expected Inline bitpacking"
+        );
+
+        // Create decompressors from the encodings
+        let decompressor = decompression_strategy
+            .create_block_decompressor(&encoding)
+            .unwrap();
+
+        // Decompress the rep values
+        let decompressed = decompressor
+            .decompress(compressed_buf, values.len() as u64)
+            .unwrap();
+        let decompressed_fixed_width = decompressed.as_fixed_width().unwrap();
+        assert_eq!(decompressed_fixed_width.num_values, values.len() as u64);
+        assert_eq!(decompressed_fixed_width.bits_per_value, 16);
+        let rep_result = decompressed_fixed_width.data.borrow_to_typed_slice::<u16>();
+        assert_eq!(rep_result.as_ref(), values.as_ref());
+    }
+
+    #[test]
+    fn test_encode_decode_complex_all_null_vals_huge() {
+        use crate::compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy};
+
+        let values: Arc<[u16]> = Arc::from((0..2000).map(|i| (i % 3) as u16).collect::<Vec<u16>>());
+
+        // Create compression and decompression strategies
+        let compression_strategy = DefaultCompressionStrategy::default();
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+
+        // Encode (compress) the rep values and the def values
+        let (compressed_buf, encoding) = PrimitiveStructuralEncoder::encode_complex_all_null_vals(
+            &values,
+            &compression_strategy,
+        )
+        .unwrap();
+
+        // should run OutOfLineBitpacking as it is larger than 1024
+        assert!(
+            matches!(
+                encoding.compression,
+                Some(Compression::OutOfLineBitpacking(_))
+            ),
+            "Expected OutOfLineBitpacking for rep"
+        );
+
+        // Create decompressors from the encodings
+        let decompressor = decompression_strategy
+            .create_block_decompressor(&encoding)
+            .unwrap();
+
+        // Decompress the rep values
+        let decompressed = decompressor
+            .decompress(compressed_buf, values.len() as u64)
+            .unwrap();
+        let decompressed_fixed_width = decompressed.as_fixed_width().unwrap();
+        assert_eq!(decompressed_fixed_width.num_values, values.len() as u64);
+        assert_eq!(decompressed_fixed_width.bits_per_value, 16);
+        let rep_result = decompressed_fixed_width.data.borrow_to_typed_slice::<u16>();
+        assert_eq!(rep_result.as_ref(), values.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_complex_all_null_round_trip() {
+        use arrow_array::ListArray;
+
+        // Create a list array with mix of null and empty lists
+        // This creates complex rep/def levels where all values are null but we need
+        // to distinguish between null lists and empty lists
+        let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
+            (0..1000).map(|i| {
+                if i % 2 == 0 {
+                    None // Null list
+                } else {
+                    Some(vec![]) // Empty list
+                }
+            }),
+        );
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
     }
 }
