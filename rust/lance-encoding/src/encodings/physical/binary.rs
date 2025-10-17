@@ -415,7 +415,13 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         // In the standard scheme we use 4 bytes for the bits per offset and 4 bytes for the bytes_start_offset and we
         // rely on the passed in num_values to be correct.
 
-        let (bits_per_offset, bytes_start_offset, offset_start) = if data[0] == 0 {
+        // This isn't perfect but it's probably good enough and the best I think we can do.  The bits per offset will
+        // never be more than 255 and it's little endian so the last 3 bytes will always be 0.  These will be the least
+        // significant 3 bytes of the number of values in the old scheme.  It's pretty unlikely these are all 0 (that would
+        // mean there are at least 16M values in a single page) so we'll use this to determine if the old scheme is used.
+        let is_old_scheme = data[1] != 0 || data[2] != 0 || data[3] != 0;
+
+        let (bits_per_offset, bytes_start_offset, offset_start) = if is_old_scheme {
             // Old scheme
             let bits_per_offset = data[0];
             match bits_per_offset {

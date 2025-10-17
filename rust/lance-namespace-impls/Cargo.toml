@@ -1,0 +1,53 @@
+[package]
+name = "lance-namespace-impls"
+description = "Lance Namespace Implementations"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
+dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
+
+[dependencies]
+lance-namespace.workspace = true
+lance-core.workspace = true
+
+# REST implementation dependencies (optional, enabled by "rest" feature)
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "charset",
+    "gzip",
+    "http2",
+    "stream",
+    "rustls-tls-native-roots"
+] }
+serde_json = { workspace = true, optional = true }
+
+# Directory implementation dependencies (optional, enabled by "dir" feature)
+lance = { workspace = true, optional = true }
+opendal = { workspace = true, optional = true, features = ["services-fs", "services-s3", "services-gcs", "services-azblob"] }
+arrow = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+# Common dependencies
+async-trait.workspace = true
+bytes.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

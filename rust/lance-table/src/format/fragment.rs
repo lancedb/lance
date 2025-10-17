@@ -14,6 +14,9 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::rowids::version::{
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+};
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -289,6 +292,14 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Last updated at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Created at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -299,6 +310,8 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -336,6 +349,8 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -457,6 +472,14 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            last_updated_at_version_meta: p
+                .last_updated_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
+            created_at_version_meta: p
+                .created_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -487,13 +510,17 @@ impl From<&Fragment> for pb::DataFragment {
                 })
             }
         });
-
+        let last_updated_at_version_sequence =
+            last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
+        let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            last_updated_at_version_sequence,
+            created_at_version_sequence,
         }
     }
 }

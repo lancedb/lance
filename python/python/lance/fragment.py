@@ -28,6 +28,9 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    RowDatasetVersionMeta as RowDatasetVersionMeta,
+)
+from .lance import (
     RowIdMeta as RowIdMeta,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
@@ -67,6 +70,10 @@ class FragmentMetadata:
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
         The row id metadata, if any.
+    created_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row created at version metadata, if any.
+    last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row last updated at version metadata, if any.
     """
 
     id: int
@@ -74,6 +81,8 @@ class FragmentMetadata:
     physical_rows: int
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
+    created_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -110,6 +119,16 @@ class FragmentMetadata:
             row_id_meta=(
                 self.row_id_meta.asdict() if self.row_id_meta is not None else None
             ),
+            created_at_version_meta=(
+                json.loads(self.created_at_version_meta.json())
+                if self.created_at_version_meta is not None
+                else None
+            ),
+            last_updated_at_version_meta=(
+                json.loads(self.last_updated_at_version_meta.json())
+                if self.last_updated_at_version_meta is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -124,12 +143,26 @@ class FragmentMetadata:
         if row_id_meta is not None:
             row_id_meta = RowIdMeta(**row_id_meta)
 
+        created_at_version_meta = json_data.get("created_at_version_meta")
+        if created_at_version_meta is not None:
+            created_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(created_at_version_meta)
+            )
+
+        last_updated_at_version_meta = json_data.get("last_updated_at_version_meta")
+        if last_updated_at_version_meta is not None:
+            last_updated_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(last_updated_at_version_meta)
+            )
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
             physical_rows=json_data["physical_rows"],
             deletion_file=deletion_file,
             row_id_meta=row_id_meta,
+            created_at_version_meta=created_at_version_meta,
+            last_updated_at_version_meta=last_updated_at_version_meta,
         )
 
 

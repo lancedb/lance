@@ -1670,6 +1670,7 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_schema::{Field, Schema};
+    use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
@@ -1734,7 +1735,7 @@ mod tests {
         let state = ctx.state();
         let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
         if optimize {
-            let props = ExecutionProps::default();
+            let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
             let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
             let simplifier =
                 datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);

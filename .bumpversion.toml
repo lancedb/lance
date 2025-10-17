@@ -1,7 +1,10 @@
 [tool.bumpversion]
 current_version = "0.32.1"
-parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
-serialize = ["{major}.{minor}.{patch}"]
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>.+))?"
+serialize = [
+    "{major}.{minor}.{patch}-{prerelease}",
+    "{major}.{minor}.{patch}"
+]
 search = "{current_version}"
 replace = "{new_version}"
 regex = false
@@ -69,6 +72,16 @@ replace = 'lance-io = {{ version = "={new_version}"'
 filename = "Cargo.toml"
 search = 'lance-linalg = {{ version = "={current_version}"'
 replace = 'lance-linalg = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'lance-namespace = {{ version = "={current_version}"'
+replace = 'lance-namespace = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'lance-namespace-impls = {{ version = "={current_version}"'
+replace = 'lance-namespace-impls = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
@@ -143,6 +156,16 @@ replace = 'version = "{new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "rust/lance-linalg/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/lance-namespace/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/lance-namespace-impls/Cargo.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
