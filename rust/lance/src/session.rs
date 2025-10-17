@@ -19,9 +19,21 @@ use self::index_extension::IndexExtension;
 
 pub(crate) mod caches;
 pub(crate) mod index_caches;
-pub mod index_extension;
+pub(crate) mod index_extension;
 
-/// A user session tracks the runtime state.
+/// A user session holds the runtime state for a [`crate::Dataset`]
+///
+/// A session will be created automatically when a Dataset is opened.  However, you
+/// can manually create the session and provide it to the Dataset builder in order
+/// to share runtime state between multiple datasets.
+///
+/// This can be used to share caches between multiple datasets, increasing the hit
+/// rate and reducing the amount of memory used.
+///
+/// A session contains two different caches:
+///  - The index cache is used to cache opened indices and will cache index data
+///  - The metadata cache is used to cache a variety of dataset metadata (more
+///    details can be found in the [performance guide](https://lancedb.github.io/lance/guide/performance/)
 #[derive(Clone)]
 pub struct Session {
     /// Global cache for opened indices.
@@ -153,12 +165,18 @@ impl Session {
     }
 
     /// Return the current size of the session in bytes
+    ///
+    /// Keep in mind that this is not trivial to compute, as we will need to walk the caches
     pub fn size_bytes(&self) -> u64 {
         // We re-expose deep_size_of here so that users don't
         // need the deepsize crate themselves (e.g. to use deep_size_of)
         self.deep_size_of() as u64
     }
 
+    /// Get the approximate number of items in the session.
+    ///
+    /// This is a rough estimate of the number of items in the session.  It is not
+    /// exact and is not guaranteed to be accurate.
     pub fn approx_num_items(&self) -> usize {
         self.index_cache.0.approx_size()
             + self.metadata_cache.0.approx_size()
@@ -170,10 +188,12 @@ impl Session {
         self.store_registry.clone()
     }
 
+    /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats().await
     }
 
+    /// Fetch statistics for the index cache
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }

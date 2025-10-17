@@ -3704,6 +3704,7 @@ pub mod test_dataset {
         ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{ArrowError, DataType};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
@@ -3711,7 +3712,6 @@ pub mod test_dataset {
         IndexType,
     };
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::index::vector::VectorIndexParams;
 
@@ -3908,7 +3908,6 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::*;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
@@ -4933,6 +4932,8 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
+        use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -5214,6 +5215,8 @@ mod test {
             VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
+            use lance_arrow::FixedSizeListArrayExt;
+
             let test_dir = TempStrDir::default();
             let test_uri = &test_dir;
 
