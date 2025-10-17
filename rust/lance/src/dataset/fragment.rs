@@ -1616,7 +1616,7 @@ impl FileFragment {
             OnMissing::Error,
             OnTypeMismatch::Error,
         )?;
-        // Prepare the read projection: align with the right stream's columns and append the left join key.
+        // Prepare the read projection: align with the write_schema's columns and append the left_on column.
         let mut read_columns: Vec<String> =
             write_schema.fields.iter().map(|f| f.name.clone()).collect();
         read_columns.push(left_on.to_string());
