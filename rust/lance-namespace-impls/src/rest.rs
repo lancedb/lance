@@ -40,6 +40,14 @@ pub struct RestNamespaceConfig {
     additional_headers: HashMap<String, String>,
     /// The base URI for the REST API
     uri: Option<String>,
+    /// Path to the client certificate file (PEM format) for mTLS
+    cert_file: Option<String>,
+    /// Path to the client private key file (PEM format) for mTLS
+    key_file: Option<String>,
+    /// Path to the CA certificate file for server verification (PEM format)
+    ssl_ca_cert: Option<String>,
+    /// Whether to verify the hostname in the server's certificate
+    assert_hostname: bool,
 }
 
 impl RestNamespaceConfig {
@@ -65,10 +73,22 @@ impl RestNamespaceConfig {
             }
         }
 
+        let cert_file = properties.get("tls.cert_file").cloned();
+        let key_file = properties.get("tls.key_file").cloned();
+        let ssl_ca_cert = properties.get("tls.ssl_ca_cert").cloned();
+        let assert_hostname = properties
+            .get("tls.assert_hostname")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
         Self {
             delimiter,
             additional_headers,
             uri,
+            cert_file,
+            key_file,
+            ssl_ca_cert,
+            assert_hostname,
         }
     }
 
@@ -150,6 +170,27 @@ impl RestNamespace {
             }
             client_builder = client_builder.default_headers(headers);
         }
+
+        // Configure mTLS if certificate and key files are provided
+        if let (Some(cert_file), Some(key_file)) = (&config.cert_file, &config.key_file) {
+            if let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file)) {
+                if let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat()) {
+                    client_builder = client_builder.identity(identity);
+                }
+            }
+        }
+
+        // Load CA certificate for server verification
+        if let Some(ca_cert_file) = &config.ssl_ca_cert {
+            if let Ok(ca_cert) = std::fs::read(ca_cert_file) {
+                if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert) {
+                    client_builder = client_builder.add_root_certificate(ca_cert);
+                }
+            }
+        }
+
+        // Configure hostname verification
+        client_builder = client_builder.danger_accept_invalid_hostnames(!config.assert_hostname);
 
         let client = client_builder
             .build()
@@ -685,6 +726,65 @@ mod tests {
 
         let _namespace = RestNamespace::new(properties);
         // Test passes if no panic
+    }
+
+    #[test]
+    fn test_tls_config_parsing() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
+        properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
+        properties.insert("tls.ssl_ca_cert".to_string(), "/path/to/ca.pem".to_string());
+        properties.insert("tls.assert_hostname".to_string(), "true".to_string());
+
+        let config = RestNamespaceConfig::new(properties);
+        assert_eq!(config.cert_file, Some("/path/to/cert.pem".to_string()));
+        assert_eq!(config.key_file, Some("/path/to/key.pem".to_string()));
+        assert_eq!(config.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
+        assert!(config.assert_hostname);
+    }
+
+    #[test]
+    fn test_tls_config_default_assert_hostname() {
+        let mut properties = HashMap::new();
+        properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
+        properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
+
+        let config = RestNamespaceConfig::new(properties);
+        // Default should be true
+        assert!(config.assert_hostname);
+    }
+
+    #[test]
+    fn test_tls_config_disable_hostname_verification() {
+        let mut properties = HashMap::new();
+        properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
+        properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
+        properties.insert("tls.assert_hostname".to_string(), "false".to_string());
+
+        let config = RestNamespaceConfig::new(properties);
+        assert!(!config.assert_hostname);
+    }
+
+    #[test]
+    fn test_namespace_creation_with_tls_config() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert(
+            "tls.cert_file".to_string(),
+            "/nonexistent/cert.pem".to_string(),
+        );
+        properties.insert(
+            "tls.key_file".to_string(),
+            "/nonexistent/key.pem".to_string(),
+        );
+        properties.insert(
+            "tls.ssl_ca_cert".to_string(),
+            "/nonexistent/ca.pem".to_string(),
+        );
+
+        // Should not panic even with nonexistent files (they're just ignored)
+        let _namespace = RestNamespace::new(properties);
     }
 
     #[tokio::test]
