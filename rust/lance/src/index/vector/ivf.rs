@@ -81,7 +81,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -1245,6 +1245,9 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
+        warn!("Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid", params.sample_rate);
+    }
 
     // If metric type is cosine, normalize the training data, and after this point,
     // treat the metric type as L2.

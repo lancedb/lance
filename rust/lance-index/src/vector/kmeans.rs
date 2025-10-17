@@ -615,6 +615,9 @@ impl KMeans {
     where
         T::Native: Num,
     {
+        // the data is `num_partitions * sample_rate` vectors,
+        // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
+        // so we need to sample the sampled data again here.
         // we have to limit the number of data to avoid division underflow,
         // the threshold 512 is chosen because the minimal normal f16 value will be 0 if divided by 1024.
         let data = if data.len() >= k * 512 {
