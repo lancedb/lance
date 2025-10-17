@@ -8,8 +8,8 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use lance_datafusion::planner::Planner;
 
-use crate::error::Result;
 use crate::Dataset;
+use crate::Result;
 
 use super::NewColumnTransform;
 

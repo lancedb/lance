@@ -59,7 +59,7 @@ use lance_namespace::LanceNamespace;
 /// ```
 pub async fn connect(
     impl_name: &str,
-    properties: HashMap<String, String>,
+    #[allow(unused)] properties: HashMap<String, String>,
 ) -> Result<Arc<dyn LanceNamespace>> {
     match impl_name {
         #[cfg(feature = "rest")]

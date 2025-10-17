@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Extends DataFusion
-//!
+//! Utilities for integrating Lance into DataFusion
 
 pub(crate) mod dataframe;
 pub(crate) mod logical_plan;
