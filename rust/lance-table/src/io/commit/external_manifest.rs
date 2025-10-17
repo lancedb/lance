@@ -8,12 +8,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lance_core::utils::tracing::{AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
+use tracing::info;
 
 use super::{
     current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
@@ -203,6 +205,7 @@ impl ExternalManifestCommitHandler {
             .await?;
 
         // step 3: delete the staging manifest
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_manifest_path.as_ref());
         match store.delete(staging_manifest_path).await {
             Ok(_) => {}
             Err(ObjectStoreError::NotFound { .. }) => {}
@@ -392,6 +395,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         if let Err(err) = res {
             // delete the staging manifest
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
             match object_store.inner.delete(&staging_path).await {
                 Ok(_) => {}
                 Err(ObjectStoreError::NotFound { .. }) => {}
