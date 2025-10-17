@@ -18,6 +18,7 @@ members = [
     "rust/lance-tools",
     "rust/compression/fsst",
     "rust/compression/bitpacking",
+    "rust/lance-geo",
 ]
 exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
@@ -55,6 +56,7 @@ lance-datafusion = { version = "=0.38.3-beta.4", path = "./rust/lance-datafusion
 lance-datagen = { version = "=0.38.3-beta.4", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=0.38.3-beta.4", path = "./rust/lance-encoding" }
 lance-file = { version = "=0.38.3-beta.4", path = "./rust/lance-file" }
+lance-geo = { version = "=0.38.3-beta.4", path = "./rust/lance-geo", default-features = false }
 lance-index = { version = "=0.38.3-beta.4", path = "./rust/lance-index" }
 lance-io = { version = "=0.38.3-beta.4", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=0.38.3-beta.4", path = "./rust/lance-linalg" }
@@ -66,17 +68,17 @@ lance-test-macros = { version = "=0.38.3-beta.4", path = "./rust/lance-test-macr
 lance-testing = { version = "=0.38.3-beta.4", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "56.1", optional = false, features = ["prettyprint"] }
-arrow-arith = "56.1"
-arrow-array = "56.1"
-arrow-buffer = "56.1"
-arrow-cast = "56.1"
-arrow-data = "56.1"
-arrow-ipc = { version = "56.1", features = ["zstd"] }
-arrow-ord = "56.1"
-arrow-row = "56.1"
-arrow-schema = "56.1"
-arrow-select = "56.1"
+arrow = { version = "56.2", optional = false, features = ["prettyprint"] }
+arrow-arith = "56.2"
+arrow-array = "56.2"
+arrow-buffer = "56.2"
+arrow-cast = "56.2"
+arrow-data = "56.2"
+arrow-ipc = { version = "56.2", features = ["zstd"] }
+arrow-ord = "56.2"
+arrow-row = "56.2"
+arrow-schema = "56.2"
+arrow-select = "56.2"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -102,7 +104,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "50.0.0", default-features = false, features = [
+datafusion = { version = "50.2.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -111,22 +113,26 @@ datafusion = { version = "50.0.0", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "50.0.0"
-datafusion-functions = { version = "50.0.0", features = ["regex_expressions"] }
-datafusion-sql = "50.0.0"
-datafusion-expr = "50.0.0"
-datafusion-ffi = "50.0.0"
-datafusion-execution = "50.0.0"
-datafusion-optimizer = "50.0.0"
-datafusion-physical-expr = "50.0.0"
-datafusion-physical-plan = "50.0.0"
-datafusion-substrait = "50.0.0"
+datafusion-common = "50.2.0"
+datafusion-functions = { version = "50.2.0", features = ["regex_expressions"] }
+datafusion-sql = "50.2.0"
+datafusion-expr = "50.2.0"
+datafusion-ffi = "50.2.0"
+datafusion-execution = "50.2.0"
+datafusion-optimizer = "50.2.0"
+datafusion-physical-expr = "50.2.0"
+datafusion-physical-plan = "50.2.0"
+datafusion-substrait = "50.2.0"
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.38.3-beta.4", path = "./rust/compression/fsst" }
 futures = "0.3"
+geoarrow-array = "0.6"
+geoarrow-schema = "0.6"
+geodatafusion = { git = "https://github.com/datafusion-contrib/datafusion-geo", rev = "d29cf97f95e74f745e9f1e4325a4fe4c18c4773e" }
+geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
@@ -175,7 +181,7 @@ tokio = { version = "1.23", features = [
     "sync",
 ] }
 tokio-stream = "0.1.14"
-tokio-util = { version = "0.7.10" }
+tokio-util = { version = "0.7.16" }
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
