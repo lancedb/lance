@@ -32,7 +32,7 @@ use crate::{
                 assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats,
                 MERGE_ACTION_COLUMN,
             },
-            write_fragments_internal, WriteParams,
+            write_fragments_internal, InputData, WriteParams,
         },
     },
     Dataset, Result,
@@ -821,7 +821,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 dataset.object_store.clone(),
                 &dataset.base,
                 dataset.schema().clone(),
-                write_data_stream,
+                InputData::Stream(write_data_stream),
                 WriteParams::default(),
                 None, // Merge insert doesn't use target_bases
             )
