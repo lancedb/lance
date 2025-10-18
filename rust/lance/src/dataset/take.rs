@@ -125,8 +125,15 @@ pub async fn take(
 /// Take rows by the internal ROW ids.
 async fn do_take_rows(
     mut builder: TakeBuilder,
-    projection: Arc<ProjectionPlan>,
+    mut projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
+    // for backwards compatibility
+    if builder.with_row_address && !projection.physical_projection.with_row_addr {
+        let mut projection_with_row_addr = projection.as_ref().clone();
+        projection_with_row_addr.include_row_addr();
+        projection = Arc::new(projection_with_row_addr);
+    }
+
     let with_row_id_in_projection = projection.physical_projection.with_row_id;
     let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
@@ -155,9 +162,16 @@ async fn do_take_rows(
             Arc::new(UInt64Array::from(valid_ids)) as ArrayRef,
             Arc::new(UInt64Array::from(valid_addrs)) as ArrayRef,
         ];
-        let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)?;
 
-        return projection.project_batch(batch).await;
+        let indices: Vec<usize> = projection
+            .output_schema()?
+            .fields
+            .iter()
+            .map(|f| schema.index_of(f.name()).unwrap())
+            .collect();
+
+        return Ok(batch.project(&indices).unwrap());
     }
 
     let row_addrs = builder.get_row_addrs().await?.clone();
@@ -438,6 +452,7 @@ pub struct TakeBuilder {
     row_ids: Option<Vec<u64>>,
     row_addrs: Option<Vec<u64>>,
     projection: Arc<ProjectionPlan>,
+    with_row_address: bool,
 }
 
 impl TakeBuilder {
@@ -452,6 +467,7 @@ impl TakeBuilder {
             row_addrs: None,
             projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
             dataset,
+            with_row_address: false,
         })
     }
 
@@ -466,7 +482,14 @@ impl TakeBuilder {
             row_addrs: Some(addresses),
             projection,
             dataset,
+            with_row_address: false,
         })
+    }
+
+    /// Adds row addresses to the output
+    pub fn with_row_address(mut self, with_row_address: bool) -> Self {
+        self.with_row_address = with_row_address;
+        self
     }
 
     /// Execute the take operation and return a single batch
@@ -979,6 +1002,79 @@ mod test {
 
     #[rstest]
     #[tokio::test]
+    async fn test_take_builder_backwards_compatibility(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+
+        let row_ids = [10, 50, 100, 420, 430];
+        let projection = ProjectionRequest::from_columns(["_rowid", "i"], dataset.schema());
+
+        let builder =
+            TakeBuilder::try_new_from_ids(Arc::new(dataset.clone()), row_ids.to_vec(), projection)
+                .unwrap()
+                .with_row_address(true);
+
+        let values = take_rows(builder).await.unwrap();
+
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ROW_ID_FIELD.clone(),
+            ArrowField::new("i", DataType::Int32, false),
+            ROW_ADDR_FIELD.clone(),
+        ]));
+
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // if users specify _rowaddr both by projection and with_row_addr, do not return repeated _rowaddr columns.
+        let projection =
+            ProjectionRequest::from_columns(["_rowid", "i", "_rowaddr"], dataset.schema());
+        let builder =
+            TakeBuilder::try_new_from_ids(Arc::new(dataset.clone()), row_ids.to_vec(), projection)
+                .unwrap()
+                .with_row_address(true);
+
+        let values = take_rows(builder).await.unwrap();
+
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                    Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_take_rows_with_empty_physical_columns(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -1017,6 +1113,44 @@ mod test {
                     Arc::new(UInt64Array::from_iter_values([10, 4294967296, 8589934592])),
                     Arc::new(UInt64Array::from_iter_values([10, 50, 100])),
                 ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // at that case, only valid row ids should be returned
+        let projection = ProjectionRequest::from_columns(["_rowid"], dataset.schema());
+        let values = dataset
+            .take_rows(&[10, 50, 100, 420, 430], projection.clone())
+            .await
+            .unwrap();
+
+        let expected_schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![Arc::new(UInt64Array::from_iter_values([10, 50, 100])),],
+            )
+            .unwrap(),
+            values
+        );
+
+        // at that case, only valid row addresses should be returned
+        let projection = ProjectionRequest::from_columns(["_rowaddr"], dataset.schema());
+        let values = dataset
+            .take_rows(&[10, 50, 100, 420, 430], projection.clone())
+            .await
+            .unwrap();
+
+        let expected_schema = Arc::new(ArrowSchema::new(vec![ROW_ADDR_FIELD.clone()]));
+
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![Arc::new(UInt64Array::from_iter_values([
+                    10, 4294967296, 8589934592
+                ])),],
             )
             .unwrap(),
             values
