@@ -59,6 +59,9 @@ impl ProjectionPlan {
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
         ));
+        fields.push(Arc::new(
+            (*lance_core::ROW_DELETED_AT_VERSION_FIELD).clone(),
+        ));
         ArrowSchema::new(fields)
     }
 
@@ -356,6 +359,21 @@ impl ProjectionPlan {
             self.requested_output_expr.push(OutputColumn {
                 expr: Expr::Column(Column::from_name(lance_core::ROW_CREATED_AT_VERSION)),
                 name: lance_core::ROW_CREATED_AT_VERSION.to_string(),
+            });
+        }
+    }
+
+    /// Include the row deleted at version in the output
+    pub fn include_row_deleted_at_version(&mut self) {
+        self.physical_projection.with_row_deleted_at_version = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == lance_core::ROW_DELETED_AT_VERSION)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(lance_core::ROW_DELETED_AT_VERSION)),
+                name: lance_core::ROW_DELETED_AT_VERSION.to_string(),
             });
         }
     }
