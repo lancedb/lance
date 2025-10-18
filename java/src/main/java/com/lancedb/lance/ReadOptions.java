@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.io.StorageOptionsProvider;
+
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
@@ -29,6 +31,7 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
+  private final Optional<StorageOptionsProvider> credentialVendor;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
@@ -37,6 +40,7 @@ public class ReadOptions {
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
     this.serializedManifest = builder.serializedManifest;
+    this.credentialVendor = builder.credentialVendor;
   }
 
   public Optional<Integer> getVersion() {
@@ -63,6 +67,10 @@ public class ReadOptions {
     return serializedManifest;
   }
 
+  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
+    return credentialVendor;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -85,6 +93,7 @@ public class ReadOptions {
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
+    private Optional<StorageOptionsProvider> credentialVendor = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -187,6 +196,20 @@ public class ReadOptions {
      */
     public Builder setSerializedManifest(ByteBuffer serializedManifest) {
       this.serializedManifest = Optional.of(serializedManifest);
+      return this;
+    }
+
+    /**
+     * Set a custom credential vendor for automatic credential refresh.
+     *
+     * <p>The credential vendor will be called automatically before credentials expire, enabling
+     * long-running operations on cloud storage without interruption.
+     *
+     * @param credentialVendor the credential vendor implementation
+     * @return this builder
+     */
+    public Builder setStorageOptionsProvider(StorageOptionsProvider credentialVendor) {
+      this.credentialVendor = Optional.of(credentialVendor);
       return this;
     }
 

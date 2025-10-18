@@ -455,7 +455,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
     fn new(
         py: Python,
         uri: String,
@@ -470,6 +470,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
+        storage_options_provider: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -554,6 +555,12 @@ impl Dataset {
 
         if let Some(session) = session {
             builder = builder.with_session(session.inner.clone());
+        }
+
+        if let Some(storage_options_provider) = storage_options_provider {
+            use crate::storage_options::py_object_to_storage_options_provider;
+            let vendor_arc = py_object_to_storage_options_provider(storage_options_provider.into())?;
+            builder = builder.with_storage_options_provider(vendor_arc, None);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;

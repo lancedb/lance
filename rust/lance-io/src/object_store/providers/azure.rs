@@ -176,7 +176,8 @@ mod tests {
                     "endpoint".to_string(),
                     "https://test_account.blob.core.windows.net".to_string(),
                 ),
-                ("account_key".to_string(), "12345=".to_string()),
+                // Use a valid base64-encoded string for OpenDAL
+                ("account_key".to_string(), "dGVzdGtleQ==".to_string()),
             ])),
             ..Default::default()
         };

@@ -32,6 +32,7 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+pub mod storage_options;
 mod list_retry;
 pub mod providers;
 mod tracing;
@@ -60,6 +61,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
+pub use storage_options::{
+    DynamicStorageOptionObjectStore, StorageOptionsProviderParams, StorageOptionsProvider,
+    LanceNamespaceStorageOptionsProvider,
+};
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 
 #[async_trait]
