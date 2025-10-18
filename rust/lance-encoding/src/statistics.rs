@@ -386,7 +386,7 @@ impl FixedWidthDataBlock {
                 let u128_slice_ref = self.data.borrow_to_typed_slice::<u128>();
                 let u128_slice = u128_slice_ref.as_ref();
 
-                const PRECISION: u8 = 4;
+                const PRECISION: u8 = 12;
                 let mut hll: HyperLogLogPlus<u128, RandomState> =
                     HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
                 for val in u128_slice {
@@ -572,15 +572,15 @@ mod tests {
 
     use super::DataBlock;
 
+    use crate::buffer::LanceBuffer;
+    use crate::data::{BlockInfo, VariableWidthBlock};
+    use crate::statistics::ComputeStat;
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, UInt64Type},
         Array,
     };
     use arrow_select::concat::concat;
-    use crate::buffer::LanceBuffer;
-    use crate::data::{BlockInfo, VariableWidthBlock};
-    use crate::statistics::{ComputeStat};
 
     #[test]
     fn test_data_size_stat() {
@@ -1180,52 +1180,63 @@ mod tests {
 
     #[test]
     fn bench_hll_precision_variable_width() {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let cardinalities = vec![100, 1000, 10000];
+        let iterations = 100;
 
         println!("\n=== HLL Precision Benchmark (VariableWidth - Strings) ===");
+        println!("Running {} iterations per cardinality", iterations);
         println!("Note: Change PRECISION constant in cardinality() to test different precisions\n");
 
         for true_cardinality in &cardinalities {
             println!("True Cardinality: {}", true_cardinality);
 
-            // Generate string data with known cardinality
-            let mut data = Vec::new();
-            let mut offsets = vec![0u32];
-            for i in 0..*true_cardinality {
-                let s = format!("value_{:08}", i);
-                data.extend_from_slice(s.as_bytes());
-                offsets.push(data.len() as u32);
+            let mut total_estimated = 0u64;
+            let mut total_duration = Duration::ZERO;
+
+            for _ in 0..iterations {
+                // Generate string data with known cardinality
+                let mut data = Vec::new();
+                let mut offsets = vec![0u32];
+                for i in 0..*true_cardinality {
+                    let s = format!("value_{:08}", i);
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len() as u32);
+                }
+
+                let start = Instant::now();
+
+                // Create VariableWidthBlock and compute cardinality
+                let mut block = VariableWidthBlock {
+                    data: LanceBuffer::reinterpret_vec(data),
+                    offsets: LanceBuffer::reinterpret_vec(offsets),
+                    bits_per_offset: 32,
+                    num_values: *true_cardinality as u64,
+                    block_info: BlockInfo::default(),
+                };
+
+                block.compute_stat();
+                total_duration += start.elapsed();
+
+                let estimated = block
+                    .get_stat(Stat::Cardinality)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .value(0);
+
+                total_estimated += estimated;
             }
 
-            let start = Instant::now();
-
-            // Create VariableWidthBlock and compute cardinality
-            let mut block = VariableWidthBlock {
-                data: LanceBuffer::reinterpret_vec(data),
-                offsets: LanceBuffer::reinterpret_vec(offsets),
-                bits_per_offset: 32,
-                num_values: *true_cardinality as u64,
-                block_info: BlockInfo::default(),
-            };
-
-            block.compute_stat();
-            let duration = start.elapsed();
-
-            let estimated = block
-                .get_stat(Stat::Cardinality)
-                .unwrap()
-                .as_primitive::<UInt64Type>()
-                .value(0);
-
-            let error_rate = ((estimated as f64 - *true_cardinality as f64).abs()
+            let avg_estimated = total_estimated as f64 / iterations as f64;
+            let avg_duration = total_duration / iterations;
+            let error_rate = ((avg_estimated - *true_cardinality as f64).abs()
                 / *true_cardinality as f64)
                 * 100.0;
 
             println!(
-                "  Estimated={:5}, Error={:6.2}%, Time={:?}",
-                estimated, error_rate, duration
+                "  Avg Estimated={:7.1}, Error={:6.2}%, Avg Time={:?}",
+                avg_estimated, error_rate, avg_duration
             );
         }
         println!();
@@ -1234,45 +1245,56 @@ mod tests {
     #[test]
     fn bench_hll_precision_fixed_width() {
         use crate::data::FixedWidthDataBlock;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let cardinalities = vec![100, 1000, 10000];
+        let iterations = 100;
 
         println!("\n=== HLL Precision Benchmark (FixedWidth - u128) ===");
+        println!("Running {} iterations per cardinality", iterations);
         println!("Note: Change PRECISION constant in cardinality() to test different precisions\n");
 
         for true_cardinality in &cardinalities {
             println!("True Cardinality: {}", true_cardinality);
 
-            // Generate u128 data with known cardinality
-            let data: Vec<u128> = (0..*true_cardinality).map(|i| i as u128).collect();
+            let mut total_estimated = 0u64;
+            let mut total_duration = Duration::ZERO;
 
-            let start = Instant::now();
+            for _ in 0..iterations {
+                // Generate u128 data with known cardinality
+                let data: Vec<u128> = (0..*true_cardinality).map(|i| i as u128).collect();
 
-            // Create FixedWidthDataBlock and compute cardinality
-            let mut block = FixedWidthDataBlock {
-                data: LanceBuffer::reinterpret_vec(data),
-                bits_per_value: 128,
-                num_values: *true_cardinality as u64,
-                block_info: BlockInfo::default(),
-            };
+                let start = Instant::now();
 
-            block.compute_stat();
-            let duration = start.elapsed();
+                // Create FixedWidthDataBlock and compute cardinality
+                let mut block = FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(data),
+                    bits_per_value: 128,
+                    num_values: *true_cardinality as u64,
+                    block_info: BlockInfo::default(),
+                };
 
-            let estimated = block
-                .get_stat(Stat::Cardinality)
-                .unwrap()
-                .as_primitive::<UInt64Type>()
-                .value(0);
+                block.compute_stat();
+                total_duration += start.elapsed();
 
-            let error_rate = ((estimated as f64 - *true_cardinality as f64).abs()
+                let estimated = block
+                    .get_stat(Stat::Cardinality)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .value(0);
+
+                total_estimated += estimated;
+            }
+
+            let avg_estimated = total_estimated as f64 / iterations as f64;
+            let avg_duration = total_duration / iterations;
+            let error_rate = ((avg_estimated - *true_cardinality as f64).abs()
                 / *true_cardinality as f64)
                 * 100.0;
 
             println!(
-                "  Estimated={:5}, Error={:6.2}%, Time={:?}",
-                estimated, error_rate, duration
+                "  Avg Estimated={:7.1}, Error={:6.2}%, Avg Time={:?}",
+                avg_estimated, error_rate, avg_duration
             );
         }
         println!();
