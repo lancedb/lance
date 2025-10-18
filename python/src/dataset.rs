@@ -21,7 +21,7 @@ use lance_index::vector::bq::RQBuildParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
@@ -1444,6 +1444,86 @@ impl Dataset {
     }
 
     /// Restore the current version
+    #[pyo3(signature = (target_path, version, storage_options=None))]
+    fn shallow_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        version: PyObject,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        // Perform a shallow clone of the dataset into the target path.
+        // `version` can be a version number or a tag name.
+        // `storage_options` will be forwarded to the object store params for the new dataset.
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options: Some(opts.clone()),
+            ..Default::default()
+        });
+
+        // Use a mutable clone of the inner dataset for operations that require &mut self
+        let mut new_self = self.ds.as_ref().clone();
+
+        let ds = if let Ok(i) = version.downcast_bound::<PyInt>(py) {
+            let v: u64 = i.extract()?;
+            rt().block_on(None, new_self.shallow_clone(&target_path, v, store_params))?
+        } else if let Ok(s) = version.downcast_bound::<PyString>(py) {
+            let tag: &str = &s.to_string_lossy();
+            rt().block_on(
+                None,
+                new_self.shallow_clone(&target_path, tag, store_params),
+            )?
+        } else if let Ok(tuple) = version.downcast_bound::<PyTuple>(py) {
+            let len = tuple.len();
+            if len == 1 {
+                let elem = tuple.get_item(0)?;
+                if let Ok(version_number) = elem.extract::<u64>() {
+                    rt().block_on(
+                        None,
+                        new_self.shallow_clone(&target_path, version_number, store_params),
+                    )?
+                } else if let Ok(branch_name) = elem.extract::<String>() {
+                    rt().block_on(
+                        None,
+                        new_self.shallow_clone(
+                            &target_path,
+                            Ref::Version(Some(branch_name), None),
+                            store_params,
+                        ),
+                    )?
+                } else {
+                    return Err(PyValueError::new_err(
+                        "Single-element tuple must contain integer or string",
+                    ));
+                }
+            } else if len == 2 {
+                let (version_number, branch_name) = tuple.extract::<(u64, String)>()?;
+                rt().block_on(
+                    None,
+                    new_self.shallow_clone(
+                        &target_path,
+                        Ref::Version(Some(branch_name), Some(version_number)),
+                        store_params,
+                    ),
+                )?
+            } else {
+                return Err(PyValueError::new_err(
+                    "Version tuple must have 1 or 2 elements",
+                ));
+            }
+        } else {
+            return Err(PyValueError::new_err(
+                "version must be an int, a str or a (int, str) tuple.",
+            ));
+        }
+        .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?
