@@ -2456,6 +2456,56 @@ def test_add_null_columns(tmp_path: Path):
     )
 
 
+def test_merge_insert_permissive_nullability(tmp_path):
+    """
+    Reported in https://github.com/lancedb/lance/issues/4518
+    Tests that merge_insert works when the source schema is nullable
+    but the target is not, as long as no nulls are present.
+    """
+    target_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("value", pa.int64(), nullable=False),
+        ]
+    )
+    initial_data = pa.table(
+        {"id": [1, 2, 3], "value": [10, 20, 30]}, schema=target_schema
+    )
+
+    uri = tmp_path / "dataset"
+    ds = lance.write_dataset(initial_data, uri)
+
+    source_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=True),
+            pa.field("value", pa.int64(), nullable=True),
+        ]
+    )
+
+    new_data = pa.table(
+        {"id": [2, 4, 5], "value": [200, 400, 500]}, schema=source_schema
+    )
+
+    # Execute merge_insert, which should now succeed.
+    stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+
+    # Verify the results.
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 2
+
+    expected_data = pa.table(
+        {"id": [1, 2, 3, 4, 5], "value": [10, 200, 30, 400, 500]}, schema=target_schema
+    )
+
+    result_table = ds.to_table()
+    assert result_table.sort_by("id").equals(expected_data.sort_by("id"))
+
+
 def test_add_null_columns_with_conflict_names(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)
