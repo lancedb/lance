@@ -3240,9 +3240,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         target_path : str or Path
             The URI or filesystem path to clone the dataset into.
-        version : int or str
-            The source version to clone. An integer specifies a version number; a string
-            specifies a tag name.
+        version : int, str or Tuple[int, str]
+            The source version to clone. An integer specifies a version number in main; a string
+            specifies a tag name; a Tuple[int, str] specifies a version number in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints).
