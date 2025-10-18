@@ -578,6 +578,10 @@ mod tests {
         Array,
     };
     use arrow_select::concat::concat;
+    use crate::buffer::LanceBuffer;
+    use crate::data::{BlockInfo, VariableWidthBlock};
+    use crate::statistics::{ComputeStat};
+
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
@@ -1172,5 +1176,105 @@ mod tests {
         let expected_run_count = 3;
         let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
         assert_eq!(actual_run_count, expected_run_count);
+    }
+
+    #[test]
+    fn bench_hll_precision_variable_width() {
+        use std::time::Instant;
+
+        let cardinalities = vec![100, 1000, 10000];
+
+        println!("\n=== HLL Precision Benchmark (VariableWidth - Strings) ===");
+        println!("Note: Change PRECISION constant in cardinality() to test different precisions\n");
+
+        for true_cardinality in &cardinalities {
+            println!("True Cardinality: {}", true_cardinality);
+
+            // Generate string data with known cardinality
+            let mut data = Vec::new();
+            let mut offsets = vec![0u32];
+            for i in 0..*true_cardinality {
+                let s = format!("value_{:08}", i);
+                data.extend_from_slice(s.as_bytes());
+                offsets.push(data.len() as u32);
+            }
+
+            let start = Instant::now();
+
+            // Create VariableWidthBlock and compute cardinality
+            let mut block = VariableWidthBlock {
+                data: LanceBuffer::reinterpret_vec(data),
+                offsets: LanceBuffer::reinterpret_vec(offsets),
+                bits_per_offset: 32,
+                num_values: *true_cardinality as u64,
+                block_info: BlockInfo::default(),
+            };
+
+            block.compute_stat();
+            let duration = start.elapsed();
+
+            let estimated = block
+                .get_stat(Stat::Cardinality)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .value(0);
+
+            let error_rate = ((estimated as f64 - *true_cardinality as f64).abs()
+                / *true_cardinality as f64)
+                * 100.0;
+
+            println!(
+                "  Estimated={:5}, Error={:6.2}%, Time={:?}",
+                estimated, error_rate, duration
+            );
+        }
+        println!();
+    }
+
+    #[test]
+    fn bench_hll_precision_fixed_width() {
+        use crate::data::FixedWidthDataBlock;
+        use std::time::Instant;
+
+        let cardinalities = vec![100, 1000, 10000];
+
+        println!("\n=== HLL Precision Benchmark (FixedWidth - u128) ===");
+        println!("Note: Change PRECISION constant in cardinality() to test different precisions\n");
+
+        for true_cardinality in &cardinalities {
+            println!("True Cardinality: {}", true_cardinality);
+
+            // Generate u128 data with known cardinality
+            let data: Vec<u128> = (0..*true_cardinality).map(|i| i as u128).collect();
+
+            let start = Instant::now();
+
+            // Create FixedWidthDataBlock and compute cardinality
+            let mut block = FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(data),
+                bits_per_value: 128,
+                num_values: *true_cardinality as u64,
+                block_info: BlockInfo::default(),
+            };
+
+            block.compute_stat();
+            let duration = start.elapsed();
+
+            let estimated = block
+                .get_stat(Stat::Cardinality)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .value(0);
+
+            let error_rate = ((estimated as f64 - *true_cardinality as f64).abs()
+                / *true_cardinality as f64)
+                * 100.0;
+
+            println!(
+                "  Estimated={:5}, Error={:6.2}%, Time={:?}",
+                estimated, error_rate, duration
+            );
+        }
+        println!();
     }
 }
