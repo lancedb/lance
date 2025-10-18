@@ -583,8 +583,9 @@ impl Schema {
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     ///
-    /// This method excludes metadata fields (which have dedicated IDs like i32::MAX)
-    /// to avoid overflow issues when allocating new field IDs.
+    /// Note2: This method excludes metadata fields (which have dedicated IDs like i32::MAX),
+    /// because caller of this method is typically only interested in the max field ID of
+    /// actual data fields.
     pub fn max_field_id(&self) -> Option<i32> {
         self.fields
             .iter()
