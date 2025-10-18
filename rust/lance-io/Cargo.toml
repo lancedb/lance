@@ -18,6 +18,7 @@ opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-namespace.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-arith.workspace = true
 arrow-array.workspace = true

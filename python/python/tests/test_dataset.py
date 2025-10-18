@@ -551,6 +551,88 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_rowid_rowaddr(tmp_path: Path):
+    sample_size = 10
+    table1 = pa.table({"a": range(1000), "b": range(1000)})
+    base_dir = tmp_path / "test_take_rowid_rowaddr"
+    lance.write_dataset(
+        table1, base_dir, enable_stable_row_ids=False, max_rows_per_file=50
+    )
+    dataset = lance.dataset(base_dir)
+    total_rows = len(dataset)
+    sampled_indices = random.sample(range(total_rows), min(sample_size, total_rows))
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr", "_rowid"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr", "b"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
 def test_take_duplicate_index(tmp_path: Path, indices: List[int]):
     table = pa.table({"x": range(24)})
@@ -2125,6 +2207,53 @@ def test_merge_insert_vector_column(tmp_path: Path):
 
     assert dataset.to_table().sort_by("key") == expected
     check_merge_stats(merge_dict, (1, 1, 0))
+
+
+def test_merge_insert_when_matched_fail(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # No matching rows should succeed
+    new_data = pa.table({"id": [6, 7, 8], "val": [60, 70, 80]})
+    result = (
+        ds.merge_insert("id")
+        .when_matched_fail()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+    assert result["num_deleted_rows"] == 0
+
+    # Matching rows should fail
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    new_data = pa.table({"id": [1, 2, 9], "val": [100, 200, 900]})
+    with pytest.raises(Exception):
+        ds.merge_insert("id").when_matched_fail().when_not_matched_insert_all().execute(
+            new_data
+        )
+
+    # Test with execute_uncommitted
+    # This should raise an exception because there are matching rows
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    with pytest.raises(Exception):
+        transaction, _ = (
+            ds.merge_insert("id")
+            .when_matched_fail()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(new_data)
+        )
+
+    # Verify that the data remains unchanged after failed operation
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    unchanged_ds = lance.dataset(tmp_path / "dataset")
+    unchanged_data = unchanged_ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    assert unchanged_data == expected
 
 
 def test_merge_insert_large():
@@ -4143,50 +4272,6 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
-
-
-def test_diff_meta(tmp_path: Path):
-    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
-    lance.write_dataset(table1, tmp_path)
-
-    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
-    dataset = lance.write_dataset(
-        table2, tmp_path, mode="append", commit_message="Append data"
-    )
-
-    dataset.delete("id = 2")
-
-    diff = dataset.diff_meta(1)
-
-    assert len(diff) == 2
-
-    for transaction in diff:
-        assert hasattr(transaction, "read_version")
-        assert hasattr(transaction, "transaction_properties")
-
-    dataset_v2 = lance.dataset(tmp_path, version=2)
-    diff_v2 = dataset_v2.diff_meta(1)
-
-    assert len(diff_v2) == 1
-
-    # Test diff with current version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version)
-
-    # Test diff with future version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version + 1)
-
-    # Test diff with non-existent version after cleanup
-    moment = datetime.now()
-    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
-    dataset = lance.write_dataset(table3, tmp_path, mode="append")
-
-    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-
-    # Now try to diff with the cleaned up version 1 (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(1)
 
 
 def test_table_metadata_updates(tmp_path: Path):

@@ -298,14 +298,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_meta_no_transaction() {
+    async fn test_list_no_transaction() {
         let ds = create_test_dataset().await;
-        let result = ds.diff_meta(1).await;
-        assert!(result.is_err());
+        let delta = ds.delta().compared_against_version(1).build().unwrap();
+        let result = delta.list_transactions().await;
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn test_diff_meta_single_transaction() {
+    async fn test_list_single_transaction() {
         let mut ds = create_test_dataset().await;
         ds.delete("key = 5").await.unwrap();
 
@@ -321,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_meta_multiple_transactions() {
+    async fn test_list_multiple_transactions() {
         let mut ds = create_test_dataset().await;
         ds.delete("key = 5").await.unwrap();
         ds.delete("key = 6").await.unwrap();
@@ -337,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_meta_contains_deleted_transaction() {
+    async fn test_list_contains_deleted_transaction() {
         let clock = MockClock::new();
 
         clock.set_system_time(Duration::seconds(1));

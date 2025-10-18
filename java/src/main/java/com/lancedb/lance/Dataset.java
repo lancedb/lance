@@ -1044,4 +1044,40 @@ public class Dataset implements Closeable {
   private native List<Tag> nativeListTags();
 
   private native long nativeGetVersionByTag(String tag);
+
+  public Dataset shallowClone(String targetPath, Reference version) {
+    return shallowClone(targetPath, version, null);
+  }
+
+  /**
+   * Shallow clone the specified tag into a new dataset at the target path.
+   *
+   * <p>This creates a new dataset that references the data files from the source dataset without
+   * copying them. Only metadata is written at the destination.
+   *
+   * @param targetPath the URI to clone the dataset into
+   * @param reference the referred version of the current dataset
+   * @param storageOptions Optional object store options for the destination dataset; empty uses
+   *     default store parameters
+   * @return a new Dataset instance at the target path
+   */
+  public Dataset shallowClone(
+      String targetPath, Reference reference, Map<String, String> storageOptions) {
+    Preconditions.checkArgument(targetPath != null, "Target path can not be null");
+    Preconditions.checkArgument(reference != null, "globalVersion can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Dataset newDataset =
+          nativeShallowClone(targetPath, reference, Optional.ofNullable(storageOptions));
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
+    }
+  }
+
+  private native Dataset nativeShallowClone(
+      String targetPath, Reference reference, Optional<Map<String, String>> storageOptions);
 }
