@@ -71,6 +71,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
 };
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
@@ -105,7 +106,6 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
-use lance_core::datatypes::NullabilityComparison;
 
 mod assign_action;
 mod exec;
@@ -531,40 +531,29 @@ impl MergeInsertJob {
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
-        let is_compatible = lance_schema.check_compatible(
-            self.dataset.schema(),
-            &SchemaCompareOptions {
-                compare_dictionary: self.dataset.is_legacy_storage(),
-                compare_nullability: NullabilityComparison::Ignore,
-                ..Default::default()
-            },
-        );
+        let target_schema = self.dataset.schema();
 
-        fn is_subschema(schema: &Schema, candidate: &Schema) -> bool {
-            // Schema::contains() cares about order, but we don't.
-            for field in candidate.fields() {
-                if !schema
-                    .field_with_name(field.name())
-                    .map(|f| f.contains(field))
-                    .unwrap_or(false)
-                {
-                    return false;
-                }
-            }
-            true
+        let mut options = SchemaCompareOptions {
+            compare_dictionary: self.dataset.is_legacy_storage(),
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+
+        // Try full schema match first.
+        if lance_schema
+            .check_compatible(&target_schema, &options)
+            .is_ok()
+        {
+            return Ok(SchemaComparison::FullCompatible);
         }
 
-        if let Err(e) = is_compatible {
-            // It might be a subschema
-            let dataset_arrow_schema = Schema::from(self.dataset.schema());
-            if is_subschema(&dataset_arrow_schema, schema) {
-                Ok(SchemaComparison::Subschema)
-            } else {
-                Err(e)
-            }
-        } else {
-            Ok(SchemaComparison::FullCompatible)
-        }
+        // If full match fails, try subschema match.
+        options.allow_subschema = true;
+        options.ignore_field_order = true; // Subschema matching should typically ignore order.
+
+        lance_schema
+            .check_compatible(&target_schema, &options)
+            .map(|_| SchemaComparison::Subschema)
     }
 
     async fn join_key_as_scalar_index(&self) -> Result<Option<IndexMetadata>> {
@@ -2118,8 +2107,8 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{
         types::{Int32Type, UInt32Type},
-        FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
-        RecordBatchReader, StringArray, UInt32Array,
+        FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+        RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
@@ -4963,7 +4952,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 Arc::new(Int64Array::from(vec![100, 200, 300])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let test_uri = "memory://test_nullable_issue_4654";
         let dataset = Dataset::write(
@@ -4971,12 +4960,12 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             test_uri,
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Step 2: Create new data with NULLABLE schema but NO actual null values
         let nullable_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true), // nullable=True
+            Field::new("id", DataType::Int64, true),    // nullable=True
             Field::new("value", DataType::Int64, true), // nullable=True
         ]));
 
@@ -4987,7 +4976,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 Arc::new(Int64Array::from(vec![999, 400, 500])), // No nulls
             ],
         )
-            .unwrap();
+        .unwrap();
 
         // Step 3: Test merge_insert()
         let merge_result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
@@ -5046,6 +5035,86 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             value_array.value(0),
             999,
             "Value for id=2 should be updated to 999"
+        );
+    }
+
+    /// Test case for Issue #3634: merge_insert should provide a helpful error
+    /// message when a subschema with a mismatched type is provided.
+    #[tokio::test]
+    async fn test_merge_insert_subschema_invalid_type_error() {
+        // Step 1: Create a dataset with a multi-column schema.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float64, true), // The target type is Float64.
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let test_uri = "memory://test_issue_3634";
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data)], schema),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Step 2: Create source data with a subschema where one field has a wrong type.
+        let subschema_with_wrong_type = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+
+        let new_data = RecordBatch::try_new(
+            subschema_with_wrong_type.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(Int32Array::from(vec![22, 44])),
+            ],
+        )
+        .unwrap();
+
+        // Step 3: Execute the merge_insert operation, which should fail.
+        let merge_result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(new_data)],
+                subschema_with_wrong_type,
+            )))
+            .await;
+
+        // Step 4: Verify that the operation failed with the correct error type and message.
+        let err = merge_result.expect_err("Merge insert should have failed but it succeeded.");
+        assert!(
+            matches!(err, lance_core::Error::SchemaMismatch { .. }),
+            "Expected a SchemaMismatch error, but got a different error type: {:?}",
+            err
+        );
+
+        let error_message = err.to_string();
+        assert!(
+            error_message.contains("`value` should have type double but type was int32"),
+            "Error message should specify the expected (double) and actual (int32) types for 'value', but was: {}",
+            error_message
+        );
+
+        assert!(
+            !error_message.contains("missing="),
+            "Error message should NOT complain about missing fields for a subschema check, but was: {}",
+            error_message
         );
     }
 }
