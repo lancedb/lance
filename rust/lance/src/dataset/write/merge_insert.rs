@@ -105,6 +105,7 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
+use lance_core::datatypes::NullabilityComparison;
 
 mod assign_action;
 mod exec;
@@ -534,6 +535,7 @@ impl MergeInsertJob {
             self.dataset.schema(),
             &SchemaCompareOptions {
                 compare_dictionary: self.dataset.is_legacy_storage(),
+                compare_nullability: NullabilityComparison::Ignore,
                 ..Default::default()
             },
         );
@@ -1397,6 +1399,8 @@ impl MergeInsertJob {
             &lance_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
+                // Allow nullable source fields for non-nullable targets.
+                compare_nullability: NullabilityComparison::Ignore,
                 ..Default::default()
             },
         );
@@ -1437,6 +1441,8 @@ impl MergeInsertJob {
             &lance_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
+                // Allow nullable source fields for non-nullable targets.
+                compare_nullability: NullabilityComparison::Ignore,
                 ..Default::default()
             },
         );
@@ -4933,5 +4939,113 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// Test case for Issue #4654: merge_insert should handle nullable source fields
+    /// when target is non-nullable, as long as there are no actual null values.
+    ///
+    /// This test verifies that:
+    /// - Dataset has non-nullable fields
+    /// - Source data has nullable fields BUT no actual null values
+    /// - merge_insert() succeeds (same behavior as insert)
+    #[tokio::test]
+    async fn test_merge_insert_permissive_nullability() {
+        // Step 1: Create dataset with NON-NULLABLE schema
+        let non_nullable_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false), // nullable=False
+            Field::new("value", DataType::Int64, false), // nullable=False
+        ]));
+
+        let initial_data = RecordBatch::try_new(
+            non_nullable_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )
+            .unwrap();
+
+        let test_uri = "memory://test_nullable_issue_4654";
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data)], non_nullable_schema.clone()),
+            test_uri,
+            None,
+        )
+            .await
+            .unwrap();
+
+        // Step 2: Create new data with NULLABLE schema but NO actual null values
+        let nullable_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true), // nullable=True
+            Field::new("value", DataType::Int64, true), // nullable=True
+        ]));
+
+        let new_data = RecordBatch::try_new(
+            nullable_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 4, 5])), // id=2 exists (update), 4,5 new (insert)
+                Arc::new(Int64Array::from(vec![999, 400, 500])), // No nulls
+            ],
+        )
+            .unwrap();
+
+        // Step 3: Test merge_insert()
+        let merge_result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(new_data.clone())],
+                nullable_schema.clone(),
+            )))
+            .await;
+
+        assert!(
+            merge_result.is_ok(),
+            "merge_insert() should succeed with nullable fields but no actual nulls. \
+             This is the same behavior as insert/append. Error: {:?}",
+            merge_result.err()
+        );
+
+        // Step 4: Verify the results
+        let (merged_dataset, stats) = merge_result.unwrap();
+
+        // Should have: 1 updated row (id=2), 2 new rows (id=4,5)
+        assert_eq!(stats.num_updated_rows, 1, "Should update 1 row (id=2)");
+        assert_eq!(
+            stats.num_inserted_rows, 2,
+            "Should insert 2 new rows (id=4,5)"
+        );
+
+        // Total: 3 original (id=1,2,3) + 2 new (id=4,5) = 5 rows
+        let count = merged_dataset.count_rows(None).await.unwrap();
+        assert_eq!(count, 5, "Should have 5 total rows");
+
+        // Verify the updated value for id=2
+        let result = merged_dataset
+            .scan()
+            .filter("id = 2")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let batch = concat_batches(&result[0].schema(), &result).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let value_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            value_array.value(0),
+            999,
+            "Value for id=2 should be updated to 999"
+        );
     }
 }
