@@ -72,6 +72,7 @@ impl TableProvider for Dataset {
             false,
             false,
             false,
+            false,
             scan_range,
             projections.into(),
         );

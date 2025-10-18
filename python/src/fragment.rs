@@ -730,6 +730,9 @@ impl FromPyObject<'_> for PyLance<Fragment> {
         let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
             ob.getattr("created_at_version_meta")?.extract()?;
         let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
+        let deleted_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
+            ob.getattr("deleted_at_version_meta")?.extract()?;
+        let deleted_at_version_meta = deleted_at_version_meta.map(|r| r.0.clone());
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -739,6 +742,7 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            deleted_at_version_meta,
         }))
     }
 }
@@ -771,6 +775,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let deleted_at_version_meta = self
+            .0
+            .deleted_at_version_meta
+            .as_ref()
+            .map(|r| PyRowDatasetVersionMeta(r.clone()));
 
         cls.call1((
             self.0.id,
@@ -780,6 +789,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            deleted_at_version_meta,
         ))
     }
 }

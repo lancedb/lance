@@ -3814,6 +3814,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3846,6 +3847,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3878,6 +3880,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3913,6 +3916,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3941,6 +3945,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3950,6 +3955,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3994,6 +4000,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
