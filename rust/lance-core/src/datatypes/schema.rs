@@ -497,11 +497,26 @@ impl Schema {
     }
 
     // Recursively collect all the field IDs, in pre-order traversal order.
-    // Only includes fields with non-negative IDs (i.e., actual data fields).
-    // Metadata fields like _rowid and _rowaddr have id=-1 and are excluded.
+    // Includes metadata fields with their dedicated IDs (i32::MAX, i32::MAX-1, etc.)
     // TODO: pub(crate)
     pub fn field_ids(&self) -> Vec<i32> {
-        self.fields_pre_order().filter(|f| f.id >= 0).map(|f| f.id).collect()
+        self.fields_pre_order().map(|f| f.id).collect()
+    }
+
+    /// Check if a field ID corresponds to a metadata field.
+    ///
+    /// Metadata fields have dedicated field IDs in the range i32::MAX down to i32::MAX-4:
+    /// - ROW_ID_FIELD_ID (i32::MAX)
+    /// - ROW_ADDR_FIELD_ID (i32::MAX - 1)
+    /// - ROW_OFFSET_FIELD_ID (i32::MAX - 2)
+    /// - ROW_LAST_UPDATED_AT_VERSION_FIELD_ID (i32::MAX - 3)
+    /// - ROW_CREATED_AT_VERSION_FIELD_ID (i32::MAX - 4)
+    pub fn is_metadata_field(field_id: i32) -> bool {
+        field_id == crate::ROW_ID_FIELD_ID
+            || field_id == crate::ROW_ADDR_FIELD_ID
+            || field_id == crate::ROW_OFFSET_FIELD_ID
+            || field_id == crate::ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+            || field_id == crate::ROW_CREATED_AT_VERSION_FIELD_ID
     }
 
     /// Get field by its id.
@@ -567,8 +582,15 @@ impl Schema {
     /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
+    ///
+    /// This method excludes metadata fields (which have dedicated IDs like i32::MAX)
+    /// to avoid overflow issues when allocating new field IDs.
     pub fn max_field_id(&self) -> Option<i32> {
-        self.fields.iter().map(|f| f.max_id()).max()
+        self.fields
+            .iter()
+            .map(|f| f.max_id())
+            .filter(|id| !Self::is_metadata_field(*id))
+            .max()
     }
 
     /// Recursively attach set up dictionary values to the dictionary fields.
@@ -1177,19 +1199,20 @@ impl Projection {
     /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
     pub fn union_schema(mut self, other: &Schema) -> Self {
         for field in other.fields_pre_order() {
-            if field.id >= 0 {
-                self.field_ids.insert(field.id);
-            } else if field.name == ROW_ID {
+            if field.id == crate::ROW_ID_FIELD_ID {
                 self.with_row_id = true;
-            } else if field.name == ROW_ADDR {
+            } else if field.id == crate::ROW_ADDR_FIELD_ID {
                 self.with_row_addr = true;
-            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+            } else if field.id == crate::ROW_LAST_UPDATED_AT_VERSION_FIELD_ID {
                 self.with_row_last_updated_at_version = true;
-            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+            } else if field.id == crate::ROW_CREATED_AT_VERSION_FIELD_ID {
                 self.with_row_created_at_version = true;
+            } else if field.id >= 0 {
+                // Regular data field
+                self.field_ids.insert(field.id);
             } else {
-                // If a field is not in our schema then it should probably have an id of -1.  If it isn't -1
-                // that probably implies some kind of weird schema mixing is going on and we should panic.
+                // If a field is not a metadata field and has negative id, it should be -1
+                // (unassigned). This probably implies some kind of weird schema mixing.
                 debug_assert_eq!(field.id, -1);
             }
         }
@@ -1286,17 +1309,20 @@ impl Projection {
     /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
     pub fn subtract_schema(mut self, other: &Schema) -> Self {
         for field in other.fields_pre_order() {
-            if field.id >= 0 {
-                self.field_ids.remove(&field.id);
-            } else if field.name == ROW_ID {
+            if field.id == crate::ROW_ID_FIELD_ID {
                 self.with_row_id = false;
-            } else if field.name == ROW_ADDR {
+            } else if field.id == crate::ROW_ADDR_FIELD_ID {
                 self.with_row_addr = false;
-            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+            } else if field.id == crate::ROW_LAST_UPDATED_AT_VERSION_FIELD_ID {
                 self.with_row_last_updated_at_version = false;
-            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+            } else if field.id == crate::ROW_CREATED_AT_VERSION_FIELD_ID {
                 self.with_row_created_at_version = false;
+            } else if field.id >= 0 {
+                // Regular data field
+                self.field_ids.remove(&field.id);
             } else {
+                // If a field is not a metadata field and has negative id, it should be -1
+                // (unassigned). This probably implies some kind of weird schema mixing.
                 debug_assert_eq!(field.id, -1);
             }
         }

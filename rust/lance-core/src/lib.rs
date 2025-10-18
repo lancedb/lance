@@ -24,6 +24,17 @@ pub const ROW_LAST_UPDATED_AT_VERSION: &str = "_row_last_updated_at_version";
 /// Column name for the row's created at dataset version.
 pub const ROW_CREATED_AT_VERSION: &str = "_row_created_at_version";
 
+/// Field ID for the meta row ID column. Uses i32::MAX to avoid conflicts with actual data fields.
+pub const ROW_ID_FIELD_ID: i32 = i32::MAX;
+/// Field ID for the meta row address column.
+pub const ROW_ADDR_FIELD_ID: i32 = i32::MAX - 1;
+/// Field ID for the meta row offset column.
+pub const ROW_OFFSET_FIELD_ID: i32 = i32::MAX - 2;
+/// Field ID for the row last updated at version column.
+pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = i32::MAX - 3;
+/// Field ID for the row created at version column.
+pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = i32::MAX - 4;
+
 /// Row ID field. This is nullable because its validity bitmap is sometimes used
 /// as a selection vector.
 pub static ROW_ID_FIELD: LazyLock<ArrowField> =

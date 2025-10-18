@@ -997,8 +997,18 @@ impl TryFrom<&ArrowField> for Field {
             LogicalType::try_from(field.data_type())?
         };
 
+        // Assign dedicated field IDs for metadata columns
+        let field_id = match field.name().as_str() {
+            crate::ROW_ID => crate::ROW_ID_FIELD_ID,
+            crate::ROW_ADDR => crate::ROW_ADDR_FIELD_ID,
+            crate::ROW_OFFSET => crate::ROW_OFFSET_FIELD_ID,
+            crate::ROW_LAST_UPDATED_AT_VERSION => crate::ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+            crate::ROW_CREATED_AT_VERSION => crate::ROW_CREATED_AT_VERSION_FIELD_ID,
+            _ => -1,
+        };
+
         Ok(Self {
-            id: -1,
+            id: field_id,
             parent_id: -1,
             name: field.name().clone(),
             logical_type,
