@@ -71,7 +71,7 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     # Create an Index object
     index = Index(
         uuid=index_id,
-        name="meta_idx",
+        name="meta_btree_idx",
         fields=[field_id],
         dataset_version=dataset_without_index.version,
         fragment_ids=set(
@@ -104,4 +104,4 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
             fast_search=True, prefilter=True, filter="meta = 'hello'"
         )
         plan = scanner.explain_plan()
-        assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan
+        assert "ScalarIndexQuery: query=[meta = hello]@meta_btree_idx" in plan

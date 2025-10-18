@@ -114,7 +114,26 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = self.name.take().unwrap_or_else(|| {
+            // Default name includes index type; for vector, use specific stage type
+            if self.index_type == IndexType::Vector
+                && self.params.index_name() == LANCE_VECTOR_INDEX
+            {
+                if let Some(vec_params) = self.params.as_any().downcast_ref::<VectorIndexParams>() {
+                    let vec_type = vec_params.index_type().to_string().to_lowercase();
+                    format!("{}_{}_idx", column, vec_type)
+                } else {
+                    // Fallback
+                    format!("{}_vector_idx", column)
+                }
+            } else {
+                format!(
+                    "{}_{}_idx",
+                    column,
+                    self.index_type.to_string().to_lowercase()
+                )
+            }
+        });
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -349,11 +368,24 @@ impl<'a> CreateIndexBuilder<'a> {
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<()> {
         let new_idx = self.execute_uncommitted().await?;
+
+        // Honor replace semantics: remove existing indices on the same fields
+        let removed_indices = if self.replace {
+            let existing = self.dataset.load_indices().await?;
+            existing
+                .iter()
+                .filter(|idx| idx.fields == new_idx.fields)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
         let transaction = Transaction::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
-                removed_indices: vec![],
+                removed_indices,
             },
             /*blobs_op= */ None,
             None,
@@ -390,6 +422,7 @@ mod tests {
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
@@ -727,5 +760,40 @@ mod tests {
             .iter()
             .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
                 && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+    }
+
+    #[tokio::test]
+    async fn test_auto_generated_index_name() {
+        // Test that when no index name is provided, the auto-generated name follows the expected pattern
+        use lance_index::scalar::BuiltinIndexType;
+
+        let tmpdir = tempdir().unwrap();
+        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+
+        // Create test data
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Test for Inverted index (original test)
+        let params = InvertedIndexParams::default();
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_inverted_idx");
+
+        // Test for BloomFilter index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BloomFilter, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_bloomfilter_idx");
+
+        // Test for ZoneMap index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::ZoneMap, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_zonemap_idx");
     }
 }
