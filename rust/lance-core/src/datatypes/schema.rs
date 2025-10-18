@@ -497,9 +497,11 @@ impl Schema {
     }
 
     // Recursively collect all the field IDs, in pre-order traversal order.
+    // Only includes fields with non-negative IDs (i.e., actual data fields).
+    // Metadata fields like _rowid and _rowaddr have id=-1 and are excluded.
     // TODO: pub(crate)
     pub fn field_ids(&self) -> Vec<i32> {
-        self.fields_pre_order().map(|f| f.id).collect()
+        self.fields_pre_order().filter(|f| f.id >= 0).map(|f| f.id).collect()
     }
 
     /// Get field by its id.
