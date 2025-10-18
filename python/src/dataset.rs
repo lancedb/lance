@@ -560,7 +560,7 @@ impl Dataset {
         if let Some(storage_options_provider) = storage_options_provider {
             use crate::storage_options::py_object_to_storage_options_provider;
             let vendor_arc = py_object_to_storage_options_provider(storage_options_provider.into())?;
-            builder = builder.with_storage_options(vendor_arc, None);
+            builder = builder.with_storage_options_provider(vendor_arc, None);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
