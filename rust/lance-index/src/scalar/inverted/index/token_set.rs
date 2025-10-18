@@ -9,15 +9,15 @@ use deepsize::DeepSizeOf;
 use fst::Streamer;
 
 /// A token set that can be appended to.
+///
+/// Token IDs are sequential indices (0, 1, 2, ...) corresponding to insertion order.
 #[derive(Debug, Clone)]
 pub struct AppendableTokenSet {
     // We use a single buffer to store all tokens.
     data: String,
     // Offsets of each token in the data buffer, similar to Arrow's LargeBinaryArray.
     offsets: Vec<i32>,
-    /// Token ids
-    token_ids: Vec<u32>,
-    /// A hash table mapping from token hash to token id.
+    /// A hash table mapping from token hash to token index (which is the token id).
     hash_table: hashbrown::hash_table::HashTable<u32>,
 }
 
@@ -26,7 +26,6 @@ impl DeepSizeOf for AppendableTokenSet {
         let mut size = 0;
         size += self.data.deep_size_of_children(ctx);
         size += self.offsets.deep_size_of_children(ctx);
-        size += self.token_ids.deep_size_of_children(ctx);
         size +=
             self.hash_table.capacity() * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>());
         size
@@ -39,7 +38,6 @@ impl AppendableTokenSet {
             data: String::new(),
             offsets: vec![0],
             hash_table: hashbrown::hash_table::HashTable::new(),
-            token_ids: Vec::new(),
         }
     }
 
@@ -51,26 +49,25 @@ impl AppendableTokenSet {
             data: String::with_capacity(capacity * average_token_length),
             offsets,
             hash_table: hashbrown::hash_table::HashTable::with_capacity(capacity),
-            token_ids: Vec::with_capacity(capacity),
         }
     }
 
     /// Returns the number of tokens in the set.
     pub fn len(&self) -> usize {
-        self.token_ids.len()
+        // offsets has one more element than the number of tokens (the initial 0)
+        self.offsets.len() - 1
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
         let hash = Self::hash(token);
-        let offset = self
-            .hash_table
+        // The hash table stores the index, which is also the token_id
+        self.hash_table
             .find(hash, |i| {
                 let start = self.offsets[*i as usize] as usize;
                 let end = self.offsets[*i as usize + 1] as usize;
                 &self.data[start..end] == token
             })
-            .copied();
-        offset.map(|i| self.token_ids[i as usize])
+            .copied()
     }
 
     fn hash(token: &str) -> u64 {
@@ -81,9 +78,11 @@ impl AppendableTokenSet {
 
     /// Insert a new token into the set without checking for duplicates.
     ///
+    /// Returns the assigned token ID (which is the index of the token).
+    ///
     /// # Safety
     /// The caller must ensure that the token does not already exist in the set.
-    pub unsafe fn insert_unchecked(&mut self, token: &str, token_id: u32) {
+    pub unsafe fn insert_unchecked(&mut self, token: &str) -> u32 {
         let hash = Self::hash(token);
 
         debug_assert!(
@@ -98,15 +97,18 @@ impl AppendableTokenSet {
             "Token already exists in the set"
         );
 
-        self.hash_table
-            .insert_unique(hash, dbg!(self.offsets.len() as u32), |offset| {
-                let start = self.offsets[*offset as usize] as usize;
-                let end = self.offsets[*offset as usize + 1] as usize;
-                Self::hash(&self.data[start..end])
-            });
+        // The token_id is the current length (number of existing tokens)
+        let token_id = self.len() as u32;
+
+        self.hash_table.insert_unique(hash, token_id, |offset| {
+            let start = self.offsets[*offset as usize] as usize;
+            let end = self.offsets[*offset as usize + 1] as usize;
+            Self::hash(&self.data[start..end])
+        });
         self.data.push_str(token);
         self.offsets.push(self.data.len() as i32);
-        self.token_ids.push(token_id);
+
+        token_id
     }
 
     pub fn iter(&self) -> AppendableTokenSetIterator<'_> {
@@ -149,10 +151,11 @@ impl From<fst::Map<Vec<u8>>> for AppendableTokenSet {
     fn from(fst_map: fst::Map<Vec<u8>>) -> Self {
         let mut token_set = AppendableTokenSet::new();
         let mut stream = fst_map.stream();
-        while let Some((token, token_id)) = stream.next() {
+        while let Some((token, _token_id)) = stream.next() {
             let token_str = String::from_utf8_lossy(token);
             // Safety: fst::Map does not allow duplicate keys.
-            unsafe { token_set.insert_unchecked(&token_str, token_id as u32) };
+            // Note: We ignore the token_id from FST and assign sequential IDs
+            unsafe { token_set.insert_unchecked(&token_str) };
         }
         token_set
     }
@@ -173,6 +176,7 @@ impl<'a> Iterator for AppendableTokenSetIterator<'a> {
         let start = self.token_set.offsets[self.index] as usize;
         let end = self.token_set.offsets[self.index + 1] as usize;
         let token = &self.token_set.data[start..end];
+        // Token ID is the index
         let token_id = self.index as u32;
         self.index += 1;
         Some((token, token_id))
