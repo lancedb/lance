@@ -1055,12 +1055,9 @@ impl TokenSet {
         if let Some(token_id) = map.get(token) {
             token_id
         } else {
-            let token_id = self.next_id;
             // Safety: we just verified the key doesn't exist, and have exclusive access to the map
-            unsafe {
-                map.insert_unchecked(token, token_id);
-            }
-            self.next_id += 1;
+            let token_id = unsafe { map.insert_unchecked(token) };
+            self.next_id = token_id + 1;
             self.total_length += token.len();
             token_id
         }
@@ -1089,14 +1086,16 @@ impl TokenSet {
                     Err(_) => true,
                 },
             )
-            .for_each(|(token, token_id)| {
+            .for_each(|(token, _old_token_id)| {
                 // Safety: we are only removing tokens, so there should be no duplicates
                 // and we have exclusive access to the map.
+                // insert_unchecked will assign sequential token IDs starting from 0
                 unsafe {
-                    new_map.insert_unchecked(&token, token_id);
+                    new_map.insert_unchecked(&token);
                 }
             });
 
+        self.next_id = new_map.len() as u32;
         self.tokens = TokenMap::Appendable(new_map);
     }
 
