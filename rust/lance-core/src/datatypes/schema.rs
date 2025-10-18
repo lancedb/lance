@@ -778,7 +778,7 @@ pub fn compare_fields(
     expected: &[Field],
     options: &SchemaCompareOptions,
 ) -> bool {
-    if options.allow_missing_if_nullable || options.ignore_field_order {
+    if options.allow_missing_if_nullable || options.ignore_field_order || options.allow_subschema {
         let expected_names = expected
             .iter()
             .map(|f| f.name.as_str())
@@ -805,6 +805,9 @@ pub fn compare_fields(
                     return false;
                 }
                 cumulative_position = *pos;
+            } else if options.allow_subschema {
+                // allow_subschema: allow missing any field
+                continue;
             } else if options.allow_missing_if_nullable && expected_field.nullable {
                 continue;
             } else {
@@ -852,7 +855,10 @@ pub fn explain_fields_difference(
         .map(prepend_path)
         .collect::<Vec<_>>();
     let missing_fields = expected_names.difference(&field_names);
-    let missing_fields = if options.allow_missing_if_nullable {
+    let missing_fields = if options.allow_subschema {
+        // allow_subschema: don't report any missing fields
+        Vec::new()
+    } else if options.allow_missing_if_nullable {
         missing_fields
             .filter(|f| {
                 let expected_field = expected.iter().find(|ef| ef.name == **f).unwrap();
