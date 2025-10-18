@@ -41,7 +41,7 @@ macro_rules! ok_or_throw_with_return {
 
 mod blocking_dataset;
 mod blocking_scanner;
-mod credential_vending;
+mod storage_options;
 pub mod error;
 pub mod ffi;
 mod file_reader;
@@ -55,7 +55,7 @@ pub mod traits;
 mod transaction;
 pub mod utils;
 
-pub use credential_vending::JavaCredentialVendor;
+pub use storage_options::JavaStorageOptionsProvider;
 pub use error::Error;
 pub use error::Result;
 pub use ffi::JNIEnvExt;

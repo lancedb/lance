@@ -25,7 +25,7 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
-from .io import CredentialVendor, StaticCredentialVendor
+from .io import StorageOptionsProvider, StaticStorageOptionsProvider
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
@@ -33,7 +33,7 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
-from .namespace import LanceNamespaceCredentialVendor
+from .namespace import LanceNamespaceStorageOptionsProvider
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
-    "CredentialVendor",
+    "StorageOptionsProvider",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -58,12 +58,12 @@ __all__ = [
     "Index",
     "LanceDataset",
     "LanceFragment",
-    "LanceNamespaceCredentialVendor",
+    "LanceNamespaceStorageOptionsProvider",
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
     "ScanStatistics",
-    "StaticCredentialVendor",
+    "StaticStorageOptionsProvider",
     "Transaction",
     "__version__",
     "batch_udf",
@@ -92,7 +92,7 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
-    credential_vendor: Optional[CredentialVendor] = None,
+    storage_options_provider: Optional[StorageOptionsProvider] = None,
     namespace: Optional[any] = None,
     table_id: Optional[list] = None,
 ) -> LanceDataset:
@@ -153,7 +153,7 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
-    credential_vendor : optional, lance.CredentialVendor
+    storage_options_provider : optional, lance.StorageOptionsProvider
         A credential vendor to use for this dataset. This is used to provide
         dynamic credentials for cloud storage access. If not specified, static
         credentials from storage_options will be used.
@@ -174,7 +174,7 @@ def dataset(
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
-    - A `LanceNamespaceCredentialVendor` will be created automatically
+    - A `LanceNamespaceStorageOptionsProvider` will be created automatically
     - Initial storage credentials from describe_table() will be merged with
       any provided `storage_options`
     """
@@ -208,8 +208,8 @@ def dataset(
             raise ValueError("Namespace did not return a table location")
 
         # Create credential vendor from namespace
-        if credential_vendor is None:
-            credential_vendor = LanceNamespaceCredentialVendor(namespace, table_id)
+        if storage_options_provider is None:
+            storage_options_provider = LanceNamespaceStorageOptionsProvider(namespace, table_id)
 
         # Merge initial storage options from describe_table with user-provided options
         namespace_storage_options = table_info.get("storage_options", {})
@@ -234,7 +234,7 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
-        credential_vendor=credential_vendor,
+        storage_options_provider=storage_options_provider,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -258,7 +258,7 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
-                credential_vendor=credential_vendor,
+                storage_options_provider=storage_options_provider,
             )
     else:
         return ds

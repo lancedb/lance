@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.namespace;
 
-import com.lancedb.lance.io.CredentialVendor;
+import com.lancedb.lance.io.StorageOptionsProvider;
 import com.lancedb.lance.namespace.model.DescribeTableRequest;
 import com.lancedb.lance.namespace.model.DescribeTableResponse;
 
@@ -39,7 +39,7 @@ import java.util.Map;
  * ));
  *
  * // Create credential vendor
- * LanceNamespaceCredentialVendor vendor = new LanceNamespaceCredentialVendor(
+ * LanceNamespaceStorageOptionsProvider vendor = new LanceNamespaceStorageOptionsProvider(
  *     namespace,
  *     Arrays.asList("workspace", "table_name")
  * );
@@ -48,12 +48,12 @@ import java.util.Map;
  * Dataset dataset = Dataset.open(
  *     "s3://bucket/table.lance",
  *     new ReadOptions.Builder()
- *         .setCredentialVendor(vendor)
+ *         .setStorageOptionsProvider(vendor)
  *         .build()
  * );
  * }</pre>
  */
-public class LanceNamespaceCredentialVendor implements CredentialVendor {
+public class LanceNamespaceStorageOptionsProvider implements StorageOptionsProvider {
 
   private final com.lancedb.lance.namespace.LanceNamespace namespace;
   private final List<String> tableId;
@@ -64,7 +64,7 @@ public class LanceNamespaceCredentialVendor implements CredentialVendor {
    * @param namespace The namespace instance to fetch credentials from
    * @param tableId The table identifier (e.g., ["workspace", "table_name"])
    */
-  public LanceNamespaceCredentialVendor(
+  public LanceNamespaceStorageOptionsProvider(
       com.lancedb.lance.namespace.LanceNamespace namespace, List<String> tableId) {
     this.namespace = namespace;
     this.tableId = tableId;

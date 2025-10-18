@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_io::object_store::CredentialVendor;
+use lance_io::object_store::StorageOptionsProvider;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -15,12 +15,12 @@ use crate::rt;
 ///
 /// This is not exposed to Python. Users pass their Python objects directly
 /// to dataset functions, and we wrap them internally with this struct.
-pub struct PyCredentialVendor {
-    /// The Python object implementing get_credentials()
+pub struct PyStorageOptionsProvider {
+    /// The Python object implementing get_storage_options()
     inner: PyObject,
 }
 
-impl Clone for PyCredentialVendor {
+impl Clone for PyStorageOptionsProvider {
     fn clone(&self) -> Self {
         Python::with_gil(|py| Self {
             inner: self.inner.clone_ref(py),
@@ -28,13 +28,13 @@ impl Clone for PyCredentialVendor {
     }
 }
 
-impl PyCredentialVendor {
+impl PyStorageOptionsProvider {
     pub fn new(obj: PyObject) -> PyResult<Self> {
         Python::with_gil(|py| {
-            // Verify the object has a get_credentials method
-            if !obj.bind(py).hasattr("get_credentials")? {
+            // Verify the object has a get_storage_options method
+            if !obj.bind(py).hasattr("get_storage_options")? {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "CredentialVendor must implement get_credentials() method",
+                    "StorageOptionsProvider must implement get_storage_options() method",
                 ));
             }
             Ok(Self { inner: obj })
@@ -42,34 +42,34 @@ impl PyCredentialVendor {
     }
 }
 
-/// Rust wrapper that implements CredentialVendor trait for Python objects
-pub struct PyCredentialVendorWrapper {
-    py_vendor: PyCredentialVendor,
+/// Rust wrapper that implements StorageOptionsProvider trait for Python objects
+pub struct PyStorageOptionsProviderWrapper {
+    py_vendor: PyStorageOptionsProvider,
 }
 
-impl PyCredentialVendorWrapper {
-    pub fn new(py_vendor: PyCredentialVendor) -> Self {
+impl PyStorageOptionsProviderWrapper {
+    pub fn new(py_vendor: PyStorageOptionsProvider) -> Self {
         Self { py_vendor }
     }
 }
 
 #[async_trait]
-impl CredentialVendor for PyCredentialVendorWrapper {
-    async fn get_credentials(&self) -> lance_core::Result<(HashMap<String, String>, u64)> {
+impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
+    async fn get_storage_options(&self) -> lance_core::Result<(HashMap<String, String>, u64)> {
         // Call Python method from async context
         let py_vendor = self.py_vendor.clone();
 
         rt().runtime
             .spawn_blocking(move || {
                 Python::with_gil(|py| {
-                    // Call the Python get_credentials method
+                    // Call the Python get_storage_options method
                     let result = py_vendor
                         .inner
                         .bind(py)
-                        .call_method0("get_credentials")
+                        .call_method0("get_storage_options")
                         .map_err(|e| lance_core::Error::IO {
                             source: Box::new(std::io::Error::other(format!(
-                                "Failed to call get_credentials: {}",
+                                "Failed to call get_storage_options: {}",
                                 e
                             ))),
                             location: snafu::location!(),
@@ -79,7 +79,7 @@ impl CredentialVendor for PyCredentialVendorWrapper {
                     let result_dict = result.downcast::<PyDict>().map_err(|_| {
                         lance_core::Error::InvalidInput {
                             source:
-                                "get_credentials() must return a dict of string key-value pairs"
+                                "get_storage_options() must return a dict of string key-value pairs"
                                     .into(),
                             location: snafu::location!(),
                         }
@@ -109,7 +109,7 @@ impl CredentialVendor for PyCredentialVendorWrapper {
                         credentials.get("expires_at_millis").ok_or_else(|| {
                             lance_core::Error::InvalidInput {
                                 source:
-                                    "get_credentials() result must contain 'expires_at_millis' key"
+                                    "get_storage_options() result must contain 'expires_at_millis' key"
                                         .into(),
                                 location: snafu::location!(),
                             }
@@ -135,7 +135,7 @@ impl CredentialVendor for PyCredentialVendorWrapper {
             .await
             .map_err(|e| lance_core::Error::IO {
                 source: Box::new(std::io::Error::other(format!(
-                    "Failed to call Python get_credentials: {}",
+                    "Failed to call Python get_storage_options: {}",
                     e
                 ))),
                 location: snafu::location!(),
@@ -143,9 +143,9 @@ impl CredentialVendor for PyCredentialVendorWrapper {
     }
 }
 
-/// Convert a Python object to an Arc<dyn CredentialVendor>
+/// Convert a Python object to an Arc<dyn StorageOptionsProvider>
 /// This is the main entry point for converting Python credential vendors to Rust
-pub fn py_object_to_credential_vendor(py_obj: PyObject) -> PyResult<Arc<dyn CredentialVendor>> {
-    let py_vendor = PyCredentialVendor::new(py_obj)?;
-    Ok(Arc::new(PyCredentialVendorWrapper::new(py_vendor)))
+pub fn py_object_to_storage_options_provider(py_obj: PyObject) -> PyResult<Arc<dyn StorageOptionsProvider>> {
+    let py_vendor = PyStorageOptionsProvider::new(py_obj)?;
+    Ok(Arc::new(PyStorageOptionsProviderWrapper::new(py_vendor)))
 }

@@ -63,7 +63,7 @@ use scanner::ScanStatistics;
 use session::Session;
 
 pub(crate) mod arrow;
-pub(crate) mod credential_vending;
+pub(crate) mod storage_options;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;

@@ -9,10 +9,10 @@ enabling automatic credential refresh for namespace-managed tables.
 
 from typing import Dict
 
-from .io import CredentialVendor
+from .io import StorageOptionsProvider
 
 
-class LanceNamespaceCredentialVendor(CredentialVendor):
+class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
     """Credential vendor that fetches credentials from a LanceNamespace.
 
     This vendor automatically fetches fresh credentials by calling the
@@ -48,7 +48,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
         })
 
         # Create credential vendor
-        vendor = lance.LanceNamespaceCredentialVendor(
+        vendor = lance.LanceNamespaceStorageOptionsProvider(
             namespace=namespace,
             table_id=["workspace", "table_name"]
         )
@@ -56,7 +56,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
         # Use with dataset - credentials auto-refresh!
         dataset = lance.dataset(
             "s3://bucket/table.lance",
-            credential_vendor=vendor
+            storage_options_provider=vendor
         )
     """
 
@@ -73,7 +73,7 @@ class LanceNamespaceCredentialVendor(CredentialVendor):
         self._namespace = namespace
         self._table_id = table_id
 
-    def get_credentials(self) -> Dict[str, str]:
+    def get_storage_options(self) -> Dict[str, str]:
         """Fetch credentials from the namespace.
 
         This calls namespace.describe_table() to get the latest credentials

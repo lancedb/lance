@@ -2,16 +2,16 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 """
-Tests for custom CredentialVendor implementations.
+Tests for custom StorageOptionsProvider implementations.
 """
 
 import time
 
 import lance
-from lance import CredentialVendor
+from lance import StorageOptionsProvider
 
 
-class CustomCredentialVendor(CredentialVendor):
+class CustomStorageOptionsProvider(StorageOptionsProvider):
     """
     Custom credential vendor that provides mock credentials.
 
@@ -24,7 +24,7 @@ class CustomCredentialVendor(CredentialVendor):
         self.call_count = 0
         self.expires_in_seconds = expires_in_seconds
 
-    def get_credentials(self):
+    def get_storage_options(self):
         """
         Called by Lance to get fresh credentials.
 
@@ -45,26 +45,26 @@ class CustomCredentialVendor(CredentialVendor):
         }
 
 
-def test_custom_credential_vendor():
+def test_custom_storage_options_provider():
     """
     Test that a custom Python credential vendor can be created and used.
     """
-    vendor = CustomCredentialVendor(access_key="my_custom_key")
+    vendor = CustomStorageOptionsProvider(access_key="my_custom_key")
 
-    # Test that get_credentials works
-    creds = vendor.get_credentials()
+    # Test that get_storage_options works
+    creds = vendor.get_storage_options()
     assert "aws_access_key_id" in creds
     assert "expires_at_millis" in creds
     assert creds["aws_access_key_id"] == "my_custom_key_1"
     assert vendor.call_count == 1
 
     # Test that second call increments counter
-    creds2 = vendor.get_credentials()
+    creds2 = vendor.get_storage_options()
     assert creds2["aws_access_key_id"] == "my_custom_key_2"
     assert vendor.call_count == 2
 
 
-def test_credential_vendor_with_dataset(tmp_path):
+def test_storage_options_provider_with_dataset(tmp_path):
     """
     Test that a credential vendor can be passed to a Dataset.
 
@@ -79,25 +79,25 @@ def test_credential_vendor_with_dataset(tmp_path):
     lance.write_dataset(table, str(dataset_path))
 
     # Create a custom credential vendor
-    vendor = CustomCredentialVendor()
+    vendor = CustomStorageOptionsProvider()
 
     # Pass the vendor directly - no wrapping needed!
     # Note: With local files, the vendor is accepted but not used
     # In a real scenario, you would use this with an S3 or cloud path
-    ds = lance.dataset(str(dataset_path), credential_vendor=vendor)
+    ds = lance.dataset(str(dataset_path), storage_options_provider=vendor)
     assert ds is not None
 
     # Verify we can read the data
     assert ds.to_table() == table
 
 
-def test_credential_vendor_error_handling():
+def test_storage_options_provider_error_handling():
     """
-    Test that errors in get_credentials are handled properly.
+    Test that errors in get_storage_options are handled properly.
     """
 
-    class FailingVendor(CredentialVendor):
-        def get_credentials(self):
+    class FailingVendor(StorageOptionsProvider):
+        def get_storage_options(self):
             raise ValueError("Intentional error for testing")
 
     vendor = FailingVendor()
@@ -105,17 +105,17 @@ def test_credential_vendor_error_handling():
     # The vendor was created successfully
     assert vendor is not None
 
-    # Error would occur when actually calling get_credentials during dataset operations
+    # Error would occur when actually calling get_storage_options during dataset operations
 
 
-def test_credential_vendor_validation(tmp_path):
+def test_storage_options_provider_validation(tmp_path):
     """
     Test that invalid credential vendors are rejected.
     """
     import pyarrow as pa
     import pytest
 
-    # Object without get_credentials method
+    # Object without get_storage_options method
     class InvalidVendor:
         pass
 
@@ -126,19 +126,19 @@ def test_credential_vendor_validation(tmp_path):
 
     # Should fail when trying to open dataset with invalid vendor
     with pytest.raises(
-        TypeError, match="CredentialVendor must implement get_credentials"
+        TypeError, match="StorageOptionsProvider must implement get_storage_options"
     ):
-        lance.dataset(str(dataset_path), credential_vendor=InvalidVendor())
+        lance.dataset(str(dataset_path), storage_options_provider=InvalidVendor())
 
 
-def test_namespace_credential_vendor(tmp_path):
+def test_namespace_storage_options_provider(tmp_path):
     """
-    Test LanceNamespaceCredentialVendor with a mock namespace.
+    Test LanceNamespaceStorageOptionsProvider with a mock namespace.
     This demonstrates how to use lance_namespace package.
     """
     import time
 
-    from lance import LanceNamespaceCredentialVendor
+    from lance import LanceNamespaceStorageOptionsProvider
 
     # Create a custom mock namespace that returns credentials
     # In production, you would use: import lance_namespace; ns = lance_namespace.connect(...)
@@ -156,12 +156,12 @@ def test_namespace_credential_vendor(tmp_path):
             }
 
     mock_ns = MockNamespace()
-    vendor = LanceNamespaceCredentialVendor(
+    vendor = LanceNamespaceStorageOptionsProvider(
         namespace=mock_ns, table_id=["workspace", "table"]
     )
 
     # Get credentials
-    creds = vendor.get_credentials()
+    creds = vendor.get_storage_options()
 
     # Verify structure - should be flat Map<String, String>
     assert "aws_access_key_id" in creds
@@ -172,31 +172,31 @@ def test_namespace_credential_vendor(tmp_path):
 
 def test_namespace_vendor_missing_credentials():
     """
-    Test that LanceNamespaceCredentialVendor raises error when namespace
+    Test that LanceNamespaceStorageOptionsProvider raises error when namespace
     doesn't return credentials.
     """
     import pytest
-    from lance import LanceNamespaceCredentialVendor
+    from lance import LanceNamespaceStorageOptionsProvider
 
     class BadNamespace:
         def describe_table(self, table_id, version):
             return {"location": "s3://bucket/table.lance"}  # Missing storage_options
 
-    vendor = LanceNamespaceCredentialVendor(
+    vendor = LanceNamespaceStorageOptionsProvider(
         namespace=BadNamespace(), table_id=["workspace", "table"]
     )
 
     with pytest.raises(RuntimeError, match="did not return storage_options"):
-        vendor.get_credentials()
+        vendor.get_storage_options()
 
 
 def test_namespace_vendor_missing_expiration():
     """
-    Test that LanceNamespaceCredentialVendor raises error when credentials
+    Test that LanceNamespaceStorageOptionsProvider raises error when credentials
     don't have expiration time.
     """
     import pytest
-    from lance import LanceNamespaceCredentialVendor
+    from lance import LanceNamespaceStorageOptionsProvider
 
     class BadNamespace:
         def describe_table(self, table_id, version):
@@ -208,12 +208,12 @@ def test_namespace_vendor_missing_expiration():
                 },
             }
 
-    vendor = LanceNamespaceCredentialVendor(
+    vendor = LanceNamespaceStorageOptionsProvider(
         namespace=BadNamespace(), table_id=["workspace", "table"]
     )
 
     with pytest.raises(RuntimeError, match="missing 'expires_at_millis'"):
-        vendor.get_credentials()
+        vendor.get_storage_options()
 
 
 if __name__ == "__main__":

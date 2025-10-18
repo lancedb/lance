@@ -455,7 +455,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, credential_vendor=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
     fn new(
         py: Python,
         uri: String,
@@ -470,7 +470,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        credential_vendor: Option<Py<PyAny>>,
+        storage_options_provider: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -557,10 +557,10 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        if let Some(credential_vendor) = credential_vendor {
-            use crate::credential_vending::py_object_to_credential_vendor;
-            let vendor_arc = py_object_to_credential_vendor(credential_vendor.into())?;
-            builder = builder.with_credential_vending(vendor_arc, None);
+        if let Some(storage_options_provider) = storage_options_provider {
+            use crate::storage_options::py_object_to_storage_options_provider;
+            let vendor_arc = py_object_to_storage_options_provider(storage_options_provider.into())?;
+            builder = builder.with_storage_options(vendor_arc, None);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;

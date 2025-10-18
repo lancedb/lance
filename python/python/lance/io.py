@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Dict
 
 
-class CredentialVendor(ABC):
+class StorageOptionsProvider(ABC):
     """Abstract base class for providing storage credentials to Lance datasets.
 
     Credential vendors enable automatic credential refresh for long-running operations
@@ -25,8 +25,8 @@ class CredentialVendor(ABC):
     Example
     -------
     >>> import lance
-    >>> class MyCredentialVendor(CredentialVendor):
-    ...     def get_credentials(self):
+    >>> class MyStorageOptionsProvider(StorageOptionsProvider):
+    ...     def get_storage_options(self):
     ...         # Fetch from your credential service
     ...         return {
     ...             "aws_access_key_id": "ASIA...",
@@ -35,20 +35,20 @@ class CredentialVendor(ABC):
     ...             "expires_at_millis": "1234567890000",
     ...         }
     ...
-    >>> vendor = MyCredentialVendor()
+    >>> vendor = MyStorageOptionsProvider()
     >>> dataset = lance.dataset(  # doctest: +SKIP
-    ...     "s3://bucket/table.lance", credential_vendor=vendor
+    ...     "s3://bucket/table.lance", storage_options_provider=vendor
     ... )
 
     Error Handling
     --------------
-    If get_credentials() raises an exception, operations requiring credentials will
+    If get_storage_options() raises an exception, operations requiring credentials will
     fail. Implementations should handle recoverable errors internally (e.g., retry
     token refresh) and only raise exceptions for unrecoverable errors.
     """
 
     @abstractmethod
-    def get_credentials(self) -> Dict[str, str]:
+    def get_storage_options(self) -> Dict[str, str]:
         """Get fresh storage credentials.
 
         This method is called automatically before each request and before existing
@@ -61,7 +61,7 @@ class CredentialVendor(ABC):
             and expiration time. Required keys:
 
             - "expires_at_millis" (str): Unix timestamp in milliseconds (as string) when
-              credentials expire. Lance will automatically call get_credentials() again
+              credentials expire. Lance will automatically call get_storage_options() again
               before this time.
 
             Plus provider-specific credential keys:
@@ -89,7 +89,7 @@ class CredentialVendor(ABC):
 
         Example
         -------
-        >>> def get_credentials(self):
+        >>> def get_storage_options(self):
         ...     # Example: AWS temporary credentials
         ...     response = sts_client.assume_role(
         ...         RoleArn='arn:aws:iam::123456789012:role/DataReader',
@@ -107,7 +107,7 @@ class CredentialVendor(ABC):
         pass
 
 
-class StaticCredentialVendor(CredentialVendor):
+class StaticStorageOptionsProvider(StorageOptionsProvider):
     """Example implementation: Vendor that returns static credentials.
 
     This is useful for testing or when credentials don't expire during the
@@ -122,14 +122,14 @@ class StaticCredentialVendor(CredentialVendor):
     Example
     -------
     >>> import lance
-    >>> vendor = StaticCredentialVendor({
+    >>> vendor = StaticStorageOptionsProvider({
     ...     "aws_access_key_id": "ASIA...",
     ...     "aws_secret_access_key": "secret",
     ...     "aws_session_token": "token",
     ...     "expires_at_millis": "1234567890000",
     ... })
     >>> dataset = lance.dataset(  # doctest: +SKIP
-    ...     "s3://bucket/table.lance", credential_vendor=vendor
+    ...     "s3://bucket/table.lance", storage_options_provider=vendor
     ... )
     """
 
@@ -143,7 +143,7 @@ class StaticCredentialVendor(CredentialVendor):
         """
         self._credentials = credentials.copy()
 
-    def get_credentials(self) -> Dict[str, str]:
+    def get_storage_options(self) -> Dict[str, str]:
         """Return the static credentials.
 
         Returns

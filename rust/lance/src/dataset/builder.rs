@@ -89,7 +89,7 @@ impl DatasetBuilder {
     pub async fn from_namespace(
         namespace: Arc<dyn lance_namespace::LanceNamespace>,
         table_id: Vec<String>,
-        params: Option<lance_io::object_store::CredentialVendingParams>,
+        params: Option<lance_io::object_store::StorageOptionsProviderParams>,
     ) -> Result<Self> {
         use lance_namespace::models::DescribeTableRequest;
 
@@ -127,10 +127,10 @@ impl DatasetBuilder {
             params
         };
 
-        // Create LanceNamespaceCredentialVendor and add to builder
+        // Create LanceNamespaceStorageOptionsProvider and add to builder
         let vendor =
-            lance_io::object_store::LanceNamespaceCredentialVendor::new(namespace, table_id);
-        builder = builder.with_credential_vending(Arc::new(vendor), params);
+            lance_io::object_store::LanceNamespaceStorageOptionsProvider::new(namespace, table_id);
+        builder = builder.with_storage_options_provider(Arc::new(vendor), params);
 
         Ok(builder)
     }
@@ -284,41 +284,41 @@ impl DatasetBuilder {
     /// ```ignore
     /// use std::sync::Arc;
     /// use lance_namespace_impls::connect;
-    /// use lance_io::object_store::{CredentialVendor, LanceNamespaceCredentialVendor, CredentialVendingParams};
+    /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider, StorageOptionsProviderParams};
     ///
     /// let namespace = connect("rest", properties).await?;
     ///
     /// // Create a credential vendor from namespace
-    /// let vendor = Arc::new(LanceNamespaceCredentialVendor::new(
+    /// let vendor = Arc::new(LanceNamespaceStorageOptionsProvider::new(
     ///     namespace,
     ///     vec!["my_table".to_string()],
     /// ));
     ///
     /// // With custom params
-    /// let params = CredentialVendingParams::new()
+    /// let params = StorageOptionsProviderParams::new()
     ///     .with_refresh_lead_time_ms(300_000); // 5 minutes
     /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
-    ///     .with_credential_vending(vendor.clone(), Some(params))
+    ///     .with_storage_options_provider(vendor.clone(), Some(params))
     ///     .load()
     ///     .await?;
     ///
     /// // With default params
     /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
-    ///     .with_credential_vending(vendor, None)
+    ///     .with_storage_options_provider(vendor, None)
     ///     .load()
     ///     .await?;
     /// ```
-    pub fn with_credential_vending(
+    pub fn with_storage_options_provider(
         mut self,
-        vendor: Arc<dyn lance_io::object_store::CredentialVendor>,
-        params: Option<lance_io::object_store::CredentialVendingParams>,
+        vendor: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
+        params: Option<lance_io::object_store::StorageOptionsProviderParams>,
     ) -> Self {
         use lance_io::object_store::{
-            ChainedWrappingObjectStore, CredentialVendingObjectStoreWrapper,
+            ChainedWrappingObjectStore, DynamicStorageOptionObjectStore,
         };
 
         let params = params.unwrap_or_default();
-        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
+        let wrapper = DynamicStorageOptionObjectStore::new(vendor, params);
 
         // Chain with existing wrappers if any
         if let Some(existing) = self.options.object_store_wrapper {

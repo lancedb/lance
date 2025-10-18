@@ -28,7 +28,7 @@ import java.util.Map;
  * <h2>Example Implementation</h2>
  *
  * <pre>{@code
- * public class MyCredentialVendor implements CredentialVendor {
+ * public class MyStorageOptionsProvider implements StorageOptionsProvider {
  *   public Map<String, String> getCredentials() {
  *     // Fetch from your credential service
  *     Map<String, String> credentials = new HashMap<>();
@@ -44,11 +44,11 @@ import java.util.Map;
  * }
  *
  * // Use with dataset
- * CredentialVendor vendor = new MyCredentialVendor();
+ * StorageOptionsProvider vendor = new MyStorageOptionsProvider();
  * Dataset dataset = Dataset.open(
  *     "s3://bucket/table.lance",
  *     new ReadOptions.Builder()
- *         .setCredentialVendor(vendor)
+ *         .setStorageOptionsProvider(vendor)
  *         .build()
  * );
  * }</pre>
@@ -59,7 +59,7 @@ import java.util.Map;
  * Implementations should handle recoverable errors internally (e.g., retry token refresh) and only
  * throw exceptions for unrecoverable errors.
  */
-public interface CredentialVendor {
+public interface StorageOptionsProvider {
 
   /**
    * Get fresh storage credentials.

@@ -25,7 +25,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-public class LanceNamespaceCredentialVendorTest {
+public class LanceNamespaceStorageOptionsProviderTest {
 
   @Test
   public void testGetCredentials() {
@@ -58,8 +58,8 @@ public class LanceNamespaceCredentialVendorTest {
 
     // Create vendor
     List<String> tableId = Arrays.asList("workspace", "table_name");
-    LanceNamespaceCredentialVendor vendor =
-        new LanceNamespaceCredentialVendor(mockNamespace, tableId);
+    LanceNamespaceStorageOptionsProvider vendor =
+        new LanceNamespaceStorageOptionsProvider(mockNamespace, tableId);
 
     // Get credentials
     Map<String, String> credentials = vendor.getCredentials();
@@ -100,8 +100,8 @@ public class LanceNamespaceCredentialVendorTest {
         };
 
     List<String> tableId = Arrays.asList("workspace", "table_name");
-    LanceNamespaceCredentialVendor vendor =
-        new LanceNamespaceCredentialVendor(mockNamespace, tableId);
+    LanceNamespaceStorageOptionsProvider vendor =
+        new LanceNamespaceStorageOptionsProvider(mockNamespace, tableId);
 
     // Should throw exception
     RuntimeException exception =
@@ -132,8 +132,8 @@ public class LanceNamespaceCredentialVendorTest {
         };
 
     List<String> tableId = Arrays.asList("workspace", "table_name");
-    LanceNamespaceCredentialVendor vendor =
-        new LanceNamespaceCredentialVendor(mockNamespace, tableId);
+    LanceNamespaceStorageOptionsProvider vendor =
+        new LanceNamespaceStorageOptionsProvider(mockNamespace, tableId);
 
     // Should throw exception
     RuntimeException exception =

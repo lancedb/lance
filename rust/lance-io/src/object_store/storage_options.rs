@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Credential vending object store wrapper
+//! Dynamic storage options object store wrapper
 //!
 //! This module provides an ObjectStore wrapper that automatically refreshes
-//! credentials from a LanceNamespace implementation.
+//! storage options (such as credentials) from a StorageOptionsProvider.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,31 +29,31 @@ use crate::{Error, Result};
 
 use super::WrappingObjectStore;
 
-/// Trait for providing credentials with expiration tracking
+/// Trait for providing storage options with expiration tracking
 ///
-/// Implementations can fetch credentials from various sources (namespace servers,
-/// credential vending machines, etc.) and are usable from Python/Java via FFI.
+/// Implementations can fetch storage options (including credentials) from various
+/// sources (namespace servers, secret managers, etc.) and are usable from Python/Java via FFI.
 #[async_trait]
-pub trait CredentialVendor: Send + Sync {
-    /// Fetch fresh credentials
+pub trait StorageOptionsProvider: Send + Sync {
+    /// Fetch fresh storage options
     ///
     /// Returns a tuple of (storage_options, expires_at_millis)
-    /// where storage_options is a map of credential key-value pairs
-    /// and expires_at_millis is the epoch time in milliseconds when credentials expire
-    async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)>;
+    /// where storage_options is a map of key-value pairs (e.g., AWS credentials)
+    /// and expires_at_millis is the epoch time in milliseconds when the options expire
+    async fn get_storage_options(&self) -> Result<(HashMap<String, String>, u64)>;
 }
 
-/// CredentialVendor implementation that fetches credentials from a LanceNamespace
-pub struct LanceNamespaceCredentialVendor {
+/// StorageOptionsProvider implementation that fetches options from a LanceNamespace
+pub struct LanceNamespaceStorageOptionsProvider {
     namespace: Arc<dyn LanceNamespace>,
     table_id: Vec<String>,
 }
 
-impl LanceNamespaceCredentialVendor {
-    /// Create a new LanceNamespaceCredentialVendor
+impl LanceNamespaceStorageOptionsProvider {
+    /// Create a new LanceNamespaceStorageOptionsProvider
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch credentials from
+    /// * `namespace` - The namespace implementation to fetch storage options from
     /// * `table_id` - The table identifier
     pub fn new(namespace: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
         Self {
@@ -64,8 +64,8 @@ impl LanceNamespaceCredentialVendor {
 }
 
 #[async_trait]
-impl CredentialVendor for LanceNamespaceCredentialVendor {
-    async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)> {
+impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
+    async fn get_storage_options(&self) -> Result<(HashMap<String, String>, u64)> {
         use lance_namespace::models::DescribeTableRequest;
 
         let request = DescribeTableRequest {
@@ -108,7 +108,7 @@ impl CredentialVendor for LanceNamespaceCredentialVendor {
 
 /// Configuration parameters for credential vending
 #[derive(Debug, Clone)]
-pub struct CredentialVendingParams {
+pub struct StorageOptionsProviderParams {
     /// How early to refresh credentials before expiration (in milliseconds)
     /// Default: 300,000 (5 minutes)
     pub refresh_lead_time_ms: u64,
@@ -118,7 +118,7 @@ pub struct CredentialVendingParams {
     pub initial_storage_options: Option<HashMap<String, String>>,
 }
 
-impl Default for CredentialVendingParams {
+impl Default for StorageOptionsProviderParams {
     fn default() -> Self {
         Self {
             refresh_lead_time_ms: 300_000, // 5 minutes
@@ -127,7 +127,7 @@ impl Default for CredentialVendingParams {
     }
 }
 
-impl CredentialVendingParams {
+impl StorageOptionsProviderParams {
     /// Create new params with default values
     pub fn new() -> Self {
         Self::default()
@@ -168,31 +168,31 @@ impl CredentialsCache {
 
 /// Wrapper that provides credential vending for ObjectStore
 ///
-/// This wrapper automatically refreshes credentials from a CredentialVendor
+/// This wrapper automatically refreshes credentials from a StorageOptionsProvider
 /// implementation before they expire.
 #[derive(Clone)]
-pub struct CredentialVendingObjectStoreWrapper {
-    vendor: Arc<dyn CredentialVendor>,
-    params: CredentialVendingParams,
+pub struct DynamicStorageOptionObjectStore {
+    vendor: Arc<dyn StorageOptionsProvider>,
+    params: StorageOptionsProviderParams,
     credentials: Arc<RwLock<CredentialsCache>>,
     refresh_lock: Arc<Mutex<()>>,
 }
 
-impl fmt::Debug for CredentialVendingObjectStoreWrapper {
+impl fmt::Debug for DynamicStorageOptionObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CredentialVendingObjectStoreWrapper")
+        f.debug_struct("DynamicStorageOptionObjectStore")
             .field("params", &self.params)
             .finish()
     }
 }
 
-impl CredentialVendingObjectStoreWrapper {
+impl DynamicStorageOptionObjectStore {
     /// Create a new credential vending wrapper
     ///
     /// # Arguments
     /// * `vendor` - The credential vendor implementation to fetch credentials from
     /// * `params` - Configuration parameters for credential vending
-    pub fn new(vendor: Arc<dyn CredentialVendor>, params: CredentialVendingParams) -> Self {
+    pub fn new(vendor: Arc<dyn StorageOptionsProvider>, params: StorageOptionsProviderParams) -> Self {
         let credentials = if let Some(initial_options) = &params.initial_storage_options {
             // Initialize with provided credentials - expires_at_millis is required
             let expires_at_millis = initial_options
@@ -220,7 +220,7 @@ impl CredentialVendingObjectStoreWrapper {
 
     /// Refresh credentials from the vendor
     async fn refresh_credentials(&self) -> Result<()> {
-        let (storage_options, expires_at_millis) = self.vendor.get_credentials().await?;
+        let (storage_options, expires_at_millis) = self.vendor.get_storage_options().await?;
 
         let mut cache = self.credentials.write().unwrap();
         cache.storage_options = storage_options;
@@ -289,7 +289,7 @@ impl CredentialVendingObjectStoreWrapper {
     }
 }
 
-impl WrappingObjectStore for CredentialVendingObjectStoreWrapper {
+impl WrappingObjectStore for DynamicStorageOptionObjectStore {
     fn wrap(
         &self,
         original: Arc<dyn OSObjectStore>,
@@ -304,7 +304,7 @@ impl WrappingObjectStore for CredentialVendingObjectStoreWrapper {
 
 /// Delegating ObjectStore that auto-refreshes credentials
 pub struct DelegatingObjectStore {
-    wrapper: Arc<CredentialVendingObjectStoreWrapper>,
+    wrapper: Arc<DynamicStorageOptionObjectStore>,
     inner: Arc<dyn OSObjectStore>,
 }
 
@@ -506,18 +506,17 @@ impl OSObjectStore for DelegatingObjectStore {
 mod tests {
     use super::*;
     use lance_namespace::models::*;
-    use lance_namespace::NamespaceError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock credential vendor for testing
-    struct MockCredentialVendor {
+    struct MockStorageOptionsProvider {
         call_count: Arc<AtomicUsize>,
         expires_at_millis: u64,
     }
 
     #[async_trait]
-    impl CredentialVendor for MockCredentialVendor {
-        async fn get_credentials(&self) -> Result<(HashMap<String, String>, u64)> {
+    impl StorageOptionsProvider for MockStorageOptionsProvider {
+        async fn get_storage_options(&self) -> Result<(HashMap<String, String>, u64)> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
 
             let mut storage_options = HashMap::new();
@@ -531,7 +530,7 @@ mod tests {
         }
     }
 
-    // Mock namespace for LanceNamespaceCredentialVendor integration tests
+    // Mock namespace for LanceNamespaceStorageOptionsProvider integration tests
     #[allow(dead_code)]
     struct MockNamespace {
         call_count: Arc<AtomicUsize>,
@@ -543,49 +542,49 @@ mod tests {
         async fn list_namespaces(
             &self,
             _request: ListNamespacesRequest,
-        ) -> std::result::Result<ListNamespacesResponse, NamespaceError> {
+        ) -> lance_core::Result<ListNamespacesResponse> {
             unimplemented!()
         }
 
         async fn describe_namespace(
             &self,
             _request: DescribeNamespaceRequest,
-        ) -> std::result::Result<DescribeNamespaceResponse, NamespaceError> {
+        ) -> lance_core::Result<DescribeNamespaceResponse> {
             unimplemented!()
         }
 
         async fn create_namespace(
             &self,
             _request: CreateNamespaceRequest,
-        ) -> std::result::Result<CreateNamespaceResponse, NamespaceError> {
+        ) -> lance_core::Result<CreateNamespaceResponse> {
             unimplemented!()
         }
 
         async fn drop_namespace(
             &self,
             _request: DropNamespaceRequest,
-        ) -> std::result::Result<DropNamespaceResponse, NamespaceError> {
+        ) -> lance_core::Result<DropNamespaceResponse> {
             unimplemented!()
         }
 
         async fn namespace_exists(
             &self,
             _request: NamespaceExistsRequest,
-        ) -> std::result::Result<(), NamespaceError> {
+        ) -> lance_core::Result<()> {
             unimplemented!()
         }
 
         async fn list_tables(
             &self,
             _request: ListTablesRequest,
-        ) -> std::result::Result<ListTablesResponse, NamespaceError> {
+        ) -> lance_core::Result<ListTablesResponse> {
             unimplemented!()
         }
 
         async fn describe_table(
             &self,
             _request: DescribeTableRequest,
-        ) -> std::result::Result<DescribeTableResponse, NamespaceError> {
+        ) -> lance_core::Result<DescribeTableResponse> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
 
             let mut storage_options = HashMap::new();
@@ -607,35 +606,35 @@ mod tests {
         async fn register_table(
             &self,
             _request: RegisterTableRequest,
-        ) -> std::result::Result<RegisterTableResponse, NamespaceError> {
+        ) -> lance_core::Result<RegisterTableResponse> {
             unimplemented!()
         }
 
         async fn table_exists(
             &self,
             _request: TableExistsRequest,
-        ) -> std::result::Result<(), NamespaceError> {
+        ) -> lance_core::Result<()> {
             unimplemented!()
         }
 
         async fn drop_table(
             &self,
             _request: DropTableRequest,
-        ) -> std::result::Result<DropTableResponse, NamespaceError> {
+        ) -> lance_core::Result<DropTableResponse> {
             unimplemented!()
         }
 
         async fn deregister_table(
             &self,
             _request: DeregisterTableRequest,
-        ) -> std::result::Result<DeregisterTableResponse, NamespaceError> {
+        ) -> lance_core::Result<DeregisterTableResponse> {
             unimplemented!()
         }
 
         async fn count_table_rows(
             &self,
             _request: CountTableRowsRequest,
-        ) -> std::result::Result<i64, NamespaceError> {
+        ) -> lance_core::Result<i64> {
             unimplemented!()
         }
 
@@ -643,14 +642,14 @@ mod tests {
             &self,
             _request: CreateTableRequest,
             _request_data: Bytes,
-        ) -> std::result::Result<CreateTableResponse, NamespaceError> {
+        ) -> lance_core::Result<CreateTableResponse> {
             unimplemented!()
         }
 
         async fn create_empty_table(
             &self,
             _request: CreateEmptyTableRequest,
-        ) -> std::result::Result<CreateEmptyTableResponse, NamespaceError> {
+        ) -> lance_core::Result<CreateEmptyTableResponse> {
             unimplemented!()
         }
 
@@ -658,7 +657,7 @@ mod tests {
             &self,
             _request: InsertIntoTableRequest,
             _request_data: Bytes,
-        ) -> std::result::Result<InsertIntoTableResponse, NamespaceError> {
+        ) -> lance_core::Result<InsertIntoTableResponse> {
             unimplemented!()
         }
 
@@ -666,63 +665,63 @@ mod tests {
             &self,
             _request: MergeInsertIntoTableRequest,
             _request_data: Bytes,
-        ) -> std::result::Result<MergeInsertIntoTableResponse, NamespaceError> {
+        ) -> lance_core::Result<MergeInsertIntoTableResponse> {
             unimplemented!()
         }
 
         async fn update_table(
             &self,
             _request: UpdateTableRequest,
-        ) -> std::result::Result<UpdateTableResponse, NamespaceError> {
+        ) -> lance_core::Result<UpdateTableResponse> {
             unimplemented!()
         }
 
         async fn delete_from_table(
             &self,
             _request: DeleteFromTableRequest,
-        ) -> std::result::Result<DeleteFromTableResponse, NamespaceError> {
+        ) -> lance_core::Result<DeleteFromTableResponse> {
             unimplemented!()
         }
 
         async fn query_table(
             &self,
             _request: QueryTableRequest,
-        ) -> std::result::Result<Bytes, NamespaceError> {
+        ) -> lance_core::Result<Bytes> {
             unimplemented!()
         }
 
         async fn create_table_index(
             &self,
             _request: CreateTableIndexRequest,
-        ) -> std::result::Result<CreateTableIndexResponse, NamespaceError> {
+        ) -> lance_core::Result<CreateTableIndexResponse> {
             unimplemented!()
         }
 
         async fn list_table_indices(
             &self,
             _request: ListTableIndicesRequest,
-        ) -> std::result::Result<ListTableIndicesResponse, NamespaceError> {
+        ) -> lance_core::Result<ListTableIndicesResponse> {
             unimplemented!()
         }
 
         async fn describe_table_index_stats(
             &self,
             _request: DescribeTableIndexStatsRequest,
-        ) -> std::result::Result<DescribeTableIndexStatsResponse, NamespaceError> {
+        ) -> lance_core::Result<DescribeTableIndexStatsResponse> {
             unimplemented!()
         }
 
         async fn describe_transaction(
             &self,
             _request: DescribeTransactionRequest,
-        ) -> std::result::Result<DescribeTransactionResponse, NamespaceError> {
+        ) -> lance_core::Result<DescribeTransactionResponse> {
             unimplemented!()
         }
 
         async fn alter_transaction(
             &self,
             _request: AlterTransactionRequest,
-        ) -> std::result::Result<AlterTransactionResponse, NamespaceError> {
+        ) -> lance_core::Result<AlterTransactionResponse> {
             unimplemented!()
         }
     }
@@ -735,13 +734,13 @@ mod tests {
             .as_millis() as u64;
 
         let call_count = Arc::new(AtomicUsize::new(0));
-        let vendor = Arc::new(MockCredentialVendor {
+        let vendor = Arc::new(MockStorageOptionsProvider {
             call_count: call_count.clone(),
             expires_at_millis: now_millis + 1000, // Expires in 1 second
         });
 
-        let params = CredentialVendingParams::new().with_refresh_lead_time_ms(2000);
-        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
+        let params = StorageOptionsProviderParams::new().with_refresh_lead_time_ms(2000);
+        let wrapper = DynamicStorageOptionObjectStore::new(vendor, params);
 
         // Should trigger refresh since we're within lead time
         wrapper.ensure_fresh_credentials().await.unwrap();
@@ -755,13 +754,13 @@ mod tests {
     #[tokio::test]
     async fn test_no_expiration() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let vendor = Arc::new(MockCredentialVendor {
+        let vendor = Arc::new(MockStorageOptionsProvider {
             call_count: call_count.clone(),
             expires_at_millis: 0, // Invalid, will be ignored
         });
 
-        let params = CredentialVendingParams::default();
-        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
+        let params = StorageOptionsProviderParams::default();
+        let wrapper = DynamicStorageOptionObjectStore::new(vendor, params);
 
         // First call should still refresh to get initial credentials
         wrapper.ensure_fresh_credentials().await.unwrap();
@@ -777,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn test_initial_storage_options() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let vendor = Arc::new(MockCredentialVendor {
+        let vendor = Arc::new(MockStorageOptionsProvider {
             call_count: call_count.clone(),
             expires_at_millis: 0,
         });
@@ -788,16 +787,16 @@ mod tests {
         initial_options.insert("expires_at_millis".to_string(), "9999999999999".to_string());
 
         let params =
-            CredentialVendingParams::default().with_initial_storage_options(initial_options);
+            StorageOptionsProviderParams::default().with_initial_storage_options(initial_options);
 
-        let wrapper = CredentialVendingObjectStoreWrapper::new(vendor, params);
+        let wrapper = DynamicStorageOptionObjectStore::new(vendor, params);
 
-        // Should not call get_credentials since we have initial credentials
+        // Should not call get_storage_options since we have initial credentials
         wrapper.ensure_fresh_credentials().await.unwrap();
         wrapper.ensure_fresh_credentials().await.unwrap();
         wrapper.ensure_fresh_credentials().await.unwrap();
 
-        // Should never call get_credentials
+        // Should never call get_storage_options
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 
@@ -808,22 +807,22 @@ mod tests {
         let call_count_a = Arc::new(AtomicUsize::new(0));
         let call_count_b = Arc::new(AtomicUsize::new(0));
 
-        let vendor_a = Arc::new(MockCredentialVendor {
+        let vendor_a = Arc::new(MockStorageOptionsProvider {
             call_count: call_count_a.clone(),
             expires_at_millis: 9999999999999,
         });
 
-        let vendor_b = Arc::new(MockCredentialVendor {
+        let vendor_b = Arc::new(MockStorageOptionsProvider {
             call_count: call_count_b.clone(),
             expires_at_millis: 9999999999999,
         });
 
         // Create two wrappers with different vendors
         let wrapper_a =
-            CredentialVendingObjectStoreWrapper::new(vendor_a, CredentialVendingParams::default());
+            DynamicStorageOptionObjectStore::new(vendor_a, StorageOptionsProviderParams::default());
 
         let wrapper_b =
-            CredentialVendingObjectStoreWrapper::new(vendor_b, CredentialVendingParams::default());
+            DynamicStorageOptionObjectStore::new(vendor_b, StorageOptionsProviderParams::default());
 
         // Fetch credentials for wrapper A
         wrapper_a.ensure_fresh_credentials().await.unwrap();
@@ -850,19 +849,19 @@ mod tests {
     fn test_wrapper_pointer_uniqueness() {
         // This test verifies that each wrapper instance has a unique pointer address
         // which is used for cache key differentiation
-        let vendor = Arc::new(MockCredentialVendor {
+        let vendor = Arc::new(MockStorageOptionsProvider {
             call_count: Arc::new(AtomicUsize::new(0)),
             expires_at_millis: 9999999999999,
         });
 
-        let wrapper_a = Arc::new(CredentialVendingObjectStoreWrapper::new(
+        let wrapper_a = Arc::new(DynamicStorageOptionObjectStore::new(
             vendor.clone(),
-            CredentialVendingParams::default(),
+            StorageOptionsProviderParams::default(),
         ));
 
-        let wrapper_b = Arc::new(CredentialVendingObjectStoreWrapper::new(
+        let wrapper_b = Arc::new(DynamicStorageOptionObjectStore::new(
             vendor,
-            CredentialVendingParams::default(),
+            StorageOptionsProviderParams::default(),
         ));
 
         // Even though both wrappers use the same vendor, they should have

@@ -7,22 +7,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
-use lance_io::object_store::CredentialVendor;
+use lance_io::object_store::StorageOptionsProvider;
 
 use crate::error::Result;
 
 /// Java-implemented credential vendor
 ///
-/// This wraps a Java object that implements the CredentialVendor interface
-/// and forwards get_credentials() calls to the Java implementation.
-pub struct JavaCredentialVendor {
-    /// GlobalRef to the Java CredentialVendor object
+/// This wraps a Java object that implements the StorageOptionsProvider interface
+/// and forwards get_storage_options() calls to the Java implementation.
+pub struct JavaStorageOptionsProvider {
+    /// GlobalRef to the Java StorageOptionsProvider object
     java_vendor: jni::objects::GlobalRef,
     /// JavaVM for making JNI calls
     jvm: Arc<jni::JavaVM>,
 }
 
-impl JavaCredentialVendor {
+impl JavaStorageOptionsProvider {
     pub fn new(env: &mut JNIEnv, java_vendor: JObject) -> Result<Self> {
         // Create a global reference to the Java object so it persists
         let java_vendor = env.new_global_ref(java_vendor)?;
@@ -35,8 +35,8 @@ impl JavaCredentialVendor {
 }
 
 #[async_trait]
-impl CredentialVendor for JavaCredentialVendor {
-    async fn get_credentials(&self) -> lance_core::Result<(HashMap<String, String>, u64)> {
+impl StorageOptionsProvider for JavaStorageOptionsProvider {
+    async fn get_storage_options(&self) -> lance_core::Result<(HashMap<String, String>, u64)> {
         // Spawn blocking task to call Java method
         let java_vendor = self.java_vendor.clone();
         let jvm = self.jvm.clone();

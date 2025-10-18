@@ -16,14 +16,14 @@ package com.lancedb.lance;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
-import com.lancedb.lance.io.CredentialVendor;
+import com.lancedb.lance.io.StorageOptionsProvider;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.merge.MergeInsertParams;
 import com.lancedb.lance.merge.MergeInsertResult;
 import com.lancedb.lance.namespace.LanceNamespace;
-import com.lancedb.lance.namespace.LanceNamespaceCredentialVendor;
+import com.lancedb.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import com.lancedb.lance.namespace.model.DescribeTableRequest;
 import com.lancedb.lance.namespace.model.DescribeTableResponse;
 import com.lancedb.lance.operation.UpdateConfig;
@@ -342,7 +342,7 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getCredentialVendor());
+            options.getStorageOptionsProvider());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -356,7 +356,7 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<CredentialVendor> credentialVendor);
+      Optional<StorageOptionsProvider> credentialVendor);
 
   /**
    * Open a dataset from a LanceNamespace.
@@ -433,15 +433,15 @@ public class Dataset implements Closeable {
     }
 
     // Create credential vendor from namespace
-    LanceNamespaceCredentialVendor credentialVendor =
-        new LanceNamespaceCredentialVendor(namespace, tableId);
+    LanceNamespaceStorageOptionsProvider credentialVendor =
+        new LanceNamespaceStorageOptionsProvider(namespace, tableId);
 
     // Build new ReadOptions with credential vendor and initial storage options
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
             .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes())
-            .setCredentialVendor(credentialVendor);
+            .setStorageOptionsProvider(credentialVendor);
 
     // Set optional fields only if present
     options.getVersion().ifPresent(optionsBuilder::setVersion);

@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import com.lancedb.lance.io.CredentialVendor;
+import com.lancedb.lance.io.StorageOptionsProvider;
 
 import com.google.common.base.MoreObjects;
 
@@ -31,7 +31,7 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
-  private final Optional<CredentialVendor> credentialVendor;
+  private final Optional<StorageOptionsProvider> credentialVendor;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
@@ -67,7 +67,7 @@ public class ReadOptions {
     return serializedManifest;
   }
 
-  public Optional<CredentialVendor> getCredentialVendor() {
+  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
     return credentialVendor;
   }
 
@@ -93,7 +93,7 @@ public class ReadOptions {
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
-    private Optional<CredentialVendor> credentialVendor = Optional.empty();
+    private Optional<StorageOptionsProvider> credentialVendor = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -208,7 +208,7 @@ public class ReadOptions {
      * @param credentialVendor the credential vendor implementation
      * @return this builder
      */
-    public Builder setCredentialVendor(CredentialVendor credentialVendor) {
+    public Builder setStorageOptionsProvider(StorageOptionsProvider credentialVendor) {
       this.credentialVendor = Optional.of(credentialVendor);
       return this;
     }
