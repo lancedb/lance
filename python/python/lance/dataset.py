@@ -3241,8 +3241,9 @@ class LanceDataset(pa.dataset.Dataset):
         target_path : str or Path
             The URI or filesystem path to clone the dataset into.
         version : int, str or Tuple[int, str]
-            The source version to clone. An integer specifies a version number in main; a string
-            specifies a tag name; a Tuple[int, str] specifies a version number in a specified branch.
+            The source version to clone. An integer specifies a version number in main;
+            a string specifies a tag name; a Tuple[int, str] specifies a version number
+            in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints).
@@ -3257,15 +3258,10 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
-        new_inner = self._ds.shallow_clone(target_uri, version, storage_options)
+        self._ds.shallow_clone(target_uri, version, storage_options)
 
-        ds = LanceDataset.__new__(LanceDataset)
-        ds._storage_options = storage_options
-        ds._ds = new_inner
-        ds._uri = new_inner.uri
-        ds._default_scan_options = None
-        ds._read_params = None
-        return ds
+        # Open and return a fresh dataset at the target URI to avoid manual overrides
+        return LanceDataset(target_uri, storage_options=storage_options)
 
     def migrate_manifest_paths_v2(self):
         """
