@@ -178,6 +178,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn when_matched_fail(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_matched(WhenMatched::Fail);
+        Ok(slf)
+    }
+
     pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
         slf.builder.when_not_matched(WhenNotMatched::InsertAll);
         Ok(slf)
@@ -2403,22 +2408,6 @@ impl Dataset {
         let mut ds = self.ds.as_ref().clone();
         let builder = ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
-    }
-
-    #[pyo3(signature=(compared_version))]
-    fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
-        let new_self = self.ds.as_ref().clone();
-        let transactions = rt()
-            .block_on(None, new_self.diff_meta(compared_version))?
-            .map_err(|err: Error| match err {
-                Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
-                Error::VersionNotFound { .. } => {
-                    PyValueError::new_err(format!("Version not found: {}", err))
-                }
-                _ => PyIOError::new_err(format!("Storage error: {}", err)),
-            })?;
-
-        Ok(transactions.into_iter().map(PyLance).collect())
     }
 }
 
