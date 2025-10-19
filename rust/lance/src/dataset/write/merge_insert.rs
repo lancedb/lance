@@ -541,7 +541,7 @@ impl MergeInsertJob {
 
         // Try full schema match first.
         if lance_schema
-            .check_compatible(&target_schema, &options)
+            .check_compatible(target_schema, &options)
             .is_ok()
         {
             return Ok(SchemaComparison::FullCompatible);
@@ -552,7 +552,7 @@ impl MergeInsertJob {
         options.ignore_field_order = true; // Subschema matching should typically ignore order.
 
         lance_schema
-            .check_compatible(&target_schema, &options)
+            .check_compatible(target_schema, &options)
             .map(|_| SchemaComparison::Subschema)
     }
 
