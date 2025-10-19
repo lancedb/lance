@@ -390,7 +390,7 @@ message PackedStruct {
   CompressiveEncoding values = 2;
 }
 
-// Variable-width packed struct encoding (2.1 extension)
+// Variable-width packed struct encoding (2.2 extension)
 //
 // Each child value is compressed independently before being transposed into
 // a row-major layout. This preserves per-field compression boundaries at the
