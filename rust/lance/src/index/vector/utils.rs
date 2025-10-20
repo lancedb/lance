@@ -35,10 +35,7 @@ fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) 
     match (data_type,in_list) {
         (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
         (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
-        _ => Err(Error::Index {
-            message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input(format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type), location!()))
     }
 }
 
@@ -93,13 +90,13 @@ fn infer_vector_element_type_impl(
         (arrow::datatypes::DataType::List(inner), false) => {
             infer_vector_element_type_impl(inner.data_type(), true)
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
-                data_type
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input(
+            format!(
+            "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+            data_type
+        ),
+            location!(),
+        )),
     }
 }
 
