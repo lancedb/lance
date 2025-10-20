@@ -223,7 +223,7 @@ def test_struct_variable_children_roundtrip(tmp_path: Path):
 
     dataset_uri = tmp_path / "struct.lance"
     ds = lance.write_dataset(
-        table, dataset_uri, data_storage_version="2.1"
+        table, dataset_uri, data_storage_version="2.2"
     )
 
     round_trip = ds.to_table()

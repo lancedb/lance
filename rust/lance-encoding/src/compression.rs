@@ -297,6 +297,12 @@ impl DefaultCompressionStrategy {
         }
     }
 
+    /// Override the file version used to make compression decisions
+    pub fn with_version(mut self, version: LanceFileVersion) -> Self {
+        self.version = version;
+        self
+    }
+
     /// Parse compression parameters from field metadata
     fn parse_field_metadata(field: &Field) -> CompressionFieldParams {
         let mut params = CompressionFieldParams::default();
@@ -481,10 +487,27 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         location!(),
                     ));
                 }
-                Ok(Box::new(PackedStructVariablePerValueEncoder::new(
-                    self.clone(),
-                    field.children.clone(),
-                )))
+                let has_variable_child = struct_block
+                    .children
+                    .iter()
+                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)));
+                if has_variable_child {
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::NotSupported {
+                            source: "Variable packed struct encoding requires Lance file version 2.2 or later".into(),
+                            location: location!(),
+                        });
+                    }
+                    Ok(Box::new(PackedStructVariablePerValueEncoder::new(
+                        self.clone(),
+                        field.children.clone(),
+                    )))
+                } else {
+                    Err(Error::invalid_input(
+                        "Packed struct per-value compression should not be used for fixed-width-only structs",
+                        location!(),
+                    ))
+                }
             }
             DataBlock::VariableWidth(variable_width) => {
                 let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);

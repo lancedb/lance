@@ -740,8 +740,10 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
 mod tests {
     use super::*;
     use crate::{
+        compression::CompressionStrategy,
         compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
         statistics::ComputeStat,
+        version::LanceFileVersion,
     };
     use arrow_array::{
         Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
@@ -776,9 +778,7 @@ mod tests {
         }
     }
 
-    fn variable_block_from_large_string_array(
-        array: LargeStringArray,
-    ) -> VariableWidthBlock {
+    fn variable_block_from_large_string_array(array: LargeStringArray) -> VariableWidthBlock {
         let num_values = array.len() as u64;
         let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
         match block {
@@ -840,7 +840,8 @@ mod tests {
 
         let data_block = DataBlock::Struct(struct_block);
 
-        let compression_strategy = DefaultCompressionStrategy::new();
+        let compression_strategy =
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
         let compressor = crate::compression::CompressionStrategy::create_per_value(
             &compression_strategy,
             &struct_field,
@@ -907,7 +908,8 @@ mod tests {
 
         let data_block = DataBlock::Struct(struct_block);
 
-        let compression_strategy = DefaultCompressionStrategy::new();
+        let compression_strategy =
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
         let compressor = crate::compression::CompressionStrategy::create_per_value(
             &compression_strategy,
             &struct_field,
@@ -942,7 +944,10 @@ mod tests {
                 .offsets
                 .borrow_to_typed_slice::<i64>()
                 .as_ref(),
-            payload_block.offsets.borrow_to_typed_slice::<i64>().as_ref()
+            payload_block
+                .offsets
+                .borrow_to_typed_slice::<i64>()
+                .as_ref()
         );
         assert_eq!(decoded_payload.data.as_ref(), payload_block.data.as_ref());
 
@@ -962,12 +967,8 @@ mod tests {
 
         let category_array = StringArray::from(vec!["red", "blue", "green", "red"]);
         let category_block = variable_block_from_string_array(category_array);
-        let payload_values: Vec<Vec<u8>> = vec![
-            vec![0x01, 0x02],
-            vec![],
-            vec![0x05, 0x06, 0x07],
-            vec![0xff],
-        ];
+        let payload_values: Vec<Vec<u8>> =
+            vec![vec![0x01, 0x02], vec![], vec![0x05, 0x06, 0x07], vec![0xff]];
         let payload_array =
             BinaryArray::from_iter_values(payload_values.iter().map(|v| v.as_slice()));
         let payload_block = variable_block_from_binary_array(payload_array);
@@ -985,7 +986,8 @@ mod tests {
 
         let data_block = DataBlock::Struct(struct_block);
 
-        let compression_strategy = DefaultCompressionStrategy::new();
+        let compression_strategy =
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
         let compressor = crate::compression::CompressionStrategy::create_per_value(
             &compression_strategy,
             &struct_field,
@@ -1016,7 +1018,10 @@ mod tests {
                 .offsets
                 .borrow_to_typed_slice::<i32>()
                 .as_ref(),
-            category_block.offsets.borrow_to_typed_slice::<i32>().as_ref()
+            category_block
+                .offsets
+                .borrow_to_typed_slice::<i32>()
+                .as_ref()
         );
         assert_eq!(decoded_category.data.as_ref(), category_block.data.as_ref());
 
@@ -1027,7 +1032,10 @@ mod tests {
                 .offsets
                 .borrow_to_typed_slice::<i32>()
                 .as_ref(),
-            payload_block.offsets.borrow_to_typed_slice::<i32>().as_ref()
+            payload_block
+                .offsets
+                .borrow_to_typed_slice::<i32>()
+                .as_ref()
         );
         assert_eq!(decoded_payload.data.as_ref(), payload_block.data.as_ref());
 
@@ -1036,5 +1044,36 @@ mod tests {
         assert_eq!(decoded_count.data.as_ref(), count_block.data.as_ref());
 
         Ok(())
+    }
+
+    #[test]
+    fn variable_packed_struct_requires_v22() {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("value", DataType::Int64, false),
+            ArrowField::new("text", DataType::Utf8, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct).unwrap();
+
+        let value_block = fixed_block_from_array(Int64Array::from(vec![1, 2, 3]));
+        let text_block =
+            variable_block_from_string_array(StringArray::from(vec!["a", "bb", "ccc"]));
+
+        let struct_block = StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(value_block),
+                DataBlock::VariableWidth(text_block),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        };
+
+        let compression_strategy =
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_1);
+        let result =
+            compression_strategy.create_per_value(&struct_field, &DataBlock::Struct(struct_block));
+
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
     }
 }
