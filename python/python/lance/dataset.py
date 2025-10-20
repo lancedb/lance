@@ -3235,6 +3235,46 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.validate()
 
+    def shallow_clone(
+        self,
+        target_path: Union[str, Path],
+        version: Union[int, str, Tuple[int, str]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Shallow clone the specified version into a new dataset at target_path.
+
+        This operation copies only the dataset metadata and references, without
+        rewriting data files.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        version : int, str or Tuple[int, str]
+            The source version to clone. An integer specifies a version number in main;
+            a string specifies a tag name; a Tuple[int, str] specifies a version number
+            in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the new dataset (e.g., credentials,
+            endpoints).
+
+        Returns
+        -------
+        LanceDataset
+            A new LanceDataset representing the shallow-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        self._ds.shallow_clone(target_uri, version, storage_options)
+
+        # Open and return a fresh dataset at the target URI to avoid manual overrides
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
     def migrate_manifest_paths_v2(self):
         """
         Migrate the manifest paths to the new format.
