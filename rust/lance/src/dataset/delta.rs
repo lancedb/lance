@@ -260,7 +260,12 @@ impl DatasetDelta {
         let mut scanner = self.base_dataset.scan();
 
         // Enable version columns
-        scanner.with_row_id();
+        scanner.project(&[
+            WILDCARD,
+            ROW_ID,
+            ROW_CREATED_AT_VERSION,
+            ROW_LAST_UPDATED_AT_VERSION,
+        ])?;
 
         // Filter for rows that were updated (not inserted) in the version range
         let filter = format!(
