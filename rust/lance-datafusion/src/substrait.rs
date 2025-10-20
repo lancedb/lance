@@ -53,6 +53,11 @@ pub fn encode_substrait(
 fn count_fields(dtype: &Type) -> usize {
     match dtype.kind.as_ref().unwrap() {
         Kind::Struct(struct_type) => struct_type.types.iter().map(count_fields).sum::<usize>() + 1,
+        Kind::List(list_type) => {
+            // Recursively count fields in the list's child type
+            // This is critical for schemas with List<Struct> patterns
+            count_fields(list_type.r#type.as_ref().unwrap())
+        }
         _ => 1,
     }
 }
@@ -390,5 +395,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_of_struct() {
+        let struct_fields = vec![
+            Field::new("company_id", DataType::Int64, true),
+            Field::new("company_name", DataType::Utf8, true),
+        ];
+        let list_field = Field::new(
+            "top_previous_companies",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(struct_fields.into()),
+                true,
+            ))),
+            true,
+        );
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_field,
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        // Create a filter expression on the id field
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("id"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("test-id".to_string())),
+                None,
+            )),
+        });
+
+        let bytes =
+            encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
+
+        let result =
+            parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state()).await;
+
+        match result {
+            Ok(decoded) => {
+                println!("✓ Roundtrip succeeded (bug may be fixed or not triggered)");
+                assert_eq!(decoded, expr);
+            }
+            Err(e) => {
+                let error_msg = format!("{:?}", e);
+                if error_msg.contains("Named schema must contain names for all fields") {
+                    panic!("\n!!! BUG REPRODUCED !!!\nSubstrait roundtrip failed with List<Struct>: {}", error_msg);
+                } else {
+                    panic!(
+                        "Substrait roundtrip failed with different error: {}",
+                        error_msg
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_struct_struct() {
+        let breakdown_fields = vec![
+            Field::new("employees_count_owner", DataType::Int64, true),
+            Field::new("employees_count_founder", DataType::Int64, true),
+            Field::new("employees_count_clevel", DataType::Int64, true),
+        ];
+
+        let list_item_fields = vec![
+            Field::new("date", DataType::Utf8, true),
+            Field::new("breakdown", DataType::Struct(breakdown_fields.into()), true),
+        ];
+
+        let list_field = Field::new(
+            "employees_count_breakdown_by_month",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(list_item_fields.into()),
+                true,
+            ))),
+            true,
+        );
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_field,
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        // Create a filter expression
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("id"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("6a21a402-9867-5c69-9eab-e4617ebeae2b".to_string())),
+                None,
+            )),
+        });
+
+        let bytes =
+            encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
+
+        let result =
+            parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state()).await;
+
+        match result {
+            Ok(decoded) => {
+                println!("✓ Roundtrip succeeded with List<Struct<Struct>> (bug may be fixed)");
+                assert_eq!(decoded, expr);
+            }
+            Err(e) => {
+                let error_msg = format!("{:?}", e);
+                if error_msg.contains("Named schema must contain names for all fields") {
+                    panic!("\n!!! BUG REPRODUCED !!!\nSubstrait roundtrip failed with List<Struct<Struct>>: {}", error_msg);
+                } else {
+                    panic!(
+                        "Substrait roundtrip failed with different error: {}",
+                        error_msg
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_many_nested_columns() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "location",
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("country", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new(
+                "top_previous_companies",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("company_id", DataType::Int64, true),
+                            Field::new("company_name", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new(
+                "employees_by_month",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("date", DataType::Utf8, true),
+                            Field::new(
+                                "breakdown",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("count_owner", DataType::Int64, true),
+                                        Field::new("count_founder", DataType::Int64, true),
+                                    ]
+                                    .into(),
+                                ),
+                                true,
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("id"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("test-id".to_string())),
+                None,
+            )),
+        });
+
+        let bytes =
+            encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
+
+        let result =
+            parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state()).await;
+
+        match result {
+            Ok(decoded) => {
+                println!("✓ Roundtrip succeeded with multiple nested columns");
+                assert_eq!(decoded, expr);
+            }
+            Err(e) => {
+                let error_msg = format!("{:?}", e);
+                if error_msg.contains("Named schema must contain names for all fields") {
+                    panic!("\n!!! BUG REPRODUCED !!!\nSubstrait roundtrip failed with multiple nested columns: {}", error_msg);
+                } else {
+                    panic!("Substrait roundtrip failed: {}", error_msg);
+                }
+            }
+        }
     }
 }
