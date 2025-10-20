@@ -581,9 +581,10 @@ impl IndexWorker {
             let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
+                // TODO: we are still creating an allocation for each document here. Where is it coming from?
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
-                    let token = token_stream.token_mut();
+                    let token = token_stream.token();
                     let token_id = self.builder.tokens.add(&token.text) as usize;
                     token_occurrences
                         .entry(token_id as u32)
@@ -592,6 +593,7 @@ impl IndexWorker {
                     token_num += 1;
                 }
             }
+            // TODO: this causes a lot of allocations. Can we do this more efficiently?
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
