@@ -1413,8 +1413,7 @@ public class DatasetTest {
 
         // shallow clone by version
         try (Dataset clone =
-            src.shallowClone(
-                dstPathByVersion, Reference.builder().versionNumber(src.version()).build())) {
+            src.shallowClone(dstPathByVersion, Reference.ofMainVersion(src.version()))) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());
@@ -1432,8 +1431,7 @@ public class DatasetTest {
 
         // shallow clone by tag
         src.tags().create("tag", src.version());
-        try (Dataset clone =
-            src.shallowClone(dstPathByTag, Reference.builder().tagName("tag").build())) {
+        try (Dataset clone = src.shallowClone(dstPathByTag, Reference.ofTag("tag"))) {
           // Validate the tag cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByTag, clone.uri());
@@ -1447,6 +1445,97 @@ public class DatasetTest {
           assertNotNull(opened);
           assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
           assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testBranches(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("branches_flow").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      try (Dataset mainV1 = suite.createEmptyDataset()) {
+        assertEquals(1, mainV1.version());
+
+        // Step 1. write to main dataset, 5 rows -> main:2
+        try (Dataset mainV2 = suite.write(1, 5)) {
+          assertEquals(2, mainV2.version());
+          assertEquals(5, mainV2.countRows());
+
+          // Step2. create branch2 based on main:2
+          try (Dataset branch1V2 = mainV2.branches().create("branch1", 2)) {
+            assertEquals(2, branch1V2.version());
+
+            // Write batch B on branch1: 3 rows -> global@3
+            FragmentMetadata fragB = suite.createNewFragment(3);
+            Append appendB = Append.builder().fragments(Collections.singletonList(fragB)).build();
+            try (Dataset branch1V3 =
+                branch1V2.newTransactionBuilder().operation(appendB).build().commit()) {
+              assertEquals(3, branch1V3.version());
+              assertEquals(8, branch1V3.countRows()); // A(5) + B(3)
+
+              // Step 3. Create branch2 based on branch1's latest version (simulate tag 't1')
+              branch1V3.tags().create("tag", 3);
+
+              try (Dataset branch2V3 = branch1V2.branches().create("branch2", "tag")) {
+                assertEquals(3, branch2V3.version());
+                assertEquals(8, branch2V3.countRows()); // A(5) + B(3)
+
+                // Step 4. Write batch C on branch2: 2 rows -> branch2:4
+                FragmentMetadata fragC = suite.createNewFragment(2);
+                Append appendC = Append.builder().fragments(Arrays.asList(fragC)).build();
+                try (Dataset branch2V4 =
+                    branch2V3.newTransactionBuilder().operation(appendC).build().commit()) {
+                  assertEquals(4, branch2V4.version());
+                  assertEquals(10, branch2V4.countRows()); // A(5) + B(3) + C(2)
+
+                  // 5) Validate branch listing metadata; delete branch1; validate listing again
+                  List<Branch> branches = mainV2.branches().list();
+                  Optional<Branch> b1 =
+                      branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  Optional<Branch> b2 =
+                      branches.stream().filter(b -> b.getName().equals("branch2")).findFirst();
+                  assertTrue(b1.isPresent(), "branch1 should be listed");
+                  assertTrue(b2.isPresent(), "branch2 should be listed");
+                  Branch branch1Meta = b1.get();
+                  Branch branch2Meta = b2.get();
+
+                  // Metadata fields and consistency checks
+                  assertEquals("branch1", branch1Meta.getName());
+                  assertEquals(2, branch1Meta.getParentVersion()); // from main@2
+                  assertTrue(
+                      branch1Meta.getParentBranch() == null
+                          || branch1Meta.getParentBranch().isEmpty()); // main branch is null
+                  assertTrue(branch1Meta.getCreateAt() > 0);
+                  assertTrue(branch1Meta.getManifestSize() > 0);
+
+                  assertEquals("branch2", branch2Meta.getName());
+                  assertEquals("branch1", branch2Meta.getParentBranch());
+                  assertEquals(3, branch2Meta.getParentVersion());
+                  assertTrue(branch2Meta.getCreateAt() > 0);
+                  assertTrue(branch2Meta.getManifestSize() > 0);
+
+                  // Delete branch1 and verify listing
+                  try {
+                    mainV2.branches().delete("branch1");
+                  } catch (Exception ignored) {
+                    // Some environments may report NotFound on cleanup; ignore and proceed
+                  }
+                  List<Branch> after = mainV2.branches().list();
+                  assertTrue(
+                      after.stream().noneMatch(b -> b.getName().equals("branch1")),
+                      "branch1 should be deleted");
+
+                  Optional<Branch> b2After =
+                      after.stream().filter(b -> b.getName().equals("branch2")).findFirst();
+                  assertTrue(b2After.isPresent(), "branch2 should remain");
+                  assertEquals(branch2Meta, b2After.get());
+                }
+              }
+            }
+          }
         }
       }
     }

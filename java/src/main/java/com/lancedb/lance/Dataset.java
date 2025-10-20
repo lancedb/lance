@@ -951,6 +951,39 @@ public class Dataset implements Closeable {
     return new Tags();
   }
 
+  /** Branch operations aligned with Rust's Dataset branch APIs. */
+  public Branches branches() {
+    return new Branches();
+  }
+
+  /**
+   * Checkout using a unified {@link Reference} which can be a tag or a branch/version.
+   *
+   * @param reference the checkout reference
+   * @return a new Dataset instance checked out to the specified reference
+   */
+  public Dataset checkout(Reference reference) {
+    Preconditions.checkNotNull(reference);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutReference(reference);
+    }
+  }
+
+  /**
+   * Checkout the latest version of a branch.
+   *
+   * @param branch branch name
+   * @return a new Dataset instance checked out to the branch's latest version
+   */
+  public Dataset checkoutBranch(String branch) {
+    Preconditions.checkArgument(branch != null, "Branch cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutBranch(branch);
+    }
+  }
+
   /**
    * Get the table metadata of the dataset.
    *
@@ -1032,6 +1065,80 @@ public class Dataset implements Closeable {
     }
   }
 
+  /** Branch operations of the dataset. */
+  public class Branches {
+    /**
+     * Create a branch at a specified version. The returned Dataset points to the created branch's
+     * initial version.
+     *
+     * @param branch the branch name to create
+     * @param version the version number to branch from
+     * @return a new Dataset of the branch
+     */
+    public Dataset create(String branch, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeCreateBranch(branch, version, Optional.empty());
+      }
+    }
+
+    /**
+     * Create a branch from a specific source branch and version.
+     *
+     * @param branch the branch name to create
+     * @param version the version number to branch from
+     * @param sourceBranch the source branch name
+     * @return a new Dataset of the created branch
+     */
+    public Dataset create(String branch, long version, String sourceBranch) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        Preconditions.checkNotNull(sourceBranch);
+        return nativeCreateBranch(branch, version, Optional.of(sourceBranch));
+      }
+    }
+
+    /**
+     * Create a branch from a specific source branch and version.
+     *
+     * @param branch the branch name to create
+     * @param version the version number to branch from
+     * @param sourceBranch the source branch name
+     * @return a new Dataset of the created branch
+     */
+    public Dataset create(String branch, String tagName) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        Preconditions.checkNotNull(tagName);
+        return nativeCreateBranchOnTag(branch, tagName);
+      }
+    }
+
+    /**
+     * Delete a branch and its metadata.
+     *
+     * @param branch the branch to delete
+     */
+    public void delete(String branch) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeDeleteBranch(branch);
+      }
+    }
+
+    /**
+     * List all branches in this dataset.
+     *
+     * @return a list of Branch objects
+     */
+    public List<Branch> list() {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeListBranches();
+      }
+    }
+  }
+
   /**
    * Execute SQL query on the dataset. The underlying SQL engine is DataFusion. Please refer to the
    * DataFusion documentation for supported SQL syntax.
@@ -1085,6 +1192,20 @@ public class Dataset implements Closeable {
   private native List<Tag> nativeListTags();
 
   private native long nativeGetVersionByTag(String tag);
+
+  // ===== Branch native methods =====
+  private native Dataset nativeCheckoutReference(Reference reference);
+
+  private native Dataset nativeCheckoutBranch(String branch);
+
+  private native Dataset nativeCreateBranch(
+      String branch, long version, Optional<String> sourceBranch);
+
+  private native Dataset nativeCreateBranchOnTag(String branch, String tagName);
+
+  private native void nativeDeleteBranch(String branch);
+
+  private native List<Branch> nativeListBranches();
 
   public Dataset shallowClone(String targetPath, Reference version) {
     return shallowClone(targetPath, version, null);

@@ -14,7 +14,6 @@
 package com.lancedb.lance;
 
 import com.google.common.base.MoreObjects;
-import com.google.common.base.Preconditions;
 
 import java.util.Optional;
 
@@ -31,20 +30,32 @@ public class Reference {
     this.tagName = tagName;
   }
 
-  public Optional<Long> getVersionNumber() {
+  public Optional<Long> versionNumber() {
     return versionNumber;
   }
 
-  public Optional<String> getBranchName() {
+  public Optional<String> branchName() {
     return branchName;
   }
 
-  public Optional<String> getTagName() {
+  public Optional<String> tagName() {
     return tagName;
   }
 
-  public static Builder builder() {
-    return new Builder();
+  public static Reference ofMainVersion(long versionNumber) {
+    return new Reference(Optional.of(versionNumber), Optional.empty(), Optional.empty());
+  }
+
+  public static Reference ofBranch(String branchName) {
+    return new Reference(Optional.empty(), Optional.of(branchName), Optional.empty());
+  }
+
+  public static Reference ofBranch(String branchName, long versionNumber) {
+    return new Reference(Optional.of(versionNumber), Optional.of(branchName), Optional.empty());
+  }
+
+  public static Reference ofTag(String tagName) {
+    return new Reference(Optional.empty(), Optional.empty(), Optional.of(tagName));
   }
 
   @Override
@@ -54,39 +65,5 @@ public class Reference {
         .add("branchName", branchName.orElse(null))
         .add("tagName", tagName.orElse(null))
         .toString();
-  }
-
-  public static class Builder {
-    private Long versionNumber;
-    private String branchName;
-    private String tagName;
-
-    private Builder() {}
-
-    public Builder versionNumber(long versionNumber) {
-      this.versionNumber = versionNumber;
-      return this;
-    }
-
-    public Builder branchName(String branchName) {
-      this.branchName = branchName;
-      return this;
-    }
-
-    public Builder tagName(String tagName) {
-      this.tagName = tagName;
-      return this;
-    }
-
-    public Reference build() {
-      Preconditions.checkArgument(
-          (tagName == null && (versionNumber != null || branchName != null))
-              || (tagName != null && (versionNumber == null && branchName == null)),
-          "Invalid parameters: either specify tagName alone, or versionNumber/branchName together");
-      return new Reference(
-          Optional.ofNullable(versionNumber),
-          Optional.ofNullable(branchName),
-          Optional.ofNullable(tagName));
-    }
   }
 }
