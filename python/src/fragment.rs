@@ -324,6 +324,22 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    fn update_columns(
+        &mut self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: String,
+        right_on: String,
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        let mut fragment = self.fragment.clone();
+        let (updated_fragment, fields_modified) = rt()
+            .spawn(None, async move {
+                fragment.update_columns(reader.0, &left_on, &right_on).await
+            })?
+            .infer_error()?;
+
+        Ok((PyLance(updated_fragment), fields_modified))
+    }
+
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
         let updated_fragment = rt()
