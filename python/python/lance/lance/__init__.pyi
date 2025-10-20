@@ -279,6 +279,7 @@ class _Dataset:
         target_path: str,
         version: int | str | Tuple[int, str],
         storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
     ) -> _Dataset: ...
     def restore(self): ...
     def cleanup_old_versions(

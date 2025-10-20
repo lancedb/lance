@@ -3240,6 +3240,7 @@ class LanceDataset(pa.dataset.Dataset):
         target_path: Union[str, Path],
         version: Union[int, str, Tuple[int, str]],
         storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
     ) -> "LanceDataset":
         """
         Shallow clone the specified version into a new dataset at target_path.
@@ -3272,7 +3273,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.shallow_clone(target_uri, version, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
-        return LanceDataset(target_uri, storage_options=storage_options)
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
 
     def migrate_manifest_paths_v2(self):
         """
