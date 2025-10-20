@@ -716,6 +716,12 @@ pub struct DictionaryDataBlock {
 
 impl DictionaryDataBlock {
     fn decode_helper<K: ArrowDictionaryKeyType>(self) -> Result<DataBlock> {
+        // Handle empty batch - this can happen when decoding a range that contains
+        // only empty/null lists, or when reading sparse data
+        if self.indices.num_values == 0 {
+            return Ok(DataBlock::AllNull(AllNullDataBlock { num_values: 0 }));
+        }
+
         // assume the indices are uniformly distributed.
         let estimated_size_bytes = self.dictionary.data_size()
             * (self.indices.num_values + self.dictionary.num_values() - 1)

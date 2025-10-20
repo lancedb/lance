@@ -409,6 +409,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert-json-diff"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "async-channel"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -429,6 +439,19 @@ dependencies = [
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-compression"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a89bce6054c720275ac2432fbba080a66a2106a44a1b804553930ca6909f4e0"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -1528,6 +1551,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "compression-codecs"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8a506ec4b81c460798f572caead636d57d3d7e940f998160f52bd254bf2d23"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47641d3deaf41fb1538ac1f54735925e275eaf3bf4d55c81b137fba797e5cbb"
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2602,6 +2642,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadpool"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be2b1d1d6ec8d846f05e137292d0b89133caf95ef33695424c09568bdd39b1b"
+dependencies = [
+ "deadpool-runtime",
+ "lazy_static",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
+name = "deadpool-runtime"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+
+[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3217,7 +3275,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -3701,6 +3759,7 @@ dependencies = [
  "http 1.3.1",
  "http-body 1.0.1",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "pin-utils",
@@ -4265,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4313,6 +4372,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "lance-table",
  "lance-test-macros",
  "lance-testing",
@@ -4350,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4368,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrayref",
  "paste",
@@ -4377,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4415,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4424,6 +4484,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "chrono",
  "datafusion",
  "datafusion-common",
  "datafusion-functions",
@@ -4445,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4464,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4511,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4537,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4580,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "approx",
  "arrow",
@@ -4595,6 +4656,7 @@ dependencies = [
  "bitpacking",
  "bitvec",
  "bytes",
+ "chrono",
  "clap",
  "criterion",
  "crossbeam-queue",
@@ -4654,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4676,6 +4738,7 @@ dependencies = [
  "futures",
  "lance-arrow",
  "lance-core",
+ "lance-namespace",
  "log",
  "mockall",
  "object_store",
@@ -4698,7 +4761,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "approx",
  "arrow-arith",
@@ -4726,8 +4789,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace"
+version = "0.38.3-beta.6"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "lance-core",
+ "lance-namespace-reqwest-client",
+ "snafu",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "lance-namespace-impls"
+version = "0.38.3-beta.6"
+dependencies = [
+ "arrow",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "lance",
+ "lance-core",
+ "lance-namespace",
+ "opendal",
+ "reqwest",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "lance-namespace-reqwest-client"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ea349999bcda4eea53fc05d334b3775ec314761e6a706555c777d7a29b18d19"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "url",
+]
+
+[[package]]
 name = "lance-table"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4772,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4781,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4792,7 +4904,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "clap",
  "futures",
@@ -5294,6 +5406,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "minimal-lexical"
@@ -6913,6 +7035,7 @@ version = "0.12.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d429f34c8092b2d42c7c93cec323bb4adeb7c67698f70839adec842ec10c7ceb"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
@@ -6929,6 +7052,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
@@ -7451,6 +7575,17 @@ dependencies = [
  "ryu",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8422,6 +8557,7 @@ dependencies = [
  "io-uring",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "slab",
@@ -9542,6 +9678,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21a0236b59786fed61e2a80582dd500fe61f18b5dca67a4a067d0bc9039339cf"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wiremock"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
+dependencies = [
+ "assert-json-diff",
+ "base64 0.22.1",
+ "deadpool",
+ "futures",
+ "http 1.3.1",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "log",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

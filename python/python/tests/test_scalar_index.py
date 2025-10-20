@@ -601,6 +601,39 @@ def test_full_text_search_without_index(dataset):
         assert query_text in row.as_py()
 
 
+def test_fts_custom_stop_words(tmp_path):
+    # Prepare dataset
+    set_language_model_path()
+    data = pa.table(
+        {
+            "text": ["他们拿着苹果手机", "他们穿着耐克阿迪"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="jieba/default",
+        remove_stop_words=True,
+        custom_stop_words=["他们"],
+    )
+
+    # Search
+    results = ds.to_table(
+        full_text_query="他们",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert len(results["_rowid"].to_pylist()) == 0
+
+    results = ds.to_table(
+        full_text_query="手机",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert len(results["_rowid"].to_pylist()) == 1
+
+
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(
@@ -3470,3 +3503,190 @@ def test_btree_query_comparison_parametrized(
             f"Test '{test_name}' failed: Fragment index "
             f"and complete index returned different results for filter: {filter_expr}"
         )
+
+
+def test_fts_flat_fallback_matches_wand(tmp_path):
+    # Repro: when filter matches < 10%, FTS fell back to flat search and missed results.
+    # Two-term query increases reproduction likelihood.
+    # Compare default scan (prefilter=True) vs WAND-path (prefilter=False).
+
+    # Deterministic data
+    random.seed(123)
+    np.random.seed(123)
+
+    n = 2000
+    # 5% category 'A' to trigger fallback (default threshold 10%)
+    categories = np.where(np.random.rand(n) < 0.05, "A", "B")
+
+    vocab = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+    ]
+    needle1 = "needle"
+    needle2 = "pin"
+
+    texts = []
+    a_indices = [i for i, c in enumerate(categories) if c == "A"]
+    # Ensure many matches within the filtered set (both terms present)
+    a_with_needle = set(
+        random.sample(
+            a_indices,
+            max(1, len(a_indices) // 2),
+        )
+    )
+    for i in range(n):
+        toks = random.choices(vocab, k=random.randint(5, 12))
+        if i in a_with_needle:
+            # Add both terms for many A rows
+            toks.append(needle1)
+            toks.append(needle2)
+        # Also sprinkle some needles in B rows to make ranking realistic
+        elif categories[i] == "B" and random.random() < 0.03:
+            # Randomly add one of the terms to some B rows
+            toks.append(needle1 if random.random() < 0.5 else needle2)
+        texts.append(" ".join(toks))
+
+    tbl = pa.table(
+        {
+            "id": np.arange(n, dtype=np.int64),
+            "category": pa.array(categories.astype(str)),
+            "text": pa.array(texts, type=pa.large_string()),
+        }
+    )
+
+    ds_path = tmp_path / "fts_fallback.lance"
+    ds = lance.write_dataset(tbl, ds_path)
+    ds.create_scalar_index("category", index_type="BTREE")
+    ds.create_scalar_index("text", index_type="INVERTED")
+
+    # Sanity: ensure there are hits in the filtered subset
+    a_hit_count = sum((needle1 in texts[i]) or (needle2 in texts[i]) for i in a_indices)
+    assert a_hit_count > 0
+
+    # Two words query
+    query = f"{needle1} {needle2}"
+    filter_expr = "category = 'A'"
+    limit = 10
+
+    # flat-fallback path (prefilter=True)
+    tbl_flat = ds.scanner(
+        columns=["_rowid", "_score"],
+        full_text_query=query,
+        filter=filter_expr,
+        limit=limit,
+        prefilter=True,
+    ).to_table()
+    flat_pairs = list(
+        zip(
+            tbl_flat.column("_rowid").to_pylist(),
+            tbl_flat.column("_score").to_pylist(),
+        )
+    )
+
+    # WAND path (prefilter=False prevents building a mask, so no flat fallback)
+    tbl_wand = (
+        ds.scanner(
+            columns=["_rowid", "_score"],
+            full_text_query=query,
+            filter=filter_expr,
+            limit=n,
+            prefilter=False,
+        )
+        .to_table()
+        .slice(0, limit)
+    )
+    wand_pairs = list(
+        zip(
+            tbl_wand.column("_rowid").to_pylist(),
+            tbl_wand.column("_score").to_pylist(),
+        )
+    )
+
+    flat_scores = [s for _, s in flat_pairs]
+    wand_scores = [s for _, s in wand_pairs]
+    # we compare only scores because it's possible two rows have the same score
+    assert flat_scores == wand_scores, (
+        f"Flat FTS fallback differs from WAND (scores).\n"
+        f"flat scores={flat_scores}\nwand scores={wand_scores}"
+    )
+
+    tbl_limited_wand = ds.scanner(
+        columns=["_rowid", "_score"],
+        full_text_query=query,
+        limit=limit,
+    ).to_table()
+
+    tbl_full_wand = (
+        ds.scanner(
+            columns=["_rowid", "_score"],
+            full_text_query=query,
+        )
+        .to_table()
+        .slice(0, limit)
+    )
+
+    limited_wand_pairs = list(
+        zip(
+            tbl_limited_wand.column("_rowid").to_pylist(),
+            tbl_limited_wand.column("_score").to_pylist(),
+        )
+    )
+    full_wand_pairs = list(
+        zip(
+            tbl_full_wand.column("_rowid").to_pylist(),
+            tbl_full_wand.column("_score").to_pylist(),
+        )
+    )
+    limited_wand_scores = [s for _, s in limited_wand_pairs]
+    full_wand_scores = [s for _, s in full_wand_pairs]
+    assert limited_wand_scores == full_wand_scores, (
+        f"Limited WAND scores differ from full WAND scores.\n"
+        f"limited scores={limited_wand_scores}\nfull scores={full_wand_scores}"
+    )
+
+
+def test_scan_statistics_callback(tmp_path):
+    """Test that scan_stats_callback receives all expected fields."""
+    # Create a simple dataset
+    table = pa.table(
+        {
+            "id": range(100),
+            "value": np.random.randn(100),
+        }
+    )
+
+    dataset = lance.write_dataset(table, tmp_path / "test_stats.lance")
+
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    result = dataset.scanner(scan_stats_callback=scan_stats_callback).to_table()
+    assert result.num_rows == 100
+    assert scan_stats is not None, "Callback should have been called"
+    assert isinstance(scan_stats.iops, int)
+    assert isinstance(scan_stats.requests, int)
+    assert isinstance(scan_stats.bytes_read, int)
+    assert isinstance(scan_stats.indices_loaded, int)
+    assert isinstance(scan_stats.parts_loaded, int)
+    assert isinstance(scan_stats.index_comparisons, int)
+    assert isinstance(scan_stats.all_counts, dict)
+
+    # Verify we got some I/O activity
+    assert scan_stats.iops > 0, "Expected some I/O operations"
+    assert scan_stats.bytes_read > 0, "Expected some bytes read"
+
+    # Verify all_counts contains the standard metrics
+    assert isinstance(scan_stats.all_counts, dict)
+    for key, value in scan_stats.all_counts.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)

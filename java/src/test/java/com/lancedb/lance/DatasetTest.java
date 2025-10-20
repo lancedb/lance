@@ -1392,6 +1392,65 @@ public class DatasetTest {
       }
     }
   }
+  
+  @Test
+  void testShallowClone(@TempDir Path tempDir) {
+    String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
+    String dstPathByVersion = tempDir.resolve("shallow_clone_version_dst").toString();
+    String dstPathByTag = tempDir.resolve("shallow_clone_tag_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Prepare a simple source dataset with some rows
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 5)) { // write 5 rows -> version 2
+        assertEquals(2, src.version());
+        long srcRowCount = src.countRows();
+        Schema srcSchema = src.getSchema();
+
+        // shallow clone by version
+        try (Dataset clone =
+            src.shallowClone(
+                dstPathByVersion, Reference.builder().versionNumber(src.version()).build())) {
+          // Validate the version cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByVersion, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByVersion, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+
+        // shallow clone by tag
+        src.tags().create("tag", src.version());
+        try (Dataset clone =
+            src.shallowClone(dstPathByTag, Reference.builder().tagName("tag").build())) {
+          // Validate the tag cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByTag, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByTag, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    }
+  }
 
   // ===== Blob API tests =====
   @Test
@@ -1453,6 +1512,5 @@ public class DatasetTest {
       byte[] allData = blobFile.read();
       assertArrayEquals(allData, combined);
       blobFile.close();
-    }
   }
 }

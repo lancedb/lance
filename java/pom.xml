@@ -7,7 +7,7 @@
     <groupId>com.lancedb</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>0.38.2</version>
+    <version>0.38.3-beta.6</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -98,7 +98,7 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
-            <version>3.14.0</version>
+            <version>3.18.0</version>
         </dependency>
         <dependency>
             <groupId>com.google.guava</groupId>

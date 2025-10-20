@@ -2140,13 +2140,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                max_score *= idf(length, self.len());
+                max_score *= idf(length, self.len()) * (K1 + 1.0);
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
         if length % BLOCK_SIZE > 0 {
-            max_score *= idf(length, self.len());
+            max_score *= idf(length, self.len()) * (K1 + 1.0);
             block_max_scores.push(max_score);
         }
         block_max_scores

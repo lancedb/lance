@@ -419,11 +419,15 @@ where
 
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
-            warn!(
-                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
-                is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors.",
-                empty_clusters, k
-            );
+            if data.len() / dimension < k * 256 {
+                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                is too small to have a meaningful index ({} < {}) or has many duplicate vectors.",
+                empty_clusters, k, data.len() / dimension, k * 256);
+            } else {
+                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                has many duplicate vectors.",
+                empty_clusters, k);
+            }
         }
 
         split_clusters(
@@ -611,6 +615,17 @@ impl KMeans {
     where
         T::Native: Num,
     {
+        // the data is `num_partitions * sample_rate` vectors,
+        // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
+        // so we need to sample the sampled data again here.
+        // we have to limit the number of data to avoid division underflow,
+        // the threshold 512 is chosen because the minimal normal f16 value will be 0 if divided by 1024.
+        let data = if data.len() >= k * 512 {
+            data.slice(0, k * 512)
+        } else {
+            data.clone()
+        };
+
         let n = data.len();
         let dimension = data.value_length() as usize;
 
@@ -779,7 +794,7 @@ impl KMeans {
             )))?
             .values();
 
-        // Initial clustering with k'=256
+        // Initial clustering with k'=16
         let initial_k = params.hierarchical_k.min(target_k).min(n);
         info!(
             "Hierarchical clustering: initial k={}, target k={}",
@@ -1309,6 +1324,9 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 mod tests {
     use std::iter::repeat_n;
 
+    use arrow_array::types::Float16Type;
+    use arrow_array::Float16Array;
+    use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
 
@@ -1467,6 +1485,44 @@ mod tests {
         let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
         for val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_float16_underflow_fix() {
+        // This test verifies the fix for float16 division underflow
+        // When training k-means on many float16 vectors with small k,
+        // without limiting the data size, dividing centroids by count
+        // can underflow to 0,
+        // The fix limits data to k * 512 to prevent this
+        const DIM: usize = 2;
+        const K: usize = 2;
+        const NUM_VALUES: usize = K * 65536; // Many vectors to trigger the issue
+
+        let f32_values = generate_random_array(NUM_VALUES * DIM);
+        let f16_values = Float16Array::from_iter_values(
+            f32_values.values().iter().map(|&v| half::f16::from_f32(v)),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(f16_values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            ..Default::default()
+        };
+
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+
+        // Verify that we have the correct number of clusters
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::Float16);
+
+        // Verify that all centroids are valid (not zero or NaN)
+        // Without the fix, they would all be zero due to underflow
+        let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
+        for &val in centroids {
+            assert!(!val.is_nan(), "Centroid should not contain NaN values");
+            assert!(val != f16::ZERO);
         }
     }
 }

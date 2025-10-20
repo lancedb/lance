@@ -2890,7 +2890,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3843,7 +3843,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3882,6 +3882,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "lance-table",
  "log",
  "moka",
@@ -3907,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3925,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrayref",
  "paste",
@@ -3934,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3970,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3979,6 +3980,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "chrono",
  "datafusion",
  "datafusion-common",
  "datafusion-functions",
@@ -3999,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4016,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4053,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4086,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4151,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4172,6 +4174,7 @@ dependencies = [
  "futures",
  "lance-arrow",
  "lance-core",
+ "lance-namespace",
  "log",
  "object_store",
  "object_store_opendal",
@@ -4190,7 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4212,8 +4215,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace"
+version = "0.38.3-beta.6"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "lance-core",
+ "lance-namespace-reqwest-client",
+ "snafu",
+]
+
+[[package]]
+name = "lance-namespace-reqwest-client"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ea349999bcda4eea53fc05d334b3775ec314761e6a706555c777d7a29b18d19"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "url",
+]
+
+[[package]]
 name = "lance-table"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4730,6 +4758,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
 ]
 
 [[package]]
@@ -5775,7 +5819,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6264,8 +6308,10 @@ version = "0.12.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbc931937e6ca3a06e3b6c0aa7841849b160a90351d6ab467a8b9b9959767531"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-core",
  "futures-util",
  "h2 0.4.11",
@@ -6277,6 +6323,8 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6716,6 +6764,17 @@ dependencies = [
  "memchr",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]

@@ -391,6 +391,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a89bce6054c720275ac2432fbba080a66a2106a44a1b804553930ca6909f4e0"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-lock"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1199,6 +1212,23 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8a506ec4b81c460798f572caead636d57d3d7e940f998160f52bd254bf2d23"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47641d3deaf41fb1538ac1f54735925e275eaf3bf4d55c81b137fba797e5cbb"
 
 [[package]]
 name = "concurrent-queue"
@@ -2179,6 +2209,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "env_filter"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2340,7 +2379,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -2575,12 +2614,6 @@ dependencies = [
  "equivalent",
  "foldhash",
 ]
-
-[[package]]
-name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "heck"
@@ -3112,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3150,6 +3183,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "lance-table",
  "log",
  "moka",
@@ -3173,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3191,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrayref",
  "paste",
@@ -3200,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3236,7 +3270,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3245,6 +3279,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "chrono",
  "datafusion",
  "datafusion-common",
  "datafusion-functions",
@@ -3265,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3282,7 +3317,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3319,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3352,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3414,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3435,6 +3470,7 @@ dependencies = [
  "futures",
  "lance-arrow",
  "lance-core",
+ "lance-namespace",
  "log",
  "object_store",
  "object_store_opendal",
@@ -3453,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3480,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3502,8 +3538,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace"
+version = "0.38.3-beta.6"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "lance-core",
+ "lance-namespace-reqwest-client",
+ "snafu",
+]
+
+[[package]]
+name = "lance-namespace-reqwest-client"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ea349999bcda4eea53fc05d334b3775ec314761e6a706555c777d7a29b18d19"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "url",
+]
+
+[[package]]
 name = "lance-table"
-version = "0.38.2"
+version = "0.38.3-beta.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3807,6 +3868,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3f7eed9d3848f8b98834af67102b720745c4ec028fcd0aa0239277e7de374f"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
 ]
 
 [[package]]
@@ -4308,7 +4385,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6eea3058763d6e656105d1403cb04e0a41b7bbac6362d413e7c33be0c32279c9"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "itertools 0.13.0",
  "prost",
  "prost-types",
@@ -4580,7 +4657,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -4964,8 +5041,10 @@ version = "0.12.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbc931937e6ca3a06e3b6c0aa7841849b160a90351d6ab467a8b9b9959767531"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-core",
  "futures-util",
  "h2",
@@ -4977,6 +5056,8 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -5345,6 +5426,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_repr"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
 name = "serde_tokenstream"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5506,7 +5598,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -5607,20 +5699,20 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.25.0"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "290d54ea6f91c969195bdbcd7442c8c2a2ba87da8bf60a7ee86a235d4bc1e125"
+checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
 dependencies = [
  "strum_macros",
 ]
 
 [[package]]
 name = "strum_macros"
-version = "0.25.3"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23dc1fa9ac9c169a78ba62f0b841814b7abae11bdd047b9c58f893439e309ea0"
+checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
 dependencies = [
- "heck 0.4.1",
+ "heck",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -5633,7 +5725,7 @@ version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de6d24c270c6c672a86c183c3a8439ba46c1936f93cf7296aa692de3b0ff0228"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "pbjson",
  "pbjson-build",
  "pbjson-types",
@@ -6212,7 +6304,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "741b7f1e2e1338c0bee5ad5a7d3a9bbd4e24c33765c08b7691810e68d879365d"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "log",
  "proc-macro2",
  "quote",
