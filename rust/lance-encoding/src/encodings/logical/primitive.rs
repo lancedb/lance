@@ -4220,15 +4220,31 @@ impl PrimitiveStructuralEncoder {
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
-            if let DataBlock::Struct(ref struct_data_block) = data_block {
-                if struct_data_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                {
-                    panic!("packed struct encoding currently only supports fixed-width fields.")
-                }
+            let requires_full_zip_packed_struct =
+                if let DataBlock::Struct(ref struct_data_block) = data_block {
+                    struct_data_block
+                        .children
+                        .iter()
+                        .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+                } else {
+                    false
+                };
+
+            if requires_full_zip_packed_struct {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip packed struct layout",
+                    column_idx,
+                    num_values
+                );
+                return Self::encode_full_zip(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdefs,
+                    row_number,
+                    num_rows,
+                );
             }
 
             if let DataBlock::Dictionary(dict) = data_block {
