@@ -743,7 +743,58 @@ mod tests {
         compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
         statistics::ComputeStat,
     };
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Fields};
+    use std::sync::Arc;
+
+    fn fixed_block_from_array(array: Int64Array) -> FixedWidthDataBlock {
+        let num_values = array.len() as u64;
+        let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
+        match block {
+            DataBlock::FixedWidth(block) => block,
+            _ => panic!("Expected fixed-width data block"),
+        }
+    }
+
+    fn fixed_i32_block_from_array(array: Int32Array) -> FixedWidthDataBlock {
+        let num_values = array.len() as u64;
+        let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
+        match block {
+            DataBlock::FixedWidth(block) => block,
+            _ => panic!("Expected fixed-width data block"),
+        }
+    }
+
+    fn variable_block_from_string_array(array: StringArray) -> VariableWidthBlock {
+        let num_values = array.len() as u64;
+        let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
+        match block {
+            DataBlock::VariableWidth(block) => block,
+            _ => panic!("Expected variable-width block"),
+        }
+    }
+
+    fn variable_block_from_large_string_array(
+        array: LargeStringArray,
+    ) -> VariableWidthBlock {
+        let num_values = array.len() as u64;
+        let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
+        match block {
+            DataBlock::VariableWidth(block) => block,
+            _ => panic!("Expected variable-width block"),
+        }
+    }
+
+    fn variable_block_from_binary_array(array: BinaryArray) -> VariableWidthBlock {
+        let num_values = array.len() as u64;
+        let block = DataBlock::from_arrays(&[Arc::new(array) as ArrayRef], num_values);
+        match block {
+            DataBlock::VariableWidth(block) => block,
+            _ => panic!("Expected variable-width block"),
+        }
+    }
 
     #[test]
     fn variable_packed_struct_round_trip() -> Result<()> {
@@ -822,6 +873,167 @@ mod tests {
         let decoded_offsets = decoded_name.offsets.borrow_to_typed_slice::<i32>();
         assert_eq!(decoded_offsets.as_ref(), name_offsets.as_slice());
         assert_eq!(decoded_name.data.as_ref(), name_bytes.as_slice());
+
+        Ok(())
+    }
+
+    #[test]
+    fn variable_packed_struct_large_utf8_round_trip() -> Result<()> {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("value", DataType::Int64, false),
+            ArrowField::new("text", DataType::LargeUtf8, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct)?;
+
+        let id_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30, 40]));
+        let payload_array = LargeStringArray::from(vec![
+            "alpha",
+            "a considerably longer payload for testing",
+            "mid",
+            "z",
+        ]);
+        let payload_block = variable_block_from_large_string_array(payload_array);
+
+        let struct_block = StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(id_block.clone()),
+                DataBlock::VariableWidth(payload_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        };
+
+        let data_block = DataBlock::Struct(struct_block);
+
+        let compression_strategy = DefaultCompressionStrategy::new();
+        let compressor = crate::compression::CompressionStrategy::create_per_value(
+            &compression_strategy,
+            &struct_field,
+            &data_block,
+        )?;
+        let (compressed, encoding) = compressor.compress(data_block)?;
+
+        let PerValueDataBlock::Variable(zipped) = compressed else {
+            panic!("expected variable-width packed struct output");
+        };
+
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+        let decompressor =
+            crate::compression::DecompressionStrategy::create_variable_per_value_decompressor(
+                &decompression_strategy,
+                &encoding,
+            )?;
+        let decoded = decompressor.decompress(zipped)?;
+
+        let DataBlock::Struct(decoded_struct) = decoded else {
+            panic!("expected struct datablock after decode");
+        };
+
+        let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_id.bits_per_value, 64);
+        assert_eq!(decoded_id.data.as_ref(), id_block.data.as_ref());
+
+        let decoded_payload = decoded_struct.children[1].as_variable_width_ref().unwrap();
+        assert_eq!(decoded_payload.bits_per_offset, 64);
+        assert_eq!(
+            decoded_payload
+                .offsets
+                .borrow_to_typed_slice::<i64>()
+                .as_ref(),
+            payload_block.offsets.borrow_to_typed_slice::<i64>().as_ref()
+        );
+        assert_eq!(decoded_payload.data.as_ref(), payload_block.data.as_ref());
+
+        Ok(())
+    }
+
+    #[test]
+    fn variable_packed_struct_multi_variable_round_trip() -> Result<()> {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("category", DataType::Utf8, false),
+            ArrowField::new("payload", DataType::Binary, false),
+            ArrowField::new("count", DataType::Int32, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct)?;
+
+        let category_array = StringArray::from(vec!["red", "blue", "green", "red"]);
+        let category_block = variable_block_from_string_array(category_array);
+        let payload_values: Vec<Vec<u8>> = vec![
+            vec![0x01, 0x02],
+            vec![],
+            vec![0x05, 0x06, 0x07],
+            vec![0xff],
+        ];
+        let payload_array =
+            BinaryArray::from_iter_values(payload_values.iter().map(|v| v.as_slice()));
+        let payload_block = variable_block_from_binary_array(payload_array);
+        let count_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3, 4]));
+
+        let struct_block = StructDataBlock {
+            children: vec![
+                DataBlock::VariableWidth(category_block.clone()),
+                DataBlock::VariableWidth(payload_block.clone()),
+                DataBlock::FixedWidth(count_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        };
+
+        let data_block = DataBlock::Struct(struct_block);
+
+        let compression_strategy = DefaultCompressionStrategy::new();
+        let compressor = crate::compression::CompressionStrategy::create_per_value(
+            &compression_strategy,
+            &struct_field,
+            &data_block,
+        )?;
+        let (compressed, encoding) = compressor.compress(data_block)?;
+
+        let PerValueDataBlock::Variable(zipped) = compressed else {
+            panic!("expected variable-width packed struct output");
+        };
+
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+        let decompressor =
+            crate::compression::DecompressionStrategy::create_variable_per_value_decompressor(
+                &decompression_strategy,
+                &encoding,
+            )?;
+        let decoded = decompressor.decompress(zipped)?;
+
+        let DataBlock::Struct(decoded_struct) = decoded else {
+            panic!("expected struct datablock after decode");
+        };
+
+        let decoded_category = decoded_struct.children[0].as_variable_width_ref().unwrap();
+        assert_eq!(decoded_category.bits_per_offset, 32);
+        assert_eq!(
+            decoded_category
+                .offsets
+                .borrow_to_typed_slice::<i32>()
+                .as_ref(),
+            category_block.offsets.borrow_to_typed_slice::<i32>().as_ref()
+        );
+        assert_eq!(decoded_category.data.as_ref(), category_block.data.as_ref());
+
+        let decoded_payload = decoded_struct.children[1].as_variable_width_ref().unwrap();
+        assert_eq!(decoded_payload.bits_per_offset, 32);
+        assert_eq!(
+            decoded_payload
+                .offsets
+                .borrow_to_typed_slice::<i32>()
+                .as_ref(),
+            payload_block.offsets.borrow_to_typed_slice::<i32>().as_ref()
+        );
+        assert_eq!(decoded_payload.data.as_ref(), payload_block.data.as_ref());
+
+        let decoded_count = decoded_struct.children[2].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_count.bits_per_value, 32);
+        assert_eq!(decoded_count.data.as_ref(), count_block.data.as_ref());
 
         Ok(())
     }
