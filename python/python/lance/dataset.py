@@ -159,6 +159,17 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
+    def when_matched_fail(self) -> "MergeInsertBuilder":
+        """
+        Configure the operation to fail if any rows match
+
+        After this method is called, when the merge insert operation executes,
+        if there are any rows that match between the source table and the target table,
+        the entire operation will fail with an exception.
+        This is useful for ensuring that no existing rows are overwritten or modified.
+        """
+        return super(MergeInsertBuilder, self).when_matched_fail()
+
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
@@ -3328,26 +3339,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         return SqlQueryBuilder(self._ds.sql(sql))
-
-    def diff_meta(self, compared_version: int) -> List[Transaction]:
-        """
-        Get the transaction list between current version and compared version
-        as metadata differences.
-
-        Parameters
-        ----------
-        compared_version : int
-            The version to compare against, the compared_version must be greater than 0
-            and less than the current version.
-            Note that the compared_version may not exist in the dataset due to
-            clean-up action, in which case it would throw a `VersionNotFound` error.
-
-        Returns
-        -------
-        List[Transaction]
-            List of transactions representing the differences
-        """
-        return self._ds.diff_meta(compared_version)
 
     @property
     def optimize(self) -> "DatasetOptimizer":

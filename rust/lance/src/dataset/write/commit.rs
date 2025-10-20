@@ -675,7 +675,7 @@ mod tests {
     #[tokio::test]
     #[rstest::rstest]
     async fn test_commit_conflict_iops(#[values(true, false)] use_cache: bool) {
-        let cache_size = if use_cache { 10_000 } else { 0 };
+        let cache_size = if use_cache { 1_000_000 } else { 0 };
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
         let io_tracker = Arc::new(IOTracker::default());
         // We need throttled to correctly count num hops. Otherwise, memory store

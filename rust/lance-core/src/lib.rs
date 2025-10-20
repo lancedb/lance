@@ -11,7 +11,7 @@ pub mod error;
 pub mod traits;
 pub mod utils;
 
-pub use error::{ArrowResult, Error, Result};
+pub use error::{box_error, ArrowResult, Error, Result};
 
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
@@ -42,3 +42,19 @@ pub static ROW_LAST_UPDATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 /// Row created at version field.
 pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
     LazyLock::new(|| ArrowField::new(ROW_CREATED_AT_VERSION, DataType::UInt64, true));
+
+/// Check if a column name is a system column.
+///
+/// System columns are virtual columns that are computed at read time and don't
+/// exist in the physical data files. They include:
+/// - `_rowid`: The row ID
+/// - `_rowaddr`: The row address
+/// - `_rowoffset`: The row offset
+/// - `_row_last_updated_at_version`: The version when the row was last updated
+/// - `_row_created_at_version`: The version when the row was created
+pub fn is_system_column(column_name: &str) -> bool {
+    matches!(
+        column_name,
+        ROW_ID | ROW_ADDR | ROW_OFFSET | ROW_LAST_UPDATED_AT_VERSION | ROW_CREATED_AT_VERSION
+    )
+}

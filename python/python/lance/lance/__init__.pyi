@@ -359,6 +359,7 @@ class _Dataset:
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
     def when_matched_update_all(self, condition: Optional[str] = None) -> Self: ...
+    def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -527,10 +528,17 @@ class PyFullTextQuery:
     ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
+    """Statistics about a scan operation."""
+
     iops: int
+    requests: int
     bytes_read: int
     indices_loaded: int
     parts_loaded: int
+    index_comparisons: int
+    all_counts: Dict[
+        str, int
+    ]  # Additional metrics for debugging purposes. Subject to change.
 
 __version__: str
 language_model_home: Callable[[], str]

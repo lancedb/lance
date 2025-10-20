@@ -75,6 +75,16 @@ replace = 'lance-linalg = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-namespace = {{ version = "={current_version}"'
+replace = 'lance-namespace = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'lance-namespace-impls = {{ version = "={current_version}"'
+replace = 'lance-namespace-impls = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-table = {{ version = "={current_version}"'
 replace = 'lance-table = {{ version = "={new_version}"'
 
@@ -146,6 +156,16 @@ replace = 'version = "{new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "rust/lance-linalg/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/lance-namespace/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/lance-namespace-impls/Cargo.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 

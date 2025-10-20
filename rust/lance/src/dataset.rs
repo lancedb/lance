@@ -18,14 +18,14 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
     DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
 };
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
@@ -326,7 +326,48 @@ impl ProjectionRequest {
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
-        let schema = dataset_schema.project(&columns).unwrap();
+
+        // Separate data columns from system columns
+        // System columns need to be added to the schema manually since Schema::project
+        // doesn't include them (they're virtual columns)
+        let mut data_columns = Vec::new();
+        let mut system_fields = Vec::new();
+
+        for col in &columns {
+            if lance_core::is_system_column(col) {
+                // For now we only support _rowid and _rowaddr in projections
+                if col == ROW_ID {
+                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
+                } else if col == ROW_ADDR {
+                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
+                }
+                // Note: Other system columns like _rowoffset are handled differently
+            } else {
+                data_columns.push(col.as_str());
+            }
+        }
+
+        // Project only the data columns
+        let mut schema = dataset_schema.project(&data_columns).unwrap();
+
+        // Add system fields in the order they appeared in the original columns list
+        // We need to reconstruct the proper order
+        let mut final_fields = Vec::new();
+        for col in &columns {
+            if lance_core::is_system_column(col) {
+                // Find and add the system field
+                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
+                    final_fields.push(field.clone());
+                }
+            } else {
+                // Find and add the data field
+                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
+                    final_fields.push(field.clone());
+                }
+            }
+        }
+
+        schema.fields = final_fields;
         Self::Schema(Arc::new(schema))
     }
 
@@ -353,12 +394,26 @@ impl ProjectionRequest {
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
         match self {
             Self::Schema(schema) => {
-                let projection = dataset.schema().project_by_schema(
-                    schema.as_ref(),
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
-                )?;
-                ProjectionPlan::from_schema(dataset, &projection)
+                // The schema might contain system columns (_rowid, _rowaddr) which are not
+                // in the dataset schema. We handle these specially in ProjectionPlan::from_schema.
+                let system_columns_present = schema
+                    .fields
+                    .iter()
+                    .any(|f| lance_core::is_system_column(&f.name));
+
+                if system_columns_present {
+                    // If system columns are present, we can't use project_by_schema directly
+                    // Just pass the schema to ProjectionPlan::from_schema which handles it
+                    ProjectionPlan::from_schema(dataset, schema.as_ref())
+                } else {
+                    // No system columns, use normal path with validation
+                    let projection = dataset.schema().project_by_schema(
+                        schema.as_ref(),
+                        OnMissing::Error,
+                        OnTypeMismatch::Error,
+                    )?;
+                    ProjectionPlan::from_schema(dataset, &projection)
+                }
             }
             Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
@@ -772,25 +827,6 @@ impl Dataset {
         &self.manifest_location
     }
 
-    async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
-        if compared_version < 1 {
-            return Err(Error::invalid_input(
-                format!("Compared version must be > 0 (got {})", compared_version),
-                Default::default(),
-            ));
-        }
-
-        let current = self.version().version;
-        if current == compared_version {
-            return Err(Error::invalid_input(
-                "Compared version cannot equal to the current version",
-                Default::default(),
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
     ///
     /// # Example
@@ -807,16 +843,6 @@ impl Dataset {
     /// ```
     pub fn delta(&self) -> delta::DatasetDeltaBuilder {
         delta::DatasetDeltaBuilder::new(self.clone())
-    }
-
-    /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
-    pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
-        self.validate_compared_version(compared_version).await?;
-        let ds_delta = self
-            .delta()
-            .compared_against_version(compared_version)
-            .build()?;
-        ds_delta.list_transactions().await
     }
 
     // TODO: Cache this
