@@ -13,6 +13,8 @@ pub mod utils;
 
 pub use error::{box_error, ArrowResult, Error, Result};
 
+/// Wildcard to indicate all non-system columns
+pub const WILDCARD: &str = "*";
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
 /// Column name for the meta row address.
