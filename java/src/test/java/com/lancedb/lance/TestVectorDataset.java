@@ -14,7 +14,6 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.index.DistanceType;
-import com.lancedb.lance.index.IndexOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.index.vector.VectorIndexParams;
@@ -146,11 +145,7 @@ public class TestVectorDataset implements AutoCloseable {
             .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2))
             .build();
     dataset.createIndex(
-        Arrays.asList(vectorColumnName),
-        IndexType.VECTOR,
-        Optional.of(indexName),
-        params,
-        IndexOptions.builder().replace(true).build());
+        Arrays.asList(vectorColumnName), IndexType.VECTOR, Optional.of(indexName), params, true);
   }
 
   @Override

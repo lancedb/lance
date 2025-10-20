@@ -13,7 +13,10 @@
  */
 package com.lancedb.lance.index;
 
+import org.apache.arrow.util.Preconditions;
+
 import java.util.List;
+import java.util.Optional;
 
 /** Options of building indexes. */
 public class IndexOptions {
@@ -21,21 +24,36 @@ public class IndexOptions {
   private final boolean train;
   private final List<Integer> fragmentIds;
   private final String fragmentUUID;
+  private final String indexName;
+  private final List<String> columns;
+  private final IndexType indexType;
+  private final IndexParams indexParams;
 
   private IndexOptions(
-      boolean replace, boolean train, List<Integer> fragmentIds, String fragmentUUID) {
+      String indexName,
+      List<String> columns,
+      IndexType indexType,
+      IndexParams indexParams,
+      boolean replace,
+      boolean train,
+      List<Integer> fragmentIds,
+      String fragmentUUID) {
     this.replace = replace;
     this.train = train;
     this.fragmentIds = fragmentIds;
     this.fragmentUUID = fragmentUUID;
+    this.indexName = indexName;
+    this.columns = columns;
+    this.indexType = indexType;
+    this.indexParams = indexParams;
   }
 
-  public String getFragmentUUID() {
-    return fragmentUUID;
+  public Optional<String> getFragmentUUID() {
+    return Optional.ofNullable(fragmentUUID);
   }
 
-  public List<Integer> getFragmentIds() {
-    return fragmentIds;
+  public Optional<List<Integer>> getFragmentIds() {
+    return Optional.ofNullable(fragmentIds);
   }
 
   public boolean isReplace() {
@@ -46,8 +64,25 @@ public class IndexOptions {
     return train;
   }
 
-  public static Builder builder() {
-    return new Builder();
+  public Optional<String> getIndexName() {
+    return Optional.ofNullable(indexName);
+  }
+
+  public IndexParams getIndexParams() {
+    return indexParams;
+  }
+
+  public IndexType getIndexType() {
+    return indexType;
+  }
+
+  public List<String> getColumns() {
+    return columns;
+  }
+
+  public static Builder builder(
+      List<String> columns, IndexType indexType, IndexParams indexParams) {
+    return new Builder(columns, indexType, indexParams);
   }
 
   /** Builder class. */
@@ -56,8 +91,16 @@ public class IndexOptions {
     private boolean train = true;
     private List<Integer> fragmentIds = null;
     private String fragmentUUID = null;
+    private String indexName = null;
+    private final List<String> columns;
+    private final IndexType indexType;
+    private final IndexParams indexParams;
 
-    private Builder() {}
+    private Builder(List<String> columns, IndexType indexType, IndexParams indexParams) {
+      this.columns = Preconditions.checkNotNull(columns);
+      this.indexType = Preconditions.checkNotNull(indexType);
+      this.indexParams = Preconditions.checkNotNull(indexParams);
+    }
 
     /**
      * Replace the existing index if it exists.
@@ -104,8 +147,20 @@ public class IndexOptions {
       return this;
     }
 
+    /**
+     * Optional index name. If not provided, a name with format like 'column' + '_idx' will be
+     * generated.
+     *
+     * @param indexName index name
+     */
+    public Builder withIndexName(String indexName) {
+      this.indexName = indexName;
+      return this;
+    }
+
     public IndexOptions build() {
-      return new IndexOptions(replace, train, fragmentIds, fragmentUUID);
+      return new IndexOptions(
+          indexName, columns, indexType, indexParams, replace, train, fragmentIds, fragmentUUID);
     }
   }
 }

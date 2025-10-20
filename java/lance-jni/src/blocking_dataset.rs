@@ -21,7 +21,7 @@ use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
-use jni::sys::jint;
+use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
@@ -668,9 +668,12 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,    // Optional<String>
-    params_jobj: JObject,  // IndexParams
-    options_jobj: JObject, // IndexOptions
+    name_jobj: JObject,          // Optional<String>
+    params_jobj: JObject,        // IndexParams
+    replace_jobj: jboolean,      // replace
+    train_jobj: jboolean,        // train
+    fragments_jobj: JObject,     // List<Integer>
+    fragment_uuid_jobj: JObject, // String
 ) {
     ok_or_throw_without_return!(
         env,
@@ -681,55 +684,37 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
             index_type_code_jobj,
             name_jobj,
             params_jobj,
-            options_jobj
+            replace_jobj,
+            train_jobj,
+            fragments_jobj,
+            fragment_uuid_jobj
         )
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_index(
     env: &mut JNIEnv,
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,    // Optional<String>
-    params_jobj: JObject,  // IndexParams
-    options_jobj: JObject, // IndexOptions
+    name_jobj: JObject,          // Optional<String>
+    params_jobj: JObject,        // IndexParams
+    replace_jobj: jboolean,      // replace
+    train_jobj: jboolean,        // train
+    fragments_jobj: JObject,     // Optional<List<String>>
+    fragment_uuid_jobj: JObject, // Optional<String>
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
-    let replace = env
-        .call_method(&options_jobj, "isReplace", "()Z", &[])?
-        .z()?;
-    let train = env.call_method(&options_jobj, "isTrain", "()Z", &[])?.z()?;
-    let fragment_ids_jlist = env
-        .call_method(&options_jobj, "getFragmentIds", "()Ljava/util/List;", &[])?
-        .l()?;
-    let fragment_ids = if fragment_ids_jlist.is_null() {
-        None
-    } else {
-        Some(
-            env.get_integers(&fragment_ids_jlist)?
-                .iter()
-                .map(|id| *id as u32)
-                .collect::<Vec<u32>>(),
-        )
-    };
-    let fragment_uuid_jstr = JString::from(
-        env.call_method(
-            &options_jobj,
-            "getFragmentUUID",
-            "()Ljava/lang/String;",
-            &[],
-        )?
-        .l()?,
-    );
-    let fragment_uuid = if fragment_uuid_jstr.is_null() {
-        None
-    } else {
-        Some(env.get_string(&fragment_uuid_jstr)?.to_str()?.to_string())
-    };
+    let replace = replace_jobj != 0;
+    let train = train_jobj != 0;
+    let fragment_ids = env
+        .get_ints_opt(&fragments_jobj)?
+        .map(|vec| vec.into_iter().map(|i| i as u32).collect());
+    let fragment_uuid = env.get_string_opt(&fragment_uuid_jobj)?;
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
