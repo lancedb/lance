@@ -69,7 +69,7 @@ public class ScalarIndexTest {
             IndexType.BTREE,
             Optional.of("btree_id_index"),
             indexParams,
-            IndexOptions.builder().replace(false).build());
+            true);
 
         // Verify index was created and is in the list
         assertTrue(
@@ -103,20 +103,14 @@ public class ScalarIndexTest {
 
         // 2. partially create index
         dataset.createIndex(
-            Collections.singletonList("name"),
-            IndexType.BTREE,
-            Optional.of("test_index"),
-            indexParams,
-            IndexOptions.builder()
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
                 .withFragmentUUID(uuid.toString())
                 .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
                 .build());
         dataset.createIndex(
-            Collections.singletonList("name"),
-            IndexType.BTREE,
-            Optional.of("test_index"),
-            indexParams,
-            IndexOptions.builder()
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
                 .withFragmentUUID(uuid.toString())
                 .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
                 .build());
@@ -190,7 +184,7 @@ public class ScalarIndexTest {
             IndexType.ZONEMAP,
             Optional.of("zonemap_value_index"),
             indexParams,
-            IndexOptions.builder().replace(false).build());
+            true);
 
         // Verify index was created
         assertTrue(
