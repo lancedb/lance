@@ -8,6 +8,10 @@ use crate::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
+use lance_core::ROW_CREATED_AT_VERSION;
+use lance_core::ROW_ID;
+use lance_core::ROW_LAST_UPDATED_AT_VERSION;
+use lance_core::WILDCARD;
 use snafu::location;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
@@ -203,9 +207,12 @@ impl DatasetDelta {
         let mut scanner = self.base_dataset.scan();
 
         // Enable version columns
-        scanner.with_row_id();
-        scanner.with_row_created_at_version();
-        scanner.with_row_last_updated_at_version();
+        scanner.project(&[
+            WILDCARD,
+            ROW_ID,
+            ROW_CREATED_AT_VERSION,
+            ROW_LAST_UPDATED_AT_VERSION,
+        ])?;
 
         // Filter for rows created in the version range
         let filter = format!(
@@ -254,8 +261,6 @@ impl DatasetDelta {
 
         // Enable version columns
         scanner.with_row_id();
-        scanner.with_row_created_at_version();
-        scanner.with_row_last_updated_at_version();
 
         // Filter for rows that were updated (not inserted) in the version range
         let filter = format!(
@@ -399,8 +404,7 @@ mod tests {
         // Scan with _row_created_at_version
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -480,8 +484,7 @@ mod tests {
         // Scan with _row_last_updated_at_version
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -575,9 +578,7 @@ mod tests {
         // Scan with both version metadata columns
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -654,9 +655,7 @@ mod tests {
         // Scan with both version metadata columns
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -711,9 +710,7 @@ mod tests {
         // Scan with both version metadata columns
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -795,9 +792,7 @@ mod tests {
         let result = ds
             .scan()
             .with_row_id()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .try_into_batch()
             .await
@@ -876,8 +871,7 @@ mod tests {
         // Test 1: Filter for rows created at version 1
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version = 1")
             .unwrap()
@@ -899,8 +893,7 @@ mod tests {
         // Test 2: Filter for rows created at version 2
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version = 2")
             .unwrap()
@@ -922,8 +915,7 @@ mod tests {
         // Test 3: Filter for rows created at version >= 2
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version >= 2")
             .unwrap()
@@ -989,8 +981,7 @@ mod tests {
         // Test 1: Filter for rows last updated at version 1
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_last_updated_at_version = 1")
             .unwrap()
@@ -1013,8 +1004,7 @@ mod tests {
         // Test 2: Filter for rows last updated at version 2
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_last_updated_at_version = 2")
             .unwrap()
@@ -1037,8 +1027,7 @@ mod tests {
         // Test 3: Filter for rows last updated at version 3
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_last_updated_at_version = 3")
             .unwrap()
@@ -1061,8 +1050,7 @@ mod tests {
         // Test 4: Filter for rows last updated at version > 1
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_last_updated_at_version > 1")
             .unwrap()
@@ -1135,9 +1123,7 @@ mod tests {
         // (Original rows that were never updated)
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version = 1 AND _row_last_updated_at_version = 1")
             .unwrap()
@@ -1166,9 +1152,7 @@ mod tests {
         // (Original rows that were updated in v3)
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version = 1 AND _row_last_updated_at_version = 3")
             .unwrap()
@@ -1196,9 +1180,7 @@ mod tests {
         // (Rows that were never updated after creation)
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version = _row_last_updated_at_version")
             .unwrap()
@@ -1223,9 +1205,7 @@ mod tests {
         // (Rows that were updated after creation)
         let result = ds
             .scan()
-            .with_row_created_at_version()
-            .with_row_last_updated_at_version()
-            .project(&["key"])
+            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("_row_created_at_version != _row_last_updated_at_version")
             .unwrap()
@@ -1284,8 +1264,7 @@ mod tests {
         // Find rows where key < 50 AND last_updated_at_version = 2
         let result = ds
             .scan()
-            .with_row_last_updated_at_version()
-            .project(&["key", "value"])
+            .project(&["key", "value", ROW_LAST_UPDATED_AT_VERSION])
             .unwrap()
             .filter("key < 50 AND _row_last_updated_at_version = 2")
             .unwrap()

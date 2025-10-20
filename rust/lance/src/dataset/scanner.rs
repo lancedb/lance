@@ -430,10 +430,6 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
-    /// Whether the user wants the row last updated at version column on top of the projection
-    legacy_with_row_last_updated_at_version: bool,
-    /// Whether the user wants the row created at version column on top of the projection
-    legacy_with_row_created_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -629,8 +625,6 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
-            legacy_with_row_last_updated_at_version: false,
-            legacy_with_row_created_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -715,12 +709,6 @@ impl Scanner {
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
-        }
-        if self.legacy_with_row_last_updated_at_version {
-            self.projection_plan.include_row_last_updated_at_version();
-        }
-        if self.legacy_with_row_created_at_version {
-            self.projection_plan.include_row_created_at_version();
         }
         Ok(self)
     }
@@ -1229,24 +1217,6 @@ impl Scanner {
         self
     }
 
-    /// Instruct the scanner to return row last updated at version column from the dataset.
-    ///
-    /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_last_updated_at_version = true;
-        self.projection_plan.include_row_last_updated_at_version();
-        self
-    }
-
-    /// Instruct the scanner to return row created at version column from the dataset.
-    ///
-    /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_created_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_created_at_version = true;
-        self.projection_plan.include_row_created_at_version();
-        self
-    }
-
     /// Instruct the scanner to disable automatic projection of scoring columns
     ///
     /// In the future, this will be the default behavior.  This method is useful for
@@ -1441,28 +1411,6 @@ impl Scanner {
                 let row_addr_expr = output_expr.remove(row_addr_pos);
                 output_expr.push(row_addr_expr);
             }
-        }
-
-        if self.legacy_with_row_last_updated_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
-        }
-
-        if self.legacy_with_row_created_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
         }
 
         Ok(output_expr)
@@ -1936,7 +1884,7 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 6: if requested, add the row offset column
+        // Stage 6: Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
@@ -3931,6 +3879,7 @@ mod test {
     use half::f16;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{
         array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
     };
@@ -8309,9 +8258,10 @@ mod test {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let mut scanner = dataset.scan();
+
         scanner
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version();
+            .project(&[ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap();
 
         // Check that the schema includes version columns
         let output_schema = scanner.schema().await.unwrap();
