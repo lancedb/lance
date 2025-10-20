@@ -759,7 +759,7 @@ pub(crate) mod tests {
 
     use arrow_array::{
         make_array, new_null_array, types::UInt32Type, Array, ArrayRef, Decimal128Array,
-        FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+        FixedSizeListArray, Int32Array, ListArray, UInt64Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -887,6 +887,20 @@ pub(crate) mod tests {
             .collect();
         let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_u64_dictionary_encoding() {
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let values: Vec<u64> = (0..100).collect();
+        let repeated_values: Vec<_> = values
+            .iter()
+            .cycle()
+            .take(values.len() * 10000)
+            .map(|&v| Some(v))
+            .collect();
+        let u64_array = Arc::new(UInt64Array::from(repeated_values)) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![u64_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
