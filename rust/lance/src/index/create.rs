@@ -152,7 +152,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
-                | IndexType::Geo,
+                | IndexType::BkdTree,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);

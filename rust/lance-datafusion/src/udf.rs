@@ -51,23 +51,28 @@ fn st_intersects() -> ScalarUDF {
     create_udf(
         "st_intersects",
         vec![
-            DataType::Struct(vec![
-                Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
-            ].into()),
-            DataType::Struct(vec![
-                Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
-            ].into())
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
+                ]
+                .into(),
+            ),
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+                ]
+                .into(),
+            ),
         ], // GeoArrow Point struct, GeoArrow Box struct
         DataType::Boolean,
         Volatility::Immutable,
         function,
     )
 }
-
 
 fn st_within() -> ScalarUDF {
     let function = Arc::new(make_scalar_function(
@@ -83,23 +88,28 @@ fn st_within() -> ScalarUDF {
     create_udf(
         "st_within",
         vec![
-            DataType::Struct(vec![
-                Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
-            ].into()),
-            DataType::Struct(vec![
-                Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
-                Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
-            ].into())
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow_schema::Field::new("x", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("y", DataType::Float64, false)),
+                ]
+                .into(),
+            ),
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+                    Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+                ]
+                .into(),
+            ),
         ], // GeoArrow Point struct, GeoArrow Box struct
         DataType::Boolean,
         Volatility::Immutable,
         function,
     )
 }
-
 
 /// BBOX function that creates a bounding box from four numeric arguments.
 /// This function is used internally by spatial queries and doesn't perform actual computation.
@@ -123,18 +133,25 @@ fn bbox() -> ScalarUDF {
 
     create_udf(
         "bbox",
-        vec![DataType::Float64, DataType::Float64, DataType::Float64, DataType::Float64], // min_x, min_y, max_x, max_y
-        DataType::Struct(vec![
-            Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
-            Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
-            Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
-            Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
-        ].into()), // Returns a GeoArrow Box struct
+        vec![
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Float64,
+        ], // min_x, min_y, max_x, max_y
+        DataType::Struct(
+            vec![
+                Arc::new(arrow_schema::Field::new("xmin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymin", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("xmax", DataType::Float64, false)),
+                Arc::new(arrow_schema::Field::new("ymax", DataType::Float64, false)),
+            ]
+            .into(),
+        ), // Returns a GeoArrow Box struct
         Volatility::Immutable,
         function,
     )
 }
-
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by
 /// punctuations and white spaces.

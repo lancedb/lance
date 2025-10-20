@@ -15,13 +15,13 @@
 //! - Groups points into leaves of configurable size
 //! - Stores tree structure separately from leaf data for lazy loading
 
-use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt64Array};
 use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use deepsize::DeepSizeOf;
 use lance_core::{Result, ROW_ID};
-use std::sync::Arc;
 use snafu::location;
+use std::sync::Arc;
 
 // Schema field names
 const NODE_ID: &str = "node_id";
@@ -192,37 +192,43 @@ impl BKDTreeLookup {
 
         // Helper to get column by name
         let get_col = |batch: &RecordBatch, name: &str| -> Result<usize> {
-            batch.schema().column_with_name(name)
+            batch
+                .schema()
+                .column_with_name(name)
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| lance_core::Error::Internal {
                     message: format!("Missing column '{}' in BKD tree batch", name),
                     location: location!(),
                 })
         };
-        
+
         // Determine total number of nodes (max node_id + 1)
         let max_node_id = {
             let mut max_id = 0u32;
-            
+
             if inner_batch.num_rows() > 0 {
                 let col_idx = get_col(&inner_batch, NODE_ID)?;
-                let node_ids = inner_batch.column(col_idx).as_primitive::<arrow_array::types::UInt32Type>();
+                let node_ids = inner_batch
+                    .column(col_idx)
+                    .as_primitive::<arrow_array::types::UInt32Type>();
                 for i in 0..inner_batch.num_rows() {
                     max_id = max_id.max(node_ids.value(i));
                 }
             }
-            
+
             if leaf_batch.num_rows() > 0 {
                 let col_idx = get_col(&leaf_batch, NODE_ID)?;
-                let node_ids = leaf_batch.column(col_idx).as_primitive::<arrow_array::types::UInt32Type>();
+                let node_ids = leaf_batch
+                    .column(col_idx)
+                    .as_primitive::<arrow_array::types::UInt32Type>();
                 for i in 0..leaf_batch.num_rows() {
                     max_id = max_id.max(node_ids.value(i));
                 }
             }
-            
+
             max_id
         };
-        
+
         // Create sparse array of nodes (filled with dummy data initially)
         let mut nodes = vec![
             BKDNode::Leaf(BKDLeafNode {
@@ -233,21 +239,39 @@ impl BKDTreeLookup {
             });
             (max_node_id + 1) as usize
         ];
-        
+
         let mut num_leaves = 0;
-        
+
         // Fill in inner nodes
         if inner_batch.num_rows() > 0 {
-            let node_ids = inner_batch.column(get_col(&inner_batch, NODE_ID)?).as_primitive::<arrow_array::types::UInt32Type>();
-            let min_x = inner_batch.column(get_col(&inner_batch, MIN_X)?).as_primitive::<arrow_array::types::Float64Type>();
-            let min_y = inner_batch.column(get_col(&inner_batch, MIN_Y)?).as_primitive::<arrow_array::types::Float64Type>();
-            let max_x = inner_batch.column(get_col(&inner_batch, MAX_X)?).as_primitive::<arrow_array::types::Float64Type>();
-            let max_y = inner_batch.column(get_col(&inner_batch, MAX_Y)?).as_primitive::<arrow_array::types::Float64Type>();
-            let split_dim = inner_batch.column(get_col(&inner_batch, SPLIT_DIM)?).as_primitive::<arrow_array::types::UInt8Type>();
-            let split_value = inner_batch.column(get_col(&inner_batch, SPLIT_VALUE)?).as_primitive::<arrow_array::types::Float64Type>();
-            let left_child = inner_batch.column(get_col(&inner_batch, LEFT_CHILD)?).as_primitive::<arrow_array::types::UInt32Type>();
-            let right_child = inner_batch.column(get_col(&inner_batch, RIGHT_CHILD)?).as_primitive::<arrow_array::types::UInt32Type>();
-            
+            let node_ids = inner_batch
+                .column(get_col(&inner_batch, NODE_ID)?)
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            let min_x = inner_batch
+                .column(get_col(&inner_batch, MIN_X)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let min_y = inner_batch
+                .column(get_col(&inner_batch, MIN_Y)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let max_x = inner_batch
+                .column(get_col(&inner_batch, MAX_X)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let max_y = inner_batch
+                .column(get_col(&inner_batch, MAX_Y)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let split_dim = inner_batch
+                .column(get_col(&inner_batch, SPLIT_DIM)?)
+                .as_primitive::<arrow_array::types::UInt8Type>();
+            let split_value = inner_batch
+                .column(get_col(&inner_batch, SPLIT_VALUE)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let left_child = inner_batch
+                .column(get_col(&inner_batch, LEFT_CHILD)?)
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            let right_child = inner_batch
+                .column(get_col(&inner_batch, RIGHT_CHILD)?)
+                .as_primitive::<arrow_array::types::UInt32Type>();
+
             for i in 0..inner_batch.num_rows() {
                 let node_id = node_ids.value(i) as usize;
                 nodes[node_id] = BKDNode::Inner(BKDInnerNode {
@@ -264,18 +288,34 @@ impl BKDTreeLookup {
                 });
             }
         }
-        
+
         // Fill in leaf nodes
         if leaf_batch.num_rows() > 0 {
-            let node_ids = leaf_batch.column(get_col(&leaf_batch, NODE_ID)?).as_primitive::<arrow_array::types::UInt32Type>();
-            let min_x = leaf_batch.column(get_col(&leaf_batch, MIN_X)?).as_primitive::<arrow_array::types::Float64Type>();
-            let min_y = leaf_batch.column(get_col(&leaf_batch, MIN_Y)?).as_primitive::<arrow_array::types::Float64Type>();
-            let max_x = leaf_batch.column(get_col(&leaf_batch, MAX_X)?).as_primitive::<arrow_array::types::Float64Type>();
-            let max_y = leaf_batch.column(get_col(&leaf_batch, MAX_Y)?).as_primitive::<arrow_array::types::Float64Type>();
-            let file_id = leaf_batch.column(get_col(&leaf_batch, FILE_ID)?).as_primitive::<arrow_array::types::UInt32Type>();
-            let row_offset = leaf_batch.column(get_col(&leaf_batch, ROW_OFFSET)?).as_primitive::<arrow_array::types::UInt64Type>();
-            let num_rows = leaf_batch.column(get_col(&leaf_batch, NUM_ROWS)?).as_primitive::<arrow_array::types::UInt64Type>();
-            
+            let node_ids = leaf_batch
+                .column(get_col(&leaf_batch, NODE_ID)?)
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            let min_x = leaf_batch
+                .column(get_col(&leaf_batch, MIN_X)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let min_y = leaf_batch
+                .column(get_col(&leaf_batch, MIN_Y)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let max_x = leaf_batch
+                .column(get_col(&leaf_batch, MAX_X)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let max_y = leaf_batch
+                .column(get_col(&leaf_batch, MAX_Y)?)
+                .as_primitive::<arrow_array::types::Float64Type>();
+            let file_id = leaf_batch
+                .column(get_col(&leaf_batch, FILE_ID)?)
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            let row_offset = leaf_batch
+                .column(get_col(&leaf_batch, ROW_OFFSET)?)
+                .as_primitive::<arrow_array::types::UInt64Type>();
+            let num_rows = leaf_batch
+                .column(get_col(&leaf_batch, NUM_ROWS)?)
+                .as_primitive::<arrow_array::types::UInt64Type>();
+
             for i in 0..leaf_batch.num_rows() {
                 let node_id = node_ids.value(i) as usize;
                 nodes[node_id] = BKDNode::Leaf(BKDLeafNode {
@@ -292,10 +332,9 @@ impl BKDTreeLookup {
                 num_leaves += 1;
             }
         }
-        
+
         Ok(Self::new(nodes, 0, num_leaves))
     }
-
 }
 
 /// Check if two bounding boxes intersect
@@ -321,7 +360,11 @@ impl BKDTreeBuilder {
 
     /// Build a BKD tree from points
     /// Returns (tree_nodes, leaf_batches)
-    pub fn build(&self, points: &mut [(f64, f64, u64)], batches_per_file: u32) -> Result<(Vec<BKDNode>, Vec<RecordBatch>)> {
+    pub fn build(
+        &self,
+        points: &mut [(f64, f64, u64)],
+        batches_per_file: u32,
+    ) -> Result<(Vec<BKDNode>, Vec<RecordBatch>)> {
         if points.is_empty() {
             return Ok((vec![], vec![]));
         }
@@ -346,24 +389,24 @@ impl BKDTreeBuilder {
         let mut row_offset_in_file = 0u64;
         let mut batches_in_current_file = 0u32;
         let mut leaf_idx = 0;
-        
+
         for node in all_nodes.iter_mut() {
             if let BKDNode::Leaf(leaf) = node {
                 if leaf_idx < all_leaf_batches.len() {
                     let batch_num_rows = all_leaf_batches[leaf_idx].num_rows() as u64;
-                    
+
                     // Check if we need to move to next file
                     if batches_in_current_file >= batches_per_file && batches_per_file > 0 {
                         current_file_id += 1;
                         row_offset_in_file = 0;
                         batches_in_current_file = 0;
                     }
-                    
+
                     // Update leaf with correct metadata
                     leaf.file_id = current_file_id;
                     leaf.row_offset = row_offset_in_file;
                     leaf.num_rows = batch_num_rows;
-                    
+
                     // Advance for next leaf
                     row_offset_in_file += batch_num_rows;
                     batches_in_current_file += 1;
@@ -402,8 +445,8 @@ impl BKDTreeBuilder {
             // Create leaf node (file_id, row_offset will be set in post-processing)
             all_nodes.push(BKDNode::Leaf(BKDLeafNode {
                 bounds: [min_x, min_y, max_x, max_y],
-                file_id: 0,  // Will be updated in post-processing
-                row_offset: 0,  // Will be updated in post-processing
+                file_id: 0,    // Will be updated in post-processing
+                row_offset: 0, // Will be updated in post-processing
                 num_rows,
             }));
 
@@ -417,7 +460,7 @@ impl BKDTreeBuilder {
         // Current: O(n log n) sorting at each level = O(n log² n) total
         // Target: O(n) radix select at each level = O(n log n) total
         // See: https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/util/bkd/BKDRadixSelector.java
-        
+
         // Sort points by the split dimension
         if split_dim == 0 {
             points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -435,7 +478,7 @@ impl BKDTreeBuilder {
 
         // Calculate bounds for this node (before splitting the slice)
         let (min_x, min_y, max_x, max_y) = calculate_bounds(points);
-        
+
         // Reserve space for this inner node (placeholder - we'll update it after building children)
         let node_id = all_nodes.len() as u32;
         all_nodes.push(BKDNode::Inner(BKDInnerNode {
@@ -517,8 +560,6 @@ fn create_leaf_batch(points: &[(f64, f64, u64)]) -> Result<RecordBatch> {
 
     Ok(batch)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -839,4 +880,3 @@ mod tests {
         assert_eq!(batches[1].num_rows(), 2);
     }
 }
-

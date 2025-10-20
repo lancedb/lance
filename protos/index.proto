@@ -190,4 +190,4 @@ message JsonIndexDetails {
 }
 message BloomFilterIndexDetails {}
 
-message GeoIndexDetails {}
+message BkdTreeIndexDetails {}

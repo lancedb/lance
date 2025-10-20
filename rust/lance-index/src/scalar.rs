@@ -62,7 +62,7 @@ pub enum BuiltinIndexType {
     ZoneMap,
     BloomFilter,
     Inverted,
-    Geo,
+    BkdTree,
 }
 
 impl BuiltinIndexType {
@@ -75,7 +75,7 @@ impl BuiltinIndexType {
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
-            Self::Geo => "geo",
+            Self::BkdTree => "bkdtree",
         }
     }
 }
@@ -92,7 +92,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
-            IndexType::Geo => Ok(Self::Geo),
+            IndexType::BkdTree => Ok(Self::BkdTree),
             _ => Err(Error::Index {
                 message: "Invalid index type".to_string(),
                 location: location!(),
@@ -607,7 +607,10 @@ impl AnyQuery for GeoQuery {
     fn format(&self, col: &str) -> String {
         match self {
             Self::Intersects(min_x, min_y, max_x, max_y) => {
-                format!("st_intersects({}, bbox({}, {}, {}, {}))", col, min_x, min_y, max_x, max_y)
+                format!(
+                    "st_intersects({}, bbox({}, {}, {}, {}))",
+                    col, min_x, min_y, max_x, max_y
+                )
             }
         }
     }

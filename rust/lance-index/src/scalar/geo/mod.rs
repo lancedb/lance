@@ -4,12 +4,11 @@
 //! Geographic indexing module
 //!
 //! This module contains implementations for spatial/geographic indexing:
-//! - BKD Tree: Block K-Dimensional tree for efficient spatial partitioning
-//! - Geo Index: Geographic index built on top of BKD trees for GeoArrow data
+//! - BKD: Block K-Dimensional tree for efficient spatial partitioning (core data structure)
+//! - BkdTree: Geographic index built on top of BKD trees for GeoArrow data
 
 pub mod bkd;
-pub mod geoindex;
+pub mod bkdtree;
 
 pub use bkd::*;
-pub use geoindex::*;
-
+pub use bkdtree::*;

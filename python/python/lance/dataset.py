@@ -2345,7 +2345,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "LABEL_LIST",
                 "INVERTED",
                 "BLOOMFILTER",
-                "GEO"
+                "BKDTREE",
             ]:
                 raise NotImplementedError(
                     (
@@ -2393,7 +2393,7 @@ class LanceDataset(pa.dataset.Dataset):
                         f"INVERTED index column {column} must be string, large string"
                         " or list of strings, but got {value_type}"
                     )
-            elif index_type == "GEO":
+            elif index_type == "BKDTREE":
                 # Accept struct<x: double, y: double> for GeoArrow point data
                 if pa.types.is_struct(field_type):
                     field_names = [field.name for field in field_type]
@@ -2402,12 +2402,12 @@ class LanceDataset(pa.dataset.Dataset):
                         pass
                     else:
                         raise TypeError(
-                            f"GEO index column {column} must be a struct with x,y fields for point data. "
+                            f"BKDTREE index column {column} must be a struct with x,y fields for point data. "
                             f"Got struct with fields: {field_names}"
                         )
                 else:
                     raise TypeError(
-                        f"GEO index column {column} must be a struct<x: double, y: double> type. "
+                        f"BKDTREE index column {column} must be a struct<x: double, y: double> type. "
                         f"Got field type: {field_type}"
                     )
                 if pa.types.is_duration(field_type):

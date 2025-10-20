@@ -25,7 +25,6 @@ message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message NGramIndexDetails {}
 message ZoneMapIndexDetails {}
-message GeoIndexDetails {}
 message InvertedIndexDetails {
   // Marking this field as optional as old versions of the index store blank details and we
   // need to make sure we have a proper optional field to detect this.

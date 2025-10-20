@@ -1,46 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Geo Index
+//! BKD Tree Index
 //!
-//! Geo indices are spatial database structures for efficient spatial queries.
+//! BKD (Bounding K-Dimensional) trees are spatial database structures for efficient spatial queries.
 //! They enable efficient filtering by location-based predicates.
 //!
 //! ## Requirements
 //!
-//! Geo indices can only be created on fields with GeoArrow metadata. The field must:
+//! BKD tree indices can only be created on fields with GeoArrow metadata. The field must:
 //! - Be a Struct data type
 //! - Have `ARROW:extension:name` metadata starting with `geoarrow.` (e.g., `geoarrow.point`, `geoarrow.polygon`)
 //!
 //! ## Query Support
 //!
-//! Geo indices are "inexact" filters - they can definitively exclude regions but may include
+//! BKD tree indices are "inexact" filters - they can definitively exclude regions but may include
 //! false positives that require rechecking.
 //!
 
+use super::bkd::{self, point_in_bbox, BKDLeafNode, BKDNode, BKDTreeBuilder, BKDTreeLookup};
 use crate::pbold;
-use super::bkd::{self, BKDTreeBuilder, BKDTreeLookup, point_in_bbox, BKDNode, BKDLeafNode};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{
-    BuiltinIndexType, CreatedIndex, GeoQuery, ScalarIndexParams, UpdateCriteria,
-};
+use crate::scalar::{BuiltinIndexType, CreatedIndex, GeoQuery, ScalarIndexParams, UpdateCriteria};
 use crate::Any;
 use futures::TryStreamExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::{ROW_ADDR, ROW_ID};
 use serde::{Deserialize, Serialize};
 
-use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt8Array};
 use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt8Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
+use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
@@ -54,11 +52,11 @@ const BKD_TREE_INNER_FILENAME: &str = "bkd_tree_inner.lance";
 const BKD_TREE_LEAF_FILENAME: &str = "bkd_tree_leaf.lance";
 const LEAF_GROUP_PREFIX: &str = "leaf_group_";
 const DEFAULT_BATCHES_PER_LEAF_FILE: u32 = 5; // Default number of leaf batches per file
-const GEO_INDEX_VERSION: u32 = 0;
+const BKD_TREE_VERSION: u32 = 0;
 const MAX_POINTS_PER_LEAF_META_KEY: &str = "max_points_per_leaf";
 const BATCHES_PER_FILE_META_KEY: &str = "batches_per_file";
 const DEFAULT_MAX_POINTS_PER_LEAF: u32 = 100; // for test
-// const DEFAULT_MAX_POINTS_PER_LEAF: u32 = 1024; // for production
+                                              // const DEFAULT_MAX_POINTS_PER_LEAF: u32 = 1024; // for production
 
 /// Get the file name for a leaf group
 fn leaf_group_filename(group_id: u32) -> String {
@@ -100,8 +98,8 @@ impl CachedLeafData {
     }
 }
 
-/// Geo index
-pub struct GeoIndex {
+/// BKD tree index for spatial queries
+pub struct BkdTree {
     data_type: DataType,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
@@ -110,9 +108,9 @@ pub struct GeoIndex {
     max_points_per_leaf: u32,
 }
 
-impl std::fmt::Debug for GeoIndex {
+impl std::fmt::Debug for BkdTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GeoIndex")
+        f.debug_struct("BkdTree")
             .field("data_type", &self.data_type)
             .field("store", &self.store)
             .field("fri", &self.fri)
@@ -123,13 +121,13 @@ impl std::fmt::Debug for GeoIndex {
     }
 }
 
-impl DeepSizeOf for GeoIndex {
+impl DeepSizeOf for BkdTree {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.bkd_tree.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
-impl GeoIndex {
+impl BkdTree {
     /// Load the geo index from storage
     pub async fn load(
         store: Arc<dyn IndexStore>,
@@ -147,9 +145,7 @@ impl GeoIndex {
 
         // Load leaf metadata
         let leaf_file = store.open_index_file(BKD_TREE_LEAF_FILENAME).await?;
-        let leaf_data = leaf_file
-            .read_range(0..leaf_file.num_rows(), None)
-            .await?;
+        let leaf_data = leaf_file.read_range(0..leaf_file.num_rows(), None).await?;
 
         // Deserialize tree structure from both files
         let bkd_tree = BKDTreeLookup::from_record_batches(inner_data, leaf_data)?;
@@ -184,26 +180,27 @@ impl GeoIndex {
         let file_id = leaf.file_id;
         let row_offset = leaf.row_offset;
         let num_rows = leaf.num_rows;
-        
+
         // Use (file_id, row_offset) as cache key
         // Combine file_id and row_offset into a single u32 (file_id should be small)
-        let cache_key = BKDLeafKey { leaf_id: file_id * 100_000 + (row_offset as u32) };
+        let cache_key = BKDLeafKey {
+            leaf_id: file_id * 100_000 + (row_offset as u32),
+        };
         let store = self.store.clone();
 
         let cached = self
             .index_cache
             .get_or_insert_with_key(cache_key, move || async move {
                 metrics.record_part_load();
-                
+
                 let filename = leaf_group_filename(file_id);
-                
+
                 // Open the leaf group file and read the specific row range
                 let reader = store.open_index_file(&filename).await?;
-                let batch = reader.read_range(
-                    row_offset as usize..(row_offset + num_rows) as usize,
-                    None
-                ).await?;
-                
+                let batch = reader
+                    .read_range(row_offset as usize..(row_offset + num_rows) as usize, None)
+                    .await?;
+
                 Ok(CachedLeafData::new(batch))
             })
             .await?;
@@ -223,19 +220,20 @@ impl GeoIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
         let mut all_row_ids = RowIdTreeMap::new();
-        
+
         // Iterate through all nodes and search every leaf
         for node in self.bkd_tree.nodes.iter() {
             if let BKDNode::Leaf(leaf) = node {
                 let leaf_row_ids = self.search_leaf(leaf, query_bbox, metrics).await?;
-                let row_ids: Option<Vec<u64>> = leaf_row_ids.row_ids()
+                let row_ids: Option<Vec<u64>> = leaf_row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|row_addr| u64::from(row_addr)).collect());
                 if let Some(row_ids) = row_ids {
                     all_row_ids.extend(row_ids);
                 }
             }
         }
-        
+
         Ok(all_row_ids)
     }
 
@@ -249,22 +247,28 @@ impl GeoIndex {
         let leaf_data = self.load_leaf(leaf, metrics).await?;
 
         // Filter points within this leaf using iterators
-        let x_array = leaf_data.column(0).as_primitive::<arrow_array::types::Float64Type>();
-        let y_array = leaf_data.column(1).as_primitive::<arrow_array::types::Float64Type>();
-        let row_id_array = leaf_data.column(2).as_primitive::<arrow_array::types::UInt64Type>();
+        let x_array = leaf_data
+            .column(0)
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let y_array = leaf_data
+            .column(1)
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let row_id_array = leaf_data
+            .column(2)
+            .as_primitive::<arrow_array::types::UInt64Type>();
 
         let row_ids: Vec<u64> = x_array
             .iter()
             .zip(y_array.iter())
             .zip(row_id_array.iter())
-            .filter_map(|((x_opt, y_opt), row_id_opt)| {
-                match (x_opt, y_opt, row_id_opt) {
+            .filter_map(
+                |((x_opt, y_opt), row_id_opt)| match (x_opt, y_opt, row_id_opt) {
                     (Some(x), Some(y), Some(row_id)) if point_in_bbox(x, y, &query_bbox) => {
                         Some(row_id)
                     }
                     _ => None,
-                }
-            })
+                },
+            )
             .collect();
 
         let mut row_id_map = RowIdTreeMap::new();
@@ -274,7 +278,7 @@ impl GeoIndex {
 }
 
 #[async_trait]
-impl Index for GeoIndex {
+impl Index for BkdTree {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -285,7 +289,7 @@ impl Index for GeoIndex {
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
         Err(Error::InvalidInput {
-            source: "GeoIndex is not a vector index".into(),
+            source: "BkdTree is not a vector index".into(),
             location: location!(),
         })
     }
@@ -297,12 +301,12 @@ impl Index for GeoIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "geo",
+            "type": "bkdtree",
         }))
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Geo
+        IndexType::BkdTree
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
@@ -312,17 +316,20 @@ impl Index for GeoIndex {
 }
 
 #[async_trait]
-impl ScalarIndex for GeoIndex {
+impl ScalarIndex for BkdTree {
     async fn search(
         &self,
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let geo_query = query.as_any().downcast_ref::<GeoQuery>()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Geo index only supports GeoQuery".into(),
-                location: location!(),
-            })?;
+        let geo_query =
+            query
+                .as_any()
+                .downcast_ref::<GeoQuery>()
+                .ok_or_else(|| Error::InvalidInput {
+                    source: "Geo index only supports GeoQuery".into(),
+                    location: location!(),
+                })?;
 
         match geo_query {
             GeoQuery::Intersects(min_x, min_y, max_x, max_y) => {
@@ -335,11 +342,10 @@ impl ScalarIndex for GeoIndex {
                 let mut all_row_ids = RowIdTreeMap::new();
 
                 for leaf_node in &leaves {
-                    let leaf_row_ids = self
-                        .search_leaf(leaf_node, query_bbox, metrics)
-                        .await?;
+                    let leaf_row_ids = self.search_leaf(leaf_node, query_bbox, metrics).await?;
                     // Collect row IDs from the leaf and add them to the result set
-                    let row_ids: Option<Vec<u64>> = leaf_row_ids.row_ids()
+                    let row_ids: Option<Vec<u64>> = leaf_row_ids
+                        .row_ids()
                         .map(|iter| iter.map(|row_addr| u64::from(row_addr)).collect());
                     if let Some(row_ids) = row_ids {
                         all_row_ids.extend(row_ids);
@@ -363,7 +369,7 @@ impl ScalarIndex for GeoIndex {
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::InvalidInput {
-            source: "GeoIndex does not support remap".into(),
+            source: "BkdTree does not support remap".into(),
             location: location!(),
         })
     }
@@ -375,7 +381,7 @@ impl ScalarIndex for GeoIndex {
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::InvalidInput {
-            source: "GeoIndex does not support update".into(),
+            source: "BkdTree does not support update".into(),
             location: location!(),
         })
     }
@@ -387,13 +393,13 @@ impl ScalarIndex for GeoIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let params = serde_json::to_value(GeoIndexBuilderParams::default())?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Geo).with_params(&params))
+        let params = serde_json::to_value(BkdTreeBuilderParams::default())?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BkdTree).with_params(&params))
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeoIndexBuilderParams {
+pub struct BkdTreeBuilderParams {
     #[serde(default = "default_max_points_per_leaf")]
     pub max_points_per_leaf: u32,
     #[serde(default = "default_batches_per_file")]
@@ -408,7 +414,7 @@ fn default_batches_per_file() -> u32 {
     DEFAULT_BATCHES_PER_LEAF_FILE
 }
 
-impl Default for GeoIndexBuilderParams {
+impl Default for BkdTreeBuilderParams {
     fn default() -> Self {
         Self {
             max_points_per_leaf: default_max_points_per_leaf(),
@@ -417,7 +423,7 @@ impl Default for GeoIndexBuilderParams {
     }
 }
 
-impl GeoIndexBuilderParams {
+impl BkdTreeBuilderParams {
     pub fn new() -> Self {
         Self::default()
     }
@@ -429,15 +435,15 @@ impl GeoIndexBuilderParams {
 }
 
 // A builder for geo index
-pub struct GeoIndexBuilder {
-    options: GeoIndexBuilderParams,
+pub struct BkdTreeBuilder {
+    options: BkdTreeBuilderParams,
     _items_type: DataType,
     // Accumulated points: (x, y, row_id)
     pub points: Vec<(f64, f64, u64)>,
 }
 
-impl GeoIndexBuilder {
-    pub fn try_new(options: GeoIndexBuilderParams, items_type: DataType) -> Result<Self> {
+impl BkdTreeBuilder {
+    pub fn try_new(options: BkdTreeBuilderParams, items_type: DataType) -> Result<Self> {
         Ok(Self {
             options,
             _items_type: items_type,
@@ -452,7 +458,10 @@ impl GeoIndexBuilder {
 
         while let Some(batch) = batches_source.try_next().await? {
             // Extract GeoArrow point coordinates
-            let geom_array = batch.column(0).as_any().downcast_ref::<arrow_array::StructArray>()
+            let geom_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
                 .ok_or_else(|| Error::InvalidInput {
                     source: "Expected Struct array for GeoArrow data".into(),
                     location: location!(),
@@ -470,11 +479,8 @@ impl GeoIndexBuilder {
                 .as_primitive::<arrow_array::types::UInt64Type>();
 
             for i in 0..batch.num_rows() {
-                self.points.push((
-                    x_array.value(i),
-                    y_array.value(i),
-                    row_ids.value(i),
-                ));
+                self.points
+                    .push((x_array.value(i), y_array.value(i), row_ids.value(i)));
             }
         }
 
@@ -509,7 +515,7 @@ impl GeoIndexBuilder {
 
         // Write tree structure to separate inner and leaf files
         let (inner_batch, leaf_metadata_batch) = self.serialize_tree_nodes(&tree_nodes)?;
-        
+
         // Write inner nodes
         let mut inner_file = index_store
             .new_index_file(BKD_TREE_INNER_FILENAME, inner_batch.schema())
@@ -517,8 +523,14 @@ impl GeoIndexBuilder {
         inner_file.write_record_batch(inner_batch).await?;
         inner_file
             .finish_with_metadata(HashMap::from([
-                (MAX_POINTS_PER_LEAF_META_KEY.to_string(), self.options.max_points_per_leaf.to_string()),
-                (BATCHES_PER_FILE_META_KEY.to_string(), self.options.batches_per_file.to_string()),
+                (
+                    MAX_POINTS_PER_LEAF_META_KEY.to_string(),
+                    self.options.max_points_per_leaf.to_string(),
+                ),
+                (
+                    BATCHES_PER_FILE_META_KEY.to_string(),
+                    self.options.batches_per_file.to_string(),
+                ),
             ]))
             .await?;
 
@@ -526,7 +538,9 @@ impl GeoIndexBuilder {
         let mut leaf_meta_file = index_store
             .new_index_file(BKD_TREE_LEAF_FILENAME, leaf_metadata_batch.schema())
             .await?;
-        leaf_meta_file.write_record_batch(leaf_metadata_batch).await?;
+        leaf_meta_file
+            .write_record_batch(leaf_metadata_batch)
+            .await?;
         leaf_meta_file.finish().await?;
 
         // Write actual leaf data grouped into files (multiple batches per file)
@@ -535,61 +549,57 @@ impl GeoIndexBuilder {
             Field::new("y", DataType::Float64, false),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
-        
+
         let batches_per_file = self.options.batches_per_file;
         let num_groups = (leaf_batches.len() as u32 + batches_per_file - 1) / batches_per_file;
-        
+
         for group_id in 0..num_groups {
             let start_idx = (group_id * batches_per_file) as usize;
-            let end_idx = ((group_id + 1) * batches_per_file).min(leaf_batches.len() as u32) as usize;
+            let end_idx =
+                ((group_id + 1) * batches_per_file).min(leaf_batches.len() as u32) as usize;
             let group_batches = &leaf_batches[start_idx..end_idx];
-            
+
             let filename = leaf_group_filename(group_id);
-            
+
             let mut leaf_file = index_store
                 .new_index_file(&filename, leaf_schema.clone())
                 .await?;
-                
+
             for leaf_batch in group_batches.iter() {
                 leaf_file.write_record_batch(leaf_batch.clone()).await?;
             }
-            
+
             leaf_file.finish().await?;
         }
 
-        log::debug!(
-            "Wrote BKD tree with {} nodes",
-            tree_nodes.len()
-        );
+        log::debug!("Wrote BKD tree with {} nodes", tree_nodes.len());
 
         Ok(())
     }
 
     // Serialize tree nodes to separate inner and leaf RecordBatches
     fn serialize_tree_nodes(&self, nodes: &[BKDNode]) -> Result<(RecordBatch, RecordBatch)> {
-        
         // Separate inner and leaf nodes with their indices
         let mut inner_nodes = Vec::new();
         let mut leaf_nodes = Vec::new();
-        
+
         for (idx, node) in nodes.iter().enumerate() {
             match node {
                 BKDNode::Inner(_) => inner_nodes.push((idx as u32, node)),
                 BKDNode::Leaf(_) => leaf_nodes.push((idx as u32, node)),
             }
         }
-        
+
         // Serialize inner nodes
         let inner_batch = Self::serialize_inner_nodes(&inner_nodes)?;
-        
+
         // Serialize leaf nodes
         let leaf_batch = Self::serialize_leaf_nodes(&leaf_nodes)?;
-        
+
         Ok((inner_batch, leaf_batch))
     }
-    
+
     fn serialize_inner_nodes(nodes: &[(u32, &BKDNode)]) -> Result<RecordBatch> {
-        
         let mut node_id_vals = Vec::with_capacity(nodes.len());
         let mut min_x_vals = Vec::with_capacity(nodes.len());
         let mut min_y_vals = Vec::with_capacity(nodes.len());
@@ -630,10 +640,10 @@ impl GeoIndexBuilder {
 
         Ok(RecordBatch::try_new(schema, columns)?)
     }
-    
+
     fn serialize_leaf_nodes(nodes: &[(u32, &BKDNode)]) -> Result<RecordBatch> {
         use arrow_array::UInt64Array;
-        
+
         let mut node_id_vals = Vec::with_capacity(nodes.len());
         let mut min_x_vals = Vec::with_capacity(nodes.len());
         let mut min_y_vals = Vec::with_capacity(nodes.len());
@@ -680,17 +690,17 @@ impl GeoIndexBuilder {
 }
 
 #[derive(Debug, Default)]
-pub struct GeoIndexPlugin;
+pub struct BkdTreePlugin;
 
-impl GeoIndexPlugin {
+impl BkdTreePlugin {
     async fn train_geo_index(
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        options: Option<GeoIndexBuilderParams>,
+        options: Option<BkdTreeBuilderParams>,
     ) -> Result<()> {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
-        let mut builder = GeoIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
+        let mut builder = BkdTreeBuilder::try_new(options.unwrap_or_default(), value_type)?;
 
         builder.train(batches_source).await?;
 
@@ -699,13 +709,13 @@ impl GeoIndexPlugin {
     }
 }
 
-pub struct GeoIndexTrainingRequest {
-    pub params: GeoIndexBuilderParams,
+pub struct BkdTreeTrainingRequest {
+    pub params: BkdTreeBuilderParams,
     pub criteria: TrainingCriteria,
 }
 
-impl GeoIndexTrainingRequest {
-    pub fn new(params: GeoIndexBuilderParams) -> Self {
+impl BkdTreeTrainingRequest {
+    pub fn new(params: BkdTreeBuilderParams) -> Self {
         Self {
             params,
             criteria: TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
@@ -713,7 +723,7 @@ impl GeoIndexTrainingRequest {
     }
 }
 
-impl TrainingRequest for GeoIndexTrainingRequest {
+impl TrainingRequest for BkdTreeTrainingRequest {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -723,7 +733,7 @@ impl TrainingRequest for GeoIndexTrainingRequest {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for GeoIndexPlugin {
+impl ScalarIndexPlugin for BkdTreePlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -756,9 +766,9 @@ impl ScalarIndexPlugin for GeoIndexPlugin {
             });
         }
 
-        let params = serde_json::from_str::<GeoIndexBuilderParams>(params)?;
+        let params = serde_json::from_str::<BkdTreeBuilderParams>(params)?;
 
-        Ok(Box::new(GeoIndexTrainingRequest::new(params)))
+        Ok(Box::new(BkdTreeTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -766,7 +776,7 @@ impl ScalarIndexPlugin for GeoIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        GEO_INDEX_VERSION
+        BKD_TREE_VERSION
     }
 
     fn new_query_parser(
@@ -792,16 +802,16 @@ impl ScalarIndexPlugin for GeoIndexPlugin {
         }
 
         let request = (request as Box<dyn std::any::Any>)
-            .downcast::<GeoIndexTrainingRequest>()
+            .downcast::<BkdTreeTrainingRequest>()
             .map_err(|_| Error::InvalidInput {
                 source: "must provide training request created by new_training_request".into(),
                 location: location!(),
             })?;
         Self::train_geo_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::GeoIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&crate::pb::BkdTreeIndexDetails::default())
                 .unwrap(),
-            index_version: GEO_INDEX_VERSION,
+            index_version: BKD_TREE_VERSION,
         })
     }
 
@@ -812,7 +822,7 @@ impl ScalarIndexPlugin for GeoIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(GeoIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(BkdTree::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
 }
 
@@ -830,7 +840,7 @@ mod tests {
 
     fn create_test_store() -> Arc<LanceIndexStore> {
         let tmpdir = TempObjDir::default();
-    
+
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             tmpdir.clone(),
@@ -840,11 +850,11 @@ mod tests {
     }
 
     /// Validates the BKD tree structure recursively
-    async fn validate_bkd_tree(index: &GeoIndex) -> Result<()> {
+    async fn validate_bkd_tree(index: &BkdTree) -> Result<()> {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let tree = &index.bkd_tree;
-        
+
         // Verify root exists
         if tree.nodes.is_empty() {
             return Err(Error::InvalidInput {
@@ -856,7 +866,12 @@ mod tests {
         let root_id = tree.root_id as usize;
         if root_id >= tree.nodes.len() {
             return Err(Error::InvalidInput {
-                source: format!("Root node id {} out of bounds (tree has {} nodes)", root_id, tree.nodes.len()).into(),
+                source: format!(
+                    "Root node id {} out of bounds (tree has {} nodes)",
+                    root_id,
+                    tree.nodes.len()
+                )
+                .into(),
                 location: location!(),
             });
         }
@@ -864,16 +879,30 @@ mod tests {
         // Count leaves and validate structure
         let mut visited = vec![false; tree.nodes.len()];
         let mut leaf_count = 0u32;
-        
+
         // Start with None for expected_split_dim - root can use any dimension
         // (typically starts with dimension 0, but we don't enforce it)
         let metrics = NoOpMetricsCollector {};
-        validate_node_recursive(index, tree, root_id as u32, &mut visited, &mut leaf_count, None, None, &metrics).await?;
+        validate_node_recursive(
+            index,
+            tree,
+            root_id as u32,
+            &mut visited,
+            &mut leaf_count,
+            None,
+            None,
+            &metrics,
+        )
+        .await?;
 
         // Verify all leaves were counted
         if leaf_count != tree.num_leaves {
             return Err(Error::InvalidInput {
-                source: format!("Leaf count mismatch: found {} leaves but tree claims {}", leaf_count, tree.num_leaves).into(),
+                source: format!(
+                    "Leaf count mismatch: found {} leaves but tree claims {}",
+                    leaf_count, tree.num_leaves
+                )
+                .into(),
                 location: location!(),
             });
         }
@@ -893,7 +922,7 @@ mod tests {
 
     /// Helper function to recursively validate a node and its descendants
     async fn validate_node_recursive(
-        index: &GeoIndex,
+        index: &BkdTree,
         tree: &BKDTreeLookup,
         node_id: u32,
         visited: &mut Vec<bool>,
@@ -903,11 +932,16 @@ mod tests {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let node_idx = node_id as usize;
-        
+
         // Check node exists
         if node_idx >= tree.nodes.len() {
             return Err(Error::InvalidInput {
-                source: format!("Node id {} out of bounds (tree has {} nodes)", node_id, tree.nodes.len()).into(),
+                source: format!(
+                    "Node id {} out of bounds (tree has {} nodes)",
+                    node_id,
+                    tree.nodes.len()
+                )
+                .into(),
                 location: location!(),
             });
         }
@@ -927,22 +961,36 @@ mod tests {
         // Validate bounds are well-formed
         if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
             return Err(Error::InvalidInput {
-                source: format!("Node {} has invalid bounds: [{}, {}, {}, {}]", 
-                    node_id, bounds[0], bounds[1], bounds[2], bounds[3]).into(),
+                source: format!(
+                    "Node {} has invalid bounds: [{}, {}, {}, {}]",
+                    node_id, bounds[0], bounds[1], bounds[2], bounds[3]
+                )
+                .into(),
                 location: location!(),
             });
         }
 
         // Verify child bounds are within parent bounds
         if let Some(parent_bounds) = parent_bounds {
-            if bounds[0] < parent_bounds[0] || bounds[1] < parent_bounds[1] ||
-               bounds[2] > parent_bounds[2] || bounds[3] > parent_bounds[3] {
+            if bounds[0] < parent_bounds[0]
+                || bounds[1] < parent_bounds[1]
+                || bounds[2] > parent_bounds[2]
+                || bounds[3] > parent_bounds[3]
+            {
                 return Err(Error::InvalidInput {
                     source: format!(
                         "Node {} bounds [{}, {}, {}, {}] exceed parent bounds [{}, {}, {}, {}]",
-                        node_id, bounds[0], bounds[1], bounds[2], bounds[3],
-                        parent_bounds[0], parent_bounds[1], parent_bounds[2], parent_bounds[3]
-                    ).into(),
+                        node_id,
+                        bounds[0],
+                        bounds[1],
+                        bounds[2],
+                        bounds[3],
+                        parent_bounds[0],
+                        parent_bounds[1],
+                        parent_bounds[2],
+                        parent_bounds[3]
+                    )
+                    .into(),
                     location: location!(),
                 });
             }
@@ -953,20 +1001,33 @@ mod tests {
                 // Validate split dimension
                 if inner.split_dim > 1 {
                     return Err(Error::InvalidInput {
-                        source: format!("Node {} has invalid split_dim: {} (must be 0 or 1)", node_id, inner.split_dim).into(),
+                        source: format!(
+                            "Node {} has invalid split_dim: {} (must be 0 or 1)",
+                            node_id, inner.split_dim
+                        )
+                        .into(),
                         location: location!(),
                     });
                 }
 
                 // Validate split value is within bounds
-                let min_val = if inner.split_dim == 0 { bounds[0] } else { bounds[1] };
-                let max_val = if inner.split_dim == 0 { bounds[2] } else { bounds[3] };
+                let min_val = if inner.split_dim == 0 {
+                    bounds[0]
+                } else {
+                    bounds[1]
+                };
+                let max_val = if inner.split_dim == 0 {
+                    bounds[2]
+                } else {
+                    bounds[3]
+                };
                 if inner.split_value < min_val || inner.split_value > max_val {
                     return Err(Error::InvalidInput {
                         source: format!(
                             "Node {} split_value {} is outside dimension bounds [{}, {}]",
                             node_id, inner.split_value, min_val, max_val
-                        ).into(),
+                        )
+                        .into(),
                         location: location!(),
                     });
                 }
@@ -976,16 +1037,16 @@ mod tests {
                 // Which means left_max <= right_min (no overlap)
                 let left_node = &tree.nodes[inner.left_child as usize];
                 let right_node = &tree.nodes[inner.right_child as usize];
-                
+
                 let left_bounds = left_node.bounds();
                 let right_bounds = right_node.bounds();
-                
+
                 let (left_max, right_min) = if inner.split_dim == 0 {
-                    (left_bounds[2], right_bounds[0])  // max_x of left, min_x of right
+                    (left_bounds[2], right_bounds[0]) // max_x of left, min_x of right
                 } else {
-                    (left_bounds[3], right_bounds[1])  // max_y of left, min_y of right
+                    (left_bounds[3], right_bounds[1]) // max_y of left, min_y of right
                 };
-                
+
                 // Simple check: left_max should not be greater than right_min
                 // If it is, points were not properly sorted before splitting!
                 if left_max > right_min {
@@ -1013,7 +1074,8 @@ mod tests {
                     Some(bounds),
                     Some((inner.split_dim, inner.split_value, true)),
                     metrics,
-                )).await?;
+                ))
+                .await?;
                 Box::pin(validate_node_recursive(
                     index,
                     tree,
@@ -1023,7 +1085,8 @@ mod tests {
                     Some(bounds),
                     Some((inner.split_dim, inner.split_value, false)),
                     metrics,
-                )).await?;
+                ))
+                .await?;
             }
             bkd::BKDNode::Leaf(leaf) => {
                 // Validate leaf data
@@ -1045,20 +1108,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_geo_intersects_with_custom_max_points_per_leaf() {
-        use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
-        
+        use rand::{Rng, SeedableRng};
+
         // Test with different max points per leaf
         for max_points_per_leaf in [10, 50, 100, 200] {
             let test_store = create_test_store();
-            
-            let params = GeoIndexBuilderParams {
+
+            let params = BkdTreeBuilderParams {
                 max_points_per_leaf,
                 batches_per_file: 5,
             };
 
-            let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-                .unwrap();
+            let mut builder =
+                BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+                    .unwrap();
 
             // Create 500 RANDOM points (not sequential!) to catch sorting bugs
             let mut rng = StdRng::seed_from_u64(42);
@@ -1072,17 +1136,17 @@ mod tests {
             builder.write_index(test_store.as_ref()).await.unwrap();
 
             // Load index and verify
-            let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
-                .expect("Failed to load GeoIndex");
+                .expect("Failed to load BkdTree");
 
             assert_eq!(index.max_points_per_leaf, max_points_per_leaf);
-            
-          
-            
+
             // Validate tree structure
-            validate_bkd_tree(&index).await
-                .expect(&format!("BKD tree validation failed for max_points_per_leaf={}", max_points_per_leaf));
+            validate_bkd_tree(&index).await.expect(&format!(
+                "BKD tree validation failed for max_points_per_leaf={}",
+                max_points_per_leaf
+            ));
         }
     }
 
@@ -1091,14 +1155,15 @@ mod tests {
         // Test with different batches_per_file configurations
         for batches_per_file in [1, 3, 5, 10, 20] {
             let test_store = create_test_store();
-            
-            let params = GeoIndexBuilderParams {
+
+            let params = BkdTreeBuilderParams {
                 max_points_per_leaf: 50,
                 batches_per_file,
             };
 
-            let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-                .unwrap();
+            let mut builder =
+                BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+                    .unwrap();
 
             // Create 500 points (BKD spatial partitioning determines actual leaf count)
             for i in 0..500 {
@@ -1111,21 +1176,22 @@ mod tests {
             builder.write_index(test_store.as_ref()).await.unwrap();
 
             // Load index and verify
-            let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
-                .expect("Failed to load GeoIndex");
+                .expect("Failed to load BkdTree");
 
             // Validate tree structure
-            validate_bkd_tree(&index).await
-                .expect(&format!("BKD tree validation failed for batches_per_file={}", batches_per_file));
-            
+            validate_bkd_tree(&index).await.expect(&format!(
+                "BKD tree validation failed for batches_per_file={}",
+                batches_per_file
+            ));
         }
     }
 
     #[tokio::test]
     async fn test_geo_intersects_query_correctness_various_configs() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test query correctness with different configurations
         let configs = vec![
             (10, 1),   // Small leaves, one per file
@@ -1135,14 +1201,15 @@ mod tests {
 
         for (max_points_per_leaf, batches_per_file) in configs {
             let test_store = create_test_store();
-            
-            let params = GeoIndexBuilderParams {
+
+            let params = BkdTreeBuilderParams {
                 max_points_per_leaf,
                 batches_per_file,
             };
 
-            let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-                .unwrap();
+            let mut builder =
+                BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+                    .unwrap();
 
             // Create a grid of points
             for x in 0..20 {
@@ -1154,34 +1221,40 @@ mod tests {
 
             // Write and load index
             builder.write_index(test_store.as_ref()).await.unwrap();
-            let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .unwrap();
-            
+
             // Validate tree structure
-            validate_bkd_tree(&index).await
-                .expect(&format!("BKD tree validation failed for max_points_per_leaf={}, batches_per_file={}", max_points_per_leaf, batches_per_file));
+            validate_bkd_tree(&index).await.expect(&format!(
+                "BKD tree validation failed for max_points_per_leaf={}, batches_per_file={}",
+                max_points_per_leaf, batches_per_file
+            ));
 
             // Query: bbox [5, 5, 10, 10] should return points in that region
             let query = GeoQuery::Intersects(5.0, 5.0, 10.0, 10.0);
-            
+
             let metrics = NoOpMetricsCollector {};
             let result = index.search(&query, &metrics).await.unwrap();
-            
+
             // Should find points (5,5) to (10,10) = 6x6 = 36 points
             match result {
                 crate::scalar::SearchResult::Exact(row_ids) => {
                     assert_eq!(row_ids.len().unwrap_or(0), 36,
                               "Expected 36 points for config max_points_per_leaf={}, batches_per_file={}, got {}",
                               max_points_per_leaf, batches_per_file, row_ids.len().unwrap_or(0));
-                    
+
                     // Verify correct row IDs
                     for x in 5..=10 {
                         for y in 5..=10 {
                             let expected_row_id = (x * 20 + y) as u64;
-                            assert!(row_ids.contains(expected_row_id),
-                                   "Missing row_id {} for point ({}, {})",
-                                   expected_row_id, x, y);
+                            assert!(
+                                row_ids.contains(expected_row_id),
+                                "Missing row_id {} for point ({}, {})",
+                                expected_row_id,
+                                x,
+                                y
+                            );
                         }
                     }
                 }
@@ -1194,14 +1267,14 @@ mod tests {
     async fn test_geo_intersects_single_leaf() {
         // Edge case: all points fit in single leaf
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 1000,
             batches_per_file: 5,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create only 50 points
         for i in 0..50 {
@@ -1209,18 +1282,19 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Should have only 1 leaf
         assert_eq!(index.bkd_tree.num_leaves, 1);
         assert_eq!(index.bkd_tree.nodes.len(), 1);
-        
+
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed for single leaf test");
-        
+
         // Single leaf should be in file 0 at offset 0
         match &index.bkd_tree.nodes[0] {
             BKDNode::Leaf(leaf) => {
@@ -1236,14 +1310,14 @@ mod tests {
     async fn test_geo_intersects_many_small_leaves() {
         // Stress test: many small leaves, test file grouping
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
-            max_points_per_leaf: 5,      // Very small leaves
-            batches_per_file: 3, // Few batches per file
+
+        let params = BkdTreeBuilderParams {
+            max_points_per_leaf: 5, // Very small leaves
+            batches_per_file: 3,    // Few batches per file
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 100 points (BKD spatial partitioning determines actual leaf count)
         for i in 0..100 {
@@ -1251,15 +1325,16 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // BKD tree creates more leaves due to spatial partitioning
         assert_eq!(index.bkd_tree.num_leaves, 32);
-        
+
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed for many small leaves test");
 
         // 32 leaves / 3 batches_per_file = 11 files (ceil)
@@ -1270,7 +1345,7 @@ mod tests {
             .filter_map(|n| n.as_leaf())
             .map(|l| l.file_id)
             .collect();
-        
+
         assert_eq!(file_ids.len(), 11);
 
         // Verify row offsets are cumulative within each file
@@ -1282,15 +1357,15 @@ mod tests {
             .collect();
 
         for file_id in 0..11 {
-            let leaves_in_file: Vec<_> = leaves
-                .iter()
-                .filter(|l| l.file_id == file_id)
-                .collect();
-            
+            let leaves_in_file: Vec<_> = leaves.iter().filter(|l| l.file_id == file_id).collect();
+
             let mut expected_offset = 0u64;
             for leaf in leaves_in_file {
-                assert_eq!(leaf.row_offset, expected_offset,
-                          "Incorrect offset in file {}", file_id);
+                assert_eq!(
+                    leaf.row_offset, expected_offset,
+                    "Incorrect offset in file {}",
+                    file_id
+                );
                 expected_offset += leaf.num_rows;
             }
         }
@@ -1300,7 +1375,7 @@ mod tests {
     async fn test_geo_index_data_integrity_after_serialization() {
         // Verify every point written can be read back exactly
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let configs = vec![
             (10, 1),   // Small leaves, one per file
             (50, 3),   // Medium leaves, few per file
@@ -1309,14 +1384,15 @@ mod tests {
 
         for (max_points_per_leaf, batches_per_file) in configs {
             let test_store = create_test_store();
-            
-            let params = GeoIndexBuilderParams {
+
+            let params = BkdTreeBuilderParams {
                 max_points_per_leaf,
                 batches_per_file,
             };
 
-            let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-                .unwrap();
+            let mut builder =
+                BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
+                    .unwrap();
 
             // Create test points with known values
             let mut original_points = Vec::new();
@@ -1332,7 +1408,7 @@ mod tests {
             builder.write_index(test_store.as_ref()).await.unwrap();
 
             // Load index
-            let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .unwrap();
 
@@ -1343,7 +1419,7 @@ mod tests {
             for leaf in index.bkd_tree.nodes.iter().filter_map(|n| n.as_leaf()) {
                 // Load the leaf data
                 let leaf_data = index.load_leaf(leaf, &metrics).await.unwrap();
-                
+
                 // Extract points from this leaf
                 let x_array = leaf_data
                     .column(0)
@@ -1364,21 +1440,30 @@ mod tests {
             }
 
             // Verify all points were recovered
-            assert_eq!(recovered_points.len(), original_points.len(),
-                      "Lost points with config max_points_per_leaf={}, batches_per_file={}",
-                      max_points_per_leaf, batches_per_file);
+            assert_eq!(
+                recovered_points.len(),
+                original_points.len(),
+                "Lost points with config max_points_per_leaf={}, batches_per_file={}",
+                max_points_per_leaf,
+                batches_per_file
+            );
 
             // Verify each point matches exactly
             for (original_x, original_y, row_id) in &original_points {
-                let (recovered_x, recovered_y) = recovered_points.get(row_id)
+                let (recovered_x, recovered_y) = recovered_points
+                    .get(row_id)
                     .expect(&format!("Missing row_id {} in recovered data", row_id));
-                
-                assert_eq!(*recovered_x, *original_x,
-                          "X coordinate mismatch for row_id {}: expected {}, got {}",
-                          row_id, original_x, recovered_x);
-                assert_eq!(*recovered_y, *original_y,
-                          "Y coordinate mismatch for row_id {}: expected {}, got {}",
-                          row_id, original_y, recovered_y);
+
+                assert_eq!(
+                    *recovered_x, *original_x,
+                    "X coordinate mismatch for row_id {}: expected {}, got {}",
+                    row_id, original_x, recovered_x
+                );
+                assert_eq!(
+                    *recovered_y, *original_y,
+                    "Y coordinate mismatch for row_id {}: expected {}, got {}",
+                    row_id, original_y, recovered_y
+                );
             }
         }
     }
@@ -1387,14 +1472,14 @@ mod tests {
     async fn test_geo_index_no_duplicate_points() {
         // Ensure no points are duplicated during write/read
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
-            max_points_per_leaf: 7,  // Odd number to test edge cases
+
+        let params = BkdTreeBuilderParams {
+            max_points_per_leaf: 7, // Odd number to test edge cases
             batches_per_file: 3,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 100 unique points
         for i in 0..100 {
@@ -1402,7 +1487,7 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1431,46 +1516,47 @@ mod tests {
 
         // Should be exactly 0..99
         for i in 0..100 {
-            assert!(unique_row_ids.contains(&(i as u64)),
-                   "Missing row_id {}", i);
+            assert!(unique_row_ids.contains(&(i as u64)), "Missing row_id {}", i);
         }
     }
 
     #[tokio::test]
     async fn test_geo_intersects_lazy_loading() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test that leaves are loaded lazily (not all at once)
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 100 points in a grid
         for x in 0..10 {
             for y in 0..10 {
-                builder.points.push((x as f64 * 10.0, y as f64 * 10.0, (x * 10 + y) as u64));
+                builder
+                    .points
+                    .push((x as f64 * 10.0, y as f64 * 10.0, (x * 10 + y) as u64));
             }
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Query a small region - should only load relevant leaves, not all of them
         let query = GeoQuery::Intersects(0.0, 0.0, 20.0, 20.0);
         let metrics = NoOpMetricsCollector {};
-        
+
         // Find which leaves would be touched
         let query_bbox = [0.0, 0.0, 20.0, 20.0];
         let intersecting_leaves = index.bkd_tree.find_intersecting_leaves(query_bbox).unwrap();
-        
+
         // Verify we're not loading ALL leaves for a small query
         assert!(
             intersecting_leaves.len() < index.bkd_tree.num_leaves as usize,
@@ -1479,10 +1565,10 @@ mod tests {
             intersecting_leaves.len(),
             index.bkd_tree.num_leaves
         );
-        
+
         // Execute the query
         let result = index.search(&query, &metrics).await.unwrap();
-        
+
         // Manually verify correctness: which points SHOULD be in bbox [0, 0, 20, 20]?
         let mut expected_row_ids = std::collections::HashSet::new();
         for x in 0..10 {
@@ -1495,32 +1581,42 @@ mod tests {
                 }
             }
         }
-        
+
         // Verify results match our manual calculation
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
                 let actual_count = row_ids.len().unwrap_or(0) as usize;
-                
-                assert_eq!(actual_count, expected_row_ids.len(),
-                          "Expected {} points, got {}",
-                          expected_row_ids.len(), actual_count);
-                
+
+                assert_eq!(
+                    actual_count,
+                    expected_row_ids.len(),
+                    "Expected {} points, got {}",
+                    expected_row_ids.len(),
+                    actual_count
+                );
+
                 // Verify each returned row_id is in our expected set
                 if let Some(iter) = row_ids.row_ids() {
                     for row_addr in iter {
                         let row_id = u64::from(row_addr);
-                        assert!(expected_row_ids.contains(&row_id),
-                               "Unexpected row_id {} in results", row_id);
+                        assert!(
+                            expected_row_ids.contains(&row_id),
+                            "Unexpected row_id {} in results",
+                            row_id
+                        );
                     }
                 }
-                
+
                 // Verify we didn't miss any expected points
                 if let Some(iter) = row_ids.row_ids() {
-                    let found_ids: std::collections::HashSet<u64> = 
+                    let found_ids: std::collections::HashSet<u64> =
                         iter.map(|addr| u64::from(addr)).collect();
                     for expected_id in &expected_row_ids {
-                        assert!(found_ids.contains(expected_id),
-                               "Missing expected row_id {} in results", expected_id);
+                        assert!(
+                            found_ids.contains(expected_id),
+                            "Missing expected row_id {} in results",
+                            expected_id
+                        );
                     }
                 }
             }
@@ -1532,54 +1628,46 @@ mod tests {
     async fn test_geo_intersects_invalid_coordinates() {
         // Test that NaN and infinity coordinates are rejected (like Lucene does)
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
-        
+
         // Test NaN in X coordinate
-        let mut builder = GeoIndexBuilder::try_new(
-            params.clone(),
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params.clone(), DataType::Struct(Vec::<Field>::new().into()))
+                .unwrap();
         builder.points.push((10.0, 10.0, 1));
         builder.points.push((f64::NAN, 20.0, 2));
         let result = builder.write_index(test_store.as_ref()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NaN"));
-        
+
         // Test NaN in Y coordinate
-        let mut builder = GeoIndexBuilder::try_new(
-            params.clone(),
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params.clone(), DataType::Struct(Vec::<Field>::new().into()))
+                .unwrap();
         builder.points.push((10.0, 10.0, 1));
         builder.points.push((20.0, f64::NAN, 2));
         let result = builder.write_index(test_store.as_ref()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NaN"));
-        
+
         // Test Infinity in X coordinate
-        let mut builder = GeoIndexBuilder::try_new(
-            params.clone(),
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params.clone(), DataType::Struct(Vec::<Field>::new().into()))
+                .unwrap();
         builder.points.push((10.0, 10.0, 1));
         builder.points.push((f64::INFINITY, 20.0, 2));
         let result = builder.write_index(test_store.as_ref()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Infinite"));
-        
+
         // Test Negative Infinity in Y coordinate
-        let mut builder = GeoIndexBuilder::try_new(
-            params.clone(),
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params.clone(), DataType::Struct(Vec::<Field>::new().into()))
+                .unwrap();
         builder.points.push((10.0, 10.0, 1));
         builder.points.push((20.0, f64::NEG_INFINITY, 2));
         let result = builder.write_index(test_store.as_ref()).await;
@@ -1590,34 +1678,31 @@ mod tests {
     #[tokio::test]
     async fn test_geo_intersects_out_of_bounds_queries() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test queries completely outside the data bounds
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
-        
-        let mut builder = GeoIndexBuilder::try_new(
-            params,
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
-        
+
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
+
         // Add points in region 0-100, 0-100
         for i in 0..50 {
             builder.points.push((i as f64, i as f64, i as u64));
         }
-        
+
         builder.write_index(test_store.as_ref()).await.unwrap();
-        
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        
+
         let metrics = NoOpMetricsCollector {};
-        
+
         // Query completely out of bounds (far away)
         let query = GeoQuery::Intersects(1000.0, 1000.0, 2000.0, 2000.0);
         let result = index.search(&query, &metrics).await.unwrap();
@@ -1628,7 +1713,7 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
-        
+
         // Query in negative space (if data is all positive)
         let query = GeoQuery::Intersects(-500.0, -500.0, -100.0, -100.0);
         let result = index.search(&query, &metrics).await.unwrap();
@@ -1644,21 +1729,18 @@ mod tests {
     #[tokio::test]
     async fn test_geo_intersects_extreme_coordinates() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test with extremely large and small (but valid) coordinates
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
-        
-        let mut builder = GeoIndexBuilder::try_new(
-            params,
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
-        
+
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
+
         // Add points with extreme coordinates
         builder.points.push((1e10, 1e10, 1));
         builder.points.push((-1e10, -1e10, 2));
@@ -1666,34 +1748,36 @@ mod tests {
         builder.points.push((-1e-10, -1e-10, 4));
         builder.points.push((f64::MAX / 2.0, f64::MAX / 2.0, 5));
         builder.points.push((f64::MIN / 2.0, f64::MIN / 2.0, 6));
-        
+
         builder.write_index(test_store.as_ref()).await.unwrap();
-        
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        
+
         let metrics = NoOpMetricsCollector {};
-        
+
         // Query for large positive values
         let query = GeoQuery::Intersects(1e10 - 1.0, 1e10 - 1.0, 1e10 + 1.0, 1e10 + 1.0);
         let result = index.search(&query, &metrics).await.unwrap();
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                let actual_ids: Vec<u64> = row_ids.row_ids()
+                let actual_ids: Vec<u64> = row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|addr| u64::from(addr)).collect())
                     .unwrap_or_default();
                 assert!(actual_ids.contains(&1));
             }
             _ => panic!("Expected Exact search result"),
         }
-        
+
         // Query for large negative values
         let query = GeoQuery::Intersects(-1e10 - 1.0, -1e10 - 1.0, -1e10 + 1.0, -1e10 + 1.0);
         let result = index.search(&query, &metrics).await.unwrap();
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                let actual_ids: Vec<u64> = row_ids.row_ids()
+                let actual_ids: Vec<u64> = row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|addr| u64::from(addr)).collect())
                     .unwrap_or_default();
                 assert!(actual_ids.contains(&2));
@@ -1705,34 +1789,31 @@ mod tests {
     #[tokio::test]
     async fn test_geo_intersects_huge_query_bbox() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test query larger than all data bounds
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
-        
-        let mut builder = GeoIndexBuilder::try_new(
-            params,
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
-        
+
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
+
         // Add points in small region
         for i in 0..20 {
             builder.points.push((i as f64, i as f64, i as u64));
         }
-        
+
         builder.write_index(test_store.as_ref()).await.unwrap();
-        
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        
+
         let metrics = NoOpMetricsCollector {};
-        
+
         // Query that encompasses ALL data
         let query = GeoQuery::Intersects(-1000.0, -1000.0, 1000.0, 1000.0);
         let result = index.search(&query, &metrics).await.unwrap();
@@ -1749,41 +1830,39 @@ mod tests {
     #[tokio::test]
     async fn test_geo_intersects_zero_size_query() {
         use crate::metrics::NoOpMetricsCollector;
-        
+
         // Test query box with zero width/height (point query)
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
-        
-        let mut builder = GeoIndexBuilder::try_new(
-            params,
-            DataType::Struct(Vec::<Field>::new().into()),
-        )
-        .unwrap();
-        
+
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
+
         // Add some points
         builder.points.push((10.0, 10.0, 1));
         builder.points.push((10.0, 10.0, 2)); // Duplicate at same location
         builder.points.push((20.0, 20.0, 3));
         builder.points.push((30.0, 30.0, 4));
-        
+
         builder.write_index(test_store.as_ref()).await.unwrap();
-        
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        
+
         let metrics = NoOpMetricsCollector {};
-        
+
         // Zero-width query (line)
         let query = GeoQuery::Intersects(10.0, 10.0, 10.0, 20.0);
         let result = index.search(&query, &metrics).await.unwrap();
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                let actual_ids: Vec<u64> = row_ids.row_ids()
+                let actual_ids: Vec<u64> = row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|addr| u64::from(addr)).collect())
                     .unwrap_or_default();
                 // Should find points at (10, 10)
@@ -1792,13 +1871,14 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
-        
+
         // Zero-height query (line)
         let query = GeoQuery::Intersects(10.0, 10.0, 20.0, 10.0);
         let result = index.search(&query, &metrics).await.unwrap();
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                let actual_ids: Vec<u64> = row_ids.row_ids()
+                let actual_ids: Vec<u64> = row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|addr| u64::from(addr)).collect())
                     .unwrap_or_default();
                 // Should find points at (10, 10)
@@ -1807,13 +1887,14 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
-        
+
         // Point query (zero width and height)
         let query = GeoQuery::Intersects(20.0, 20.0, 20.0, 20.0);
         let result = index.search(&query, &metrics).await.unwrap();
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                let actual_ids: Vec<u64> = row_ids.row_ids()
+                let actual_ids: Vec<u64> = row_ids
+                    .row_ids()
                     .map(|iter| iter.map(|addr| u64::from(addr)).collect())
                     .unwrap_or_default();
                 // Should find point at (20, 20)
@@ -1826,10 +1907,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_geo_intersects_large_scale_lazy_loading() {
-        use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        
+
         // Custom metrics collector to track I/O operations
         struct LoadTracker {
             part_loads: AtomicUsize,
@@ -1842,16 +1923,16 @@ mod tests {
             fn record_index_loads(&self, _num_indices: usize) {}
             fn record_comparisons(&self, _num_comparisons: usize) {}
         }
-        
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
-            max_points_per_leaf: 1000,  // Realistic leaf size
+
+        let params = BkdTreeBuilderParams {
+            max_points_per_leaf: 1000, // Realistic leaf size
             batches_per_file: 10,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 1 million random points across a 1000x1000 grid
         let mut rng = StdRng::seed_from_u64(42);
@@ -1862,15 +1943,17 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Run 100 random queries with load tracking
-        let metrics = LoadTracker { part_loads: AtomicUsize::new(0) };
+        let metrics = LoadTracker {
+            part_loads: AtomicUsize::new(0),
+        };
         let mut total_leaves_touched = 0;
-        
+
         for _i in 0..100 {
             // Random query bbox with varying sizes (1x1 to 50x50 regions in 1000x1000 space)
             let width = rng.random_range(1.0..50.0);
@@ -1879,29 +1962,30 @@ mod tests {
             let min_y = rng.random_range(0.0..(1000.0 - height));
             let max_x = min_x + width;
             let max_y = min_y + height;
-            
+
             let query = GeoQuery::Intersects(min_x, min_y, max_x, max_y);
-            
+
             // Count leaves touched
             let query_bbox = [min_x, min_y, max_x, max_y];
             let intersecting_leaves = index.bkd_tree.find_intersecting_leaves(query_bbox).unwrap();
             total_leaves_touched += intersecting_leaves.len();
-            
+
             // Execute query
             let _result = index.search(&query, &metrics).await.unwrap();
         }
-        
+
         let total_io_ops = metrics.part_loads.load(Ordering::Relaxed);
-        
+
         // CRITICAL: Verify lazy loading is working!
         // We should NOT load all leaves - only the ones intersecting query bboxes
         assert!(
             total_io_ops < index.bkd_tree.num_leaves as usize,
             "❌ LAZY LOADING FAILED: Loaded {} leaves but index only has {} leaves! \
              Should load much fewer than total.",
-            total_io_ops, index.bkd_tree.num_leaves
+            total_io_ops,
+            index.bkd_tree.num_leaves
         );
-        
+
         // Verify lazy loading is effective (< 10% of leaves touched on average per query)
         let avg_leaves_touched = total_leaves_touched as f64 / 100.0;
         let total_leaves = index.bkd_tree.num_leaves as f64;
@@ -1916,24 +2000,26 @@ mod tests {
     async fn test_geo_index_points_in_correct_leaves() {
         // Verify points are in leaves with correct bounding boxes
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 5,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create a grid of points
         for x in 0..20 {
             for y in 0..20 {
-                builder.points.push((x as f64, y as f64, (x * 20 + y) as u64));
+                builder
+                    .points
+                    .push((x as f64, y as f64, (x * 20 + y) as u64));
             }
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1943,7 +2029,7 @@ mod tests {
 
         for leaf in index.bkd_tree.nodes.iter().filter_map(|n| n.as_leaf()) {
             let leaf_data = index.load_leaf(leaf, &metrics).await.unwrap();
-            
+
             let x_array = leaf_data
                 .column(0)
                 .as_primitive::<arrow_array::types::Float64Type>();
@@ -1954,14 +2040,22 @@ mod tests {
             for i in 0..leaf_data.num_rows() {
                 let x = x_array.value(i);
                 let y = y_array.value(i);
-                
+
                 // Point must be within leaf's bounding box
-                assert!(x >= leaf.bounds[0] && x <= leaf.bounds[2],
-                       "Point x={} outside leaf bounds [{}, {}]",
-                       x, leaf.bounds[0], leaf.bounds[2]);
-                assert!(y >= leaf.bounds[1] && y <= leaf.bounds[3],
-                       "Point y={} outside leaf bounds [{}, {}]",
-                       y, leaf.bounds[1], leaf.bounds[3]);
+                assert!(
+                    x >= leaf.bounds[0] && x <= leaf.bounds[2],
+                    "Point x={} outside leaf bounds [{}, {}]",
+                    x,
+                    leaf.bounds[0],
+                    leaf.bounds[2]
+                );
+                assert!(
+                    y >= leaf.bounds[1] && y <= leaf.bounds[3],
+                    "Point y={} outside leaf bounds [{}, {}]",
+                    y,
+                    leaf.bounds[1],
+                    leaf.bounds[3]
+                );
             }
         }
     }
@@ -1970,16 +2064,16 @@ mod tests {
     async fn test_geo_index_duplicate_coordinates_different_row_ids() {
         // Test that duplicate coordinates with different row_ids are all stored correctly
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 10,
             batches_per_file: 3,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create multiple points at the same coordinates with different row_ids
         // This simulates real-world scenarios where multiple records have the same location
@@ -1987,14 +2081,14 @@ mod tests {
             // 5 points at location (10.0, 10.0) with different row_ids
             builder.points.push((10.0, 10.0, i as u64));
         }
-        
+
         // Add some other points at different locations
         for i in 20..50 {
             builder.points.push((i as f64, i as f64, i as u64));
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2002,17 +2096,23 @@ mod tests {
         let query = GeoQuery::Intersects(9.0, 9.0, 11.0, 11.0);
         let metrics = NoOpMetricsCollector {};
         let result = index.search(&query, &metrics).await.unwrap();
-        
+
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
                 // Should find all 20 points at (10.0, 10.0)
-                assert_eq!(row_ids.len().unwrap_or(0), 20,
-                          "Expected 20 duplicate coordinate entries");
-                
+                assert_eq!(
+                    row_ids.len().unwrap_or(0),
+                    20,
+                    "Expected 20 duplicate coordinate entries"
+                );
+
                 // Verify all row_ids 0..19 are present
                 for i in 0..20 {
-                    assert!(row_ids.contains(i as u64),
-                           "Missing row_id {} for duplicate coordinate", i);
+                    assert!(
+                        row_ids.contains(i as u64),
+                        "Missing row_id {} for duplicate coordinate",
+                        i
+                    );
                 }
             }
             _ => panic!("Expected Exact search result"),
@@ -2031,8 +2131,12 @@ mod tests {
             }
         }
 
-        assert_eq!(all_row_ids.len(), 50, "Should store all 50 points including duplicates");
-        
+        assert_eq!(
+            all_row_ids.len(),
+            50,
+            "Should store all 50 points including duplicates"
+        );
+
         let unique_row_ids: std::collections::HashSet<u64> = all_row_ids.iter().copied().collect();
         assert_eq!(unique_row_ids.len(), 50, "All 50 row_ids should be unique");
     }
@@ -2041,16 +2145,16 @@ mod tests {
     async fn test_geo_index_many_duplicates_at_same_location() {
         // Test with many duplicate coordinates to ensure they don't cause issues
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 20,
             batches_per_file: 5,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 100 points all at the exact same location
         for i in 0..100 {
@@ -2058,28 +2162,35 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed with many duplicates");
 
         // Query should return all 100 points
         let query = GeoQuery::Intersects(49.0, 49.0, 51.0, 51.0);
         let metrics = NoOpMetricsCollector {};
         let result = index.search(&query, &metrics).await.unwrap();
-        
+
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                assert_eq!(row_ids.len().unwrap_or(0), 100,
-                          "Expected all 100 duplicate coordinate entries");
-                
+                assert_eq!(
+                    row_ids.len().unwrap_or(0),
+                    100,
+                    "Expected all 100 duplicate coordinate entries"
+                );
+
                 // Verify all row_ids are present
                 for i in 0..100 {
-                    assert!(row_ids.contains(i as u64),
-                           "Missing row_id {} in duplicate set", i);
+                    assert!(
+                        row_ids.contains(i as u64),
+                        "Missing row_id {} in duplicate set",
+                        i
+                    );
                 }
             }
             _ => panic!("Expected Exact search result"),
@@ -2090,24 +2201,19 @@ mod tests {
     async fn test_geo_index_duplicates_across_multiple_locations() {
         // Test duplicates at multiple different locations
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 15,
             batches_per_file: 3,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create clusters of duplicates at different locations
-        let locations = vec![
-            (10.0, 10.0),
-            (20.0, 20.0),
-            (30.0, 30.0),
-            (40.0, 40.0),
-        ];
+        let locations = vec![(10.0, 10.0), (20.0, 20.0), (30.0, 30.0), (40.0, 40.0)];
 
         let mut row_id = 0u64;
         for (x, y) in &locations {
@@ -2127,12 +2233,13 @@ mod tests {
         let total_points = row_id;
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed with duplicates at multiple locations");
 
         let metrics = NoOpMetricsCollector {};
@@ -2141,18 +2248,27 @@ mod tests {
         for (i, (x, y)) in locations.iter().enumerate() {
             let query = GeoQuery::Intersects(x - 1.0, y - 1.0, x + 1.0, y + 1.0);
             let result = index.search(&query, &metrics).await.unwrap();
-            
+
             match result {
                 crate::scalar::SearchResult::Exact(row_ids) => {
-                    assert_eq!(row_ids.len().unwrap_or(0), 10,
-                              "Expected 10 duplicates at location {}", i);
-                    
+                    assert_eq!(
+                        row_ids.len().unwrap_or(0),
+                        10,
+                        "Expected 10 duplicates at location {}",
+                        i
+                    );
+
                     // Verify the correct row_ids for this cluster
                     let expected_start = (i * 10) as u64;
                     let expected_end = expected_start + 10;
                     for expected_id in expected_start..expected_end {
-                        assert!(row_ids.contains(expected_id),
-                               "Missing row_id {} in cluster at ({}, {})", expected_id, x, y);
+                        assert!(
+                            row_ids.contains(expected_id),
+                            "Missing row_id {} in cluster at ({}, {})",
+                            expected_id,
+                            x,
+                            y
+                        );
                     }
                 }
                 _ => panic!("Expected Exact search result"),
@@ -2172,24 +2288,28 @@ mod tests {
             }
         }
 
-        assert_eq!(all_row_ids.len(), total_points as usize,
-                  "Should store all {} points including duplicates", total_points);
+        assert_eq!(
+            all_row_ids.len(),
+            total_points as usize,
+            "Should store all {} points including duplicates",
+            total_points
+        );
     }
 
     #[tokio::test]
     async fn test_geo_index_duplicate_handling_with_leaf_splits() {
         // Test that duplicates are handled correctly when they cause leaf splits
         use crate::metrics::NoOpMetricsCollector;
-        
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
-            max_points_per_leaf: 10,  // Small leaf size to force splits
+
+        let params = BkdTreeBuilderParams {
+            max_points_per_leaf: 10, // Small leaf size to force splits
             batches_per_file: 3,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         // Create 50 points at the same location - should span multiple leaves
         for i in 0..50 {
@@ -2197,28 +2317,35 @@ mod tests {
         }
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed with duplicate-induced splits");
 
         // Query should return all 50 points
         let query = GeoQuery::Intersects(24.0, 24.0, 26.0, 26.0);
         let metrics = NoOpMetricsCollector {};
         let result = index.search(&query, &metrics).await.unwrap();
-        
+
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                assert_eq!(row_ids.len().unwrap_or(0), 50,
-                          "Expected all 50 duplicate entries after leaf splits");
-                
+                assert_eq!(
+                    row_ids.len().unwrap_or(0),
+                    50,
+                    "Expected all 50 duplicate entries after leaf splits"
+                );
+
                 // Verify all row_ids are present
                 for i in 0..50 {
-                    assert!(row_ids.contains(i as u64),
-                           "Missing row_id {} after leaf split", i);
+                    assert!(
+                        row_ids.contains(i as u64),
+                        "Missing row_id {} after leaf split",
+                        i
+                    );
                 }
             }
             _ => panic!("Expected Exact search result"),
@@ -2229,18 +2356,18 @@ mod tests {
     async fn test_geo_index_mixed_duplicates_and_unique_points() {
         // Realistic test: mix of unique points and duplicates
         use crate::metrics::NoOpMetricsCollector;
-        use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
-        
+        use rand::{Rng, SeedableRng};
+
         let test_store = create_test_store();
-        
-        let params = GeoIndexBuilderParams {
+
+        let params = BkdTreeBuilderParams {
             max_points_per_leaf: 20,
             batches_per_file: 5,
         };
 
-        let mut builder = GeoIndexBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into()))
-            .unwrap();
+        let mut builder =
+            BkdTreeBuilder::try_new(params, DataType::Struct(Vec::<Field>::new().into())).unwrap();
 
         let mut rng = StdRng::seed_from_u64(123);
         let mut row_id = 0u64;
@@ -2270,12 +2397,13 @@ mod tests {
         let total_points = 170;
 
         builder.write_index(test_store.as_ref()).await.unwrap();
-        let index = GeoIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BkdTree::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
         // Validate tree structure
-        validate_bkd_tree(&index).await
+        validate_bkd_tree(&index)
+            .await
             .expect("BKD tree validation failed with mixed duplicates and unique points");
 
         let metrics = NoOpMetricsCollector {};
@@ -2283,16 +2411,22 @@ mod tests {
         // Query the duplicate cluster
         let query = GeoQuery::Intersects(49.0, 49.0, 51.0, 51.0);
         let result = index.search(&query, &metrics).await.unwrap();
-        
+
         match result {
             crate::scalar::SearchResult::Exact(row_ids) => {
-                assert_eq!(row_ids.len().unwrap_or(0), 20,
-                          "Expected 20 duplicate entries at (50, 50)");
-                
+                assert_eq!(
+                    row_ids.len().unwrap_or(0),
+                    20,
+                    "Expected 20 duplicate entries at (50, 50)"
+                );
+
                 // Verify the duplicate row_ids (100..119)
                 for expected_id in 100..120 {
-                    assert!(row_ids.contains(expected_id as u64),
-                           "Missing row_id {} in duplicate cluster", expected_id);
+                    assert!(
+                        row_ids.contains(expected_id as u64),
+                        "Missing row_id {} in duplicate cluster",
+                        expected_id
+                    );
                 }
             }
             _ => panic!("Expected Exact search result"),
@@ -2311,13 +2445,19 @@ mod tests {
             }
         }
 
-        assert_eq!(all_row_ids.len(), total_points,
-                  "Should store all {} points", total_points);
-        
+        assert_eq!(
+            all_row_ids.len(),
+            total_points,
+            "Should store all {} points",
+            total_points
+        );
+
         // Verify all row_ids are unique (no double-counting)
         let unique_row_ids: std::collections::HashSet<u64> = all_row_ids.iter().copied().collect();
-        assert_eq!(unique_row_ids.len(), total_points,
-                  "All row_ids should be unique");
+        assert_eq!(
+            unique_row_ids.len(),
+            total_points,
+            "All row_ids should be unique"
+        );
     }
 }
-
