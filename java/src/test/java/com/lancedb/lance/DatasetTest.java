@@ -1392,7 +1392,7 @@ public class DatasetTest {
       }
     }
   }
-  
+
   @Test
   void testShallowClone(@TempDir Path tempDir) {
     String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
@@ -1512,5 +1512,6 @@ public class DatasetTest {
       byte[] allData = blobFile.read();
       assertArrayEquals(allData, combined);
       blobFile.close();
+    }
   }
 }
