@@ -663,6 +663,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedWidthMiniBlockDecompressor::new(description),
             )),
+            Compression::VariablePackedStruct(_) => Err(Error::NotSupported {
+                source: "variable packed struct decoding is not yet implemented".into(),
+                location: location!(),
+            }),
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
