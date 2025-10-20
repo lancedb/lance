@@ -526,13 +526,13 @@ def test_fragment_update_columns_basic(tmp_path):
             "value": [10, 20, 30, 40],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_basic"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Prepare update data with _rowid (must be UInt64 to match Lance's internal type)
     update_data = pa.table(
         {
-            "_rowid": pa.array([0, 2], type=pa.uint64()),  # Update rows 0 and 2
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
             "name": ["Alice_Updated", "Charlie_Updated"],
             "value": [100, 300],
         }
@@ -573,14 +573,14 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
             "score": [85, 90, 75, 80],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_custom_join_key"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Prepare update data using 'id' as join key
     # Note: We only update 'score', not 'id' itself
     update_data = pa.table(
         {
-            "id": [1, 3],  # Join on these id values
+            "id": [1, 3],
             "name": ["Alan", "Chase"],
             "score": [95, 85],
         }
@@ -604,15 +604,6 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
 
     # Verify the update
     result = updated_dataset.to_table().to_pydict()
-    # The score column should be updated for rows where id=1 and id=3
-    # id=1 (row 0): score should be 95
-    # id=2 (row 1): score should remain 90
-    # id=3 (row 2): score should be 85
-    # id=4 (row 3): score should remain 80
-    # However, the current implementation might also update the 'id' column
-    # Let's check what actually happened
-    print(f"Result: {result}")
-    # For now, let's just verify that score was updated for at least some rows
     assert result["score"][0] == 95  # id=1 should have score 95
     assert result["score"][2] == 85  # id=3 should have score 85
     assert result["name"][0] == "Alan"  # id=1 should have name Alan
@@ -629,7 +620,7 @@ def test_fragment_update_columns_with_nulls(tmp_path):
             "optional_field": ["A", "B", "C", "D"],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_nulls"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Prepare update data with null values
@@ -670,7 +661,7 @@ def test_fragment_update_columns_partial_update(tmp_path):
             "city": ["NYC", "LA", "SF"],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_partial_update"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Update only 'age' column, leaving 'name' and 'city' unchanged
@@ -711,7 +702,7 @@ def test_fragment_update_columns_no_match(tmp_path):
             "value": [10, 20, 30],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_no_match"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Update data with non-existent _rowid
@@ -752,7 +743,7 @@ def test_fragment_update_columns_error_on_nonexistent_column(tmp_path):
             "value": [10, 20, 30],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_error_on_nonexistent_column"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Try to update a column that doesn't exist
@@ -781,7 +772,7 @@ def test_fragment_update_columns_error_on_metadata_column(tmp_path):
             "value": [10, 20, 30],
         }
     )
-    dataset_uri = tmp_path / "test_dataset"
+    dataset_uri = tmp_path / "test_dataset_update_columns_error_on_metadata_column"
     dataset = lance.write_dataset(data, dataset_uri)
 
     # Try to update _rowid column (metadata column)
