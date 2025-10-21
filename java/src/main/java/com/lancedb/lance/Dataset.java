@@ -1127,11 +1127,10 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Create a branch from a specific source branch and version.
+     * Create a branch from a tag reference.
      *
      * @param branch the branch name to create
-     * @param version the version number to branch from
-     * @param sourceBranch the source branch name
+     * @param tagName the tag name to branch from
      * @return a new Dataset of the created branch
      */
     public Dataset create(String branch, String tagName) {
