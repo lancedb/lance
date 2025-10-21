@@ -105,13 +105,13 @@ public class ScalarIndexTest {
         dataset.createIndex(
             IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
                 .withIndexName("test_index")
-                .withFragmentUUID(uuid.toString())
+                .withIndexUUID(uuid.toString())
                 .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
                 .build());
         dataset.createIndex(
             IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
                 .withIndexName("test_index")
-                .withFragmentUUID(uuid.toString())
+                .withIndexUUID(uuid.toString())
                 .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
                 .build());
 

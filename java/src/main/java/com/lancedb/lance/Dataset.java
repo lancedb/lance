@@ -655,7 +655,7 @@ public class Dataset implements Closeable {
           options.isReplace(),
           options.isTrain(),
           options.getFragmentIds(),
-          options.getFragmentUUID());
+          options.getIndexUUID());
     }
   }
 
@@ -667,7 +667,7 @@ public class Dataset implements Closeable {
       boolean replace,
       boolean train,
       Optional<List<Integer>> fragments,
-      Optional<String> fragmentUUID);
+      Optional<String> indexUUID);
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {

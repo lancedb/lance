@@ -23,7 +23,7 @@ public class IndexOptions {
   private final boolean replace;
   private final boolean train;
   private final List<Integer> fragmentIds;
-  private final String fragmentUUID;
+  private final String indexUUID;
   private final String indexName;
   private final List<String> columns;
   private final IndexType indexType;
@@ -37,19 +37,19 @@ public class IndexOptions {
       boolean replace,
       boolean train,
       List<Integer> fragmentIds,
-      String fragmentUUID) {
+      String indexUUID) {
     this.replace = replace;
     this.train = train;
     this.fragmentIds = fragmentIds;
-    this.fragmentUUID = fragmentUUID;
+    this.indexUUID = indexUUID;
     this.indexName = indexName;
     this.columns = columns;
     this.indexType = indexType;
     this.indexParams = indexParams;
   }
 
-  public Optional<String> getFragmentUUID() {
-    return Optional.ofNullable(fragmentUUID);
+  public Optional<String> getIndexUUID() {
+    return Optional.ofNullable(indexUUID);
   }
 
   public Optional<List<Integer>> getFragmentIds() {
@@ -90,7 +90,7 @@ public class IndexOptions {
     private boolean replace = false;
     private boolean train = true;
     private List<Integer> fragmentIds = null;
-    private String fragmentUUID = null;
+    private String indexUUID = null;
     private String indexName = null;
     private final List<String> columns;
     private final IndexType indexType;
@@ -140,10 +140,10 @@ public class IndexOptions {
      * A UUID to use for fragment-level distributed indexing multiple fragment-level indices need to
      * share UUID for later merging. If not provided, a new UUID will be generated.
      *
-     * @param fragmentUUID fragmentUUID option
+     * @param indexUUID indexUUID option
      */
-    public Builder withFragmentUUID(String fragmentUUID) {
-      this.fragmentUUID = fragmentUUID;
+    public Builder withIndexUUID(String indexUUID) {
+      this.indexUUID = indexUUID;
       return this;
     }
 
@@ -160,7 +160,7 @@ public class IndexOptions {
 
     public IndexOptions build() {
       return new IndexOptions(
-          indexName, columns, indexType, indexParams, replace, train, fragmentIds, fragmentUUID);
+          indexName, columns, indexType, indexParams, replace, train, fragmentIds, indexUUID);
     }
   }
 }
