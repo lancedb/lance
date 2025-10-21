@@ -1416,6 +1416,13 @@ impl Dataset {
         &self.object_store
     }
 
+    /// Returns the storage options used when opening this dataset, if any.
+    pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref())
+    }
+
     pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
