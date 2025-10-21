@@ -95,7 +95,6 @@ use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::error::box_error;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
@@ -106,6 +105,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
+use lance_core::box_error;
 pub use lance_core::ROW_ID;
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
@@ -2598,12 +2598,12 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::copy_test_data_to_tmp;
+    use lance_arrow::FixedSizeListArrayExt;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
