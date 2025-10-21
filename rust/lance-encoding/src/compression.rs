@@ -1282,50 +1282,42 @@ mod tests {
     #[test]
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn test_general_block_decompression_fixed_width_v2_2() {
-        use crate::compression::BlockCompressor;
-        use crate::encodings::physical::block::GeneralBufferCompressor;
-        use crate::encodings::physical::value::ValueEncoder;
+        // Request general compression via the write path (2.2 requirement) and ensure the read path mirrors it.
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some(if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string()),
+                ..Default::default()
+            },
+        );
 
-        // General block compression is enabled for file version 2.2; ensure fixed-width blocks read correctly.
-        let num_values = 16u64;
-        let mut raw = Vec::new();
-        for i in 0..num_values {
-            raw.extend_from_slice(&(i as u32).to_le_bytes());
+        let mut strategy = DefaultCompressionStrategy::with_params(params);
+        strategy.version = LanceFileVersion::V2_2;
+
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 1024);
+        let DataBlock::FixedWidth(expected_block) = &data else {
+            panic!("expected fixed width block");
+        };
+        let expected_bits = expected_block.bits_per_value;
+        let expected_num_values = expected_block.num_values;
+        let num_values = expected_num_values;
+
+        let (compressor, encoding) = strategy
+            .create_block_compressor(&field, &data)
+            .expect("general compression should be selected");
+        match encoding.compression.as_ref() {
+            Some(Compression::General(_)) => {}
+            other => panic!("expected general compression, got {:?}", other),
         }
 
-        let expected_block = FixedWidthDataBlock {
-            data: LanceBuffer::from(raw),
-            bits_per_value: 32,
-            num_values,
-            block_info: BlockInfo::new(),
-        };
-
-        let raw_encoded = BlockCompressor::compress(
-            &ValueEncoder::default(),
-            DataBlock::FixedWidth(expected_block.clone()),
-        )
-        .expect("value compression should succeed");
-
-        let compression_config = if cfg!(feature = "lz4") {
-            CompressionConfig::new(CompressionScheme::Lz4, None)
-        } else {
-            CompressionConfig::new(CompressionScheme::Zstd, Some(0))
-        };
-
-        let compressor = GeneralBufferCompressor::get_compressor(compression_config)
-            .expect("general compressor must be available");
-        let mut compressed = Vec::new();
-        compressor
-            .compress(raw_encoded.as_ref(), &mut compressed)
-            .expect("general compression should succeed");
-        let compressed_buffer = LanceBuffer::from(compressed);
-
-        let inner_encoding = ProtobufUtils21::flat(32, None);
-        let general_encoding = ProtobufUtils21::wrapped(compression_config, inner_encoding)
-            .expect("should wrap encoding for general compression");
+        let compressed_buffer = compressor
+            .compress(data.clone())
+            .expect("write path general compression should succeed");
 
         let decompressor = DefaultDecompressionStrategy::default()
-            .create_block_decompressor(&general_encoding)
+            .create_block_decompressor(&encoding)
             .expect("general block decompressor should be created");
 
         let decoded = decompressor
@@ -1333,7 +1325,11 @@ mod tests {
             .expect("decompression should succeed");
 
         match decoded {
-            DataBlock::FixedWidth(block) => assert_eq!(block, expected_block),
+            DataBlock::FixedWidth(block) => {
+                assert_eq!(block.bits_per_value, expected_bits);
+                assert_eq!(block.num_values, expected_num_values);
+                assert_eq!(block.data.as_ref(), expected_block.data.as_ref());
+            }
             _ => panic!("expected fixed width block"),
         }
     }
