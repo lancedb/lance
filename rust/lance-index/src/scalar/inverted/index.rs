@@ -1401,7 +1401,7 @@ impl PostingListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        Ok(self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
+        let positions = self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
             let batch = self
                 .reader
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
@@ -1417,9 +1417,8 @@ impl PostingListReader {
             Result::Ok(Positions(batch[POSITION_COL]
                 .as_list::<i32>()
                 .clone()))
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))?.as_ref()
-            .clone()
-            .0)
+        }).await?;
+        Ok(positions.0.clone())
     }
 
     fn posting_list_range(&self, token_id: u32) -> Range<usize> {

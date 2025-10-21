@@ -175,33 +175,59 @@ impl ProjectionPlan {
     ///
     /// This is something that cannot be done easily using expressions.
     pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
-        // Calculate the physical projection directly from the schema
-        //
-        // The _rowid and _rowaddr columns will be recognized and added to the physical projection
-        //
-        // Any columns with an id of -1 (e.g. _rowoffset) will be ignored
-        let mut physical_projection = Projection::empty(base).union_schema(projection);
+        // Separate data columns from system columns
+        // System columns (_rowid, _rowaddr, etc.) are handled via flags in Projection,
+        // not as fields in the Schema
+        let mut data_fields = Vec::new();
+        let mut with_row_id = false;
+        let mut with_row_addr = false;
         let mut must_add_row_offset = false;
-        // Now calculate the output expressions.  This will only reorder top-level columns.  We don't
-        // support reordering nested fields.
+
+        for field in projection.fields.iter() {
+            if lance_core::is_system_column(&field.name) {
+                // Handle known system columns that can be included in projections
+                if field.name == ROW_ID {
+                    with_row_id = true;
+                    must_add_row_offset = true;
+                } else if field.name == ROW_ADDR {
+                    with_row_addr = true;
+                    must_add_row_offset = true;
+                }
+                // Note: Other system columns like _rowoffset are computed differently
+                // and shouldn't appear in the schema at this point
+            } else {
+                // Regular data column - validate it exists in base schema
+                if base.schema().field(&field.name).is_none() {
+                    return Err(Error::io(
+                        format!("Column '{}' not found in schema", field.name),
+                        location!(),
+                    ));
+                }
+                data_fields.push(field.clone());
+            }
+        }
+
+        // Create a schema with only data columns for the physical projection
+        let data_schema = Schema {
+            fields: data_fields,
+            metadata: projection.metadata.clone(),
+        };
+
+        // Calculate the physical projection from data columns only
+        let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
+        physical_projection.with_row_id = with_row_id;
+        physical_projection.with_row_addr = with_row_addr;
+
+        // Build output expressions preserving the original order (including system columns)
         let exprs = projection
             .fields
             .iter()
-            .map(|f| {
-                if f.name == ROW_ADDR {
-                    must_add_row_offset = true;
-                    physical_projection.with_row_addr = true;
-                }
-                if f.name == ROW_ID {
-                    must_add_row_offset = true;
-                    physical_projection.with_row_id = true;
-                }
-                OutputColumn {
-                    expr: Expr::Column(Column::from_name(&f.name)),
-                    name: f.name.clone(),
-                }
+            .map(|f| OutputColumn {
+                expr: Expr::Column(Column::from_name(&f.name)),
+                name: f.name.clone(),
             })
             .collect::<Vec<_>>();
+
         Ok(Self {
             physical_projection,
             requested_output_expr: exprs,
