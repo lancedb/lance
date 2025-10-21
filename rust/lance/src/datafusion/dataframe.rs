@@ -22,6 +22,19 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+/// A [TableProvider] for Lance datasets.
+///
+/// Note: Datafusion has no concept of "system columns".  As a result, you must specify
+/// which schema columns should be included in the table's schema when you create the
+/// provider.
+///
+/// This table provider should support:
+///  - Filter pushdown
+///  - Limit pushdown
+///  - Projection pushdown
+///
+/// Note that LanceDB also has a TableProvider implementation that should be preferred
+/// if you are working in LanceDB.
 #[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
