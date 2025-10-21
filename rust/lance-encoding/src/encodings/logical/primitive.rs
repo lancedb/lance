@@ -4222,10 +4222,7 @@ impl PrimitiveStructuralEncoder {
 
             let requires_full_zip_packed_struct =
                 if let DataBlock::Struct(ref struct_data_block) = data_block {
-                    struct_data_block
-                        .children
-                        .iter()
-                        .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+                    struct_data_block.has_variable_width_child()
                 } else {
                     false
                 };

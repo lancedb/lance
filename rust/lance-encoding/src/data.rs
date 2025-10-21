@@ -681,6 +681,12 @@ impl StructDataBlock {
             .collect()
     }
 
+    pub fn has_variable_width_child(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+    }
+
     pub fn data_size(&self) -> u64 {
         self.children
             .iter()

@@ -437,11 +437,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
             DataBlock::Struct(struct_data_block) => {
                 // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
                 // just being cautious here.
-                if struct_data_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                {
+                if struct_data_block.has_variable_width_child() {
                     return Err(Error::invalid_input(
                         "Packed struct mini-block encoding supports only fixed-width children",
                         location!(),
@@ -487,10 +483,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         location!(),
                     ));
                 }
-                let has_variable_child = struct_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)));
+                let has_variable_child = struct_block.has_variable_width_child();
                 if has_variable_child {
                     if self.version < LanceFileVersion::V2_2 {
                         return Err(Error::NotSupported {
