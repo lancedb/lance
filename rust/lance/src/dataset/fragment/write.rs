@@ -197,7 +197,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let version = params.data_storage_version.clone().unwrap_or_default();
+        let version = params.data_storage_version.unwrap_or_default();
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
