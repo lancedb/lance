@@ -52,6 +52,7 @@ from .lance import (
     CleanupStats,
     Compaction,
     CompactionMetrics,
+    DatasetBasePath,
     LanceSchema,
     ScanStatistics,
     _Dataset,
@@ -157,6 +158,17 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         a "matched" row to become a "not matched" row.
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
+
+    def when_matched_fail(self) -> "MergeInsertBuilder":
+        """
+        Configure the operation to fail if any rows match
+
+        After this method is called, when the merge insert operation executes,
+        if there are any rows that match between the source table and the target table,
+        the entire operation will fail with an exception.
+        This is useful for ensuring that no existing rows are overwritten or modified.
+        """
+        return super(MergeInsertBuilder, self).when_matched_fail()
 
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
@@ -2055,6 +2067,32 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
+    def add_bases(
+        self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
+    ):
+        """
+        Add new base paths to the dataset for multi-base storage.
+
+        This method allows you to register additional storage locations (bases)
+        that can be used for future data writes. The base paths are added to the
+        dataset's manifest and can be referenced by name in subsequent write operations.
+
+        Parameters
+        ----------
+        new_bases : list[DatasetBasePath]
+            A list of DatasetBasePath objects representing the new storage locations
+            to add. Each base path should have a unique name and path.
+        transaction_properties : Optional[Dict[str, str]]
+            Optional key-value pairs for audit metadata.
+
+        Returns
+        -------
+        LanceDataset
+            Returns self to allow method chaining.
+        """
+        self._ds.add_bases(new_bases, transaction_properties)
+        return self
+
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
@@ -2251,6 +2289,11 @@ class LanceDataset(pa.dataset.Dataset):
         remove_stop_words: bool, default True
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
+        custom_stop_words: Optional[List[str]], default None
+            This is for the ``INVERTED`` index, only used when `remove_stop_words` is
+            true.
+            Users can specify their customised stop words, if none, the built-in stop
+            words for the specified language will be used.
         ascii_folding: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
@@ -2404,7 +2447,6 @@ class LanceDataset(pa.dataset.Dataset):
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
-        one_pass_ivfpq: bool = False,
         train: bool = True,
         *,
         target_partition_size: Optional[int] = None,
@@ -2473,8 +2515,6 @@ class LanceDataset(pa.dataset.Dataset):
             Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
             values are present (and otherwise will not). Disables the null filter used
             for nullable columns. Obtains a small speed boost.
-        one_pass_ivfpq: bool
-            Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
         train : bool, default True
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
@@ -2642,14 +2682,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
             )
-        if index_type != "IVF_PQ" and one_pass_ivfpq:
-            raise ValueError(
-                f'one_pass_ivfpq requires index_type="IVF_PQ", got {index_type}'
-            )
 
         # Handle timing for various parts of accelerated builds
         timers = {}
-        if one_pass_ivfpq and accelerator is not None:
+        if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
                 one_pass_train_ivf_pq_on_accelerator,
@@ -2758,49 +2794,6 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
-            if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
-                LOGGER.info("Computing new precomputed partition dataset")
-                # Use accelerator to train ivf centroids
-                from .vector import (
-                    compute_partitions,
-                    train_ivf_centroids_on_accelerator,
-                )
-
-                timers["ivf_train:start"] = time.time()
-                if num_partitions is None:
-                    num_rows = self.count_rows()
-                    num_partitions = _target_partition_size_to_num_partitions(
-                        num_rows, target_partition_size
-                    )
-                ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_train:end"] = time.time()
-                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
-                LOGGER.info("ivf training time: %ss", ivf_train_time)
-                timers["ivf_assign:start"] = time.time()
-                num_sub_vectors_cur = None
-                if "PQ" in index_type and pq_codebook is None:
-                    # compute residual subspace columns in the same pass
-                    num_sub_vectors_cur = num_sub_vectors
-                partitions_file = compute_partitions(
-                    self,
-                    column[0],
-                    kmeans,
-                    batch_size=20480,
-                    num_sub_vectors=num_sub_vectors_cur,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_assign:end"] = time.time()
-                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
-                LOGGER.info("ivf transform time: %ss", ivf_assign_time)
-                kwargs["precomputed_partitions_file"] = partitions_file
-
             if (ivf_centroids is None) and (pq_codebook is not None):
                 raise ValueError(
                     "ivf_centroids must be specified when pq_codebook is provided"
@@ -2839,58 +2832,6 @@ class LanceDataset(pa.dataset.Dataset):
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
-
-            if (
-                pq_codebook is None
-                and accelerator is not None
-                and "precomputed_partitions_file" in kwargs
-                and not one_pass_ivfpq
-            ):
-                LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
-                partitions_file = kwargs["precomputed_partitions_file"]
-                del kwargs["precomputed_partitions_file"]
-
-                partitions_ds = LanceDataset(partitions_file)
-                # Use accelerator to train pq codebook
-                from .vector import (
-                    compute_pq_codes,
-                    train_pq_codebook_on_accelerator,
-                )
-
-                timers["pq_train:start"] = time.time()
-                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
-                    partitions_ds,
-                    metric,
-                    accelerator=accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    dtype=element_type.to_pandas_dtype(),
-                )
-                timers["pq_train:end"] = time.time()
-                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
-                LOGGER.info("pq training time: %ss", pq_train_time)
-                timers["pq_assign:start"] = time.time()
-                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
-                    partitions_ds,
-                    kmeans_list,
-                    batch_size=20480,
-                )
-                timers["pq_assign:end"] = time.time()
-                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
-                LOGGER.info("pq transform time: %ss", pq_assign_time)
-                # Save disk space
-                if precomputed_partition_dataset is not None and os.path.exists(
-                    partitions_file
-                ):
-                    LOGGER.info(
-                        "Temporary partitions file stored at %s,"
-                        "you may want to delete it.",
-                        partitions_file,
-                    )
-
-                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                    shuffle_output_dir, "data"
-                )
 
             if pq_codebook is not None:
                 # User provided IVF centroids
@@ -3033,6 +2974,8 @@ class LanceDataset(pa.dataset.Dataset):
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
+        *,
+        commit_message: Optional[str] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3089,6 +3032,9 @@ class LanceDataset(pa.dataset.Dataset):
             the future.
         max_retries : int
             The maximum number of retries to perform when committing the dataset.
+        commit_message: str, optional
+            A message to associate with this commit. This message will be stored in the
+            dataset's metadata and can be retrieved using read_transaction().
 
         Returns
         -------
@@ -3143,6 +3089,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "Overwrite and Restore"
             )
         if isinstance(operation, Transaction):
+            if commit_message is not None:
+                raise ValueError(
+                    "commit_message is not supported when calling commit with "
+                    "a Transaction.  Set the message on the transaction properties "
+                    "instead."
+                )
             new_ds = _Dataset.commit_transaction(
                 base_uri,
                 operation,
@@ -3163,6 +3115,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
+                commit_message=commit_message,
             )
         else:
             raise TypeError(
@@ -3282,6 +3235,46 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.validate()
 
+    def shallow_clone(
+        self,
+        target_path: Union[str, Path],
+        version: Union[int, str, Tuple[int, str]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Shallow clone the specified version into a new dataset at target_path.
+
+        This operation copies only the dataset metadata and references, without
+        rewriting data files.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        version : int, str or Tuple[int, str]
+            The source version to clone. An integer specifies a version number in main;
+            a string specifies a tag name; a Tuple[int, str] specifies a version number
+            in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the new dataset (e.g., credentials,
+            endpoints).
+
+        Returns
+        -------
+        LanceDataset
+            A new LanceDataset representing the shallow-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        self._ds.shallow_clone(target_uri, version, storage_options)
+
+        # Open and return a fresh dataset at the target URI to avoid manual overrides
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
     def migrate_manifest_paths_v2(self):
         """
         Migrate the manifest paths to the new format.
@@ -3358,7 +3351,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.read_transaction(version)
 
-    def get_transactions(self, recent_transactions=10) -> Optional[List[Transaction]]:
+    def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
     def sql(self, sql: str) -> "SqlQueryBuilder":
@@ -3386,26 +3379,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         return SqlQueryBuilder(self._ds.sql(sql))
-
-    def diff_meta(self, compared_version: int) -> List[Transaction]:
-        """
-        Get the transaction list between current version and compared version
-        as metadata differences.
-
-        Parameters
-        ----------
-        compared_version : int
-            The version to compare against, the compared_version must be greater than 0
-            and less than the current version.
-            Note that the compared_version may not exist in the dataset due to
-            clean-up action, in which case it would throw a `VersionNotFound` error.
-
-        Returns
-        -------
-        List[Transaction]
-            List of transactions representing the differences
-        """
-        return self._ds.diff_meta(compared_version)
 
     @property
     def optimize(self) -> "DatasetOptimizer":
@@ -4999,6 +4972,8 @@ def write_dataset(
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
+    initial_bases: Optional[List[DatasetBasePath]] = None,
+    target_bases: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5077,6 +5052,19 @@ def write_dataset(
         and can be retrieved using read_transaction().
         If both `commit_message` and `properties` are provided, `commit_message` will
         override any "lance.commit.message" key in `properties`.
+    initial_bases: list of DatasetBasePath, optional
+        New base paths to register in the manifest. Only used in **CREATE mode**.
+        Cannot be specified in APPEND or OVERWRITE modes.
+    target_bases: list of str, optional
+        References to base paths where data should be written. Can be
+        specified in all modes.
+
+        Each string is resolved by trying to match:
+        1. Base name (e.g., "primary", "archive") from registered bases
+        2. Base path URI (e.g., "s3://bucket1/data")
+
+        **CREATE mode**: References must match bases in `initial_bases`
+        **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -5118,6 +5106,8 @@ def write_dataset(
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
+        "initial_bases": initial_bases,
+        "target_bases": target_bases,
     }
 
     if commit_lock:

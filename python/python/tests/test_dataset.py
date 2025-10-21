@@ -31,6 +31,7 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
+from lance.file import stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
@@ -550,6 +551,88 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_rowid_rowaddr(tmp_path: Path):
+    sample_size = 10
+    table1 = pa.table({"a": range(1000), "b": range(1000)})
+    base_dir = tmp_path / "test_take_rowid_rowaddr"
+    lance.write_dataset(
+        table1, base_dir, enable_stable_row_ids=False, max_rows_per_file=50
+    )
+    dataset = lance.dataset(base_dir)
+    total_rows = len(dataset)
+    sampled_indices = random.sample(range(total_rows), min(sample_size, total_rows))
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr", "_rowid"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr", "b"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
 def test_take_duplicate_index(tmp_path: Path, indices: List[int]):
     table = pa.table({"x": range(24)})
@@ -936,10 +1019,8 @@ def test_analyze_scan(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(table, tmp_path)
     plan = dataset.scanner().analyze_plan()
-    # The bytes_read part might get brittle if we change file versions a lot
-    # future us are free to ignore that part.
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=3643.*iops=3.*requests=3.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -949,7 +1030,7 @@ def test_analyze_take(tmp_path: Path):
     dataset.create_scalar_index("a", "BTREE")
     plan = dataset.scanner(filter="a = 50").analyze_plan()
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=16.*iops=2.*requests=2.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -2126,6 +2207,53 @@ def test_merge_insert_vector_column(tmp_path: Path):
 
     assert dataset.to_table().sort_by("key") == expected
     check_merge_stats(merge_dict, (1, 1, 0))
+
+
+def test_merge_insert_when_matched_fail(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # No matching rows should succeed
+    new_data = pa.table({"id": [6, 7, 8], "val": [60, 70, 80]})
+    result = (
+        ds.merge_insert("id")
+        .when_matched_fail()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+    assert result["num_deleted_rows"] == 0
+
+    # Matching rows should fail
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    new_data = pa.table({"id": [1, 2, 9], "val": [100, 200, 900]})
+    with pytest.raises(Exception):
+        ds.merge_insert("id").when_matched_fail().when_not_matched_insert_all().execute(
+            new_data
+        )
+
+    # Test with execute_uncommitted
+    # This should raise an exception because there are matching rows
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    with pytest.raises(Exception):
+        transaction, _ = (
+            ds.merge_insert("id")
+            .when_matched_fail()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(new_data)
+        )
+
+    # Verify that the data remains unchanged after failed operation
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    unchanged_ds = lance.dataset(tmp_path / "dataset")
+    unchanged_data = unchanged_ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    assert unchanged_data == expected
 
 
 def test_merge_insert_large():
@@ -3508,7 +3636,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
-    assert dataset.data_storage_version == "2.0"
+    assert dataset.data_storage_version == stable_version()
 
     # Append will write v2 if dataset was originally created with v2
     dataset = lance.write_dataset(table, tmp_path, mode="append")
@@ -3650,9 +3778,9 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
-EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
-EXPECTED_MAJOR_VERSION = 2
-EXPECTED_MINOR_VERSION = 0
+EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
+EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
+EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
 def test_stats(tmp_path: Path):
@@ -3667,9 +3795,9 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 32
+    assert data_stats.fields[0].bytes_on_disk > 0
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk > 0
 
     dataset.add_columns({"z": "y"})
 
@@ -3678,11 +3806,11 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 40
+    assert data_stats.fields[0].bytes_on_disk > 0
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk > 0
     assert data_stats.fields[2].id == 2
-    assert data_stats.fields[2].bytes_on_disk == 56  # 16 bytes data + 40 bytes offset
+    assert data_stats.fields[2].bytes_on_disk > 0
 
 
 def test_default_storage_version(tmp_path: Path):
@@ -4129,49 +4257,21 @@ def test_commit_message_and_get_properties(tmp_path):
     # The latest transaction from delete should have no properties.
     assert transactions[0].transaction_properties == {}
 
-
-def test_diff_meta(tmp_path: Path):
-    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
-    lance.write_dataset(table1, tmp_path)
-
-    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
-    dataset = lance.write_dataset(
-        table2, tmp_path, mode="append", commit_message="Append data"
+    # 4. Test case: Commit using the commit method instead of write_dataset
+    frags = lance.fragment.write_fragments(pa.table({"a": [5]}), dataset.uri)
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Append(frags),
+        read_version=dataset.version,
+        commit_message="Use Dataset.commit",
     )
 
-    dataset.delete("id = 2")
-
-    diff = dataset.diff_meta(1)
-
-    assert len(diff) == 2
-
-    for transaction in diff:
-        assert hasattr(transaction, "read_version")
-        assert hasattr(transaction, "transaction_properties")
-
-    dataset_v2 = lance.dataset(tmp_path, version=2)
-    diff_v2 = dataset_v2.diff_meta(1)
-
-    assert len(diff_v2) == 1
-
-    # Test diff with current version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version)
-
-    # Test diff with future version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version + 1)
-
-    # Test diff with non-existent version after cleanup
-    moment = datetime.now()
-    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
-    dataset = lance.write_dataset(table3, tmp_path, mode="append")
-
-    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-
-    # Now try to diff with the cleaned up version 1 (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(1)
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 4
+    assert (
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "Use Dataset.commit"
+    )
 
 
 def test_table_metadata_updates(tmp_path: Path):
@@ -4570,3 +4670,44 @@ def test_update_config_transaction(tmp_path: Path):
     assert table_metadata == {
         "only_key": "only_value"
     }  # All previous metadata should be gone
+
+
+def test_shallow_clone(tmp_path: Path):
+    """Shallow clone a filesystem dataset by version number and by tag.
+
+    Arrange:
+      - Create a source dataset at a filesystem path with two versions
+        (create v1, then overwrite to v2).
+      - Create a tag "v1" pointing to version 1.
+    Act:
+      - Shallow clone by version=2 (numeric) to one destination.
+      - Shallow clone by version="v1" (tag) to another destination.
+    Assert:
+      - Re-open cloned datasets and verify their tables equal the source
+        version they were cloned from (schema and record count).
+
+    This test uses pathlib paths and tmp_path for cross-platform compatibility
+    and should not skip on Windows.
+    """
+    # Prepare source dataset with two versions
+    src_dir = tmp_path / "shallow_src"
+    table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
+    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+
+    # Create a tag pointing to version 1
+    ds.tags.create("v1", 1)
+
+    # Clone by numeric version (v2) and assert equality
+    clone_v2_dir = tmp_path / "clone_v2"
+    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, version=2)
+    assert ds_clone_v2.to_table() == table_v2
+    assert lance.dataset(clone_v2_dir).to_table() == table_v2
+
+    # Clone by tag (v1) and assert equality
+    clone_v1_tag_dir = tmp_path / "clone_v1_tag"
+    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, version="v1")
+    assert ds_clone_v1_tag.to_table() == table_v1
+    assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1

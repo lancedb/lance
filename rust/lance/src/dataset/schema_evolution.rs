@@ -695,6 +695,7 @@ mod test {
     use super::*;
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Fields as ArrowFields;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use rstest::rstest;
 
@@ -717,8 +718,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -807,8 +808,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -911,8 +912,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -966,6 +967,8 @@ mod test {
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
                     }))
                 } else {
                     Ok(None)
@@ -1077,8 +1080,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1154,8 +1157,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1226,8 +1229,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1354,8 +1357,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
@@ -1556,8 +1559,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1621,8 +1624,8 @@ mod test {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1732,8 +1735,8 @@ mod test {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1789,8 +1792,8 @@ mod test {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,

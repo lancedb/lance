@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
@@ -10,7 +11,7 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
@@ -166,10 +167,23 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fragments = extract_vec(&ob.getattr("fragments")?)?;
 
+                let initial_bases = ob
+                    .getattr("initial_bases")
+                    .ok()
+                    .and_then(|attr| attr.extract::<Option<Vec<DatasetBasePath>>>().ok())
+                    .flatten()
+                    .map(|py_bases| {
+                        py_bases
+                            .into_iter()
+                            .map(BasePath::from)
+                            .collect::<Vec<BasePath>>()
+                    });
+
                 let op = Operation::Overwrite {
                     schema,
                     fragments,
                     config_upsert_values: None,
+                    initial_bases,
                 };
                 Ok(Self(op))
             }
@@ -484,6 +498,20 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     };
 
                     cls.call1((config, table_meta, schema_meta, field_meta))
+                } else {
+                    let base_op = namespace.getattr("BaseOperation")?;
+                    base_op.call0()
+                }
+            }
+            Operation::UpdateBases { ref new_bases } => {
+                if let Ok(cls) = namespace.getattr("UpdateBases") {
+                    use crate::dataset::DatasetBasePath;
+                    let new_bases_py: Vec<DatasetBasePath> = new_bases
+                        .iter()
+                        .map(|bp| DatasetBasePath::from(bp.clone()))
+                        .collect();
+                    let new_bases_list = pyo3::types::PyList::new(py, new_bases_py)?;
+                    cls.call1((new_bases_list,))
                 } else {
                     let base_op = namespace.getattr("BaseOperation")?;
                     base_op.call0()

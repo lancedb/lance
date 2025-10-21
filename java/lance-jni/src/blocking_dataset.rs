@@ -24,7 +24,7 @@ use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
-use lance::dataset::refs::TagContents;
+use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
@@ -182,27 +182,27 @@ impl BlockingDataset {
     }
 
     pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
-        let tags = RT.block_on(self.inner.tags.list())?;
+        let tags = RT.block_on(self.inner.tags().list())?;
         Ok(tags)
     }
 
     pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.create(tag, version))?;
+        RT.block_on(self.inner.tags().create(tag, version))?;
         Ok(())
     }
 
     pub fn delete_tag(&mut self, tag: &str) -> Result<()> {
-        RT.block_on(self.inner.tags.delete(tag))?;
+        RT.block_on(self.inner.tags().delete(tag))?;
         Ok(())
     }
 
     pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.update(tag, version))?;
+        RT.block_on(self.inner.tags().update(tag, version))?;
         Ok(())
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags.get_version(tag))?;
+        let version = RT.block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
     }
 
@@ -268,6 +268,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -281,6 +282,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            data_storage_version,
             storage_options_obj
         )
     )
@@ -296,6 +298,7 @@ fn inner_create_with_ffi_schema<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -311,6 +314,7 @@ fn inner_create_with_ffi_schema<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -341,6 +345,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -354,6 +359,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            data_storage_version,
             storage_options_obj
         )
     )
@@ -369,6 +375,7 @@ fn inner_create_with_ffi_stream<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -381,6 +388,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -395,6 +403,7 @@ fn create_dataset<'local>(
     max_bytes_per_file: JObject,
     mode: JObject,
     enable_stable_row_ids: JObject,
+    data_storage_version: JObject,
     storage_options_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
@@ -407,6 +416,7 @@ fn create_dataset<'local>(
         &max_bytes_per_file,
         &mode,
         &enable_stable_row_ids,
+        &data_storage_version,
         &storage_options_obj,
     )?;
 
@@ -564,6 +574,7 @@ pub fn inner_commit_overwrite<'local>(
         fragments,
         schema,
         config_upsert_values: None,
+        initial_bases: None,
     };
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;
@@ -995,6 +1006,79 @@ fn inner_restore(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.restore()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeShallowClone<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    target_path: JString,
+    reference: JObject,
+    storage_options: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_shallow_clone(
+            &mut env,
+            java_dataset,
+            target_path,
+            reference,
+            storage_options
+        )
+    )
+}
+
+fn inner_shallow_clone<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    target_path: JString,
+    reference: JObject,
+    storage_options: JObject,
+) -> Result<JObject<'local>> {
+    let target_path_str = target_path.extract(env)?;
+    let storage_options = env.get_optional(&storage_options, |env, map_obj| {
+        let jmap = JMap::from_env(env, map_obj)?;
+        to_rust_map(env, &jmap)
+    })?;
+
+    let reference = {
+        let version_number = env.get_optional_u64_from_method(&reference, "getVersionNumber")?;
+        let tag_name = env.get_optional_string_from_method(&reference, "getTagName")?;
+        let branch_name = env.get_optional_string_from_method(&reference, "getBranchName")?;
+        match (version_number, branch_name, tag_name) {
+            (Some(version_number), branch_name, None) => {
+                Ref::Version(branch_name, Some(version_number))
+            }
+            (None, None, Some(tag_name)) => Ref::Tag(tag_name),
+            _ => {
+                return Err(Error::input_error(
+                    "One of (optional branch, version_number) and tag must be specified"
+                        .to_string(),
+                ))
+            }
+        }
+    };
+
+    let new_ds = {
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        RT.block_on(
+            dataset_guard.inner.shallow_clone(
+                &target_path_str,
+                reference,
+                storage_options
+                    .map(|options| {
+                        Some(ObjectStoreParams {
+                            storage_options: Some(options),
+                            ..Default::default()
+                        })
+                    })
+                    .unwrap_or(None),
+            ),
+        )?
+    };
+
+    BlockingDataset { inner: new_ds }.into_java(env)
 }
 
 #[no_mangle]

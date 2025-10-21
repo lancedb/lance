@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
@@ -15,6 +11,9 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
@@ -22,7 +21,7 @@ use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 use snafu::location;
 
@@ -42,6 +41,9 @@ pub struct Manifest {
 
     /// Dataset version
     pub version: u64,
+
+    /// Branch name, None if the dataset is the main branch.
+    pub branch: Option<String>,
 
     /// Version of the writer library that wrote this manifest.
     pub writer_version: Option<WriterVersion>,
@@ -70,7 +72,7 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far  
+    /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
@@ -182,6 +184,7 @@ impl Manifest {
             schema,
             local_schema,
             version: 1,
+            branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -217,6 +220,7 @@ impl Manifest {
             schema,
             local_schema,
             version: previous.version + 1,
+            branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -240,11 +244,13 @@ impl Manifest {
     /// Performs a shallow_clone of the manifest entirely in memory without:
     /// - Any persistent storage operations
     /// - Modifications to the original data
+    /// - If the shallow clone is for branch, ref_name is the source branch
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
         ref_path: String,
         ref_base_id: u32,
+        branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
         let cloned_fragments = self
@@ -272,6 +278,7 @@ impl Manifest {
             schema: self.schema.clone(),
             local_schema: self.local_schema.clone(),
             version: self.version,
+            branch: branch_name,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
@@ -289,12 +296,7 @@ impl Manifest {
             blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
-                let base_path = BasePath {
-                    id: ref_base_id,
-                    name: ref_name,
-                    is_dataset_root: true,
-                    path: ref_path,
-                };
+                let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
                 base_paths.insert(ref_base_id, base_path);
                 base_paths
             },
@@ -568,12 +570,47 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasePath {
     pub id: u32,
     pub name: Option<String>,
     pub is_dataset_root: bool,
+    /// The full URI string (e.g., "s3://bucket/path")
     pub path: String,
+}
+
+impl BasePath {
+    /// Create a new BasePath
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique identifier for this base path
+    /// * `path` - Full URI string (e.g., "s3://bucket/path", "/local/path")
+    /// * `name` - Optional human-readable name for this base
+    /// * `is_dataset_root` - Whether this is the dataset root or a data-only base
+    pub fn new(id: u32, path: String, name: Option<String>, is_dataset_root: bool) -> Self {
+        Self {
+            id,
+            name,
+            is_dataset_root,
+            path,
+        }
+    }
+
+    /// Extract the object store path from this BasePath's URI.
+    ///
+    /// This is a synchronous operation that parses the URI without initializing an object store.
+    pub fn extract_path(&self, registry: Arc<ObjectStoreRegistry>) -> Result<Path> {
+        ObjectStore::extract_path_from_uri(registry, &self.path)
+    }
+}
+
+impl DeepSizeOf for BasePath {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.name.deep_size_of_children(context)
+            + self.path.deep_size_of_children(context) * 2
+            + size_of::<bool>()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -629,11 +666,21 @@ impl WriterVersion {
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
-        let mut parts = self.version.split('.');
+        // First split by '-' to separate the version from the pre-release tag
+        let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
+            (
+                &self.version[..dash_idx],
+                Some(&self.version[dash_idx + 1..]),
+            )
+        } else {
+            (self.version.as_str(), None)
+        };
+
+        let mut parts = version_part.split('.');
         let major = parts.next().unwrap_or("0").parse().ok()?;
         let minor = parts.next().unwrap_or("0").parse().ok()?;
         let patch = parts.next().unwrap_or("0").parse().ok()?;
-        let tag = parts.next();
+
         Some((major, minor, patch, tag))
     }
 
@@ -657,7 +704,7 @@ impl WriterVersion {
             VersionPart::Patch => (parts.0, parts.1, parts.2 + 1, tag),
         };
         let new_version = if let Some(tag) = tag {
-            format!("{}.{}.{}.{}", new_parts.0, new_parts.1, new_parts.2, tag)
+            format!("{}.{}.{}-{}", new_parts.0, new_parts.1, new_parts.2, tag)
         } else {
             format!("{}.{}.{}", new_parts.0, new_parts.1, new_parts.2)
         };
@@ -694,6 +741,12 @@ impl ProtoStruct for Manifest {
 
 impl From<pb::BasePath> for BasePath {
     fn from(p: pb::BasePath) -> Self {
+        Self::new(p.id, p.path, p.name, p.is_dataset_root)
+    }
+}
+
+impl From<BasePath> for pb::BasePath {
+    fn from(p: BasePath) -> Self {
         Self {
             id: p.id,
             name: p.name,
@@ -764,6 +817,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             schema,
             local_schema,
             version: p.version,
+            branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -819,6 +873,7 @@ impl From<&Manifest> for pb::Manifest {
                 .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
                 .collect(),
             version: m.version,
+            branch: m.branch.clone(),
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -935,6 +990,15 @@ mod tests {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
         let parts = wv.semver().unwrap();
+
+        // Parse the actual cargo version to check if it has a pre-release tag
+        let cargo_version = env!("CARGO_PKG_VERSION");
+        let expected_tag = if cargo_version.contains('-') {
+            Some(cargo_version.split('-').nth(1).unwrap())
+        } else {
+            None
+        };
+
         assert_eq!(
             parts,
             (
@@ -942,13 +1006,17 @@ mod tests {
                 env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
                 // Unit tests run against (major,minor,patch + 1)
                 env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap() + 1,
-                None
+                expected_tag
             )
         );
+
+        // Verify the base version (without tag) matches CARGO_PKG_VERSION
+        let base_version = cargo_version.split('-').next().unwrap();
         assert_eq!(
             format!("{}.{}.{}", parts.0, parts.1, parts.2 - 1),
-            env!("CARGO_PKG_VERSION")
+            base_version
         );
+
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
             let bumped = wv.bump(*part, false);
             let bumped_parts = bumped.semver_or_panic();
@@ -1020,20 +1088,28 @@ mod tests {
         let fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    vec![0, 1, 2],
+                    None,
+                )],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
-                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
+                    DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
         ];
 

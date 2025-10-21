@@ -666,7 +666,7 @@ impl DatasetIndexExt for Dataset {
                 base_id: None, // Mew merged index file locates in the cloned dataset.
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed_indices.len() {
+            if deltas.len() > res.removed_indices.len() {
                 new_indices.extend(
                     deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
@@ -889,7 +889,7 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
-fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
     indices.retain(|idx| {
         let max_supported_version = idx
             .index_details
@@ -954,7 +954,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     ) -> Result<Option<Arc<MemWalIndex>>>;
 
     /// Gets the fragment reuse index UUID from the current manifest, if it exists
-    fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
+    async fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
 
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
@@ -982,7 +982,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index.as_index());
@@ -1031,7 +1031,7 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index);
@@ -1059,7 +1059,7 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
@@ -1337,7 +1337,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -1361,10 +1361,8 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(Some(index))
     }
 
-    fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
-        // We need to load indices first, but we can't make this async
-        // For now, let's use a synchronous approach by checking if indices are already loaded
-        if let Ok(indices) = futures::executor::block_on(self.load_indices()) {
+    async fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
+        if let Ok(indices) = self.load_indices().await {
             indices
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -1611,10 +1609,10 @@ mod tests {
     use crate::dataset::{ReadParams, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{
-        copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount, StatsHolder,
-    };
+    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::Int32Array;
+    use lance_io::utils::tracking_store::IOTracker;
+    use lance_io::{assert_io_eq, assert_io_lt};
 
     use super::*;
 
@@ -1625,6 +1623,7 @@ mod tests {
     };
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
@@ -1636,7 +1635,6 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
     use std::collections::HashSet;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_recreate_index() {
@@ -1663,8 +1661,8 @@ mod tests {
         )
         .unwrap()];
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
@@ -1712,14 +1710,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_index() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let schema = Schema::new(vec![
             sample_vector_field(),
             Field::new("ints", DataType::Int32, false),
         ]);
         let mut dataset = lance_datagen::rand(&schema)
             .into_dataset(
-                test_dir.path().to_str().unwrap(),
+                &test_dir,
                 FragmentCount::from(1),
                 FragmentRowCount::from(256),
             )
@@ -1766,7 +1764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_index_rows() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 16;
         let column_name = "vec";
         let field = sample_vector_field();
@@ -1781,7 +1779,7 @@ mod tests {
 
         let reader =
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -2001,7 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_ivf_hnsw_sq_delta_indices() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 16;
         let column_name = "vec";
         let field = Field::new(
@@ -2026,7 +2024,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let ivf_params = IvfBuildParams::default();
@@ -2105,15 +2103,13 @@ mod tests {
     async fn test_optimize_fts(#[values(false, true)] with_position: bool) {
         let words = ["apple", "banana", "cherry", "date"];
 
-        let dir = tempdir().unwrap();
+        let dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batch_iterator, &dir, None).await.unwrap();
 
         let params = InvertedIndexParams::default()
             .lower_case(false)
@@ -2298,7 +2294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_too_small_for_pq() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let dimensions = 1536;
 
         let field = Field::new(
@@ -2321,7 +2317,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(1, 8, 96, DistanceType::L2, 1);
@@ -2340,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_bitmap_index() {
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let field = Field::new("tag", DataType::Utf8, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
@@ -2350,7 +2346,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset
             .create_index(
@@ -2374,17 +2370,17 @@ mod tests {
     #[lance_test_macros::test(tokio::test)]
     async fn test_load_indices() {
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(StatsHolder::default());
+        let io_tracker = Arc::new(IOTracker::default());
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
+                object_store_wrapper: Some(io_tracker.clone()),
                 ..Default::default()
             }),
             session: Some(session.clone()),
             ..Default::default()
         };
 
-        let test_dir = tempdir().unwrap();
+        let test_dir = TempStrDir::default();
         let field = Field::new("tag", DataType::Utf8, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
@@ -2394,7 +2390,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -2408,17 +2404,13 @@ mod tests {
             )
             .await
             .unwrap();
-        io_stats.incremental_stats(); // Reset
+        io_tracker.incremental_stats(); // Reset
 
         let indices = dataset.load_indices().await.unwrap();
-        let stats = io_stats.incremental_stats();
+        let stats = io_tracker.incremental_stats();
         // We should already have this cached since we just wrote it.
-        assert_eq!(
-            stats.read_iops, 0,
-            "Read IOPS should be 0. Saw requests: {:?}",
-            stats.requests
-        );
-        assert_eq!(stats.read_bytes, 0);
+        assert_io_eq!(stats, read_iops, 0);
+        assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
         session.index_cache.clear().await; // Clear the cache
@@ -2427,7 +2419,7 @@ mod tests {
             .with_session(session.clone())
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_stats.clone()),
+                    object_store_wrapper: Some(io_tracker.clone()),
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -2436,15 +2428,15 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let stats = io_stats.incremental_stats(); // Reset
-        assert!(stats.read_bytes < 64 * 1024);
+        let stats = io_tracker.incremental_stats(); // Reset
+        assert_io_lt!(stats, read_bytes, 64 * 1024);
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
-        let stats = io_stats.incremental_stats();
-        assert_eq!(stats.read_iops, 0);
-        assert_eq!(stats.read_bytes, 0);
+        let stats = io_tracker.incremental_stats();
+        assert_io_eq!(stats, read_iops, 0);
+        assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices2.len(), 1);
     }
 
@@ -2758,7 +2750,8 @@ mod tests {
         // Use test data created with Lance 0.29.0 (before created_at field was added)
         let test_dir =
             copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
@@ -3347,8 +3340,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_shallow_clone_with_index() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create a schema with both vector and scalar columns
         let dimensions = 16u32;
@@ -3416,14 +3409,14 @@ mod tests {
         let mut current_dataset = dataset;
 
         for round in 1..=clone_rounds {
-            let round_clone_dir = test_dir.path().join(format!("clone_round_{}", round));
-            let round_cloned_uri = round_clone_dir.to_str().unwrap();
+            let round_clone_dir = format!("{}/clone_round_{}", test_dir, round);
+            let round_cloned_uri = &round_clone_dir;
             let tag_name = format!("shallow_clone_test_{}", round);
 
             // Create tag for this round (use current dataset for chain cloning)
             let current_version = current_dataset.version().version;
             current_dataset
-                .tags
+                .tags()
                 .create(&tag_name, current_version)
                 .await
                 .unwrap();
@@ -3697,16 +3690,16 @@ mod tests {
     async fn test_initialize_indices() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use std::collections::HashSet;
-        use tempfile::tempdir;
 
         // Create source dataset with various index types
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Generate test data using lance_datagen (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -3847,14 +3840,14 @@ mod tests {
     async fn test_initialize_indices_with_missing_field() {
         use crate::dataset::Dataset;
         use arrow_array::types::Int32Type;
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
-        use tempfile::tempdir;
 
         // Test that initialize_indices handles missing fields gracefully
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Create source dataset with extra field
         let source_reader = lance_datagen::gen_batch()
@@ -3901,14 +3894,14 @@ mod tests {
         use crate::dataset::Dataset;
         use crate::index::vector::VectorIndexParams;
         use arrow_array::types::{Float32Type, Int32Type};
+        use lance_core::utils::tempfile::TempStrDir;
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
         use lance_linalg::distance::MetricType;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/{}", test_dir, "source");
+        let target_uri = format!("{}/{}", test_dir, "target");
 
         // Create source dataset (need at least 256 rows for PQ training)
         let source_reader = lance_datagen::gen_batch()
@@ -4084,8 +4077,8 @@ mod tests {
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // Test creating index on nested field with dots using quoted syntax
@@ -4189,8 +4182,8 @@ mod tests {
     #[tokio::test]
     async fn test_btree_index_on_nested_field_with_dots() {
         // Test creating BTree index on nested field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested field containing dots
         let schema = Arc::new(Schema::new(vec![
@@ -4300,8 +4293,8 @@ mod tests {
     #[tokio::test]
     async fn test_bitmap_index_on_nested_field_with_dots() {
         // Test creating Bitmap index on nested field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested field containing dots - using low cardinality for bitmap
         let schema = Arc::new(Schema::new(vec![
@@ -4410,8 +4403,8 @@ mod tests {
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 
         // Test creating Inverted index on nested text field with dots in the name
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Create schema with nested text field containing dots
         let schema = Arc::new(Schema::new(vec![

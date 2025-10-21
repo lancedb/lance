@@ -40,14 +40,6 @@ use lance_table::io::commit::{
 use rand::{rng, Rng};
 use snafu::location;
 
-use futures::future::Either;
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::{Error, Result};
-use lance_index::{is_system_index, DatasetIndexExt};
-use log;
-use object_store::path::Path;
-use prost::Message;
-
 use super::ObjectStore;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
@@ -61,6 +53,14 @@ use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
 use crate::session::Session;
 use crate::Dataset;
+use futures::future::Either;
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::{Error, Result};
+use lance_index::{is_system_index, DatasetIndexExt};
+use lance_io::object_store::ObjectStoreRegistry;
+use log;
+use object_store::path::Path;
+use prost::Message;
 
 mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
@@ -109,6 +109,7 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
     metadata_cache: &DSMetadataCache,
+    store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -116,15 +117,14 @@ async fn do_commit_new_dataset(
         ref_name,
         ref_version,
         ref_path,
+        branch_name,
         ..
     } = &transaction.operation
     {
+        let source_base_path =
+            ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
         let source_manifest_location = commit_handler
-            .resolve_version_location(
-                &Path::parse(ref_path.as_str())?,
-                *ref_version,
-                &object_store.inner,
-            )
+            .resolve_version_location(&source_base_path, *ref_version, &object_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
             object_store,
@@ -144,6 +144,7 @@ async fn do_commit_new_dataset(
             ref_name.clone(),
             ref_path.clone(),
             new_base_id,
+            branch_name.clone(),
             transaction_file,
         );
 
@@ -220,6 +221,7 @@ async fn do_commit_new_dataset(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
@@ -228,6 +230,7 @@ pub(crate) async fn commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
+    store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -241,6 +244,7 @@ pub(crate) async fn commit_new_dataset(
             manifest_naming_scheme,
             None,
             metadata_cache,
+            store_registry.clone(),
         )
         .await?;
         Some(blob_manifest.version)
@@ -257,6 +261,7 @@ pub(crate) async fn commit_new_dataset(
         manifest_naming_scheme,
         blob_version,
         metadata_cache,
+        store_registry,
     )
     .await
 }
@@ -993,6 +998,7 @@ mod tests {
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1165,8 +1171,8 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_create_index() {
         // Create a table with two vector columns
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let dimension = 16;
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1297,8 +1303,8 @@ mod tests {
     async fn test_concurrent_writes() {
         for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
             // Create an empty table
-            let test_dir = tempfile::tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_dir = TempStrDir::default();
+            let test_uri = test_dir.as_str();
 
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
@@ -1365,9 +1371,9 @@ mod tests {
         }
     }
 
-    async fn get_empty_dataset() -> (tempfile::TempDir, Dataset) {
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+    async fn get_empty_dataset() -> (TempStrDir, Dataset) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -1517,22 +1523,26 @@ mod tests {
             Fragment {
                 id: 0,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("unused", vec![9]),
+                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("unused", vec![9], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
         ];
 
@@ -1561,20 +1571,28 @@ mod tests {
         let expected_fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 10])],
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    vec![0, 1, 10],
+                    None,
+                )],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
-                    DataFile::new_legacy_from_fields("path3", vec![10]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
+                    DataFile::new_legacy_from_fields("path3", vec![10], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);

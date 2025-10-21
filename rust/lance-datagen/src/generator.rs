@@ -2010,7 +2010,7 @@ impl BatchGeneratorBuilder {
             )
             .sum::<Result<u64, ArrowError>>()?;
         let mut num_rows = RowCount::from(batch_size_bytes.0 / bytes_per_row);
-        if batch_size_bytes.0 % bytes_per_row != 0 {
+        if !batch_size_bytes.0.is_multiple_of(bytes_per_row) {
             match rounding {
                 RoundingBehavior::ExactOrErr => {
                     return Err(ArrowError::NotYetImplemented(
@@ -2329,6 +2329,21 @@ pub mod array {
         cycle_vec(underlying, dimension)
     }
 
+    /// Create a generator of 1d vectors (of a primitive type) consisting of randomly sampled nullable values
+    pub fn rand_vec_nullable<DataType>(
+        dimension: Dimension,
+        null_probability: f64,
+    ) -> Box<dyn ArrayGenerator>
+    where
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+        rand::distr::StandardUniform: rand::distr::Distribution<DataType::Native>,
+    {
+        let underlying = rand::<DataType>().with_random_nulls(null_probability);
+        cycle_vec(underlying, dimension)
+    }
+
     /// Create a generator of randomly sampled time32 values covering the entire
     /// range of 1 day
     pub fn rand_time32(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
@@ -2485,7 +2500,7 @@ pub mod array {
         let dist = Uniform::new(start_ticks, end_ticks).unwrap();
 
         let data_type = data_type.clone();
-        let sample_fn = move |rng: &mut _| (dist.sample(rng));
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
         let width = data_type
             .primitive_width()
             .map(|width| ByteCount::from(width as u64))

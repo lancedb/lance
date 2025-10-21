@@ -379,13 +379,17 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteMode, WriteParams};
+    use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::RecordBatchIterator;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_linalg::distance::MetricType;
     use std::sync::Arc;
-    use tempfile::tempdir;
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
@@ -421,8 +425,8 @@ mod tests {
         // 5. Verify IndexMetadata contains correct fragment_bitmap
 
         // Create temporary directory for dataset
-        let tmpdir = tempdir().unwrap();
-        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
 
         // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 10);
@@ -454,8 +458,15 @@ mod tests {
             "Should have multiple fragments for testing"
         );
 
-        // Test fragments() method with specific fragment IDs
-        let selected_fragments = vec![fragment_ids[0], fragment_ids[1]];
+        // Test fragments() method with specific fragment IDs and ensure duplicate/out-of-order fragments are handled properly
+        let selected_fragments = vec![
+            fragment_ids[1],
+            fragment_ids[0],
+            fragment_ids[1],
+            fragment_ids[2],
+        ];
+        let selected_fragments_expected = vec![fragment_ids[0], fragment_ids[1], fragment_ids[2]];
+
         let mut builder =
             CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                 .name("fragment_index".to_string())
@@ -468,7 +479,7 @@ mod tests {
         let fragment_bitmap = index_metadata.fragment_bitmap.unwrap();
         let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
         assert_eq!(
-            indexed_fragments, selected_fragments,
+            indexed_fragments, selected_fragments_expected,
             "Index should only cover the selected fragments"
         );
 
@@ -487,8 +498,8 @@ mod tests {
         // 4. Verify the final index is properly created and accessible
 
         // Create temporary directory for dataset
-        let tmpdir = tempdir().unwrap();
-        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
 
         // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 15);
@@ -565,5 +576,156 @@ mod tests {
         let mut expected_fragments = fragment_ids.clone();
         expected_fragments.sort();
         assert_eq!(all_covered_fragments, expected_fragments);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_should_not_removes_delta_indices() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let num_rows = 256;
+        let reader = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(num_rows),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let vector_params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Should have 1 index");
+        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+
+        // create again with replace=false
+        let res = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                false,
+            )
+            .await;
+        assert!(res.is_err());
+
+        // create again with replace=true
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None, // Will auto-generate name "vector_idx"
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Should have 1 index");
+        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+
+        let scalar_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None, // Will auto-generate name "id_idx"
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2, "Should have 2 indices");
+
+        let num_new_rows = 32;
+        let new_reader = lance_datagen::gen_batch()
+            .col(
+                "id",
+                lance_datagen::array::step_custom::<Int32Type>(num_rows as i32, 1),
+            )
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(num_new_rows),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        dataset = Dataset::write(
+            new_reader,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Load indices before optimization
+        let indices_before = dataset.load_indices().await.unwrap();
+        assert_eq!(indices_before.len(), 2, "Should still have 2 indices");
+
+        // Optimize with num_indices_to_merge=0
+        let optimize_options = OptimizeOptions::append();
+        dataset.optimize_indices(&optimize_options).await.unwrap();
+
+        // Load indices after optimization
+        let indices_after = dataset.load_indices().await.unwrap();
+
+        // There should be 3 indices:
+        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
+        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
+        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
+        assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
+        let id_idx = indices_after
+            .iter()
+            .find(|idx| idx.name == "id_idx")
+            .unwrap();
+        let vector_indices = indices_after
+            .iter()
+            .filter(|idx| idx.name == "vector_idx")
+            .collect::<Vec<_>>();
+        assert!(
+            id_idx
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains_range(0..2)
+                && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
+        );
+        assert_eq!(vector_indices.len(), 2);
+        assert!(vector_indices
+            .iter()
+            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(vector_indices
+            .iter()
+            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
     }
 }

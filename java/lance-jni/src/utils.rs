@@ -24,6 +24,7 @@ use crate::ffi::JNIEnvExt;
 
 use lance_index::vector::Query;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub fn extract_storage_options(
     env: &mut JNIEnv,
@@ -34,6 +35,7 @@ pub fn extract_storage_options(
     Ok(storage_options)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
     max_rows_per_file: &JObject,
@@ -41,6 +43,7 @@ pub fn extract_write_params(
     max_bytes_per_file: &JObject,
     mode: &JObject,
     enable_stable_row_ids: &JObject,
+    data_storage_version: &JObject,
     storage_options_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
@@ -60,8 +63,11 @@ pub fn extract_write_params(
     if let Some(enable_stable_row_ids_val) = env.get_boolean_opt(enable_stable_row_ids)? {
         write_params.enable_stable_row_ids = enable_stable_row_ids_val;
     }
-    // Java code always sets the data storage version to stable for now
-    write_params.data_storage_version = Some(LanceFileVersion::Stable);
+    if let Some(data_storage_version_val) = env.get_string_opt(data_storage_version)? {
+        write_params.data_storage_version = Some(LanceFileVersion::from_str(
+            data_storage_version_val.as_str(),
+        )?);
+    }
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 

@@ -60,8 +60,7 @@ tests = [
     # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
-    # Need to align with the datafusion version we use at lance rust
-    "datafusion==49.0.0",
+    "datafusion>=48.0.0",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]

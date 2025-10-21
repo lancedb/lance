@@ -14,13 +14,20 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.fragment.FragmentMergeResult;
+import com.lancedb.lance.fragment.FragmentUpdateResult;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.LargeVarBinaryVector;
+import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -51,6 +58,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -60,7 +68,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class TestUtils {
   private abstract static class TestDataset {
     protected final BufferAllocator allocator;
-    private final String datasetPath;
+    protected final String datasetPath;
 
     public TestDataset(BufferAllocator allocator, String datasetPath) {
       this.allocator = allocator;
@@ -430,6 +438,305 @@ public class TestUtils {
         } catch (Exception e) {
           throw new RuntimeException("Cannot read arrow stream.", e);
         }
+      }
+    }
+  }
+
+  public static class UpdateColumnTestDataset extends TestDataset {
+    private static final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8()),
+                Field.nullable("timeStamp", new ArrowType.Timestamp(TimeUnit.SECOND, "UTC"))),
+            null);
+
+    private static final Schema updateSchema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("_rowid", new ArrowType.Int(64, false)),
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+
+    private static final int actualRowCount = 6;
+    private static final int actualUpdateRowCount = 4;
+
+    public UpdateColumnTestDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return schema;
+    }
+
+    @Override
+    public FragmentMetadata createNewFragment(int rowCount) {
+      assertEquals(actualRowCount, rowCount);
+      List<FragmentMetadata> fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
+      assertEquals(1, fragmentMetas.size());
+      FragmentMetadata fragmentMeta = fragmentMetas.get(0);
+      assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+      return fragmentMeta;
+    }
+
+    @Override
+    public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      assertEquals(actualRowCount, rowCount);
+      List<FragmentMetadata> fragmentMetas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
+        root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        TimeStampSecTZVector timeStampSecVector =
+            (TimeStampSecTZVector) root.getVector("timeStamp");
+        /* dataset content
+         * _rowid |   id   |     name     | timeStamp |
+         *   0:   |    0   |  "Person 0"  |     0     |
+         *   1:   |    1   |  "Person 1"  |    null   |
+         *   2:   |  null  |     null     |     2     |
+         *   3:   |  null  |     null     |    null   |
+         *   4:   |    4   |  "Person 4"  |     4     |
+         *   5:   |  null  |     null     |    null   |
+         */
+        idVector.setSafe(0, 0);
+        idVector.set(1, 1);
+        idVector.setNull(2);
+        idVector.setNull(3);
+        idVector.set(4, 4);
+        idVector.setNull(5);
+
+        nameVector.setSafe(0, "Person 0".getBytes(StandardCharsets.UTF_8));
+        nameVector.setSafe(1, "Person 1".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(2);
+        nameVector.setNull(3);
+        nameVector.setSafe(4, "Person 4".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(5);
+
+        timeStampSecVector.setSafe(0, 0);
+        timeStampSecVector.setNull(1);
+        timeStampSecVector.setSafe(2, 2);
+        timeStampSecVector.setNull(3);
+        timeStampSecVector.setSafe(4, 4);
+        timeStampSecVector.setNull(5);
+        root.setRowCount(actualRowCount);
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+      }
+      return fragmentMetas;
+    }
+    /**
+     * Test method to update columns. Note that for simplicity, the updated column rowid is fixed
+     * with [0, updateNum). Please only use this method to test the first fragment.
+     *
+     * @param fragment fragment to update.
+     * @param updateNum number of new rows.
+     * @return update result
+     */
+    public FragmentUpdateResult updateColumn(Fragment fragment, int updateNum) {
+      assertEquals(actualUpdateRowCount, updateNum);
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(updateSchema, allocator)) {
+        root.allocateNew();
+        UInt8Vector rowidVec = (UInt8Vector) root.getVector("_rowid");
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        /* source fragment content
+         * _rowid |   id   |     name     |
+         *   0:   |   100  |  "Update 0"  |
+         *   1:   |  null  |     null     |
+         *   2:   |    2   |  "Update 2"  |
+         *   3:   |  null  |     null     |
+         */
+        rowidVec.set(0, 0);
+        rowidVec.set(1, 1);
+        rowidVec.set(2, 2);
+        rowidVec.set(3, 3);
+
+        idVector.set(0, 100);
+        idVector.setNull(1);
+        idVector.set(2, 2);
+        idVector.setNull(3);
+
+        nameVector.setSafe(0, "Update 0".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(1);
+        nameVector.setSafe(2, "Update 2".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(3);
+        root.setRowCount(actualUpdateRowCount);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+          writer.start();
+          writer.writeBatch();
+          writer.end();
+        } catch (IOException e) {
+          throw new RuntimeException("Cannot write schema root", e);
+        }
+        byte[] arrowData = out.toByteArray();
+        try (ArrowStreamReader reader =
+                new ArrowStreamReader(
+                    new ByteArrayReadableSeekableByteChannel(arrowData), allocator);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          return fragment.updateColumns(stream);
+        } catch (Exception e) {
+          throw new RuntimeException("Cannot read arrow stream.", e);
+        }
+      }
+    }
+  }
+
+  /** Convenience method mirroring the previous JNI helper shape. */
+  public static Dataset createBlobDataset(String path, int rows, int batches) {
+    BlobTestDataset dataset = new BlobTestDataset(new RootAllocator(Long.MAX_VALUE), path);
+    return dataset.createAndAppendRows(rows, batches);
+  }
+
+  /**
+   * BlobTestDataset: Java-side helper to construct a blob-capable dataset for tests.
+   *
+   * <p>This class defines a schema that includes a blob column annotated with Lance metadata and
+   * uses JNI-backed Dataset/Fragment operations to create the dataset and append rows with large
+   * binary payloads. No Java-only storage/writer logic is used.
+   */
+  public static final class BlobTestDataset {
+
+    /** Lance blob metadata key required by Rust. */
+    private static final String BLOB_META_KEY = "lance-encoding:blob";
+    /** Lance blob metadata value. */
+    private static final String BLOB_META_TRUE = "true";
+
+    private final BufferAllocator allocator;
+    private final String datasetPath;
+
+    /**
+     * Create a new dataset at the given path and append rows with large binary payloads.
+     *
+     * <p>Rows are appended in batches of batchSize, with each batch containing rows with
+     */
+    BlobTestDataset(BufferAllocator allocator, String datasetPath) {
+      Preconditions.checkNotNull(allocator, "allocator cannot be null");
+      Preconditions.checkArgument(
+          datasetPath != null && !datasetPath.isEmpty(), "datasetPath cannot be null or empty");
+      this.allocator = allocator;
+      this.datasetPath = datasetPath;
+    }
+
+    /**
+     * Build the Arrow schema with a filter column and a blob column marked as blob storage.
+     *
+     * <p>Columns: - filterer: Int64 (not nullable) - blobs: Binary (nullable) with metadata
+     * {"lance-schema:storage-class":"blob"}
+     *
+     * <p>Note: ArrowType.LargeBinary may not be available in our Arrow Java version; Binary is
+     * sufficient for tests and aligns with Lance blob storage when annotated via metadata.
+     */
+    public Schema getSchema() {
+      Map<String, String> blobMeta = Maps.newHashMap();
+      blobMeta.put(BLOB_META_KEY, BLOB_META_TRUE);
+      Field filterField = Field.notNullable("filterer", new ArrowType.Int(64, true));
+      Field blobField =
+          new Field(
+              "blobs",
+              new FieldType(true, ArrowType.LargeBinary.INSTANCE, /* dict */ null, blobMeta),
+              /* children */ Collections.emptyList());
+      return new Schema(Arrays.asList(filterField, blobField), /* metadata */ null);
+    }
+
+    /** Create an empty dataset at the path with the blob-capable schema. */
+    public Dataset createEmptyDataset() {
+      WriteParams params =
+          new WriteParams.Builder()
+              // Enable stable row ids to simplify test assertions across fragments
+              .withEnableStableRowIds(true)
+              .withMode(WriteParams.WriteMode.CREATE)
+              .build();
+      Dataset ds = Dataset.create(allocator, datasetPath, getSchema(), params);
+      Preconditions.checkArgument(ds.countRows() == 0, "dataset should be empty at creation");
+      return ds;
+    }
+
+    /**
+     * Create a single fragment with given row count and return its metadata. The fragment contains
+     * deterministic blob payloads: - Every 16th row starting at 0 has zero-length blob - Every 16th
+     * row starting at 1 has a ~1 MiB payload - Others have small variable blobs (128..383 bytes)
+     */
+    public FragmentMetadata createBlobFragment(int rowCount, int maxRowsPerFile) {
+      Preconditions.checkArgument(rowCount >= 0, "rowCount must be non-negative");
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
+        root.allocateNew();
+
+        BigIntVector filterVec = (BigIntVector) root.getVector("filterer");
+        LargeVarBinaryVector blobsVec = (LargeVarBinaryVector) root.getVector("blobs");
+        filterVec.allocateNew(rowCount);
+        blobsVec.allocateNew();
+
+        for (int i = 0; i < rowCount; i++) {
+          filterVec.setSafe(i, i);
+          if (i % 16 == 0) {
+            // zero-length blob
+            blobsVec.setSafe(i, new byte[0]);
+          } else if (i % 16 == 1) {
+            // large blob ~1MiB
+            byte[] big = new byte[1024 * 1024];
+            Arrays.fill(big, (byte) 0xAB);
+            blobsVec.setSafe(i, big);
+          } else {
+            // small variable blob
+            int sz = 128 + (i % 256);
+            byte[] data = new byte[sz];
+            Arrays.fill(data, (byte) (i % 256));
+            blobsVec.setSafe(i, data);
+          }
+        }
+        root.setRowCount(rowCount);
+
+        WriteParams params =
+            new WriteParams.Builder()
+                .withMaxRowsPerFile(maxRowsPerFile)
+                .withMode(WriteParams.WriteMode.APPEND)
+                .withEnableStableRowIds(true)
+                .build();
+
+        List<FragmentMetadata> metas = Fragment.create(datasetPath, allocator, root, params);
+        Preconditions.checkArgument(!metas.isEmpty(), "fragment metadata should not be empty");
+        FragmentMetadata meta = metas.get(0);
+        Preconditions.checkArgument(
+            meta.getPhysicalRows() == rowCount, "fragment physical rows mismatch");
+        return meta;
+      }
+    }
+
+    /**
+     * Create a dataset and append rows generated into the specified number of batches. Returns the
+     * final dataset after commit.
+     */
+    public Dataset createAndAppendRows(int totalRows, int batches) {
+      Preconditions.checkArgument(totalRows >= 0, "totalRows must be non-negative");
+      int effectiveBatches = Math.max(1, batches);
+      try (Dataset ds = createEmptyDataset()) {
+
+        List<FragmentMetadata> fragments = Lists.newArrayList();
+        int remaining = totalRows;
+        for (int b = 0; b < effectiveBatches; b++) {
+          int batchRows =
+              (b == effectiveBatches - 1) ? remaining : Math.max(1, totalRows / effectiveBatches);
+          remaining = Math.max(0, remaining - batchRows);
+          fragments.add(createBlobFragment(batchRows, Integer.MAX_VALUE));
+        }
+
+        Transaction txn =
+            ds.newTransactionBuilder()
+                .operation(
+                    com.lancedb.lance.operation.Append.builder().fragments(fragments).build())
+                .build();
+        Dataset newDs = txn.commit();
+        Preconditions.checkArgument(
+            newDs.countRows() == totalRows, "dataset row count mismatch after append");
+        return newDs;
       }
     }
   }

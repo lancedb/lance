@@ -7,6 +7,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
+from lance.file import stable_version
 
 
 def prep_dataset(tmp_path: Path, version, name: str):
@@ -35,7 +36,7 @@ def test_add_data_storage_version(tmp_path: Path):
         assert ds.data_storage_version == expected_version
 
     check_dataset("v1_no_files.lance", "0.1")
-    check_dataset("v2_no_files.lance", "2.0")
+    check_dataset("v2_no_files.lance", stable_version())
     check_dataset("v1_with_files.lance", "0.1")
     check_dataset("v2_with_files.lance", "2.0")
 

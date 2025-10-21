@@ -78,10 +78,10 @@ criterion.workspace = true
 env_logger = "0.11.6"
 lance-datagen.workspace = true
 lance-testing.workspace = true
-tempfile.workspace = true
 test-log.workspace = true
 datafusion-sql.workspace = true
 rstest.workspace = true
+chrono.workspace = true
 
 [features]
 protoc = ["dep:protobuf-src"]

@@ -25,7 +25,8 @@
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{self, Ordering};
+use std::sync::Arc;
 
 use std::ffi::CString;
 
@@ -46,10 +47,10 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{MergeInsertBuilder, PyFullTextQuery};
+use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery};
 use env_logger::{Builder, Env};
 use file::{
-    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
@@ -88,7 +89,7 @@ use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
-use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
+use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
@@ -112,8 +113,51 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-// TODO: make this runtime configurable (e.g. num threads)
-static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
+fn create_background_executor() -> BackgroundExecutor {
+    // TODO: make this runtime configurable (e.g. num threads)
+    BackgroundExecutor::new()
+}
+
+static BACKGROUND_EXECUTOR: atomic::AtomicPtr<BackgroundExecutor> =
+    atomic::AtomicPtr::new(std::ptr::null_mut());
+
+static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+pub fn rt() -> &'static mut BackgroundExecutor {
+    loop {
+        let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
+        if !ptr.is_null() {
+            return unsafe { &mut *ptr };
+        }
+        if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if !ATFORK_INSTALLED.fetch_or(true, Ordering::SeqCst) {
+        install_atfork();
+    }
+    let new_ptr = Box::into_raw(Box::new(create_background_executor()));
+    BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
+    unsafe { &mut *new_ptr }
+}
+
+/// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
+/// runs in "async-signal context" which means that we can't (safely) do much here.
+extern "C" fn atfork_child() {
+    BACKGROUND_EXECUTOR.store(std::ptr::null_mut(), Ordering::SeqCst);
+    EXECUTOR_INSTALLED.store(false, Ordering::SeqCst);
+}
+
+#[cfg(not(windows))]
+fn install_atfork() {
+    unsafe { libc::pthread_atfork(None, None, Some(atfork_child)) };
+}
+
+#[cfg(windows)]
+fn install_atfork() {}
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
@@ -196,9 +240,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
+    m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
@@ -239,6 +285,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
@@ -334,7 +381,7 @@ fn infer_tfrecord_schema(
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<_>>();
-    let schema = RT
+    let schema = rt()
         .runtime
         .block_on(::lance::utils::tfrecord::infer_tfrecord_schema(
             uri,
@@ -379,7 +426,7 @@ fn read_tfrecord(
         std::sync::mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>();
 
     let schema_ref = schema.clone();
-    RT.spawn_background(None, async move {
+    rt().spawn_background(None, async move {
         let mut stream =
             match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await
             {
@@ -421,10 +468,10 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
-    let indices = RT
+    let indices = rt()
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let (manifest, _) = RT
+    let (manifest, _) = rt()
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(
@@ -449,7 +496,7 @@ impl FFILanceTableProvider {
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
         // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
-        let _ = RT.block_on(Some(py), dataset_ref.load_indices())?;
+        let _ = rt().block_on(Some(py), dataset_ref.load_indices())?;
         Ok(Self {
             dataset: dataset_ref.clone(),
             with_row_id,
@@ -469,7 +516,7 @@ impl FFILanceTableProvider {
         ));
 
         let ffi_provider =
-            FFI_TableProvider::new(a_lance_table_provider, true, RT.get_runtime_handle());
+            FFI_TableProvider::new(a_lance_table_provider, true, rt().get_runtime_handle());
         let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
         capsule
     }

@@ -81,7 +81,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -380,8 +380,8 @@ pub(crate) async fn optimize_vector_indices_v2(
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let num_indices_to_merge = options.num_indices_to_merge;
-    let temp_dir = tempfile::tempdir()?;
-    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
+    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
@@ -1245,6 +1245,9 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
+        warn!("Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid", params.sample_rate);
+    }
 
     // If metric type is cosine, normalize the training data, and after this point,
     // treat the metric type as L2.
@@ -1883,6 +1886,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
@@ -1895,7 +1899,6 @@ mod tests {
     };
     use rand::{rng, seq::SliceRandom};
     use rstest::rstest;
-    use tempfile::tempdir;
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
@@ -2157,8 +2160,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_with_centroids() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
@@ -2252,8 +2255,8 @@ mod tests {
         // remap the rows, and then verify that we can still search the index and will get
         // back the remapped row ids.
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let mut test_data = WellKnownIvfPqData::new(DIM, CENTROIDS);
 
@@ -2672,8 +2675,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_cosine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
@@ -2722,8 +2725,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_ivf_model_l2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
@@ -2750,8 +2753,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_ivf_model_cosine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
@@ -2782,8 +2785,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_dot() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
@@ -2833,8 +2836,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_f16() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         const DIM: usize = 32;
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2897,8 +2900,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_f16_with_codebook() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         const DIM: usize = 32;
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2965,8 +2968,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_with_invalid_num_sub_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         const DIM: usize = 32;
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -3031,8 +3034,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 4;
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
@@ -3106,8 +3109,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw_with_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         // the generate_test_dataset function generates a dataset with 1000 vectors,
         // so 1001 partitions will have at least one empty partition
@@ -3188,8 +3191,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_cosine_normalization() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         const DIM: usize = 32;
 
         let schema = Arc::new(Schema::new(vec![Field::new(

@@ -280,6 +280,10 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -537,6 +541,10 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
                 as SendableRecordBatchStream,
         )
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -956,17 +964,20 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
             .and_then(move |batch| {
-                let part_id_col = batch
-                    .column_by_name(PART_ID_COLUMN)
-                    .expect("ANNSubIndexExec: input missing part_id column");
+                let part_id_col = batch.column_by_name(PART_ID_COLUMN).unwrap_or_else(|| {
+                    panic!("ANNSubIndexExec: input missing {} column", PART_ID_COLUMN)
+                });
                 let part_id_arr = part_id_col.as_list::<i32>().clone();
-                let dist_q_c_col = batch
-                    .column_by_name(DIST_Q_C_COLUMN)
-                    .expect("ANNSubIndexExec: input missing dist_q_c column");
+                let dist_q_c_col = batch.column_by_name(DIST_Q_C_COLUMN).unwrap_or_else(|| {
+                    panic!("ANNSubIndexExec: input missing {} column", DIST_Q_C_COLUMN)
+                });
                 let dist_q_c_arr = dist_q_c_col.as_list::<i32>().clone();
-                let index_uuid_col = batch
-                    .column_by_name(INDEX_UUID_COLUMN)
-                    .expect("ANNSubIndexExec: input missing index_uuid column");
+                let index_uuid_col = batch.column_by_name(INDEX_UUID_COLUMN).unwrap_or_else(|| {
+                    panic!(
+                        "ANNSubIndexExec: input missing {} column",
+                        INDEX_UUID_COLUMN
+                    )
+                });
                 let index_uuid = index_uuid_col.as_string::<i32>().clone();
 
                 let plan: Vec<DataFusionResult<(_, _, _)>> = part_id_arr
@@ -1082,6 +1093,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -1278,6 +1293,10 @@ impl ExecutionPlan for MultivectorScoringExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1288,6 +1307,7 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
@@ -1297,7 +1317,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
@@ -1340,8 +1359,8 @@ mod tests {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
@@ -1509,13 +1528,13 @@ mod tests {
     struct NprobesTestFixture {
         dataset: Dataset,
         centroids: Arc<dyn Array>,
-        _tmp_dir: TempDir,
+        _tmp_dir: TempStrDir,
     }
 
     impl NprobesTestFixture {
         pub async fn new(num_centroids: usize, num_deltas: usize) -> Self {
-            let tempdir = tempdir().unwrap();
-            let tmppath = tempdir.path().to_str().unwrap();
+            let tempdir = TempStrDir::default();
+            let tmppath = tempdir.as_str();
 
             // We create 100 centroids
             // We generate 10,000 vectors evenly divided (100 vectors per centroid)

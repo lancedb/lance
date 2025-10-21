@@ -144,6 +144,7 @@ mod tests {
             arg_fields,
             number_rows: 5,
             return_field: Arc::new(Field::new("res".to_string(), DataType::Boolean, false)),
+            config_options: Arc::new(Default::default()),
         };
 
         // Invoke contains_tokens manually

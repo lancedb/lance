@@ -18,6 +18,7 @@ opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-namespace.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-arith.workspace = true
 arrow-array.workspace = true
@@ -46,11 +47,9 @@ tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
-async-priority-channel = "0.2.0"
 
 [dev-dependencies]
 criterion.workspace = true
-tempfile.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true

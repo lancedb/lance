@@ -717,9 +717,9 @@ mod test {
     use arrow_select::concat::concat_batches;
     use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
-    use tempfile::tempdir;
 
     use crate::dataset::WriteParams;
     use lance_datafusion::logical_expr::ExprExt;
@@ -732,8 +732,8 @@ mod test {
     #[tokio::test]
     async fn test_empty_result() {
         // Test we can get no results
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "i",
@@ -785,8 +785,8 @@ mod test {
     async fn test_null_batch() {
         // If every row in a batch is null then a predicate can evaluate to Scalar(NULL)
         // Ensure we handle that.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "s",
@@ -841,8 +841,8 @@ mod test {
     async fn test_nested_filter() {
         // Validate we can filter and project nested columns and they will be
         // merged correctly.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let field_a = Arc::new(Field::new("a", DataType::Int32, false));
         let field_b = Arc::new(Field::new("b", DataType::Int32, false));
@@ -953,8 +953,8 @@ mod test {
         // Expected simplification: false, s.x > 150, true
         // Expected result: [150..300]
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let field = Arc::new(Field::new("int", DataType::Int32, false));
 
@@ -1349,10 +1349,9 @@ mod test {
         }
 
         async fn run_test(&self) {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_uri = TempStrDir::default();
 
-            let dataset = Arc::new(Self::dataset(test_uri, self.data.clone()).await);
+            let dataset = Arc::new(Self::dataset(&test_uri, self.data.clone()).await);
             let expected = self.expected_result().await;
 
             let ctx = SessionContext::new();
@@ -1422,8 +1421,8 @@ mod test {
 
     #[tokio::test]
     async fn test_retrieve_just_row_id() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "int",
@@ -1483,8 +1482,8 @@ mod test {
 
     #[tokio::test]
     async fn test_with_deletions() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("int", DataType::Int32, false),

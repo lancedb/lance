@@ -15,6 +15,7 @@ use futures::{
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
@@ -57,7 +58,6 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
-use tempfile::{tempdir, TempDir};
 use tracing::{instrument, span, Level};
 
 use crate::dataset::ProjectionRequest;
@@ -87,7 +87,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: Option<S::BuildParams>,
-    _temp_dir: TempDir, // store this for keeping the temp dir alive and clean up after build
+    _temp_dir: TempStdDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
     // fields will be set during build
@@ -117,8 +117,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let temp_dir = tempdir()?;
-        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+        let temp_dir = TempStdDir::default();
+        let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -177,8 +177,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     location!(),
                 ))?;
 
-        let temp_dir = tempdir()?;
-        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+        let temp_dir = TempStdDir::default();
+        let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         Ok(Self {
             store,
             column,
@@ -251,11 +251,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             location: location!(),
                         },
                     )?;
-                    Result::Ok(Some((
-                        part.storage.remap(&mapping)?,
-                        part.index.remap(&mapping)?,
-                        0.0,
-                    )))
+
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    Result::Ok(Some((storage, index, 0.0)))
                 }
             })
             .buffered(get_num_compute_intensive_cpus())

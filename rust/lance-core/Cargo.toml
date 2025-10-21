@@ -24,6 +24,7 @@ datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
 deepsize.workspace = true
 futures.workspace = true
+libc.workspace = true
 mock_instant.workspace = true
 moka.workspace = true
 num_cpus = "1.0"
@@ -34,6 +35,7 @@ rand.workspace = true
 roaring.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -47,7 +49,6 @@ log.workspace = true
 libc = { version = "0.2" }
 
 [dev-dependencies]
-tempfile.workspace = true
 lance-testing.workspace = true
 proptest.workspace = true
 

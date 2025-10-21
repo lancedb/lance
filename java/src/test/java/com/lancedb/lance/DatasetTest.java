@@ -1392,4 +1392,126 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testShallowClone(@TempDir Path tempDir) {
+    String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
+    String dstPathByVersion = tempDir.resolve("shallow_clone_version_dst").toString();
+    String dstPathByTag = tempDir.resolve("shallow_clone_tag_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Prepare a simple source dataset with some rows
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 5)) { // write 5 rows -> version 2
+        assertEquals(2, src.version());
+        long srcRowCount = src.countRows();
+        Schema srcSchema = src.getSchema();
+
+        // shallow clone by version
+        try (Dataset clone =
+            src.shallowClone(
+                dstPathByVersion, Reference.builder().versionNumber(src.version()).build())) {
+          // Validate the version cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByVersion, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByVersion, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+
+        // shallow clone by tag
+        src.tags().create("tag", src.version());
+        try (Dataset clone =
+            src.shallowClone(dstPathByTag, Reference.builder().tagName("tag").build())) {
+          // Validate the tag cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByTag, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByTag, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    }
+  }
+
+  // ===== Blob API tests =====
+  @Test
+  void testReadZeroLengthBlob(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadZeroLengthBlob").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(0L), "blobs");
+      assertEquals(1, blobs.size());
+      BlobFile blobFile = blobs.get(0);
+      assertEquals(0L, blobFile.size());
+      assertArrayEquals(new byte[0], blobFile.read());
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 1_000_000, "expected large blob size");
+      byte[] data1 = blobFile.readUpTo(256);
+      assertEquals(256, data1.length);
+      assertEquals(256L, blobFile.tell());
+      blobFile.seek(512);
+      byte[] range = blobFile.readUpTo(256);
+      assertEquals(256, range.length);
+      assertEquals(768L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertEquals(size, all.length);
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), data1);
+      assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadSmallBlobSequentialIntegrity(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadSmallBlobSequentialIntegrity").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 128, "expected small blob size");
+
+      blobFile.seek(0);
+      byte[] data1 = blobFile.readUpTo(64);
+      byte[] data2 = blobFile.readUpTo(64);
+      byte[] restData = blobFile.read();
+      byte[] combined = new byte[data1.length + data2.length + restData.length];
+      System.arraycopy(data1, 0, combined, 0, data1.length);
+      System.arraycopy(data2, 0, combined, data2.length, data2.length);
+      System.arraycopy(restData, 0, combined, data1.length + data2.length, restData.length);
+
+      blobFile.seek(0);
+      byte[] allData = blobFile.read();
+      assertArrayEquals(allData, combined);
+      blobFile.close();
+    }
+  }
 }

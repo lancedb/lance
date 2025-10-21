@@ -945,8 +945,8 @@ mod tests {
     use std::{collections::VecDeque, time::Duration};
 
     use futures::poll;
+    use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
-    use tempfile::tempdir;
 
     use object_store::{memory::InMemory, GetRange, ObjectStore as OSObjectStore};
     use tokio::{runtime::Handle, time::timeout};
@@ -961,10 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_seq_read() {
-        let tmpdir = tempdir().unwrap();
-        let tmp_path = tmpdir.path().to_str().unwrap();
-        let tmp_path = Path::parse(tmp_path).unwrap();
-        let tmp_file = tmp_path.child("foo.file");
+        let tmp_file = TempObjFile::default();
 
         let obj_store = Arc::new(ObjectStore::local());
 
@@ -1011,10 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_split_coalesce() {
-        let tmpdir = tempdir().unwrap();
-        let tmp_path = tmpdir.path().to_str().unwrap();
-        let tmp_path = Path::parse(tmp_path).unwrap();
-        let tmp_file = tmp_path.child("foo.file");
+        let tmp_file = TempObjFile::default();
 
         let obj_store = Arc::new(ObjectStore::local());
 
@@ -1083,7 +1077,7 @@ mod tests {
         assert_eq!(8, scheduler.stats().iops);
 
         let reads = (0..44)
-            .map(|i| (i * 1_000_000..(i + 1) * 1_000_000))
+            .map(|i| i * 1_000_000..(i + 1) * 1_000_000)
             .collect::<Vec<_>>();
         let req = file_scheduler.submit_request(reads, 0);
         let bytes = req.await.unwrap();

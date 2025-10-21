@@ -78,7 +78,6 @@ jobs:
       matrix:
         toolchain:
           - stable
-          - nightly
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -108,16 +107,6 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
-      - name: Build tests (nightly)
-        if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run
-      - name: Run tests (nightly)
-        if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES} --workspace
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -156,21 +145,13 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --locked --features ${ALL_FEATURES}
   build-no-lock:
-    runs-on: ubuntu-24.04
+    runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
       CC: clang
       CXX: clang++
     steps:
-      # Remove not needed tools from runner
-      - uses: easimon/maximize-build-space@v10
-        with:
-          remove-dotnet: true
-          remove-android: true
-          remove-haskell: true
-          remove-codeql: true
-          remove-docker-images: true
       - uses: actions/checkout@v4
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
@@ -185,13 +166,12 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo build --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: "macos-14"
+    runs-on: "warp-macos-14-arm64-6x"
     timeout-minutes: 45
     strategy:
       matrix:
         toolchain:
           - stable
-          - nightly
     defaults:
       run:
         working-directory: ./rust
@@ -221,7 +201,7 @@ jobs:
         run: |
           cargo check --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
   windows-build:
-    runs-on: windows-latest
+    runs-on: warp-windows-latest-x64-4x
     defaults:
       run:
         working-directory: rust

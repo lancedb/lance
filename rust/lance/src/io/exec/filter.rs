@@ -68,7 +68,17 @@ impl ExecutionPlan for LanceFilterExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.filter.clone().with_new_children(children)
+        // Rewrap the result in a LanceFilterExec to preserve the logical expression
+        let new_filter_plan = self.filter.clone().with_new_children(children)?;
+        let new_filter = new_filter_plan
+            .as_any()
+            .downcast_ref::<FilterExec>()
+            .expect("FilterExec::with_new_children should return FilterExec")
+            .clone();
+        Ok(Arc::new(Self {
+            expr: self.expr.clone(),
+            filter: Arc::new(new_filter),
+        }))
     }
 
     fn execute(
@@ -96,5 +106,9 @@ impl ExecutionPlan for LanceFilterExec {
         projection: &datafusion_physical_plan::projection::ProjectionExec,
     ) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
         self.filter.try_swapping_with_projection(projection)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }

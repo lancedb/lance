@@ -30,10 +30,7 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_META_KEY},
-    Error, Result,
-};
+use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 
@@ -927,11 +924,13 @@ impl Field {
 
     // Check if field has metadata `packed` set to true, this check is case insensitive.
     pub fn is_packed_struct(&self) -> bool {
-        let field_metadata = &self.metadata;
-        field_metadata
-            .get("packed")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+        const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
+        PACKED_KEYS.iter().any(|key| {
+            self.metadata
+                .get(*key)
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
     }
 
     /// Return true if the field is a leaf field.

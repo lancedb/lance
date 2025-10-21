@@ -33,7 +33,7 @@ async fn apply_deletions(
 
     enum FragmentChange {
         Unchanged,
-        Modified(Fragment),
+        Modified(Box<Fragment>),
         Removed(u64),
     }
 
@@ -48,7 +48,7 @@ async fn apply_deletions(
                 if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                     match fragment.extend_deletions(*bitmap).await {
                         Ok(Some(new_fragment)) => {
-                            Ok(FragmentChange::Modified(new_fragment.metadata))
+                            Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                         }
                         Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                         Err(e) => Err(e),
@@ -63,7 +63,7 @@ async fn apply_deletions(
     while let Some(res) = stream.next().await.transpose()? {
         match res {
             FragmentChange::Unchanged => {}
-            FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+            FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
             FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
         }
     }
@@ -277,6 +277,7 @@ mod tests {
     use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
     use rstest::rstest;
@@ -306,8 +307,8 @@ mod tests {
             .unwrap()
         }
         // Write a dataset
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        let tmp_dir = TempStrDir::default();
+        let tmp_path = tmp_dir.as_str().to_string();
         let data = sequence_data(0..100);
         // Split over two files.
         let batches = vec![data.slice(0, 50), data.slice(50, 50)];
@@ -466,8 +467,8 @@ mod tests {
         }
 
         // Create dataset with multiple fragments
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        let tmp_dir = TempStrDir::default();
+        let tmp_path = tmp_dir.as_str().to_string();
 
         // Create 5 fragments with 100 rows each
         let mut batches = Vec::new();
@@ -543,8 +544,8 @@ mod tests {
                 .unwrap()
         }
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        let tmp_dir = TempStrDir::default();
+        let tmp_path = tmp_dir.as_str().to_string();
 
         let data = sequence_data(0..100);
         let mut dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
@@ -581,8 +582,8 @@ mod tests {
                 .unwrap()
         }
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        let tmp_dir = TempStrDir::default();
+        let tmp_path = tmp_dir.as_str().to_string();
 
         let data = sequence_data(0..100);
         let dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)

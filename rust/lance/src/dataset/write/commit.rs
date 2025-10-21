@@ -17,7 +17,7 @@ use crate::{
     dataset::{
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
-        refs::Tags,
+        refs::Refs,
         transaction::{Operation, Transaction},
         ManifestWriteConfig, ReadParams,
     },
@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -356,6 +357,7 @@ impl<'a> CommitBuilder<'a> {
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
+                session.store_registry(),
             )
             .await?
         };
@@ -370,12 +372,6 @@ impl<'a> CommitBuilder<'a> {
             operation=&transaction.operation.name()
         );
 
-        let tags = Tags::new(
-            object_store.clone(),
-            commit_handler.clone(),
-            base_path.clone(),
-        );
-
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
@@ -386,20 +382,33 @@ impl<'a> CommitBuilder<'a> {
                 fragment_bitmap,
                 ..dataset.as_ref().clone()
             }),
-            WriteDestination::Uri(uri) => Ok(Dataset {
-                object_store,
-                base: base_path,
-                uri: uri.to_string(),
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                commit_handler,
-                tags,
-                index_cache,
-                fragment_bitmap,
-                metadata_cache,
-                file_reader_options: None,
-            }),
+            WriteDestination::Uri(uri) => {
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    BranchLocation {
+                        path: base_path.clone(),
+                        uri: uri.to_string(),
+                        branch: manifest.branch.clone(),
+                    },
+                );
+
+                Ok(Dataset {
+                    object_store,
+                    base: base_path,
+                    uri: uri.to_string(),
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    commit_handler,
+                    refs,
+                    index_cache,
+                    fragment_bitmap,
+                    metadata_cache,
+                    file_reader_options: None,
+                    store_params: self.store_params.clone().map(Box::new),
+                })
+            }
         }
     }
 
@@ -478,6 +487,8 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_io::utils::tracking_store::IOTracker;
+    use lance_io::{assert_io_eq, assert_io_gt};
     use lance_io::{object_store::ChainedWrappingObjectStore, utils::CachedFileSize};
     use lance_table::format::{DataFile, Fragment};
     use std::time::Duration;
@@ -486,10 +497,7 @@ mod tests {
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::{
-        dataset::{InsertBuilder, WriteParams},
-        utils::test::StatsHolder,
-    };
+    use crate::dataset::{InsertBuilder, WriteParams};
 
     use super::*;
 
@@ -509,6 +517,8 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -528,8 +538,7 @@ mod tests {
     #[tokio::test]
     async fn test_reuse_session() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
-
+        let io_tracker = IOTracker::default();
         let session = Arc::new(Session::default());
         // Create new dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -542,9 +551,8 @@ mod tests {
             vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
         )
         .unwrap();
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let store_params = ObjectStoreParams {
-            object_store_wrapper: Some(io_stats_wrapper),
+            object_store_wrapper: Some(Arc::new(io_tracker.clone())),
             ..Default::default()
         };
         let dataset = InsertBuilder::new("memory://test")
@@ -559,20 +567,9 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let reset_iops = || {
-            io_stats.lock().unwrap().read_iops = 0;
-            io_stats.lock().unwrap().write_iops = 0;
-        };
-        let get_new_iops = || {
-            let read_iops = io_stats.lock().unwrap().read_iops;
-            let write_iops = io_stats.lock().unwrap().write_iops;
-            reset_iops();
-            (read_iops, write_iops)
-        };
-
-        let (initial_reads, initial_writes) = get_new_iops();
-        assert!(initial_reads > 0);
-        assert!(initial_writes > 0);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_gt!(io_stats, read_iops, 0);
+        assert_io_gt!(io_stats, write_iops, 0);
 
         // Commit transaction 5 times
         for i in 0..5 {
@@ -586,12 +583,12 @@ mod tests {
             // we shouldn't need to read anything from disk. Except we do need
             // to check for the latest version to see if we need to do conflict
             // resolution.
-            let (reads, writes) = get_new_iops();
-            assert_eq!(reads, 1, "i = {}", i);
+            let io_stats = io_tracker.incremental_stats();
+            assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
             // Should see 2 IOPs:
             // 1. Write the transaction files
             // 2. Write (conditional put) the manifest
-            assert_eq!(writes, 2, "i = {}", i);
+            assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest, i = {}", i);
         }
 
         // Commit transaction with URI and session
@@ -605,9 +602,9 @@ mod tests {
         // Session should still be re-used
         // However, the dataset needs to be loaded and the read version checked out,
         // so an additional 4 IOPs are needed.
-        let (reads, writes) = get_new_iops();
-        assert_eq!(reads, 5);
-        assert_eq!(writes, 2);
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
+        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store
         // registry so we see the same store.
@@ -620,9 +617,10 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
-        let (reads, writes) = get_new_iops();
-        assert!(reads > 10);
-        assert_eq!(writes, 2);
+
+        let io_stats = io_tracker.incremental_stats();
+        assert_io_gt!(io_stats, read_iops, 10);
+        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
 
     #[tokio::test]
@@ -631,10 +629,10 @@ mod tests {
         // * write txn file (this could be optional one day)
         // * write manifest
         let session = Arc::new(Session::default());
-        let io_tracker = Arc::new(StatsHolder::default());
+        let io_tracker = IOTracker::default();
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
+                object_store_wrapper: Some(Arc::new(io_tracker.clone())),
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -667,19 +665,19 @@ mod tests {
         // This could be zero, if we decided to be optimistic. However, that
         // would mean two wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
-        assert_eq!(io_stats.read_iops, 1);
-        assert_eq!(io_stats.write_iops, 2);
+        assert_io_eq!(io_stats, read_iops, 1);
+        assert_io_eq!(io_stats, write_iops, 2);
         // We can't write them in parallel. The transaction file must exist before
         // we can write the manifest.
-        assert_eq!(io_stats.num_hops, 3);
+        assert_io_eq!(io_stats, num_hops, 3);
     }
 
     #[tokio::test]
     #[rstest::rstest]
     async fn test_commit_conflict_iops(#[values(true, false)] use_cache: bool) {
-        let cache_size = if use_cache { 10_000 } else { 0 };
+        let cache_size = if use_cache { 1_000_000 } else { 0 };
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
-        let io_tracker = Arc::new(StatsHolder::default());
+        let io_tracker = Arc::new(IOTracker::default());
         // We need throttled to correctly count num hops. Otherwise, memory store
         // returns synchronously, and each request is 1 hop.
         let throttled = Arc::new(ThrottledStoreWrapper {
@@ -743,17 +741,19 @@ mod tests {
         // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
         // of those. We should be able to read in 5 hops.
         if use_cache {
-            assert_eq!(io_stats.read_iops, 1); // Just list versions
-            assert_eq!(io_stats.num_hops, 3);
+            assert_io_eq!(io_stats, read_iops, 1); // Just list versions
+            assert_io_eq!(io_stats, num_hops, 3);
         } else {
             // We need to read the other manifests and transactions.
-            assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
+
+            use lance_io::assert_io_lt;
+            assert_io_eq!(io_stats, read_iops, 1 + num_other_txns * 2);
             // It's possible to read the txns for some versions before we
             // finish reading later versions and so the entire "read versions
             // and txs" may appear as 1 hop instead of 2.
-            assert!(io_stats.num_hops <= 5);
+            assert_io_lt!(io_stats, num_hops, 6);
         }
-        assert_eq!(io_stats.write_iops, 2); // txn + manifest
+        assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
     }
 
     #[tokio::test]

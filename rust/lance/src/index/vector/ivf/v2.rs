@@ -376,7 +376,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
-                size: self.ivf.partition_size(part_id) as u32,
+                size: self.storage.partition_size(part_id) as u32,
             })
             .collect::<Vec<_>>();
 
@@ -592,20 +592,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         column: String,
         index_dir: Path,
     ) -> Result<()> {
-        match self.sub_index_type() {
-            (SubIndexType::Flat, _) => {
-                let mut remapper =
-                    IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
-                remapper.remap(mapping).await
-            }
-            _ => Err(Error::Index {
-                message: format!(
-                    "Remapping is not supported for index type {}",
-                    self.index_type(),
-                ),
-                location: location!(),
-            }),
-        }
+        let mut remapper = IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
+        remapper.remap(mapping).await
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -658,6 +646,7 @@ mod tests {
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
@@ -687,7 +676,6 @@ mod tests {
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
-    use tempfile::tempdir;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
@@ -906,8 +894,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = match dataset {
             Some((dataset, vectors)) => (dataset, vectors),
             None => generate_test_dataset::<T>(test_uri, range).await,
@@ -968,8 +956,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1074,8 +1062,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1104,8 +1092,8 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         // compact after delete all rows
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1285,8 +1273,9 @@ mod tests {
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1313,7 +1302,8 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params).await;
+        test_delete_all_rows(params.clone()).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1337,8 +1327,9 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1394,8 +1385,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
 
@@ -1468,8 +1459,8 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
         test_index(
             v1_params,
@@ -1518,8 +1509,8 @@ mod tests {
         index: (VectorIndexParams, IndexType),
     ) {
         let (params, index_type) = index;
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 4;
         let (mut dataset, _) = match params.metric_type {
@@ -1568,8 +1559,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_stats_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 500;
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -1627,8 +1618,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1739,8 +1730,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_with_zero_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
         let vector_field = schema.field(1).clone();
         let zero_batch = RecordBatch::try_new(
@@ -1876,7 +1867,8 @@ mod tests {
     #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
 
         // Just make sure we can query the index.
         let dataset = Dataset::open(test_uri).await.unwrap();
@@ -1954,8 +1946,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_with_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1983,18 +1975,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_with_many_invalid_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
-        // we use 8192 batch size by default, so we need to generate 8192 * 2 vectors to get 2 batches
-        // generate 2 batches, and the first batch's vectors are all with NaN
-        let num_rows = 8192 * 2;
+        // we use 8192 batch size by default, so we need to generate 8192 * 3 vectors to get 3 batches
+        // generate 3 batches, and the first batch's vectors are all with NaN
+        let num_rows = 8192 * 3;
         let mut vectors = Vec::new();
         for i in 0..num_rows {
             if i < 8192 {
                 vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
-            } else {
+            } else if i < 8192 * 2 {
                 vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
+            } else {
+                vectors.extend(std::iter::repeat_n(rand::random::<f32>() * 1e20, DIM));
             }
         }
         let schema = Schema::new(vec![Field::new(
