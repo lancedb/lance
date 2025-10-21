@@ -1005,12 +1005,12 @@ public class Dataset implements Closeable {
      * Create a new tag on main branch.
      *
      * @param tag the tag name
-     * @param version the version to tag
+     * @param versionNumber the version number to tag
      */
-    public void create(String tag, long version) {
+    public void create(String tag, long versionNumber) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTag(tag, version);
+        nativeCreateTag(tag, versionNumber);
       }
     }
 
@@ -1018,13 +1018,13 @@ public class Dataset implements Closeable {
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param version the version to tag
+     * @param versionNumber the version number to tag
      */
-    public void create(String tag, long version, String branch) {
-      Preconditions.checkArgument(branch != null, "Branch cannot be null");
+    public void create(String tag, long versionNumber, String targetBranch) {
+      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTagOnBranch(tag, version, branch);
+        nativeCreateTagOnBranch(tag, versionNumber, targetBranch);
       }
     }
 
@@ -1044,12 +1044,12 @@ public class Dataset implements Closeable {
      * Update a tag to a new version on main branch.
      *
      * @param tag the tag name
-     * @param version the version to tag
+     * @param versionNumber the version number to tag
      */
-    public void update(String tag, long version) {
+    public void update(String tag, long versionNumber) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTag(tag, version);
+        nativeUpdateTag(tag, versionNumber);
       }
     }
 
@@ -1059,11 +1059,11 @@ public class Dataset implements Closeable {
      * @param tag the tag name
      * @param version the version to tag
      */
-    public void update(String tag, long version, String branch) {
-      Preconditions.checkArgument(branch != null, "Branch cannot be null");
+    public void update(String tag, long version, String targetBranch) {
+      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTagOnBranch(tag, version, branch);
+        nativeUpdateTagOnBranch(tag, version, targetBranch);
       }
     }
 
@@ -1100,56 +1100,56 @@ public class Dataset implements Closeable {
      * initial version.
      *
      * @param branch the branch name to create
-     * @param version the version number to branch from
+     * @param versionNumber the version number to create branch from
      * @return a new Dataset of the branch
      */
-    public Dataset create(String branch, long version) {
+    public Dataset create(String branch, long versionNumber) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        return nativeCreateBranch(branch, version, Optional.empty());
+        return nativeCreateBranch(branch, versionNumber, Optional.empty());
       }
     }
 
     /**
      * Create a branch from a specific source branch and version.
      *
-     * @param branch the branch name to create
-     * @param version the version number to branch from
+     * @param branchName the branch name to create
+     * @param versionNumber the version number to create branch from
      * @param sourceBranch the source branch name
      * @return a new Dataset of the created branch
      */
-    public Dataset create(String branch, long version, String sourceBranch) {
+    public Dataset create(String branchName, long versionNumber, String sourceBranch) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         Preconditions.checkNotNull(sourceBranch);
-        return nativeCreateBranch(branch, version, Optional.of(sourceBranch));
+        return nativeCreateBranch(branchName, versionNumber, Optional.of(sourceBranch));
       }
     }
 
     /**
      * Create a branch from a tag reference.
      *
-     * @param branch the branch name to create
-     * @param tagName the tag name to branch from
+     * @param branchName the branch name to create
+     * @param sourceTag the tag name to create branch from
      * @return a new Dataset of the created branch
      */
-    public Dataset create(String branch, String tagName) {
+    public Dataset create(String branchName, String sourceTag) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        Preconditions.checkNotNull(tagName);
-        return nativeCreateBranchOnTag(branch, tagName);
+        Preconditions.checkNotNull(sourceTag);
+        return nativeCreateBranchOnTag(branchName, sourceTag);
       }
     }
 
     /**
      * Delete a branch and its metadata.
      *
-     * @param branch the branch to delete
+     * @param branchName the branch to delete
      */
-    public void delete(String branch) {
+    public void delete(String branchName) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeDeleteBranch(branch);
+        nativeDeleteBranch(branchName);
       }
     }
 
@@ -1210,15 +1210,15 @@ public class Dataset implements Closeable {
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
-  private native void nativeCreateTag(String tag, long version);
+  private native void nativeCreateTag(String tag, long versionNumber);
 
-  private native void nativeCreateTagOnBranch(String tag, long version, String branch);
+  private native void nativeCreateTagOnBranch(String tag, long versionNumber, String branch);
 
   private native void nativeDeleteTag(String tag);
 
-  private native void nativeUpdateTag(String tag, long version);
+  private native void nativeUpdateTag(String tag, long versionNumber);
 
-  private native void nativeUpdateTagOnBranch(String tag, long version, String branch);
+  private native void nativeUpdateTagOnBranch(String tag, long versionNumber, String branch);
 
   private native List<Tag> nativeListTags();
 
@@ -1230,7 +1230,7 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckoutBranch(String branch);
 
   private native Dataset nativeCreateBranch(
-      String branch, long version, Optional<String> sourceBranch);
+      String branch, long versionNumber, Optional<String> sourceBranch);
 
   private native Dataset nativeCreateBranchOnTag(String branch, String tagName);
 
