@@ -20,8 +20,8 @@ from lance.arrow import (
     PandasBFloat16Array,
     bfloat16_array,
 )
-from ml_dtypes import bfloat16
 from lance.file import LanceFileReader
+from ml_dtypes import bfloat16
 
 
 def test_bf16_value():
