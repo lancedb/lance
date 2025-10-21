@@ -1740,4 +1740,88 @@ mod tests {
         let ctx_provider = LanceContextProvider::default();
         assert!(!ctx_provider.get_expr_planners().is_empty());
     }
+
+    #[test]
+    fn test_regexp_match_and_non_empty_captions() {
+        // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
+        // causing planning/evaluation failures. This should evaluate successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("Liberty for all"),
+                    Some("peace"),
+                    Some("revolution now"),
+                    Some("Liberty"),
+                    Some("revolutionary"),
+                    Some("none"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some(""),
+                    Some("c"),
+                    Some("d"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some(""),
+                    Some("y"),
+                    Some("z"),
+                    None,
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let result = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            result.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_regexp_match_infer_error_without_boolean_coercion() {
+        // With the fix applied, using parse_filter should coerce regexp_match to boolean
+        // even when nested in a larger AND expression, so this should plan successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema);
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        // Should not panic
+        let _physical = planner.create_physical_expr(&expr).unwrap();
+    }
 }
