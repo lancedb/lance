@@ -17,7 +17,7 @@ use pyo3::{
     PyResult,
 };
 
-use lance::error::Error as LanceError;
+use lance::Error as LanceError;
 
 pub trait PythonErrorExt<T> {
     /// Convert to a python error based on the Lance error type

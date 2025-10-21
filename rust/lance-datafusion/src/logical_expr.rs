@@ -198,17 +198,24 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
 ///
 /// - *expr*: a datafusion logical expression
 pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
-    match &expr {
-        // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
-        // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction(ScalarFunction { func, .. }) => {
-            if func.name() == "regexp_match" {
-                Expr::IsNotNull(Box::new(expr))
-            } else {
-                expr
-            }
+    match expr {
+        // Coerce regexp_match to boolean by checking for non-null
+        Expr::ScalarFunction(sf) if sf.func.name() == "regexp_match" => {
+            Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
-        _ => expr,
+
+        // Recurse into boolean contexts so nested regexp_match terms are also coerced
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(coerce_filter_type_to_boolean(*left)),
+            op,
+            right: Box::new(coerce_filter_type_to_boolean(*right)),
+        }),
+        Expr::Not(inner) => Expr::Not(Box::new(coerce_filter_type_to_boolean(*inner))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(coerce_filter_type_to_boolean(*inner))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(coerce_filter_type_to_boolean(*inner))),
+
+        // Pass-through for all other nodes
+        other => other,
     }
 }
 

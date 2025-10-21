@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{MergeInsertParams, WhenNotMatchedBySource};
-use crate::{dataset::WhenMatched, error::Result};
+use crate::{dataset::WhenMatched, Result};
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{col, Case, Expr};
 use snafu::location;

@@ -54,7 +54,7 @@ def test_table_loading():
         ffi_lance_table = FFILanceTableProvider(
             dataset, with_row_id=True, with_row_addr=True
         )
-        ctx.register_table_provider("ffi_lance_table", ffi_lance_table)
+        ctx.register_table("ffi_lance_table", ffi_lance_table)
         return ctx
 
     result = normalize(make_ctx().table("ffi_lance_table").collect())

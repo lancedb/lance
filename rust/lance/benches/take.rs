@@ -9,8 +9,9 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use futures::StreamExt;
+use lance::dataset::ProjectionRequest;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::{arrow::FixedSizeListArrayExt, dataset::ProjectionRequest};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};

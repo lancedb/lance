@@ -127,7 +127,7 @@ ctx = SessionContext()
 table1 = FFILanceTableProvider(
     my_lance_dataset, with_row_id=True, with_row_addr=True
 )
-ctx.register_table_provider("table1", table1)
+ctx.register_table("table1", table1)
 ctx.table("table1")
 ctx.sql("SELECT * FROM table1 LIMIT 10")
 ```

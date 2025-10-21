@@ -3704,6 +3704,7 @@ pub mod test_dataset {
         ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{ArrowError, DataType};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
@@ -3711,7 +3712,6 @@ pub mod test_dataset {
         IndexType,
     };
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::index::vector::VectorIndexParams;
 
@@ -3908,7 +3908,6 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::*;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
@@ -4125,6 +4124,82 @@ mod test {
             assert_eq!(batch, expected_batch);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scan_regexp_match_and_non_empty_captions() {
+        // Build a small dataset with three Utf8 columns and verify the full
+        // scan().filter(...) path handles regexp_match combined with non-null/non-empty checks.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("keywords", DataType::Utf8, true),
+            ArrowField::new("natural_caption", DataType::Utf8, true),
+            ArrowField::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("Liberty for all"),
+                    Some("peace"),
+                    Some("revolution now"),
+                    Some("Liberty"),
+                    Some("revolutionary"),
+                    Some("none"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some(""),
+                    Some("c"),
+                    Some("d"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some(""),
+                    Some("y"),
+                    Some("z"),
+                    None,
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.filter(
+            "regexp_match(keywords, 'Liberty|revolution') AND \
+             (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+              poetic_caption IS NOT NULL AND poetic_caption <> '')",
+        )
+        .unwrap();
+
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 1);
+
+        let out_keywords = out
+            .column_by_name("keywords")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        let out_nat = out
+            .column_by_name("natural_caption")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        let out_poetic = out
+            .column_by_name("poetic_caption")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+
+        assert_eq!(out_keywords, "Liberty for all");
+        assert_eq!(out_nat, "a");
+        assert_eq!(out_poetic, "x");
     }
 
     #[tokio::test]
@@ -4933,6 +5008,8 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
+        use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -5214,6 +5291,8 @@ mod test {
             VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
+            use lance_arrow::FixedSizeListArrayExt;
+
             let test_dir = TempStrDir::default();
             let test_uri = &test_dir;
 

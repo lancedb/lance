@@ -5,11 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::dataset::branch_location::BranchLocation;
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
+use crate::{session::Session, Dataset, Error, Result};
 use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;

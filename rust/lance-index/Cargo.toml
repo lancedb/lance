@@ -99,9 +99,6 @@ pprof.workspace = true
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
 
-[profile.bench]
-debug = true
-
 [[bench]]
 name = "find_partitions"
 harness = false

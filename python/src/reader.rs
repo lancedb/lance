@@ -38,7 +38,7 @@ pub struct LanceReader {
 }
 
 impl LanceReader {
-    pub async fn try_new(mut scanner: Arc<LanceScanner>) -> ::lance::error::Result<Self> {
+    pub async fn try_new(mut scanner: Arc<LanceScanner>) -> ::lance::Result<Self> {
         let stream = Arc::make_mut(&mut scanner).try_into_stream().await?;
         let schema = stream.schema();
         Ok(Self {
