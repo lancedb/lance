@@ -4863,7 +4863,6 @@ mod test {
         check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
 
         let check_fails = |projection: &[&str]| {
-            println!("Checking fails: {:?}", projection);
             let mut scan = data.scan();
             assert!(scan.project(projection).is_err());
         };
