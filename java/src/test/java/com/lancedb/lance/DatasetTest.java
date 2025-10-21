@@ -1412,8 +1412,7 @@ public class DatasetTest {
         Schema srcSchema = src.getSchema();
 
         // shallow clone by version
-        try (Dataset clone =
-            src.shallowClone(dstPathByVersion, Reference.ofMain(src.version()))) {
+        try (Dataset clone = src.shallowClone(dstPathByVersion, Reference.ofMain(src.version()))) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());
