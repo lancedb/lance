@@ -9,7 +9,3 @@ pub(crate) mod temporal;
 pub(crate) mod test;
 #[cfg(feature = "tensorflow")]
 pub mod tfrecord;
-
-// Re-export
-pub use lance_datafusion::sql;
-pub use lance_index::vector::kmeans;
