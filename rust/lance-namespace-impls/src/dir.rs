@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteParams};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreExt};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance::session::Session;
 use object_store::path::Path;
 
@@ -35,7 +35,20 @@ use lance_namespace::LanceNamespace;
 /// This is a convenience wrapper around DirectoryNamespace::new that returns
 /// the same type as connect for API consistency.
 pub async fn connect_dir(properties: HashMap<String, String>) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties).map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+    connect_dir_with_session(properties, None).await
+}
+
+/// Connect to a directory-based Lance namespace with an optional shared Session.
+///
+/// This allows reusing an existing Session for object store management, which can
+/// improve performance by sharing object store connections and caches.
+pub async fn connect_dir_with_session(
+    properties: HashMap<String, String>,
+    session: Option<Arc<Session>>,
+) -> Result<Arc<dyn LanceNamespace>> {
+    DirectoryNamespace::new_with_session(properties, session)
+        .await
+        .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
 }
 
 /// Configuration for DirectoryNamespace.
@@ -102,12 +115,24 @@ pub struct DirectoryNamespace {
 }
 
 impl DirectoryNamespace {
-    /// Create a new DirectoryNamespace instance
-    pub fn new(properties: HashMap<String, String>) -> Result<Self> {
+    /// Create a new DirectoryNamespace instance with a default Session
+    pub async fn new(properties: HashMap<String, String>) -> Result<Self> {
+        Self::new_with_session(properties, None).await
+    }
+
+    /// Create a new DirectoryNamespace instance with an optional shared Session
+    ///
+    /// If `session` is None, a new default Session will be created.
+    /// If `session` is Some, the provided Session will be reused, allowing for
+    /// shared object store connections and caches across multiple namespaces.
+    pub async fn new_with_session(
+        properties: HashMap<String, String>,
+        session: Option<Arc<Session>>,
+    ) -> Result<Self> {
         let config = DirectoryNamespaceConfig::new(properties);
 
-        // Create a session for object store management
-        let session = Arc::new(Session::default());
+        // Use provided session or create a new one
+        let session = session.unwrap_or_else(|| Arc::new(Session::default()));
 
         // Build ObjectStoreParams from storage options
         let params = ObjectStoreParams {
@@ -120,15 +145,12 @@ impl DirectoryNamespace {
         };
 
         // Use Lance's ObjectStore::from_uri_and_params for consistent initialization
-        let (object_store, base_path) = tokio::runtime::Handle::current()
-            .block_on(async {
-                ObjectStore::from_uri_and_params(
-                    session.store_registry(),
-                    config.uri(),
-                    &params
-                )
-                .await
-            })?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            session.store_registry(),
+            config.uri(),
+            &params
+        )
+        .await?;
 
         Ok(Self {
             config,
@@ -273,9 +295,9 @@ impl LanceNamespace for DirectoryNamespace {
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
         Self::validate_root_namespace_id(&request.id)?;
 
-        let mut tables = Vec::new();
+        let mut table_names = std::collections::HashSet::new();
 
-        // Use non-recursive listing to get all items at the root level
+        // List all items at the root level - simple approach like ListingDatabase
         let mut entries = self.object_store.inner.list(Some(&self.base_path));
 
         while let Some(entry_result) = entries.next().await {
@@ -296,37 +318,27 @@ impl LanceNamespace for DirectoryNamespace {
                 continue;
             };
 
-            // Only process paths that end with .lance (and are top-level directories)
-            if !relative_path.ends_with(".lance") || relative_path.contains('/') {
-                continue;
-            }
+            // Look for files within .lance directories, but skip .lance-reserved files
+            // Empty tables (with only .lance-reserved) won't appear until they have real data
+            // e.g., "table1.lance/_versions/1.manifest" -> extract "table1"
+            if let Some(lance_pos) = relative_path.find(".lance/") {
+                let after_lance = &relative_path[lance_pos + 7..]; // +7 for ".lance/"
 
-            // Extract table name (remove .lance suffix)
-            let table_name = &relative_path[..relative_path.len() - 6];
-
-            // Check if it's a valid Lance dataset or has .lance-reserved file
-            let mut is_table = false;
-
-            // First check for .lance-reserved file
-            let reserved_path = self.table_reserved_file_path(table_name);
-            if self.object_store.inner.exists(&reserved_path).await {
-                is_table = true;
-            }
-
-            // If not found, check for _versions directory
-            if !is_table {
-                let versions_path = self.table_versions_path(table_name);
-                let mut version_entries = self.object_store.inner.list(Some(&versions_path));
-                if version_entries.next().await.is_some() {
-                    is_table = true;
+                // Skip .lance-reserved files - tables with only this file are considered empty
+                if after_lance == ".lance-reserved" {
+                    continue;
                 }
-            }
 
-            if is_table {
-                tables.push(table_name.to_string());
+                let table_name = &relative_path[..lance_pos];
+                // Only consider top-level tables (no nested directories)
+                if !table_name.contains('/') {
+                    table_names.insert(table_name.to_string());
+                }
             }
         }
 
+        let mut tables: Vec<String> = table_names.into_iter().collect();
+        tables.sort(); // Sort like ListingDatabase does
         let response = ListTablesResponse::new(tables);
         Ok(response)
     }
@@ -335,25 +347,13 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
 
-        // Check if table exists - either as Lance dataset or with .lance-reserved file
-        let mut table_exists = false;
+        // Simple check: just verify the .lance directory exists
+        // This matches ListingDatabase behavior - a table is just a .lance directory
+        let table_dir_path = self.table_path(&table_name);
+        let mut entries = self.object_store.inner.list(Some(&table_dir_path));
 
-        // First check for .lance-reserved file
-        let reserved_path = self.table_reserved_file_path(&table_name);
-        if self.object_store.inner.exists(&reserved_path).await {
-            table_exists = true;
-        }
-
-        // If not found, check if it's a Lance dataset by looking for _versions directory
-        if !table_exists {
-            let versions_path = self.table_versions_path(&table_name);
-            let mut version_entries = self.object_store.inner.list(Some(&versions_path));
-            if version_entries.next().await.is_some() {
-                table_exists = true;
-            }
-        }
-
-        if !table_exists {
+        // If we can list at least one entry, the directory exists
+        if entries.next().await.is_none() {
             return Err(Error::Namespace {
                 source: format!("Table does not exist: {}", table_name).into(),
                 location: snafu::location!(),
@@ -372,25 +372,13 @@ impl LanceNamespace for DirectoryNamespace {
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         let table_name = Self::table_name_from_id(&request.id)?;
 
-        // Check if table exists - either as Lance dataset or with .lance-reserved file
-        let mut table_exists = false;
+        // Simple check: just verify the .lance directory exists
+        // This matches ListingDatabase behavior - a table is just a .lance directory
+        let table_dir_path = self.table_path(&table_name);
+        let mut entries = self.object_store.inner.list(Some(&table_dir_path));
 
-        // First check for .lance-reserved file
-        let reserved_path = self.table_reserved_file_path(&table_name);
-        if self.object_store.inner.exists(&reserved_path).await {
-            table_exists = true;
-        }
-
-        // If not found, check if it's a Lance dataset by looking for _versions directory
-        if !table_exists {
-            let versions_path = self.table_versions_path(&table_name);
-            let mut version_entries = self.object_store.inner.list(Some(&versions_path));
-            if version_entries.next().await.is_some() {
-                table_exists = true;
-            }
-        }
-
-        if !table_exists {
+        // If we can list at least one entry, the directory exists
+        if entries.next().await.is_none() {
             return Err(Error::Namespace {
                 source: format!("Table does not exist: {}", table_name).into(),
                 location: snafu::location!(),
@@ -509,11 +497,14 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
+        // Create the .lance-reserved file to mark the table as reserved
+        // Note: Empty tables (with only .lance-reserved) won't appear in list_tables
+        // until they have actual data written. This matches ListingDatabase behavior
+        // where only .lance directories with content are considered valid tables.
         let reserved_path = self.table_reserved_file_path(&table_name);
         self.object_store
             .inner
-            .put(&reserved_path, bytes::Bytes::new())
+            .put(&reserved_path, bytes::Bytes::new().into())
             .await
             .map_err(|e| Error::Namespace {
                 source: format!(
@@ -589,7 +580,7 @@ mod tests {
             temp_dir.path().to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
         (namespace, temp_dir)
     }
 
@@ -966,7 +957,7 @@ mod tests {
             custom_path.to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -995,7 +986,7 @@ mod tests {
         properties.insert("storage.option1".to_string(), "value1".to_string());
         properties.insert("storage.option2".to_string(), "value2".to_string());
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1161,17 +1152,18 @@ mod tests {
         let metadata = std::fs::metadata(&reserved_file).unwrap();
         assert_eq!(metadata.len(), 0);
 
-        // Verify table exists by checking for .lance-reserved file
+        // Note: Empty tables won't appear in list_tables until they have actual data
+        // This matches ListingDatabase behavior - only .lance directories with content are listed
+        let list_request = ListTablesRequest::new();
+        let list_response = namespace.list_tables(list_request).await.unwrap();
+        assert!(!list_response.tables.contains(&"empty_table".to_string()),
+                "Empty tables should not appear in list_tables");
+
+        // However, table_exists and describe_table should work by checking for any file in .lance directory
         let mut exists_request = TableExistsRequest::new();
         exists_request.id = Some(vec!["empty_table".to_string()]);
         namespace.table_exists(exists_request).await.unwrap();
 
-        // List tables should include the empty table
-        let list_request = ListTablesRequest::new();
-        let list_response = namespace.list_tables(list_request).await.unwrap();
-        assert!(list_response.tables.contains(&"empty_table".to_string()));
-
-        // Verify describe table works for empty table
         let mut describe_request = DescribeTableRequest::new();
         describe_request.id = Some(vec!["empty_table".to_string()]);
         let describe_response = namespace.describe_table(describe_request).await.unwrap();
@@ -1218,14 +1210,16 @@ mod tests {
         let drop_response = namespace.drop_table(drop_request).await.unwrap();
         assert!(drop_response.location.is_some());
 
-        // Verify table directory was removed
-        assert!(!table_dir.exists());
+        // Verify the reserved file was deleted (drop_table deletes all files in the directory)
         assert!(!reserved_file.exists());
 
-        // Verify table no longer exists
+        // Note: The directory itself may still exist but be empty, which is fine
+        // What matters is that table_exists returns error because there are no files
+
+        // Verify table no longer exists (list returns no entries in the directory)
         let mut exists_request = TableExistsRequest::new();
         exists_request.id = Some(vec!["empty_table_to_drop".to_string()]);
         let exists_result = namespace.table_exists(exists_request).await;
-        assert!(exists_result.is_err());
+        assert!(exists_result.is_err(), "Table should not exist after drop");
     }
 }

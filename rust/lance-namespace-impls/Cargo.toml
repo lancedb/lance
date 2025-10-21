@@ -14,7 +14,7 @@ rust-version.workspace = true
 [features]
 default = []
 rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
-dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
+dir = ["dep:lance", "dep:lance-io", "dep:futures", "dep:object_store", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema"]
 rest-server = ["dep:axum", "dep:tokio", "dep:tower", "dep:tower-http", "dep:serde", "dep:serde_json"]
 
 [dependencies]
@@ -31,14 +31,16 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "rustls-tls-native-roots"
 ] }
 serde_json = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 # Directory implementation dependencies (optional, enabled by "dir" feature)
 lance = { workspace = true, optional = true }
-opendal = { workspace = true, optional = true, features = ["services-fs", "services-s3", "services-gcs", "services-azblob"] }
+lance-io = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
 
 # REST server implementation dependencies (optional, enabled by "rest-server" feature)
 axum = { version = "0.7", optional = true }

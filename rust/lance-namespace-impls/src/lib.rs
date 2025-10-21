@@ -22,8 +22,8 @@ pub mod dir;
 #[cfg(feature = "rest-server")]
 pub mod rest_adapter;
 
-// Re-export connect function
-pub use connect::connect;
+// Re-export connect function and ConnectBuilder
+pub use connect::{connect, ConnectBuilder};
 
 #[cfg(feature = "rest")]
 pub use rest::RestNamespace;
