@@ -360,51 +360,44 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             }
         }
 
-        let mut row_buffers: Vec<Vec<u8>> = Vec::with_capacity(num_values as usize);
+        let mut row_data: Vec<u8> = Vec::new();
+        let mut row_offsets: Vec<u64> = Vec::with_capacity(num_values as usize + 1);
+        row_offsets.push(0);
         let mut total_bytes: usize = 0;
         let mut max_row_len: usize = 0;
         for row in 0..num_values as usize {
-            let mut row_bytes = Vec::new();
+            let start = row_data.len();
             for field in &field_data {
-                field.append_row_bytes(row, &mut row_bytes)?;
+                field.append_row_bytes(row, &mut row_data)?;
             }
-            max_row_len = max_row_len.max(row_bytes.len());
-            total_bytes = total_bytes.checked_add(row_bytes.len()).ok_or_else(|| {
+            let end = row_data.len();
+            let row_len = end - start;
+            max_row_len = max_row_len.max(row_len);
+            total_bytes = total_bytes.checked_add(row_len).ok_or_else(|| {
                 Error::invalid_input("Packed struct row data size overflow", location!())
             })?;
-            row_buffers.push(row_bytes);
+            row_offsets.push(end as u64);
         }
+        debug_assert_eq!(total_bytes, row_data.len());
 
         let use_u32_offsets = total_bytes <= u32::MAX as usize && max_row_len <= u32::MAX as usize;
         let bits_per_offset = if use_u32_offsets { 32 } else { 64 };
-        let mut row_builder = DataBlockBuilder::with_capacity_estimate(total_bytes as u64);
+        let offsets_buffer = if use_u32_offsets {
+            let offsets_u32 = row_offsets
+                .iter()
+                .map(|&offset| offset as u32)
+                .collect::<Vec<_>>();
+            LanceBuffer::reinterpret_vec(offsets_u32)
+        } else {
+            LanceBuffer::reinterpret_vec(row_offsets)
+        };
 
-        for row_bytes in row_buffers {
-            let row_len = row_bytes.len();
-            let data_buffer = LanceBuffer::from(row_bytes);
-            if use_u32_offsets {
-                let row_block = DataBlock::VariableWidth(VariableWidthBlock {
-                    data: data_buffer,
-                    bits_per_offset,
-                    offsets: LanceBuffer::reinterpret_vec(vec![0_u32, row_len as u32]),
-                    num_values: 1,
-                    block_info: BlockInfo::new(),
-                });
-                row_builder.append(&row_block, 0..1);
-            } else {
-                let row_block = DataBlock::VariableWidth(VariableWidthBlock {
-                    data: data_buffer,
-                    bits_per_offset,
-                    offsets: LanceBuffer::reinterpret_vec(vec![0_u64, row_len as u64]),
-                    num_values: 1,
-                    block_info: BlockInfo::new(),
-                });
-                row_builder.append(&row_block, 0..1);
-            }
-        }
-
-        let DataBlock::VariableWidth(data_block) = row_builder.finish() else {
-            panic!("Packed struct variable encoder expected variable-width block")
+        let data_block = VariableWidthBlock {
+            data: LanceBuffer::from(row_data),
+            bits_per_offset,
+            offsets: offsets_buffer,
+            num_values,
+            block_info: BlockInfo::new(),
         };
 
         Ok((

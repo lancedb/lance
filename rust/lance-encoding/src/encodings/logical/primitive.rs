@@ -1235,9 +1235,9 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 16,
                     num_dictionary_items,
                 }),
-                _ => {
-                    unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
-                }
+                _ => unreachable!(
+                    "Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary."
+                ),
             }
         } else {
             None
