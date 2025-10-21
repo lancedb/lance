@@ -1452,7 +1452,7 @@ public class DatasetTest {
 
   @Test
   void testBranches(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("branches_flow").toString();
+    String datasetPath = tempDir.resolve("testBranches").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
 
@@ -1491,8 +1491,9 @@ public class DatasetTest {
                   assertEquals(4, branch2V4.version());
                   assertEquals(10, branch2V4.countRows()); // A(5) + B(3) + C(2)
 
-                  // 5) Validate branch listing metadata; delete branch1; validate listing again
-                  List<Branch> branches = mainV2.branches().list();
+                  // Step 5. Validate branch listing metadata; delete branch1; validate listing
+                  // again
+                  List<Branch> branches = branch2V4.branches().list();
                   Optional<Branch> b1 =
                       branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
                   Optional<Branch> b2 =
@@ -1504,7 +1505,7 @@ public class DatasetTest {
 
                   // Metadata fields and consistency checks
                   assertEquals("branch1", branch1Meta.getName());
-                  assertEquals(2, branch1Meta.getParentVersion()); // from main@2
+                  assertEquals(2, branch1Meta.getParentVersion());
                   assertTrue(
                       branch1Meta.getParentBranch() == null
                           || branch1Meta.getParentBranch().isEmpty()); // main branch is null
@@ -1523,15 +1524,23 @@ public class DatasetTest {
                   } catch (Exception ignored) {
                     // Some environments may report NotFound on cleanup; ignore and proceed
                   }
-                  List<Branch> after = mainV2.branches().list();
+                  List<Branch> branchListAfterDelete = mainV2.branches().list();
                   assertTrue(
-                      after.stream().noneMatch(b -> b.getName().equals("branch1")),
+                      branchListAfterDelete.stream().noneMatch(b -> b.getName().equals("branch1")),
                       "branch1 should be deleted");
 
-                  Optional<Branch> b2After =
-                      after.stream().filter(b -> b.getName().equals("branch2")).findFirst();
-                  assertTrue(b2After.isPresent(), "branch2 should remain");
-                  assertEquals(branch2Meta, b2After.get());
+                  Optional<Branch> branch2AfterDelete =
+                      branchListAfterDelete.stream()
+                          .filter(b -> b.getName().equals("branch2"))
+                          .findFirst();
+                  assertTrue(branch2AfterDelete.isPresent(), "branch2 should remain");
+                  assertEquals(branch2Meta, branch2AfterDelete.get());
+
+                  // Step 6. use checkout_branch to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkoutBranch("branch2")) {
+                    assertEquals(4, branch2V4New.version());
+                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  }
                 }
               }
             }
