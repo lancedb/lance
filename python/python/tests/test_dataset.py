@@ -62,6 +62,18 @@ input_data = [
 ]
 
 
+def test_write_unstable_data_version(tmp_path: Path, capfd):
+    # Note: this test will only work if no earlier test attempts
+    # to use an unstable version.  If we need that later we can find a way to
+    # run this test in a separate process (pytest-xdist?)
+    tab = pa.table({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(
+        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
+    )
+    assert ds.to_table() == tab
+    assert "You have requested an unstable format version" in capfd.readouterr().err
+
+
 @pytest.mark.parametrize("schema,data", input_data, ids=type)
 def test_input_data(tmp_path: Path, schema, data):
     base_dir = tmp_path / "test"
@@ -1690,18 +1702,6 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     # Accepts an iterator
     scanner = dataset.scanner(fragments=iter(fragments[0:2]), scan_in_order=False)
     assert scanner.to_table().num_rows == 2 * 100
-
-
-def test_write_unstable_data_version(tmp_path: Path, capfd):
-    # Note: this test will only work if no earlier test attempts
-    # to use an unstable version.  If we need that later we can find a way to
-    # run this test in a separate process (pytest-xdist?)
-    tab = pa.table({"a": range(100), "b": range(100)})
-    ds = lance.write_dataset(
-        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
-    )
-    assert ds.to_table() == tab
-    assert "You have requested an unstable format version" in capfd.readouterr().err
 
 
 def test_merge_data(tmp_path: Path):

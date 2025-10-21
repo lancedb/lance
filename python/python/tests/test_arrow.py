@@ -217,14 +217,10 @@ def test_struct_variable_children_roundtrip(tmp_path: Path):
         ],
         type=struct_type,
     )
-    table = pa.Table.from_arrays(
-        [struct_array], schema=pa.schema([struct_field])
-    )
+    table = pa.Table.from_arrays([struct_array], schema=pa.schema([struct_field]))
 
     dataset_uri = tmp_path / "struct.lance"
-    ds = lance.write_dataset(
-        table, dataset_uri, data_storage_version="2.2"
-    )
+    ds = lance.write_dataset(table, dataset_uri, data_storage_version="2.2")
 
     round_trip = ds.to_table()
     assert round_trip.schema == table.schema
