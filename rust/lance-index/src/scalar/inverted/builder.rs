@@ -36,6 +36,7 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
+use crate::scalar::inverted::lance_tokenizer::DocType;
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -144,6 +145,15 @@ impl InvertedIndexBuilder {
     ) -> Result<()> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
+
+        // infer lance_tokenizer based on document type
+        if self.params.lance_tokenizer.is_none() {
+            let schema = new_data.schema();
+            let field = schema.column_with_name(doc_col).expect_ok()?.1;
+            let doc_type = DocType::try_from(field)?;
+            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        }
+
         let new_data = document_input(new_data, doc_col)?;
 
         self.update_index(new_data).await?;
