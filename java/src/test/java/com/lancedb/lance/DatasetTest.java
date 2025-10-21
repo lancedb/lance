@@ -1413,7 +1413,7 @@ public class DatasetTest {
 
         // shallow clone by version
         try (Dataset clone =
-            src.shallowClone(dstPathByVersion, Reference.ofMainVersion(src.version()))) {
+            src.shallowClone(dstPathByVersion, Reference.ofMain(src.version()))) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());

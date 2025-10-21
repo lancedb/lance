@@ -42,7 +42,7 @@ public class Reference {
     return tagName;
   }
 
-  public static Reference ofMainVersion(long versionNumber) {
+  public static Reference ofMain(long versionNumber) {
     return new Reference(Optional.of(versionNumber), Optional.empty(), Optional.empty());
   }
 
