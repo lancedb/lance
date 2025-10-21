@@ -668,12 +668,12 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,          // Optional<String>
-    params_jobj: JObject,        // IndexParams
-    replace_jobj: jboolean,      // replace
-    train_jobj: jboolean,        // train
-    fragments_jobj: JObject,     // List<Integer>
-    fragment_uuid_jobj: JObject, // String
+    name_jobj: JObject,       // Optional<String>
+    params_jobj: JObject,     // IndexParams
+    replace_jobj: jboolean,   // replace
+    train_jobj: jboolean,     // train
+    fragments_jobj: JObject,  // List<Integer>
+    index_uuid_jobj: JObject, // String
 ) {
     ok_or_throw_without_return!(
         env,
@@ -687,7 +687,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
             replace_jobj,
             train_jobj,
             fragments_jobj,
-            fragment_uuid_jobj
+            index_uuid_jobj
         )
     );
 }
@@ -698,12 +698,12 @@ fn inner_create_index(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,          // Optional<String>
-    params_jobj: JObject,        // IndexParams
-    replace_jobj: jboolean,      // replace
-    train_jobj: jboolean,        // train
-    fragments_jobj: JObject,     // Optional<List<String>>
-    fragment_uuid_jobj: JObject, // Optional<String>
+    name_jobj: JObject,       // Optional<String>
+    params_jobj: JObject,     // IndexParams
+    replace_jobj: jboolean,   // replace
+    train_jobj: jboolean,     // train
+    fragments_jobj: JObject,  // Optional<List<String>>
+    index_uuid_jobj: JObject, // Optional<String>
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -714,7 +714,7 @@ fn inner_create_index(
     let fragment_ids = env
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
-    let fragment_uuid = env.get_string_opt(&fragment_uuid_jobj)?;
+    let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -774,8 +774,8 @@ fn inner_create_index(
         index_builder = index_builder.fragments(fragment_ids);
     }
 
-    if let Some(fragment_uuid) = fragment_uuid {
-        index_builder = index_builder.fragment_uuid(fragment_uuid);
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
     }
 
     if has_fragment_ids {
