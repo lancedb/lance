@@ -21,7 +21,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
-use lance::arrow::FixedSizeListArrayExt;
+use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use std::sync::Arc;
