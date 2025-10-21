@@ -11,6 +11,7 @@ use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
+use datafusion_physical_expr::LexOrdering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
@@ -786,4 +787,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// If supported, scan back original data. If not, return None.
+    fn scan(
+        &self,
+        _query: Option<&dyn AnyQuery>,
+        _limit: Option<usize>,
+        _metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        Ok(None)
+    }
 }

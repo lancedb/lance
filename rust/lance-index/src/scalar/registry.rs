@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion_physical_expr::LexOrdering;
 use lance_core::{cache::LanceCache, Error, Result};
 use snafu::location;
 
@@ -155,6 +156,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<ScalarIndexPluginRegistry>) {}
+
+    /// Supports scanning back original data
+    fn supports_scan(&self) -> bool {
+        true
+    }
 }
 
 /// A registry of scalar index plugins

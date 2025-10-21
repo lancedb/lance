@@ -5,6 +5,8 @@
 //!
 
 pub(crate) mod dataframe;
+pub(crate) mod index_scan;
 pub(crate) mod logical_plan;
 
 pub use dataframe::LanceTableProvider;
+pub use index_scan::LanceIndexTableProvider;

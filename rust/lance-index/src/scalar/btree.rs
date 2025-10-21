@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
     union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
+use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
 use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
@@ -791,6 +791,26 @@ impl BTreeIndex {
         }
     }
 
+    fn find_pages(&self, query: &SargableQuery) -> Result<Vec<u32>> {
+        let pages = match query {
+            SargableQuery::Equals(val) => self
+                .page_lookup
+                .pages_eq(&OrderableScalarValue(val.clone())),
+            SargableQuery::Range(start, end) => self
+                .page_lookup
+                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
+            SargableQuery::IsIn(values) => self
+                .page_lookup
+                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for BTree index, build a inverted index for it",
+                location!(),
+            )),
+            SargableQuery::IsNull() => self.page_lookup.pages_null(),
+        };
+        Ok(pages)
+    }
+
     async fn lookup_page(
         &self,
         page_number: u32,
@@ -845,6 +865,24 @@ impl BTreeIndex {
                 location: location!(),
             }),
         }
+    }
+
+    async fn scan_page(
+        &self,
+        query: &SargableQuery,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        let subindex = self
+            .lookup_page(page_number, index_reader, metrics.as_ref())
+            .await?;
+        subindex
+            .scan(Some(query), metrics)?
+            .ok_or_else(|| Error::Internal {
+                message: "BTree sub-indices need to implement scan".to_string(),
+                location: location!(),
+            })
     }
 
     fn try_from_serialized(
@@ -1153,22 +1191,7 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let pages = match query {
-            SargableQuery::Equals(val) => self
-                .page_lookup
-                .pages_eq(&OrderableScalarValue(val.clone())),
-            SargableQuery::Range(start, end) => self
-                .page_lookup
-                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
-            SargableQuery::IsIn(values) => self
-                .page_lookup
-                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
-            )),
-            SargableQuery::IsNull() => self.page_lookup.pages_null(),
-        };
+        let pages = self.find_pages(query)?;
         let lazy_index_reader = LazyIndexReader::new(self.store.clone());
         let page_tasks = pages
             .into_iter()
@@ -1259,6 +1282,31 @@ impl ScalarIndex for BTreeIndex {
             zone_size: Some(self.batch_size),
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
+    }
+
+    fn scan(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        limit: Option<usize>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        // TODO: to push down the limit we also need to provide the deletion mask.
+        if let Some(query) = query {
+            let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            let pages = self.find_pages(query)?;
+
+            let stream = futures::stream::iter(pages.into_iter()).map(|page_number| {
+                // self.scan_page(query, page_number, index_reader, metrics)
+                todo!()
+            });
+            let schema = todo!();
+            Ok(Some(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        } else {
+            let stream = todo!("Re-use existing stream");
+            Ok(Some(stream))
+        }
     }
 }
 
@@ -1996,6 +2044,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_scan(&self) -> bool {
+        true
     }
 }
 
