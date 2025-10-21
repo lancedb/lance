@@ -197,11 +197,11 @@ impl BlockingDataset {
         version: u64,
         source_branch: Option<&str>,
     ) -> Result<Self> {
-        let ref_ = match source_branch {
-            Some(b) => lance::dataset::refs::Ref::from((b, version)),
-            None => lance::dataset::refs::Ref::from(version),
+        let reference = match source_branch {
+            Some(b) => Ref::from((b, version)),
+            None => Ref::from(version),
         };
-        let inner = RT.block_on(self.inner.create_branch(branch, ref_, None))?;
+        let inner = RT.block_on(self.inner.create_branch(branch, reference, None))?;
         Ok(Self { inner })
     }
 
@@ -221,12 +221,12 @@ impl BlockingDataset {
         version: Option<u64>,
         tag: Option<String>,
     ) -> Result<Self> {
-        let ref_ = if let Some(tag_name) = tag {
+        let reference = if let Some(tag_name) = tag {
             Ref::from(tag_name.as_str())
         } else {
             Ref::Version(branch, version)
         };
-        let inner = RT.block_on(self.inner.checkout_version(ref_))?;
+        let inner = RT.block_on(self.inner.checkout_version(reference))?;
         Ok(Self { inner })
     }
 
@@ -1095,9 +1095,9 @@ fn inner_shallow_clone<'local>(
     })?;
 
     let reference = {
-        let version_number = env.get_optional_u64_from_method(&reference, "versionNumber")?;
-        let tag_name = env.get_optional_string_from_method(&reference, "tagName")?;
-        let branch_name = env.get_optional_string_from_method(&reference, "branchName")?;
+        let version_number = env.get_optional_u64_from_method(&reference, "getVersionNumber")?;
+        let tag_name = env.get_optional_string_from_method(&reference, "getTagName")?;
+        let branch_name = env.get_optional_string_from_method(&reference, "getBranchName")?;
         match (version_number, branch_name, tag_name) {
             (Some(version_number), branch_name, None) => {
                 Ref::Version(branch_name, Some(version_number))
@@ -1914,14 +1914,14 @@ fn inner_create_branch_on_tag<'local>(
 ) -> Result<JObject<'local>> {
     let branch_name: String = jbranch.extract(env)?;
     let tag_name: String = jtag_name.extract(env)?;
-    let ref_ = Ref::from(tag_name.as_str());
+    let reference = Ref::from(tag_name.as_str());
 
     let new_blocking_dataset = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         let inner = RT.block_on(dataset_guard.inner.create_branch(
             branch_name.as_str(),
-            ref_,
+            reference,
             None,
         ))?;
         BlockingDataset { inner }
@@ -1992,7 +1992,7 @@ fn inner_checkout_reference<'local>(
     let version_opt_obj = env
         .call_method(
             &reference_obj,
-            "version_number",
+            "versionNumber",
             "()Ljava/util/Optional;",
             &[],
         )?

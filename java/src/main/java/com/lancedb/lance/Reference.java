@@ -30,20 +30,24 @@ public class Reference {
     this.tagName = tagName;
   }
 
-  public Optional<Long> versionNumber() {
+  public Optional<Long> getVersionNumber() {
     return versionNumber;
   }
 
-  public Optional<String> branchName() {
+  public Optional<String> getBranchName() {
     return branchName;
   }
 
-  public Optional<String> tagName() {
+  public Optional<String> getTagName() {
     return tagName;
   }
 
   public static Reference ofMain(long versionNumber) {
     return new Reference(Optional.of(versionNumber), Optional.empty(), Optional.empty());
+  }
+
+  public static Reference ofMain() {
+    return new Reference(Optional.empty(), Optional.empty(), Optional.empty());
   }
 
   public static Reference ofBranch(String branchName) {

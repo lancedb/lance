@@ -16,6 +16,7 @@ package com.lancedb.lance;
 import com.google.common.base.MoreObjects;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Branch metadata aligned with Rust's BranchContents. name is the branch name, parentBranch may be
@@ -25,7 +26,7 @@ import java.util.Objects;
  */
 public class Branch {
   private final String name;
-  private final String parentBranch; // nullable
+  private final Optional<String> parentBranch;
   private final long parentVersion;
   private final long createAt;
   private final int manifestSize;
@@ -33,7 +34,7 @@ public class Branch {
   public Branch(
       String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
     this.name = name;
-    this.parentBranch = parentBranch;
+    this.parentBranch = Optional.ofNullable(parentBranch);
     this.parentVersion = parentVersion;
     this.createAt = createAt;
     this.manifestSize = manifestSize;
@@ -43,7 +44,7 @@ public class Branch {
     return name;
   }
 
-  public String getParentBranch() {
+  public Optional<String> getParentBranch() {
     return parentBranch;
   }
 

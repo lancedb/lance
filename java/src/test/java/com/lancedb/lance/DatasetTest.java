@@ -1540,6 +1540,12 @@ public class DatasetTest {
                     assertEquals(4, branch2V4New.version());
                     assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
                   }
+
+                  // Step 7. use checkout reference to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkout(Reference.ofBranch("branch2", 4))) {
+                    assertEquals(4, branch2V4New.version());
+                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  }
                 }
               }
             }
