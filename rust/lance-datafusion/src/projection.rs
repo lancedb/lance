@@ -61,13 +61,18 @@ impl ProjectionBuilder {
         }
     }
 
-    fn add_column(&mut self, output_name: &str, raw_expr: &str) -> Result<()> {
-        if self.output.contains_key(output_name) {
+    fn check_duplicate_column(&self, name: &str) -> Result<()> {
+        if self.output.contains_key(name) {
             return Err(Error::io(
-                format!("Duplicate column name: {}", output_name),
+                format!("Duplicate column name: {}", name),
                 location!(),
             ));
         }
+        Ok(())
+    }
+
+    fn add_column(&mut self, output_name: &str, raw_expr: &str) -> Result<()> {
+        self.check_duplicate_column(output_name)?;
 
         let expr = self.planner.parse_expr(raw_expr)?;
 
@@ -113,6 +118,7 @@ impl ProjectionBuilder {
             if raw_expr.as_ref() == WILDCARD {
                 self.has_wildcard = true;
                 for col in self.base.schema().fields.iter().map(|f| f.name.as_str()) {
+                    self.check_duplicate_column(col)?;
                     self.output_cols.push(OutputColumn {
                         expr: Expr::Column(Column::from_name(col)),
                         name: col.to_string(),

@@ -3864,7 +3864,7 @@ mod test {
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::datatypes::{Int32Type, Int64Type};
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
@@ -4815,6 +4815,62 @@ mod test {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_wildcard() {
+        let data = gen_batch()
+            .col("x", array::step::<Float64Type>())
+            .col("y", array::step::<Float64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let check_cols = async |projection: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            scan.project(projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        check_cols(&["*"], &["x", "y"]).await;
+        check_cols(&["x", "y"], &["x", "y"]).await;
+        check_cols(&["x"], &["x"]).await;
+        check_cols(&["_rowid", "*"], &["_rowid", "x", "y"]).await;
+        check_cols(&["*", "_rowid"], &["x", "y", "_rowid"]).await;
+        check_cols(
+            &["_rowid", "*", "_rowoffset"],
+            &["_rowid", "x", "y", "_rowoffset"],
+        )
+        .await;
+
+        let check_exprs = async |exprs: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            let projection = exprs
+                .iter()
+                .map(|e| (e.to_string(), e.to_string()))
+                .collect::<Vec<_>>();
+            scan.project_with_transform(&projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        // Make sure we can reference * fields in exprs and add new columns
+        check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
+
+        let check_fails = |projection: &[&str]| {
+            println!("Checking fails: {:?}", projection);
+            let mut scan = data.scan();
+            assert!(scan.project(projection).is_err());
+        };
+
+        // Would duplicate x
+        check_fails(&["x", "*"]);
+        check_fails(&["_rowid", "_rowid"]);
     }
 
     #[rstest]
