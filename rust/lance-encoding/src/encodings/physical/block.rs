@@ -390,6 +390,33 @@ impl GeneralBufferCompressor {
     }
 }
 
+/// A block decompressor that first applies general-purpose compression (LZ4/Zstd)
+/// before delegating to an inner block decompressor.
+#[derive(Debug)]
+pub struct GeneralBlockDecompressor {
+    inner: Box<dyn BlockDecompressor>,
+    compressor: Box<dyn BufferCompressor>,
+}
+
+impl GeneralBlockDecompressor {
+    pub fn try_new(
+        inner: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+    ) -> Result<Self> {
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        Ok(Self { inner, compressor })
+    }
+}
+
+impl BlockDecompressor for GeneralBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+        self.inner
+            .decompress(LanceBuffer::from(decompressed), num_values)
+    }
+}
+
 // An encoder which uses generic compression, such as zstd/lz4 to encode buffers
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
