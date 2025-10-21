@@ -222,16 +222,25 @@ impl BlockingDataset {
         tag: Option<String>,
     ) -> Result<Self> {
         let ref_ = if let Some(tag_name) = tag {
-            lance::dataset::refs::Ref::from(tag_name.as_str())
+            Ref::from(tag_name.as_str())
         } else {
-            lance::dataset::refs::Ref::Version(branch, version)
+            Ref::Version(branch, version)
         };
         let inner = RT.block_on(self.inner.checkout_version(ref_))?;
         Ok(Self { inner })
     }
 
-    pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags().create(tag, version))?;
+    pub fn create_tag(
+        &mut self,
+        tag: &str,
+        version_number: u64,
+        branch: Option<&str>,
+    ) -> Result<()> {
+        RT.block_on(
+            self.inner
+                .tags()
+                .create_on_branch(tag, version_number, branch),
+        )?;
         Ok(())
     }
 
@@ -240,8 +249,8 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags().update(tag, version))?;
+    pub fn update_tag(&mut self, tag: &str, version: u64, branch: Option<&str>) -> Result<()> {
+        RT.block_on(self.inner.tags().update_on_branch(tag, version, branch))?;
         Ok(())
     }
 
@@ -1665,21 +1674,45 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateTag(
     )
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateTagOnBranch(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jtag_version: jlong,
+    jbranch: JString,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_create_tag_on_branch(&mut env, java_dataset, jtag_name, jtag_version, jbranch)
+    )
+}
+
 fn inner_create_tag(
     env: &mut JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
     jtag_version: jlong,
 ) -> Result<()> {
-    let tag = { jtag_name.extract(env)? };
+    let tag = jtag_name.extract(env)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    let current_branch = dataset_guard.inner.manifest.branch.as_deref();
-    RT.block_on(dataset_guard.inner.tags().create_on_branch(
-        tag.as_str(),
-        jtag_version as u64,
-        current_branch,
-    ))?;
+    dataset_guard.create_tag(tag.as_str(), jtag_version as u64, None)?;
+    Ok(())
+}
+
+fn inner_create_tag_on_branch(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jtag_version: jlong,
+    jbranch: JString,
+) -> Result<()> {
+    let tag = jtag_name.extract(env)?;
+    let branch = jbranch.extract(env)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.create_tag(tag.as_str(), jtag_version as u64, Some(branch.as_str()))?;
     Ok(())
 }
 
@@ -1712,21 +1745,45 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateTag(
     )
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateTagOnBranch(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jtag_version: jlong,
+    jbranch: JString,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_tag_on_branch(&mut env, java_dataset, jtag_name, jtag_version, jbranch)
+    )
+}
+
+fn inner_update_tag_on_branch(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jtag_version: jlong,
+    jbranch: JString,
+) -> Result<()> {
+    let tag = jtag_name.extract(env)?;
+    let branch = jbranch.extract(env)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_tag(tag.as_str(), jtag_version as u64, Some(branch.as_str()))?;
+    Ok(())
+}
+
 fn inner_update_tag(
     env: &mut JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
     jtag_version: jlong,
 ) -> Result<()> {
-    let tag = { jtag_name.extract(env)? };
+    let tag = jtag_name.extract(env)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    let current_branch = dataset_guard.inner.manifest.branch.as_deref();
-    RT.block_on(dataset_guard.inner.tags().update_on_branch(
-        tag.as_str(),
-        jtag_version as u64,
-        current_branch,
-    ))?;
+    dataset_guard.update_tag(tag.as_str(), jtag_version as u64, None)?;
     Ok(())
 }
 

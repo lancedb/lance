@@ -1002,7 +1002,7 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag for this dataset.
+     * Create a new tag on main branch.
      *
      * @param tag the tag name
      * @param version the version to tag
@@ -1011,6 +1011,20 @@ public class Dataset implements Closeable {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         nativeCreateTag(tag, version);
+      }
+    }
+
+    /**
+     * Create a new tag on a specified branch.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void create(String tag, long version, String branch) {
+      Preconditions.checkArgument(branch != null, "Branch cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeCreateTagOnBranch(tag, version, branch);
       }
     }
 
@@ -1027,7 +1041,7 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version for the dataset.
+     * Update a tag to a new version on main branch.
      *
      * @param tag the tag name
      * @param version the version to tag
@@ -1036,6 +1050,20 @@ public class Dataset implements Closeable {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         nativeUpdateTag(tag, version);
+      }
+    }
+
+    /**
+     * Update a tag to a new version on a specified branch.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void update(String tag, long version, String branch) {
+      Preconditions.checkArgument(branch != null, "Branch cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateTagOnBranch(tag, version, branch);
       }
     }
 
@@ -1185,9 +1213,13 @@ public class Dataset implements Closeable {
 
   private native void nativeCreateTag(String tag, long version);
 
+  private native void nativeCreateTagOnBranch(String tag, long version, String branch);
+
   private native void nativeDeleteTag(String tag);
 
   private native void nativeUpdateTag(String tag, long version);
+
+  private native void nativeUpdateTagOnBranch(String tag, long version, String branch);
 
   private native List<Tag> nativeListTags();
 

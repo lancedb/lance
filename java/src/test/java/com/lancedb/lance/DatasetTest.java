@@ -1477,7 +1477,7 @@ public class DatasetTest {
               assertEquals(8, branch1V3.countRows()); // A(5) + B(3)
 
               // Step 3. Create branch2 based on branch1's latest version (simulate tag 't1')
-              branch1V3.tags().create("tag", 3);
+              mainV1.tags().create("tag", 3, "branch1");
 
               try (Dataset branch2V3 = branch1V2.branches().create("branch2", "tag")) {
                 assertEquals(3, branch2V3.version());
