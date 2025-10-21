@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_array::RecordBatchIterator;
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
@@ -89,7 +88,10 @@ impl<'a> InsertBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        let input_data = super::InputData::Stream(stream);
+        let (transaction, context) = self
+            .write_uncommitted_input_impl(input_data, schema)
+            .await?;
         Self::do_commit(&context, transaction).await
     }
 
@@ -162,9 +164,14 @@ impl<'a> InsertBuilder<'a> {
                 });
             }
         }
-        let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
-        let (stream, schema) = reader.into_stream_and_schema().await?;
-        self.write_uncommitted_stream_impl(stream, schema).await
+        // Use InputData::Materialized to avoid unnecessary spilling
+        let input_data = super::InputData::Materialized {
+            batches: data,
+            schema: schema.clone(),
+        };
+        let lance_schema = Schema::try_from(schema.as_ref())?;
+        self.write_uncommitted_input_impl(input_data, lance_schema)
+            .await
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -175,13 +182,16 @@ impl<'a> InsertBuilder<'a> {
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
         let (stream, schema) = source.into_stream_and_schema().await?;
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        let input_data = super::InputData::Stream(stream);
+        let (transaction, _) = self
+            .write_uncommitted_input_impl(input_data, schema)
+            .await?;
         Ok(transaction)
     }
 
-    async fn write_uncommitted_stream_impl(
+    async fn write_uncommitted_input_impl(
         &self,
-        stream: SendableRecordBatchStream,
+        input_data: super::InputData,
         schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
@@ -204,7 +214,7 @@ impl<'a> InsertBuilder<'a> {
             context.object_store.clone(),
             &context.base_path,
             schema.clone(),
-            stream,
+            input_data,
             context.params.clone(),
             target_base_info,
         )
@@ -483,7 +493,7 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::StructArray;
+    use arrow_array::{RecordBatchIterator, StructArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::session::Session;
