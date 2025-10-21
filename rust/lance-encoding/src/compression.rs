@@ -32,7 +32,10 @@ use crate::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
             },
-            block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            block::{
+                CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+                GeneralBlockDecompressor,
+            },
             byte_stream_split::{
                 should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
             },
@@ -802,6 +805,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
+            Compression::FixedSizeList(fsl) => {
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())))
+            }
             Compression::OutOfLineBitpacking(out_of_line) => {
                 // Extract the compressed bit width from the values encoding
                 let compressed_bit_width = match out_of_line
@@ -826,9 +832,30 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 )))
             }
             Compression::General(general) => {
-                let compression = general.compression.as_ref().unwrap();
-                let scheme = compression.scheme();
-                Ok(Box::new(CompressedBufferEncoder::from_scheme(scheme)?))
+                let inner_desc = general
+                    .values
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "General compression missing inner encoding",
+                            location!(),
+                        )
+                    })?
+                    .as_ref();
+                let inner_decompressor = self.create_block_decompressor(inner_desc)?;
+
+                let compression = general.compression.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "General compression missing compression config",
+                        location!(),
+                    )
+                })?;
+                let scheme = compression.scheme().try_into()?;
+                let config = CompressionConfig::new(scheme, compression.level);
+                let general_decompressor =
+                    GeneralBlockDecompressor::try_new(inner_decompressor, config)?;
+
+                Ok(Box::new(general_decompressor))
             }
             _ => todo!(),
         }
@@ -839,7 +866,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
-    use crate::data::{BlockInfo, DataBlock};
+    use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
@@ -1250,5 +1277,64 @@ mod tests {
         // Should have BSS wrapped in general compression
         assert!(debug_str.contains("GeneralMiniBlockCompressor"));
         assert!(debug_str.contains("ByteStreamSplitEncoder"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn test_general_block_decompression_fixed_width_v2_2() {
+        use crate::compression::BlockCompressor;
+        use crate::encodings::physical::block::GeneralBufferCompressor;
+        use crate::encodings::physical::value::ValueEncoder;
+
+        // General block compression is enabled for file version 2.2; ensure fixed-width blocks read correctly.
+        let num_values = 16u64;
+        let mut raw = Vec::new();
+        for i in 0..num_values {
+            raw.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+
+        let expected_block = FixedWidthDataBlock {
+            data: LanceBuffer::from(raw),
+            bits_per_value: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        };
+
+        let raw_encoded = BlockCompressor::compress(
+            &ValueEncoder::default(),
+            DataBlock::FixedWidth(expected_block.clone()),
+        )
+        .expect("value compression should succeed");
+
+        let compression_config = if cfg!(feature = "lz4") {
+            CompressionConfig::new(CompressionScheme::Lz4, None)
+        } else {
+            CompressionConfig::new(CompressionScheme::Zstd, Some(0))
+        };
+
+        let compressor = GeneralBufferCompressor::get_compressor(compression_config)
+            .expect("general compressor must be available");
+        let mut compressed = Vec::new();
+        compressor
+            .compress(raw_encoded.as_ref(), &mut compressed)
+            .expect("general compression should succeed");
+        let compressed_buffer = LanceBuffer::from(compressed);
+
+        let inner_encoding = ProtobufUtils21::flat(32, None);
+        let general_encoding = ProtobufUtils21::wrapped(compression_config, inner_encoding)
+            .expect("should wrap encoding for general compression");
+
+        let decompressor = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&general_encoding)
+            .expect("general block decompressor should be created");
+
+        let decoded = decompressor
+            .decompress(compressed_buffer, num_values)
+            .expect("decompression should succeed");
+
+        match decoded {
+            DataBlock::FixedWidth(block) => assert_eq!(block, expected_block),
+            _ => panic!("expected fixed width block"),
+        }
     }
 }
