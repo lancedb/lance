@@ -201,6 +201,7 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
     match expr {
         // Coerce regexp_match to boolean by checking for non-null
         Expr::ScalarFunction(sf) if sf.func.name() == "regexp_match" => {
+            log::warn!("regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead");
             Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
 
