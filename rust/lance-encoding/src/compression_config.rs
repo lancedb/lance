@@ -68,8 +68,8 @@ pub struct CompressionFieldParams {
     /// Byte stream split mode for floating point data
     pub bss: Option<BssMode>,
 
-    /// Minichunk size threshold for binary encoding
-    pub binary_minichunk_size: Option<i64>,
+    /// Minichunk size threshold for encoding
+    pub minichunk_size: Option<i64>,
 }
 
 impl CompressionParams {
@@ -134,8 +134,8 @@ impl CompressionFieldParams {
         if other.bss.is_some() {
             self.bss = other.bss;
         }
-        if other.binary_minichunk_size.is_some() {
-            self.binary_minichunk_size = other.binary_minichunk_size;
+        if other.minichunk_size.is_some() {
+            self.minichunk_size = other.minichunk_size;
         }
     }
 }
@@ -203,7 +203,7 @@ mod tests {
             compression: Some("lz4".to_string()),
             compression_level: None,
             bss: Some(BssMode::On),
-            binary_minichunk_size: None,
+            minichunk_size: None,
         };
 
         params.merge(&other);
@@ -217,7 +217,7 @@ mod tests {
             compression: Some("zstd".to_string()),
             compression_level: Some(3),
             bss: Some(BssMode::Auto),
-            binary_minichunk_size: None,
+            minichunk_size: None,
         };
 
         params.merge(&another);
@@ -249,7 +249,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: None,
-                binary_minichunk_size: None,
+                minichunk_size: None,
             },
         );
 

@@ -129,7 +129,15 @@ impl FsstCompressed {
 }
 
 #[derive(Debug, Default)]
-pub struct FsstMiniBlockEncoder {}
+pub struct FsstMiniBlockEncoder {
+    minichunk_size: Option<i64>,
+}
+
+impl FsstMiniBlockEncoder {
+    pub fn new(minichunk_size: Option<i64>) -> Self {
+        Self { minichunk_size }
+    }
+}
 
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
     fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
@@ -138,8 +146,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
         let data_block = DataBlock::VariableWidth(compressed.data);
 
         // compress the fsst compressed data using `BinaryMiniBlockEncoder`
-        let binary_minichunk_size = *super::binary::AIM_MINICHUNK_SIZE;
-        let binary_compressor = Box::new(BinaryMiniBlockEncoder::new(Some(binary_minichunk_size)))
+        let binary_compressor = Box::new(BinaryMiniBlockEncoder::new(self.minichunk_size))
             as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
@@ -368,7 +375,6 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
 
 #[cfg(test)]
 mod tests {
-
     use std::collections::HashMap;
 
     use lance_datagen::{ByteCount, RowCount};
