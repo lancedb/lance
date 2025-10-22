@@ -1133,35 +1133,41 @@ impl FilteredReadStream {
         let start = range.start as usize;
         let end = range.end as usize;
         let rows_seen = Arc::new(AtomicUsize::new(0));
+        let rows_seen_clone = rows_seen.clone();
 
-        stream.try_filter_map(move |batch| {
-            if batch.num_rows() == 0 {
-                return future::ready(Ok(None));
-            }
+        stream
+            .take_while(move |_| {
+                let rows_seen = rows_seen.load(Ordering::Relaxed);
+                future::ready(rows_seen <= end)
+            })
+            .try_filter_map(move |batch| {
+                if batch.num_rows() == 0 {
+                    return future::ready(Ok(None));
+                }
 
-            let batch_rows = batch.num_rows();
-            let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
-            let batch_end = current_position + batch_rows;
+                let batch_rows = batch.num_rows();
+                let current_position = rows_seen_clone.fetch_add(batch_rows, Ordering::Relaxed);
+                let batch_end = current_position + batch_rows;
 
-            if batch_end <= start || current_position >= end {
-                return future::ready(Ok(None));
-            }
+                if batch_end <= start || current_position >= end {
+                    return future::ready(Ok(None));
+                }
 
-            let skip = start.saturating_sub(current_position);
-            let end_pos = (end - current_position).min(batch_rows);
-            let take = end_pos.saturating_sub(skip);
+                let skip = start.saturating_sub(current_position);
+                let end_pos = (end - current_position).min(batch_rows);
+                let take = end_pos.saturating_sub(skip);
 
-            if take == 0 {
-                return future::ready(Ok(None));
-            }
+                if take == 0 {
+                    return future::ready(Ok(None));
+                }
 
-            let result = if skip == 0 && take == batch_rows {
-                batch
-            } else {
-                batch.slice(skip, take)
-            };
-            future::ready(Ok(Some(result)))
-        })
+                let result = if skip == 0 && take == batch_rows {
+                    batch
+                } else {
+                    batch.slice(skip, take)
+                };
+                future::ready(Ok(Some(result)))
+            })
     }
 }
 
