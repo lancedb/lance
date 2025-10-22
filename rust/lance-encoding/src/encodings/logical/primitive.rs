@@ -1235,8 +1235,16 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 16,
                     num_dictionary_items,
                 }),
+                Compression::General(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 1,
+                    num_dictionary_items,
+                }),
                 _ => unreachable!(
-                    "Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary."
+                    "Mini-block dictionary encoding must use Variable, Flat, or General compression"
                 ),
             }
         } else {
