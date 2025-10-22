@@ -11,7 +11,6 @@ use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
-use datafusion_physical_expr::LexOrdering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
@@ -792,7 +791,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn scan(
         &self,
         _query: Option<&dyn AnyQuery>,
-        _limit: Option<usize>,
         _batch_size: usize,
         _deletion_mask: Option<Arc<RowIdMask>>,
         _metrics: Arc<dyn MetricsCollector>,

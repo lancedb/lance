@@ -9,20 +9,19 @@ use datafusion::{
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
 };
-use datafusion_expr::Expr;
-use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     metrics::ExecutionPlanMetricsSet,
-    sorts::sort::SortExec,
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
 use futures::executor::block_on;
 use itertools::Itertools;
+use lance_core::{datatypes::format_field_path, ROW_ADDR};
 use lance_index::{
-    metrics::MetricsCollector,
-    scalar::{registry::ScalarIndexPluginRegistry, AnyQuery, ScalarIndex},
-    DatasetIndexExt, IndexMetadata,
+    metrics::{MetricsCollector, NoOpMetricsCollector},
+    scalar::{AnyQuery, ScalarIndex},
+    DatasetIndexExt, ScalarIndexCriteria,
 };
 use roaring::RoaringBitmap;
 use tokio::task::block_in_place;
@@ -30,9 +29,11 @@ use uuid::Uuid;
 
 use crate::{
     index::prefilter::DatasetPreFilter,
+    index::DatasetIndexInternalExt,
     io::exec::{
         filtered_read::FilteredReadExec,
         utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter},
+        AddRowAddrExec,
     },
     Dataset,
 };
@@ -43,7 +44,6 @@ pub struct IndexScanExec {
     ids: Vec<Uuid>,
     indexes: Vec<Arc<dyn ScalarIndex>>,
     properties: PlanProperties,
-    limit: Option<usize>,
     query: Option<Arc<dyn AnyQuery>>,
     dataset: Arc<Dataset>,
     fragment_bitmaps: Vec<Option<RoaringBitmap>>,
@@ -56,12 +56,11 @@ impl IndexScanExec {
         ids: Vec<Uuid>,
         indexes: Vec<Arc<dyn ScalarIndex>>,
         output_schema: SchemaRef,
-        limit: Option<usize>,
         query: Option<Arc<dyn AnyQuery>>,
         dataset: Arc<Dataset>,
         fragment_bitmaps: Vec<Option<RoaringBitmap>>,
     ) -> Self {
-        let mut eq_properties = EquivalenceProperties::new(output_schema);
+        let eq_properties = EquivalenceProperties::new(output_schema);
         let partitioning = Partitioning::UnknownPartitioning(indexes.len());
         let properties = PlanProperties::new(
             eq_properties,
@@ -77,7 +76,6 @@ impl IndexScanExec {
             ids,
             indexes,
             properties,
-            limit,
             query,
             dataset,
             fragment_bitmaps,
@@ -191,7 +189,7 @@ impl ExecutionPlan for IndexScanExec {
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let collector: Arc<dyn MetricsCollector> = metrics.clone();
         let stream = index
-            .scan(query, self.limit, batch_size, deletion_mask, collector)?
+            .scan(query, batch_size, deletion_mask, collector)?
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
                     "Index {} does not support scanning.",
@@ -208,48 +206,137 @@ impl ExecutionPlan for IndexScanExec {
     }
 
     fn metrics(&self) -> Option<datafusion_physical_plan::metrics::MetricsSet> {
-        todo!("Use same IO metrics from loading the indices")
+        Some(self.metrics.clone_inner())
     }
 
     fn partition_statistics(
         &self,
-        partition: Option<usize>,
+        _partition: Option<usize>,
     ) -> datafusion::error::Result<datafusion_physical_plan::Statistics> {
-        todo!("If index is loaded, we should be able to provide statistics eagerly")
+        let schema = self.schema();
+        Ok(Statistics::new_unknown(schema.as_ref()))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        false
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(Self {
-            limit,
-            ..self.clone()
-        }))
+        let _ = limit;
+        None
     }
 }
 
-/// Physical optimizer rule to scan indexes when applicable.
+/// Physical optimizer rule to replace simple Lance reads with index scans.
 ///
-/// Transforms `LanceRead -> SortExec -> GlobalLimitExec` into
-/// `IndexScan -> SortPreservingMergeExec -> GlobalLimitExec -> Take` when the index sort order matches
-/// the requested sort and when the filter in LanceRead (if any) is satisfiable
-/// by the index.
-///
-/// Also transforms `LanceRead -> JoinExec` into
-/// `IndexScan -> JoinExec -> Take` when joining on an indexed column.
+/// If a `FilteredReadExec` only needs `_rowid` and a single indexed column,
+/// it is replaced with `IndexScanExec`. When `_rowaddr` is also requested,
+/// an `AddRowAddrExec` is appended after the scan so the public schema remains unchanged.
 #[derive(Debug)]
 pub struct ScanIndexRule; // TODO: we might have to put index info in here.
 
 impl ScanIndexRule {
-    fn scannable_index(
-        ds: &Dataset,
-        fields: &[i32],
-        ordering: Option<LexOrdering>,
-        predicate: Option<Expr>,
-    ) -> Vec<IndexMetadata> {
-        todo!("Find a unique index that can provide the columns and is sorted on them.")
+    fn rewrite_filtered_read(
+        read: &FilteredReadExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        // Only consider scans with no filters or index inputs.
+        let options = read.options();
+        if options.with_deleted_rows
+            || options.full_filter.is_some()
+            || options.refine_filter.is_some()
+            || options.scan_range_before_filter.is_some()
+            || options.scan_range_after_filter.is_some()
+            || read.index_input().is_some()
+        {
+            return Ok(None);
+        }
+
+        let projection = &options.projection;
+
+        if !projection.with_row_id
+            || projection.with_row_last_updated_at_version
+            || projection.with_row_created_at_version
+            || projection.field_ids.len() != 1
+        {
+            return Ok(None);
+        }
+
+        // Determine the indexed column.
+        let field_id = *projection.field_ids.iter().next().unwrap();
+        let dataset = read.dataset().clone();
+        let schema = dataset.schema();
+        let field = match schema.field_by_id(field_id) {
+            Some(field) => field,
+            None => return Ok(None),
+        };
+
+        let column_name = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+            let segments: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+            format_field_path(&segments)
+        } else {
+            field.name.clone()
+        };
+
+        // Find a matching scalar index for the column.
+        let criteria = ScalarIndexCriteria::default().for_column(column_name.as_str());
+        let index_meta = block_in_place(|| block_on(dataset.load_scalar_index(criteria)))
+            .map_err(|err| DataFusionError::External(Box::new(err)))?;
+        let Some(index_meta) = index_meta else {
+            return Ok(None);
+        };
+
+        // Load the index implementation.
+        let index_uuid = index_meta.uuid.to_string();
+        let column_name_clone = column_name.clone();
+        let index = block_in_place(|| {
+            block_on(dataset.open_scalar_index(
+                column_name_clone.as_str(),
+                &index_uuid,
+                &NoOpMetricsCollector,
+            ))
+        })
+        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+
+        // Determine the schema produced by the index scan.
+        let read_schema = read.schema();
+        let needs_row_addr = projection.with_row_addr;
+
+        let index_schema = if needs_row_addr {
+            let fields: Vec<_> = read_schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != ROW_ADDR)
+                .cloned()
+                .collect();
+            Arc::new(arrow_schema::Schema::new(fields))
+        } else {
+            read_schema.clone()
+        };
+
+        let index_exec: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
+            index_meta.name.clone(),
+            vec![index_meta.uuid],
+            vec![index],
+            index_schema,
+            None,
+            dataset.clone(),
+            vec![index_meta.fragment_bitmap.clone()],
+        ));
+
+        if needs_row_addr {
+            let Some(rowaddr_pos) = read_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == ROW_ADDR)
+            else {
+                return Ok(None);
+            };
+            let add_row_addr = AddRowAddrExec::try_new(index_exec, dataset.clone(), rowaddr_pos)
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+            Ok(Some(Arc::new(add_row_addr)))
+        } else {
+            Ok(Some(index_exec))
+        }
     }
 }
 
@@ -257,18 +344,12 @@ impl PhysicalOptimizerRule for ScanIndexRule {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        config: &datafusion::config::ConfigOptions,
+        _config: &datafusion::config::ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|plan| {
-            // LanceRead -> SortExec
-            if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
-                // Check that we are limited in how much we are taking.
-                // if sort_exec.fetch().is_some();
-                if let Some(read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
-                    let ds = read.dataset();
-                    if let Some(indices) = self.scannable_index(ds, todo!(), todo!(), todo!()) {
-                        todo!("rewrite")
-                    }
+            if let Some(read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+                if let Some(new_plan) = Self::rewrite_filtered_read(read)? {
+                    return Ok(Transformed::yes(new_plan));
                 }
             }
             Ok(Transformed::no(plan))

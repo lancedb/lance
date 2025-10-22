@@ -172,6 +172,7 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+        Arc::new(crate::datafusion::index_scan::ScanIndexRule),
         // Push down limit into FilteredReadExec and other Execs via with_fetch()
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
     ])

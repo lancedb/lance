@@ -36,7 +36,7 @@ use datafusion::{
     },
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
@@ -902,7 +902,7 @@ impl BTreeIndex {
             .await?;
         let query_ref = query.as_ref().map(|q| q as &dyn AnyQuery);
         subindex
-            .scan(query_ref, None, batch_size, deletion_mask, metrics)?
+            .scan(query_ref, batch_size, deletion_mask, metrics)?
             .ok_or_else(|| Error::Internal {
                 message: "BTree sub-indices need to implement scan".to_string(),
                 location: location!(),
@@ -1311,13 +1311,10 @@ impl ScalarIndex for BTreeIndex {
     fn scan(
         &self,
         query: Option<&dyn AnyQuery>,
-        limit: Option<usize>,
         batch_size: usize,
         deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {
-        let _ = limit; // TODO: Push down limit when deletion masks are available.
-
         let (pages, query_clone) = if let Some(query) = query {
             let sarg = query
                 .as_any()

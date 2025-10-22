@@ -399,7 +399,6 @@ impl ScalarIndex for FlatIndex {
     fn scan(
         &self,
         query: Option<&dyn AnyQuery>,
-        _limit: Option<usize>,
         batch_size: usize,
         deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,

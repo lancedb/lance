@@ -6,7 +6,6 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion_physical_expr::LexOrdering;
 use lance_core::{cache::LanceCache, Error, Result};
 use snafu::location;
 
