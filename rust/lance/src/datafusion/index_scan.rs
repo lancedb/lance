@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
 };
@@ -17,13 +17,16 @@ use datafusion_physical_plan::{
 };
 use futures::executor::block_on;
 use itertools::Itertools;
-use lance_core::{datatypes::format_field_path, ROW_ADDR};
+use lance_core::{
+    datatypes::format_field_path, Error as LanceError, Result as LanceResult, ROW_ADDR,
+};
 use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
     scalar::{AnyQuery, ScalarIndex},
     DatasetIndexExt, ScalarIndexCriteria,
 };
 use roaring::RoaringBitmap;
+use snafu::location;
 use tokio::task::block_in_place;
 use uuid::Uuid;
 
@@ -37,6 +40,139 @@ use crate::{
     },
     Dataset,
 };
+
+#[derive(Debug, Clone)]
+pub struct ColumnIndexContext {
+    column_name: String,
+    index_name: String,
+    ids: Vec<Uuid>,
+    index: Arc<dyn ScalarIndex>,
+    fragment_bitmap: Option<RoaringBitmap>,
+}
+
+#[derive(Debug)]
+pub struct DatasetIndexScanContext {
+    columns: HashMap<i32, ColumnIndexContext>,
+}
+
+impl DatasetIndexScanContext {
+    fn column_context(&self, field_id: i32) -> Option<&ColumnIndexContext> {
+        self.columns.get(&field_id)
+    }
+
+    async fn prepare(
+        dataset: Arc<Dataset>,
+        columns: HashMap<i32, String>,
+    ) -> LanceResult<Option<Self>> {
+        let mut column_map = HashMap::new();
+        for (field_id, column_name) in columns {
+            let criteria = ScalarIndexCriteria::default().for_column(column_name.as_str());
+            let Some(index_meta) = dataset.load_scalar_index(criteria).await? else {
+                continue;
+            };
+            let index_uuid = index_meta.uuid.to_string();
+            let index = dataset
+                .open_scalar_index(column_name.as_str(), &index_uuid, &NoOpMetricsCollector)
+                .await?;
+            column_map.insert(
+                field_id,
+                ColumnIndexContext {
+                    column_name: column_name.clone(),
+                    index_name: index_meta.name.clone(),
+                    ids: vec![index_meta.uuid],
+                    index,
+                    fragment_bitmap: index_meta.fragment_bitmap.clone(),
+                },
+            );
+        }
+        if column_map.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Self {
+                columns: column_map,
+            }))
+        }
+    }
+}
+
+struct Candidate {
+    dataset: Arc<Dataset>,
+    field_id: i32,
+    column_name: String,
+}
+
+fn detect_candidate(read: &FilteredReadExec) -> Option<Candidate> {
+    let options = read.options();
+    let projection = &options.projection;
+    if options.with_deleted_rows
+        || options.refine_filter.is_some()
+        || options.scan_range_before_filter.is_some()
+        || options.scan_range_after_filter.is_some()
+        || read.index_input().is_some()
+        || projection.with_row_last_updated_at_version
+        || projection.with_row_created_at_version
+        || projection.field_ids.len() != 1
+    {
+        return None;
+    }
+    let dataset = Arc::clone(read.dataset());
+    let schema = dataset.schema();
+    let field_id = *projection.field_ids.iter().next()?;
+    let field = schema.field_by_id(field_id)?;
+    let column_name = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+        let segments: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+        format_field_path(&segments)
+    } else {
+        field.name.clone()
+    };
+    if let Some(filter_expr) = options.full_filter.as_ref() {
+        let filter_columns = Planner::column_names_in_expr(filter_expr);
+        if filter_columns.iter().any(|col| col != &column_name) {
+            return None;
+        }
+    }
+    Some(Candidate {
+        dataset,
+        field_id,
+        column_name,
+    })
+}
+
+pub async fn prepare_index_scan_contexts(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> LanceResult<HashMap<usize, Arc<DatasetIndexScanContext>>> {
+    let mut requests: HashMap<usize, (Arc<Dataset>, HashMap<i32, String>)> = HashMap::new();
+
+    plan.apply(|node| {
+        if let Some(read) = node.as_any().downcast_ref::<FilteredReadExec>() {
+            if let Some(candidate) = detect_candidate(read) {
+                let key = Arc::as_ptr(&candidate.dataset) as usize;
+                let Candidate {
+                    dataset,
+                    field_id,
+                    column_name,
+                } = candidate;
+                let entry = requests
+                    .entry(key)
+                    .or_insert_with(|| (dataset.clone(), HashMap::new()));
+                entry.1.entry(field_id).or_insert(column_name);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|err| LanceError::Execution {
+        message: err.to_string(),
+        location: location!(),
+    })?;
+
+    let mut contexts = HashMap::new();
+    for (key, (dataset, columns)) in requests {
+        if let Some(context) = DatasetIndexScanContext::prepare(dataset.clone(), columns).await? {
+            contexts.insert(key, Arc::new(context));
+        }
+    }
+    Ok(contexts)
+}
 
 #[derive(Clone, Debug)]
 pub struct IndexScanExec {
@@ -233,11 +369,21 @@ impl ExecutionPlan for IndexScanExec {
 /// it is replaced with `IndexScanExec`. When `_rowaddr` is also requested,
 /// an `AddRowAddrExec` is appended after the scan so the public schema remains unchanged.
 #[derive(Debug)]
-pub struct ScanIndexRule; // TODO: we might have to put index info in here.
+pub struct ScanIndexRule {
+    contexts: Arc<HashMap<usize, Arc<DatasetIndexScanContext>>>,
+}
 
 impl ScanIndexRule {
+    pub fn new(contexts: HashMap<usize, Arc<DatasetIndexScanContext>>) -> Self {
+        Self {
+            contexts: Arc::new(contexts),
+        }
+    }
+
     fn rewrite_filtered_read(
+        &self,
         read: &FilteredReadExec,
+        context: &DatasetIndexScanContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
         // Only consider scans with no filters or index inputs.
         let options = read.options();
@@ -269,39 +415,19 @@ impl ScanIndexRule {
             None => return Ok(None),
         };
 
-        let column_name = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-            let segments: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-            format_field_path(&segments)
-        } else {
-            field.name.clone()
+        let Some(column_context) = context.column_context(field.id) else {
+            return Ok(None);
         };
 
         if let Some(filter_expr) = options.full_filter.as_ref() {
             let filter_columns = Planner::column_names_in_expr(filter_expr);
-            if filter_columns.iter().any(|col| col != &column_name) {
+            if filter_columns
+                .iter()
+                .any(|col| col != &column_context.column_name)
+            {
                 return Ok(None);
             }
         }
-
-        // Find a matching scalar index for the column.
-        let criteria = ScalarIndexCriteria::default().for_column(column_name.as_str());
-        let index_meta = block_in_place(|| block_on(dataset.load_scalar_index(criteria)))
-            .map_err(|err| DataFusionError::External(Box::new(err)))?;
-        let Some(index_meta) = index_meta else {
-            return Ok(None);
-        };
-
-        // Load the index implementation.
-        let index_uuid = index_meta.uuid.to_string();
-        let column_name_clone = column_name.clone();
-        let index = block_in_place(|| {
-            block_on(dataset.open_scalar_index(
-                column_name_clone.as_str(),
-                &index_uuid,
-                &NoOpMetricsCollector,
-            ))
-        })
-        .map_err(|err| DataFusionError::External(Box::new(err)))?;
 
         // Determine the schema produced by the index scan.
         let read_schema = read.schema();
@@ -320,13 +446,13 @@ impl ScanIndexRule {
         };
 
         let index_exec: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
-            index_meta.name.clone(),
-            vec![index_meta.uuid],
-            vec![index],
+            column_context.index_name.clone(),
+            column_context.ids.clone(),
+            vec![column_context.index.clone()],
             index_schema,
             None,
             dataset.clone(),
-            vec![index_meta.fragment_bitmap.clone()],
+            vec![column_context.fragment_bitmap.clone()],
         ));
 
         if needs_row_addr {
@@ -352,10 +478,17 @@ impl PhysicalOptimizerRule for ScanIndexRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &datafusion::config::ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if self.contexts.is_empty() {
+            return Ok(plan);
+        }
+
         plan.transform_down(|plan| {
             if let Some(read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
-                if let Some(new_plan) = Self::rewrite_filtered_read(read)? {
-                    return Ok(Transformed::yes(new_plan));
+                let key = Arc::as_ptr(read.dataset()) as usize;
+                if let Some(context) = self.contexts.get(&key) {
+                    if let Some(new_plan) = self.rewrite_filtered_read(read, context)? {
+                        return Ok(Transformed::yes(new_plan));
+                    }
                 }
             }
             Ok(Transformed::no(plan))
