@@ -5,32 +5,36 @@ use std::{any::Any, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    catalog::{Session, TableProvider},
     common::tree_node::{Transformed, TreeNode},
     error::DataFusionError,
-    logical_expr_common::sort_properties,
     physical_optimizer::PhysicalOptimizerRule,
 };
-use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::{
-    EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
-};
+use datafusion_expr::Expr;
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
 use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
-    limit::GlobalLimitExec,
     metrics::ExecutionPlanMetricsSet,
     sorts::sort::SortExec,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
+use futures::executor::block_on;
 use itertools::Itertools;
 use lance_index::{
-    scalar::{registry::ScalarIndexPluginRegistry, ScalarIndex},
+    metrics::MetricsCollector,
+    scalar::{registry::ScalarIndexPluginRegistry, AnyQuery, ScalarIndex},
     DatasetIndexExt, IndexMetadata,
 };
+use roaring::RoaringBitmap;
+use tokio::task::block_in_place;
 use uuid::Uuid;
 
 use crate::{
-    index::scalar::fetch_index_details, io::exec::filtered_read::FilteredReadExec, Dataset,
+    index::prefilter::DatasetPreFilter,
+    io::exec::{
+        filtered_read::FilteredReadExec,
+        utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter},
+    },
+    Dataset,
 };
 
 #[derive(Clone, Debug)]
@@ -40,6 +44,9 @@ pub struct IndexScanExec {
     indexes: Vec<Arc<dyn ScalarIndex>>,
     properties: PlanProperties,
     limit: Option<usize>,
+    query: Option<Arc<dyn AnyQuery>>,
+    dataset: Arc<Dataset>,
+    fragment_bitmaps: Vec<Option<RoaringBitmap>>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -50,6 +57,9 @@ impl IndexScanExec {
         indexes: Vec<Arc<dyn ScalarIndex>>,
         output_schema: SchemaRef,
         limit: Option<usize>,
+        query: Option<Arc<dyn AnyQuery>>,
+        dataset: Arc<Dataset>,
+        fragment_bitmaps: Vec<Option<RoaringBitmap>>,
     ) -> Self {
         let mut eq_properties = EquivalenceProperties::new(output_schema);
         let partitioning = Partitioning::UnknownPartitioning(indexes.len());
@@ -60,12 +70,18 @@ impl IndexScanExec {
             Boundedness::Bounded,
         );
 
+        assert_eq!(indexes.len(), fragment_bitmaps.len());
+
         Self {
             index_name,
             ids,
             indexes,
             properties,
             limit,
+            query,
+            dataset,
+            fragment_bitmaps,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -149,14 +165,46 @@ impl ExecutionPlan for IndexScanExec {
                 ))
             })?
             .clone();
-        index
-            .scan(self.limit, self.predicate, todo!())
+        let batch_size = context.session_config().options().execution.batch_size;
+        let query = self
+            .query
+            .as_ref()
+            .map(|query| query.as_ref() as &dyn AnyQuery);
+        let fragment_bitmap = self
+            .fragment_bitmaps
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Partition metadata out of bounds {} versus len {}",
+                    partition,
+                    self.fragment_bitmaps.len()
+                ))
+            })?;
+        let deletion_mask = match fragment_bitmap {
+            Some(bitmap) => DatasetPreFilter::create_deletion_mask(self.dataset.clone(), bitmap)
+                .map(|fut| block_in_place(|| block_on(fut)))
+                .transpose()
+                .map_err(|err| DataFusionError::External(Box::new(err)))?,
+            None => None,
+        };
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let collector: Arc<dyn MetricsCollector> = metrics.clone();
+        let stream = index
+            .scan(query, self.limit, batch_size, deletion_mask, collector)?
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
                     "Index {} does not support scanning.",
                     index.index_type()
                 ))
-            })
+            })?;
+        let schema = stream.schema();
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            schema,
+            stream,
+            partition,
+            &self.metrics,
+        )))
     }
 
     fn metrics(&self) -> Option<datafusion_physical_plan::metrics::MetricsSet> {

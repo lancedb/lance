@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -28,9 +28,12 @@ use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
+use datafusion::{
+    error::Result as DataFusionResult,
+    physical_plan::{
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+        union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
+    },
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
@@ -44,7 +47,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::RowIdTreeMap,
+        mask::{RowIdMask, RowIdTreeMap},
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -682,6 +685,24 @@ impl BTreeLookup {
     fn pages_null(&self) -> Vec<u32> {
         self.null_pages.clone()
     }
+
+    fn all_pages(&self) -> Vec<u32> {
+        let mut seen = HashSet::new();
+        let mut pages = Vec::new();
+        for records in self.tree.values() {
+            for record in records {
+                if seen.insert(record.page_number) {
+                    pages.push(record.page_number);
+                }
+            }
+        }
+        for page in &self.null_pages {
+            if seen.insert(*page) {
+                pages.push(*page);
+            }
+        }
+        pages
+    }
 }
 
 // We only need to open a file reader for pages if we need to load a page.  If all
@@ -868,17 +889,20 @@ impl BTreeIndex {
     }
 
     async fn scan_page(
-        &self,
-        query: &SargableQuery,
+        self: Arc<Self>,
+        query: Option<SargableQuery>,
         page_number: u32,
         index_reader: LazyIndexReader,
+        batch_size: usize,
+        deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
         let subindex = self
             .lookup_page(page_number, index_reader, metrics.as_ref())
             .await?;
+        let query_ref = query.as_ref().map(|q| q as &dyn AnyQuery);
         subindex
-            .scan(Some(query), metrics)?
+            .scan(query_ref, None, batch_size, deletion_mask, metrics)?
             .ok_or_else(|| Error::Internal {
                 message: "BTree sub-indices need to implement scan".to_string(),
                 location: location!(),
@@ -1288,25 +1312,72 @@ impl ScalarIndex for BTreeIndex {
         &self,
         query: Option<&dyn AnyQuery>,
         limit: Option<usize>,
+        batch_size: usize,
+        deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {
-        // TODO: to push down the limit we also need to provide the deletion mask.
-        if let Some(query) = query {
-            let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-            let pages = self.find_pages(query)?;
+        let _ = limit; // TODO: Push down limit when deletion masks are available.
 
-            let stream = futures::stream::iter(pages.into_iter()).map(|page_number| {
-                // self.scan_page(query, page_number, index_reader, metrics)
-                todo!()
-            });
-            let schema = todo!();
-            Ok(Some(Box::pin(RecordBatchStreamAdapter::new(
-                schema, stream,
-            ))))
+        let (pages, query_clone) = if let Some(query) = query {
+            let sarg = query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .ok_or_else(|| Error::Internal {
+                    message: "BTree scan received non-sargable query".to_string(),
+                    location: location!(),
+                })?
+                .clone();
+            (self.find_pages(&sarg)?, Some(sarg))
         } else {
-            let stream = todo!("Re-use existing stream");
-            Ok(Some(stream))
+            (self.page_lookup.all_pages(), None)
+        };
+
+        if pages.is_empty() {
+            let stream = stream::empty::<DataFusionResult<RecordBatch>>();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                self.sub_index.schema().clone(),
+                stream,
+            ));
+            let stream = chunk_concat_stream(stream, batch_size);
+            return Ok(Some(stream));
         }
+
+        let reader = LazyIndexReader::new(self.store.clone());
+        let index = Arc::new(self.clone());
+        let query_arc = Arc::new(query_clone);
+        let deletion_mask_arc = deletion_mask;
+        let metrics_arc = metrics;
+
+        let page_streams = stream::iter(pages.into_iter()).then(move |page_number| {
+            let index = Arc::clone(&index);
+            let reader = reader.clone();
+            let deletion_mask = deletion_mask_arc.clone();
+            let metrics = Arc::clone(&metrics_arc);
+            let query = Arc::clone(&query_arc);
+            async move {
+                index
+                    .clone()
+                    .scan_page(
+                        (*query).clone(),
+                        page_number,
+                        reader,
+                        batch_size,
+                        deletion_mask,
+                        metrics,
+                    )
+                    .await
+                    .map_err(|err| DataFusionError::External(Box::new(err)))
+            }
+        });
+
+        let stream = page_streams.try_flatten();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            self.sub_index.schema().clone(),
+            stream,
+        ));
+        let stream = chunk_concat_stream(stream, batch_size);
+
+        Ok(Some(stream))
     }
 }
 

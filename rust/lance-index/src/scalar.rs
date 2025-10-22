@@ -20,7 +20,7 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Error, Result};
 use serde::Serialize;
 use snafu::location;
@@ -793,6 +793,8 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         &self,
         _query: Option<&dyn AnyQuery>,
         _limit: Option<usize>,
+        _batch_size: usize,
+        _deletion_mask: Option<Arc<RowIdMask>>,
         _metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {
         Ok(None)

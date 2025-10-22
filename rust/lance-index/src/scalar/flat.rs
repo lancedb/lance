@@ -7,16 +7,21 @@ use std::{any::Any, ops::Bound, sync::Arc};
 use arrow_array::{
     cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
 };
+use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field, Schema};
+use arrow_select::filter::filter_record_batch;
 use async_trait::async_trait;
 
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
+use futures::stream;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Error, Result, ROW_ID};
+use lance_datafusion::chunker::chunk_concat_stream;
 use roaring::RoaringBitmap;
 use snafu::location;
 
@@ -52,6 +57,143 @@ impl FlatIndex {
 
     fn ids(&self) -> &ArrayRef {
         self.data.column(1)
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.data.schema()
+    }
+
+    fn build_predicate(
+        &self,
+        query: &SargableQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<BooleanArray> {
+        metrics.record_comparisons(self.data.num_rows());
+        let mut predicate = match query {
+            SargableQuery::Equals(value) => {
+                if value.is_null() {
+                    arrow::compute::is_null(self.values())?
+                } else {
+                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
+                }
+            }
+            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
+            SargableQuery::IsIn(values) => {
+                let mut has_null = false;
+                let choices = values
+                    .iter()
+                    .map(|val| {
+                        has_null |= val.is_null();
+                        lit(val.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let in_list_expr = in_list(
+                    Arc::new(Column::new("values", 0)),
+                    choices,
+                    &false,
+                    &self.data.schema(),
+                )?;
+                let result_col = in_list_expr.evaluate(&self.data)?;
+                let predicate = result_col
+                    .into_array(self.data.num_rows())?
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("InList evaluation should return boolean array")
+                    .clone();
+
+                if has_null && self.has_nulls {
+                    let nulls = arrow::compute::is_null(self.values())?;
+                    arrow::compute::or(&predicate, &nulls)?
+                } else {
+                    predicate
+                }
+            }
+            SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
+                (Bound::Unbounded, Bound::Unbounded) => {
+                    panic!("Scalar range query received with no upper or lower bound")
+                }
+                (Bound::Unbounded, Bound::Included(upper)) => {
+                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?
+                }
+                (Bound::Unbounded, Bound::Excluded(upper)) => {
+                    arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?
+                }
+                (Bound::Included(lower), Bound::Unbounded) => {
+                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?
+                }
+                (Bound::Included(lower), Bound::Included(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
+                )?,
+                (Bound::Included(lower), Bound::Excluded(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
+                )?,
+                (Bound::Excluded(lower), Bound::Unbounded) => {
+                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?
+                }
+                (Bound::Excluded(lower), Bound::Included(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
+                )?,
+                (Bound::Excluded(lower), Bound::Excluded(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
+                )?,
+            },
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for flat index, build a inverted index for it",
+                location!(),
+            )),
+        };
+        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
+            let valid_values = arrow::compute::is_not_null(self.values())?;
+            predicate = arrow::compute::and(&valid_values, &predicate)?;
+        }
+        Ok(predicate)
+    }
+
+    fn filter_batch(
+        &self,
+        query: &SargableQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let predicate = self.build_predicate(query, metrics)?;
+        let batch = filter_record_batch(self.data.as_ref(), &predicate)?;
+        Ok(batch)
+    }
+    fn apply_deletion_mask(
+        &self,
+        batch: RecordBatch,
+        deletion_mask: &RowIdMask,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("row ids column should be UInt64");
+        let selected = deletion_mask.selected_indices(row_ids.values().iter());
+        if selected.len() == row_ids.len() {
+            return Ok(batch);
+        }
+        if selected.is_empty() {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+        let indices = UInt64Array::from_iter_values(selected.into_iter());
+        let filtered_columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                arrow_select::take::take(column, &indices, None).map_err(|err| Error::Internal {
+                    message: format!("failed to apply deletion mask: {err}"),
+                    location: location!(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(batch.schema(), filtered_columns).map_err(|err| Error::Internal {
+            message: format!("failed to rebuild batch after applying deletion mask: {err}"),
+            location: location!(),
+        })
     }
 }
 
@@ -211,94 +353,8 @@ impl ScalarIndex for FlatIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.data.num_rows());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        // Since we have all the values in memory we can use basic arrow-rs compute
-        // functions to satisfy scalar queries.
-        let mut predicate = match query {
-            SargableQuery::Equals(value) => {
-                if value.is_null() {
-                    arrow::compute::is_null(self.values())?
-                } else {
-                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
-                }
-            }
-            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
-            SargableQuery::IsIn(values) => {
-                let mut has_null = false;
-                let choices = values
-                    .iter()
-                    .map(|val| {
-                        has_null |= val.is_null();
-                        lit(val.clone())
-                    })
-                    .collect::<Vec<_>>();
-                let in_list_expr = in_list(
-                    Arc::new(Column::new("values", 0)),
-                    choices,
-                    &false,
-                    &self.data.schema(),
-                )?;
-                let result_col = in_list_expr.evaluate(&self.data)?;
-                let predicate = result_col
-                    .into_array(self.data.num_rows())?
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("InList evaluation should return boolean array")
-                    .clone();
-
-                // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
-                if has_null && self.has_nulls {
-                    let nulls = arrow::compute::is_null(self.values())?;
-                    arrow::compute::or(&predicate, &nulls)?
-                } else {
-                    predicate
-                }
-            }
-            SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
-                (Bound::Unbounded, Bound::Unbounded) => {
-                    panic!("Scalar range query received with no upper or lower bound")
-                }
-                (Bound::Unbounded, Bound::Included(upper)) => {
-                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?
-                }
-                (Bound::Unbounded, Bound::Excluded(upper)) => {
-                    arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?
-                }
-                (Bound::Included(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?
-                }
-                (Bound::Included(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Included(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Excluded(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?
-                }
-                (Bound::Excluded(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Excluded(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
-                )?,
-            },
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for flat index, build a inverted index for it",
-                location!(),
-            )),
-        };
-        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
-            // Arrow's comparison kernels do not return false for nulls.  They consider nulls to
-            // be less than any value.  So we need to filter out the nulls manually.
-            let valid_values = arrow::compute::is_not_null(self.values())?;
-            predicate = arrow::compute::and(&valid_values, &predicate)?;
-        }
+        let predicate = self.build_predicate(query, metrics)?;
         let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
         let matching_ids = matching_ids
             .as_any()
@@ -338,6 +394,30 @@ impl ScalarIndex for FlatIndex {
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
         // FlatIndex is used internally and doesn't have user-configurable parameters
         unimplemented!("FlatIndex is an internal index type and cannot be recreated")
+    }
+
+    fn scan(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        _limit: Option<usize>,
+        batch_size: usize,
+        deletion_mask: Option<Arc<RowIdMask>>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        let output_schema = self.schema();
+        let mut batch = if let Some(query) = query {
+            let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            self.filter_batch(query, metrics.as_ref())?
+        } else {
+            self.data.as_ref().clone()
+        };
+        if let Some(mask) = deletion_mask.as_ref() {
+            batch = self.apply_deletion_mask(batch, mask.as_ref())?;
+        }
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(output_schema, stream));
+        let stream = chunk_concat_stream(stream, batch_size);
+        Ok(Some(stream))
     }
 }
 
