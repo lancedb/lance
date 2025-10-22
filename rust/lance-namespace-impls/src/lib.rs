@@ -7,21 +7,23 @@
 //!
 //! ## Features
 //!
-//! - `dir`: Directory-based namespace implementation that stores tables as Lance datasets
+//! - `rest`: REST API-based namespace implementation
+//! - `aws`, `azure`, `gcp`, `oss`: Cloud storage backend support (via lance-io)
+//!
+//! ## Implementations
+//!
+//! - `DirectoryNamespace`: Directory-based implementation (always available)
+//! - `RestNamespace`: REST API-based implementation (requires `rest` feature)
 
 pub mod connect;
+pub mod dir;
 
 #[cfg(feature = "rest")]
 pub mod rest;
 
-#[cfg(feature = "dir")]
-pub mod dir;
-
 // Re-export connect function
 pub use connect::connect;
+pub use dir::{connect_dir, DirectoryNamespace, DirectoryNamespaceConfig};
 
 #[cfg(feature = "rest")]
 pub use rest::RestNamespace;
-
-#[cfg(feature = "dir")]
-pub use dir::{connect_dir, DirectoryNamespace, DirectoryNamespaceConfig};

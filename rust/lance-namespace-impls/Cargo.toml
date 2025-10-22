@@ -12,9 +12,13 @@ categories.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["aws", "azure", "gcp"]
 rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
-dir = ["dep:lance", "dep:opendal", "dep:arrow", "dep:arrow-ipc", "dep:arrow-schema", "dep:url"]
+# Cloud storage features - align with lance-io
+gcp = ["lance-io/gcp"]
+aws = ["lance-io/aws"]
+azure = ["lance-io/azure"]
+oss = ["lance-io/oss"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -30,14 +34,15 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "rustls-tls-native-roots"
 ] }
 serde_json = { workspace = true, optional = true }
-
-# Directory implementation dependencies (optional, enabled by "dir" feature)
-lance = { workspace = true, optional = true }
-opendal = { workspace = true, optional = true, features = ["services-fs", "services-s3", "services-gcs", "services-azblob"] }
-arrow = { workspace = true, optional = true }
-arrow-ipc = { workspace = true, optional = true }
-arrow-schema = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+
+# Directory implementation dependencies (always enabled)
+lance = { workspace = true }
+lance-io = { workspace = true }
+object_store = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
 
 # Common dependencies
 async-trait.workspace = true

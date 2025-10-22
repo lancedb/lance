@@ -18,7 +18,7 @@ use lance_namespace::LanceNamespace;
 ///
 /// * `impl_name` - Implementation identifier. Supported values:
 ///   - "rest": REST API implementation (requires "rest" feature)
-///   - "dir": Directory-based implementation (requires "dir" feature)
+///   - "dir": Directory-based implementation (always available)
 ///
 /// * `properties` - Configuration properties specific to the implementation.
 ///   Common properties:
@@ -45,12 +45,11 @@ use lance_namespace::LanceNamespace;
 /// ```
 ///
 /// ```no_run
-/// # #[cfg(feature = "dir")]
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// use lance_namespace_impls::connect;
 /// use std::collections::HashMap;
 ///
-/// // Connect to directory implementation (requires "dir" feature)
+/// // Connect to directory implementation
 /// let mut props = HashMap::new();
 /// props.insert("root".to_string(), "/path/to/data".to_string());
 /// let namespace = connect("dir", props).await?;
@@ -59,7 +58,7 @@ use lance_namespace::LanceNamespace;
 /// ```
 pub async fn connect(
     impl_name: &str,
-    #[allow(unused)] properties: HashMap<String, String>,
+    properties: HashMap<String, String>,
 ) -> Result<Arc<dyn LanceNamespace>> {
     match impl_name {
         #[cfg(feature = "rest")]
@@ -72,31 +71,15 @@ pub async fn connect(
             source: "REST namespace implementation requires 'rest' feature to be enabled".into(),
             location: snafu::location!(),
         }),
-        #[cfg(feature = "dir")]
         "dir" => {
-            // Create directory implementation
+            // Create directory implementation (always available)
             crate::dir::connect_dir(properties).await
         }
-        #[cfg(not(feature = "dir"))]
-        "dir" => Err(Error::Namespace {
-            source: "Directory namespace implementation requires 'dir' feature to be enabled"
-                .into(),
-            location: snafu::location!(),
-        }),
         _ => Err(Error::Namespace {
             source: format!(
-                "Implementation '{}' is not available. Supported: {}{}",
+                "Implementation '{}' is not available. Supported: dir{}",
                 impl_name,
-                if cfg!(feature = "rest") { "rest" } else { "" },
-                if cfg!(feature = "dir") {
-                    if cfg!(feature = "rest") {
-                        ", dir"
-                    } else {
-                        "dir"
-                    }
-                } else {
-                    ""
-                }
+                if cfg!(feature = "rest") { ", rest" } else { "" }
             )
             .into(),
             location: snafu::location!(),

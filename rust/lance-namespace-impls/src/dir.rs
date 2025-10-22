@@ -7,13 +7,13 @@
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
-use opendal::Operator;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use object_store::path::Path;
 
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -32,7 +32,9 @@ use lance_namespace::LanceNamespace;
 /// This is a convenience wrapper around DirectoryNamespace::new that returns
 /// the same type as connect for API consistency.
 pub async fn connect_dir(properties: HashMap<String, String>) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties).map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+    DirectoryNamespace::new(properties)
+        .await
+        .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
 }
 
 /// Configuration for DirectoryNamespace.
@@ -92,119 +94,56 @@ impl DirectoryNamespaceConfig {
 /// Directory-based implementation of Lance Namespace.
 ///
 /// This implementation stores tables as Lance datasets in a directory structure.
-/// It supports local filesystems and cloud storage backends through OpenDAL.
+/// It supports local filesystems and cloud storage backends through Lance's object store.
 pub struct DirectoryNamespace {
     config: DirectoryNamespaceConfig,
-    operator: Operator,
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
 }
 
 impl DirectoryNamespace {
     /// Create a new DirectoryNamespace instance
-    pub fn new(properties: HashMap<String, String>) -> Result<Self> {
+    pub async fn new(properties: HashMap<String, String>) -> Result<Self> {
         let config = DirectoryNamespaceConfig::new(properties);
-        let operator = Self::initialize_operator(&config)?;
+        let (object_store, base_path) = Self::initialize_object_store(&config).await?;
 
-        Ok(Self { config, operator })
+        Ok(Self {
+            config,
+            object_store,
+            base_path,
+        })
     }
 
-    /// Initialize the OpenDAL operator based on the configuration
-    fn initialize_operator(config: &DirectoryNamespaceConfig) -> Result<Operator> {
+    /// Initialize the Lance ObjectStore based on the configuration
+    async fn initialize_object_store(
+        config: &DirectoryNamespaceConfig,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
         let root = config.root();
-        let storage_options = &config.storage_options;
+        let storage_options = config.storage_options().clone();
 
-        // Parse the root path to determine scheme and configuration
-        let (scheme, opendal_config) = Self::parse_storage_path(root, storage_options)?;
-
-        // Create the operator with the determined scheme and configuration
-        let operator =
-            Operator::via_iter(scheme, opendal_config).map_err(|e| Error::Namespace {
-                source: format!("Failed to create operator: {}", e).into(),
-                location: snafu::location!(),
-            })?;
-
-        Ok(operator)
-    }
-
-    /// Parse storage path and return scheme and configuration
-    fn parse_storage_path(
-        root: &str,
-        storage_options: &HashMap<String, String>,
-    ) -> Result<(opendal::Scheme, HashMap<String, String>)> {
-        use url::Url;
-
-        let mut config = HashMap::new();
-
-        // Try to parse as URL, if it fails, treat as local filesystem path
-        let (scheme, authority, path) = if let Ok(url) = Url::parse(root) {
-            let scheme = Self::normalize_scheme(url.scheme());
-            let authority = url.host_str().unwrap_or("");
-            // For file:// and fs:// URLs, preserve the full path including leading slash
-            // For cloud storage URLs, remove the leading slash
-            let path = if scheme == "fs" || scheme == "file" {
-                url.path().to_string()
+        // Build ObjectStoreParams from storage options
+        let params = ObjectStoreParams {
+            storage_options: if storage_options.is_empty() {
+                None
             } else {
-                url.path().trim_start_matches('/').to_string()
-            };
-            (scheme, authority.to_string(), path)
-        } else {
-            // Not a URL, treat as local filesystem - prepend fs://
-            ("fs".to_string(), String::new(), root.to_string())
+                Some(storage_options)
+            },
+            ..Default::default()
         };
 
-        // Configure based on scheme
-        let opendal_scheme = match scheme.as_str() {
-            "fs" | "file" => {
-                // For filesystem, use the full path (authority is empty for local paths)
-                if authority.is_empty() {
-                    config.insert("root".to_string(), path);
-                } else {
-                    // Handle file:///absolute/path or fs://hostname/path
-                    config.insert("root".to_string(), format!("{}/{}", authority, path));
-                }
-                opendal::Scheme::Fs
-            }
-            "s3" => {
-                config.insert("root".to_string(), path);
-                config.insert("bucket".to_string(), authority);
-                opendal::Scheme::S3
-            }
-            "gcs" => {
-                config.insert("root".to_string(), path);
-                config.insert("bucket".to_string(), authority);
-                opendal::Scheme::Gcs
-            }
-            "azblob" => {
-                config.insert("root".to_string(), path);
-                config.insert("container".to_string(), authority);
-                opendal::Scheme::Azblob
-            }
-            _ => {
-                // For unknown schemes, try to parse as OpenDAL scheme
-                config.insert("root".to_string(), path);
-                if !authority.is_empty() {
-                    config.insert("bucket".to_string(), authority);
-                }
-                opendal::Scheme::from_str(&scheme).map_err(|_| Error::Namespace {
-                    source: format!("Unsupported storage scheme: {}", scheme).into(),
+        // Create object store registry (shared across operations)
+        let registry = Arc::new(ObjectStoreRegistry::default());
+
+        // Use Lance's object store factory to create from URI
+        let (object_store, base_path) =
+            ObjectStore::from_uri_and_params(registry, root, &params)
+                .await
+                .map_err(|e| Error::Namespace {
+                    source: format!("Failed to create object store: {}", e).into(),
                     location: snafu::location!(),
-                })?
-            }
-        };
+                })?;
 
-        // Add storage options for all schemes
-        config.extend(storage_options.clone());
-
-        Ok((opendal_scheme, config))
-    }
-
-    /// Normalize scheme names with common aliases
-    fn normalize_scheme(scheme: &str) -> String {
-        match scheme.to_lowercase().as_str() {
-            "s3a" | "s3n" => "s3".to_string(),
-            "abfs" => "azblob".to_string(),
-            "file" => "fs".to_string(),
-            s => s.to_string(),
-        }
+        Ok((object_store, base_path))
     }
 
     /// Validate that the namespace ID represents the root namespace
@@ -244,14 +183,30 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
-    /// Get the full path for a table
-    fn table_full_path(&self, table_name: &str) -> String {
+    /// Get the full URI path for a table (for returning in responses)
+    fn table_full_uri(&self, table_name: &str) -> String {
         format!("{}/{}.lance", self.config.root(), table_name)
     }
 
-    /// Get the versions path for a table
-    fn table_versions_path(&self, table_name: &str) -> String {
-        format!("{}.lance/_versions/", table_name)
+    /// Get the object store path for a table (relative to base_path)
+    fn table_path(&self, table_name: &str) -> Path {
+        self.base_path.child(format!("{}.lance", table_name).as_str())
+    }
+
+    /// Get the versions directory path for a table
+    fn table_versions_path(&self, table_name: &str) -> Path {
+        // Need to chain child calls to avoid URL encoding the slash
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
+            .child("_versions")
+    }
+
+    /// Get the reserved file path for a table
+    fn table_reserved_file_path(&self, table_name: &str) -> Path {
+        // Need to chain child calls to avoid URL encoding the slash
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
+            .child(".lance-reserved")
     }
 }
 
@@ -334,17 +289,21 @@ impl LanceNamespace for DirectoryNamespace {
 
         let mut tables = Vec::new();
 
-        // Use non-recursive listing to avoid issues with object stores that don't have directory concept
-        let entries = self.operator.list("").await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to list directory: {}",
-                e
-            ))),
-            location: snafu::location!(),
-        })?;
+        // List all entries in the base directory
+        let entries = self
+            .object_store
+            .read_dir(self.base_path.clone())
+            .await
+            .map_err(|e| Error::IO {
+                source: box_error(std::io::Error::other(format!(
+                    "Failed to list directory: {}",
+                    e
+                ))),
+                location: snafu::location!(),
+            })?;
 
         for entry in entries {
-            let path = entry.path().trim_end_matches('/');
+            let path = entry.trim_end_matches('/');
 
             // Only process directory-like paths that end with .lance
             if !path.ends_with(".lance") {
@@ -358,9 +317,9 @@ impl LanceNamespace for DirectoryNamespace {
             let mut is_table = false;
 
             // First check for .lance-reserved file
-            let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
+            let reserved_file_path = self.table_reserved_file_path(table_name);
             if self
-                .operator
+                .object_store
                 .exists(&reserved_file_path)
                 .await
                 .unwrap_or(false)
@@ -371,7 +330,7 @@ impl LanceNamespace for DirectoryNamespace {
             // If not found, check for _versions directory
             if !is_table {
                 let versions_path = self.table_versions_path(table_name);
-                if let Ok(version_entries) = self.operator.list(&versions_path).await {
+                if let Ok(version_entries) = self.object_store.read_dir(versions_path).await {
                     // If there's at least one version file, it's a valid Lance dataset
                     if !version_entries.is_empty() {
                         is_table = true;
@@ -390,15 +349,15 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        let table_uri = self.table_full_uri(&table_name);
 
         // Check if table exists - either as Lance dataset or with .lance-reserved file
         let mut table_exists = false;
 
         // First check for .lance-reserved file
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
+        let reserved_file_path = self.table_reserved_file_path(&table_name);
         if self
-            .operator
+            .object_store
             .exists(&reserved_file_path)
             .await
             .unwrap_or(false)
@@ -409,7 +368,7 @@ impl LanceNamespace for DirectoryNamespace {
         // If not found, check if it's a Lance dataset by looking for _versions directory
         if !table_exists {
             let versions_path = self.table_versions_path(&table_name);
-            if let Ok(entries) = self.operator.list(&versions_path).await {
+            if let Ok(entries) = self.object_store.read_dir(versions_path).await {
                 if !entries.is_empty() {
                     table_exists = true;
                 }
@@ -425,7 +384,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(DescribeTableResponse {
             version: None,
-            location: Some(table_path),
+            location: Some(table_uri),
             schema: None,
             properties: None,
             storage_options: Some(self.config.storage_options.clone()),
@@ -439,9 +398,9 @@ impl LanceNamespace for DirectoryNamespace {
         let mut table_exists = false;
 
         // First check for .lance-reserved file
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
+        let reserved_file_path = self.table_reserved_file_path(&table_name);
         if self
-            .operator
+            .object_store
             .exists(&reserved_file_path)
             .await
             .unwrap_or(false)
@@ -452,7 +411,7 @@ impl LanceNamespace for DirectoryNamespace {
         // If not found, check if it's a Lance dataset by looking for _versions directory
         if !table_exists {
             let versions_path = self.table_versions_path(&table_name);
-            if let Ok(entries) = self.operator.list(&versions_path).await {
+            if let Ok(entries) = self.object_store.read_dir(versions_path).await {
                 if !entries.is_empty() {
                     table_exists = true;
                 }
@@ -475,7 +434,7 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        let table_uri = self.table_full_uri(&table_name);
 
         // Validate that request_data is provided and is a valid Arrow IPC stream
         if request_data.is_empty() {
@@ -488,11 +447,11 @@ impl LanceNamespace for DirectoryNamespace {
         // Validate location if provided
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
-            if location != table_path {
+            if location != table_uri {
                 return Err(Error::Namespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_path
+                        table_name, location, table_uri
                     )
                     .into(),
                     location: snafu::location!(),
@@ -541,7 +500,7 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         // Create the Lance dataset using the actual Lance API
-        Dataset::write(reader, &table_path, Some(write_params))
+        Dataset::write(reader, &table_uri, Some(write_params))
             .await
             .map_err(|e| Error::Namespace {
                 source: format!("Failed to create Lance dataset: {}", e).into(),
@@ -550,7 +509,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(CreateTableResponse {
             version: Some(1),
-            location: Some(table_path),
+            location: Some(table_uri),
             properties: None,
             storage_options: Some(self.config.storage_options.clone()),
         })
@@ -561,16 +520,16 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        let table_uri = self.table_full_uri(&table_name);
 
         // Validate location if provided
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
-            if location != table_path {
+            if location != table_uri {
                 return Err(Error::Namespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_path
+                        table_name, location, table_uri
                     )
                     .into(),
                     location: snafu::location!(),
@@ -579,9 +538,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Create the .lance-reserved file to mark the table as existing
-        let reserved_file_path = format!("{}.lance/.lance-reserved", table_name);
-        self.operator
-            .write(&reserved_file_path, Vec::<u8>::new())
+        let reserved_file_path = self.table_reserved_file_path(&table_name);
+
+        self.object_store
+            .create(&reserved_file_path)
             .await
             .map_err(|e| Error::Namespace {
                 source: format!(
@@ -590,10 +550,20 @@ impl LanceNamespace for DirectoryNamespace {
                 )
                 .into(),
                 location: snafu::location!(),
+            })?
+            .shutdown()
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to finalize .lance-reserved file for table {}: {}",
+                    table_name, e
+                )
+                .into(),
+                location: snafu::location!(),
             })?;
 
         Ok(CreateEmptyTableResponse {
-            location: Some(table_path),
+            location: Some(table_uri),
             properties: None,
             storage_options: Some(self.config.storage_options.clone()),
         })
@@ -601,12 +571,13 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_path = self.table_full_path(&table_name);
+        let table_uri = self.table_full_uri(&table_name);
 
         // Remove the entire table directory
-        let table_dir = format!("{}.lance/", table_name);
-        self.operator
-            .remove_all(&table_dir)
+        let table_path = self.table_path(&table_name);
+
+        self.object_store
+            .remove_dir_all(table_path)
             .await
             .map_err(|e| Error::Namespace {
                 source: format!("Failed to drop table {}: {}", table_name, e).into(),
@@ -615,7 +586,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(DropTableResponse {
             id: request.id,
-            location: Some(table_path),
+            location: Some(table_uri),
             properties: None,
             transaction_id: None,
         })
@@ -640,7 +611,7 @@ mod tests {
             temp_dir.path().to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
         (namespace, temp_dir)
     }
 
@@ -1017,7 +988,7 @@ mod tests {
             custom_path.to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1046,7 +1017,7 @@ mod tests {
         properties.insert("storage.option1".to_string(), "value1".to_string());
         properties.insert("storage.option2".to_string(), "value2".to_string());
 
-        let namespace = DirectoryNamespace::new(properties).unwrap();
+        let namespace = DirectoryNamespace::new(properties).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1132,145 +1103,6 @@ mod tests {
         let request = ListTablesRequest::new();
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_storage_path_local() {
-        let storage_options = HashMap::new();
-
-        // Test local filesystem paths
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("/path/to/data", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/path/to/data");
-
-        // Test relative path
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("./data", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "./data");
-    }
-
-    #[test]
-    fn test_parse_storage_path_s3() {
-        let storage_options = HashMap::new();
-
-        // Test S3 URL
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket/path/to/data", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-
-        // Test S3 with just bucket
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "");
-    }
-
-    #[test]
-    fn test_parse_storage_path_gcs() {
-        let storage_options = HashMap::new();
-
-        // Test GCS URL
-        let (scheme, config) = DirectoryNamespace::parse_storage_path(
-            "gcs://my-bucket/path/to/data",
-            &storage_options,
-        )
-        .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Gcs));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-    }
-
-    #[test]
-    fn test_parse_storage_path_azblob() {
-        let storage_options = HashMap::new();
-
-        // Test Azure Blob URL
-        let (scheme, config) = DirectoryNamespace::parse_storage_path(
-            "azblob://my-container/path/to/data",
-            &storage_options,
-        )
-        .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Azblob));
-        assert_eq!(config.get("container").unwrap(), "my-container");
-        assert_eq!(config.get("root").unwrap(), "path/to/data");
-
-        // Test with abfs alias
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("abfs://my-container/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Azblob));
-        assert_eq!(config.get("container").unwrap(), "my-container");
-        assert_eq!(config.get("root").unwrap(), "path");
-    }
-
-    #[test]
-    fn test_normalize_scheme() {
-        // Test scheme normalization
-        assert_eq!(DirectoryNamespace::normalize_scheme("s3a"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("s3n"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("S3A"), "s3");
-        assert_eq!(DirectoryNamespace::normalize_scheme("abfs"), "azblob");
-        assert_eq!(DirectoryNamespace::normalize_scheme("ABFS"), "azblob");
-        assert_eq!(DirectoryNamespace::normalize_scheme("file"), "fs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("FILE"), "fs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("gcs"), "gcs");
-        assert_eq!(DirectoryNamespace::normalize_scheme("random"), "random");
-    }
-
-    #[test]
-    fn test_fs_scheme_url() {
-        let storage_options = HashMap::new();
-
-        // Test file:// URLs
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("file:///absolute/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/absolute/path");
-
-        // Test fs:// URLs
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("fs:///absolute/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/absolute/path");
-    }
-
-    #[test]
-    fn test_storage_options_passed_through() {
-        // Test that storage options are properly passed through parse_storage_path
-        let mut storage_options = HashMap::new();
-        storage_options.insert("aws_access_key_id".to_string(), "test_key".to_string());
-        storage_options.insert(
-            "aws_secret_access_key".to_string(),
-            "test_secret".to_string(),
-        );
-        storage_options.insert("region".to_string(), "us-west-2".to_string());
-
-        // Test with S3 - storage options should be included
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("s3://my-bucket/path", &storage_options)
-                .unwrap();
-        assert!(matches!(scheme, opendal::Scheme::S3));
-        assert_eq!(config.get("bucket").unwrap(), "my-bucket");
-        assert_eq!(config.get("root").unwrap(), "path");
-        assert_eq!(config.get("aws_access_key_id").unwrap(), "test_key");
-        assert_eq!(config.get("aws_secret_access_key").unwrap(), "test_secret");
-        assert_eq!(config.get("region").unwrap(), "us-west-2");
-
-        // Test with local filesystem - storage options should still be included
-        let (scheme, config) =
-            DirectoryNamespace::parse_storage_path("/local/path", &storage_options).unwrap();
-        assert!(matches!(scheme, opendal::Scheme::Fs));
-        assert_eq!(config.get("root").unwrap(), "/local/path");
-        // Even for local fs, storage options should be passed through
-        assert_eq!(config.get("aws_access_key_id").unwrap(), "test_key");
     }
 
     #[tokio::test]
