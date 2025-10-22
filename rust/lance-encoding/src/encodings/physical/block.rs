@@ -28,7 +28,7 @@ use snafu::location;
 use std::str::FromStr;
 
 use crate::compression::{BlockCompressor, BlockDecompressor};
-use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
+use crate::encodings::physical::binary::VariableEncoder;
 use crate::format::{
     pb21::{self, CompressiveEncoding},
     ProtobufUtils21,
@@ -598,21 +598,12 @@ impl BlockCompressor for CompressedBufferEncoder {
     }
 }
 
-impl BlockDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        let mut decompressed = Vec::new();
-        self.compressor.decompress(&data, &mut decompressed)?;
-
-        // Delegate to BinaryBlockDecompressor which handles the inline metadata
-        let inner_decoder = BinaryBlockDecompressor::default();
-        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use crate::encodings::physical::binary::BinaryBlockDecompressor;
 
     use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
 
@@ -631,6 +622,37 @@ mod tests {
     #[test]
     fn test_compression_scheme_from_str_invalid() {
         assert!(CompressionScheme::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_general_block_decompressor_roundtrip() {
+        let encoder = CompressedBufferEncoder::default();
+        let original = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+            num_values: 2,
+            block_info: BlockInfo::new(),
+        };
+        let expected = original.try_clone().unwrap();
+
+        let compressed = BlockCompressor::compress(&encoder, DataBlock::FixedWidth(original))
+            .expect("compression should succeed");
+
+        let decompressor = GeneralBlockDecompressor::try_new(
+            Box::new(BinaryBlockDecompressor::default()),
+            encoder.compressor.config(),
+        )
+        .expect("general block decompressor should initialize");
+
+        let decoded = decompressor
+            .decompress(compressed, expected.num_values)
+            .expect("decompression should succeed")
+            .as_fixed_width()
+            .expect("decoded block should be fixed width");
+
+        assert_eq!(decoded.bits_per_value, expected.bits_per_value);
+        assert_eq!(decoded.num_values, expected.num_values);
+        assert_eq!(decoded.data.as_ref(), expected.data.as_ref());
     }
 
     #[cfg(feature = "zstd")]
