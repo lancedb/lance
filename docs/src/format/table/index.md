@@ -110,7 +110,7 @@ schema = pa.schema([
 ## Deletion
 
 Rows can be marked deleted by adding a deletion file next to the data in the `_deletions` folder.
-These files contain the indices of rows that have between deleted for some fragment.
+These files contain the indices of rows that have been deleted for some fragments.
 For a given version of the dataset, each fragment can have up to one deletion file.
 Fragments that have no deleted rows have no deletion file.
 
