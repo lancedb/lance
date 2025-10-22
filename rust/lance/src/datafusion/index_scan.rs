@@ -33,7 +33,7 @@ use crate::{
     io::exec::{
         filtered_read::FilteredReadExec,
         utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter},
-        AddRowAddrExec,
+        AddRowAddrExec, Planner,
     },
     Dataset,
 };
@@ -242,7 +242,6 @@ impl ScanIndexRule {
         // Only consider scans with no filters or index inputs.
         let options = read.options();
         if options.with_deleted_rows
-            || options.full_filter.is_some()
             || options.refine_filter.is_some()
             || options.scan_range_before_filter.is_some()
             || options.scan_range_after_filter.is_some()
@@ -276,6 +275,13 @@ impl ScanIndexRule {
         } else {
             field.name.clone()
         };
+
+        if let Some(filter_expr) = options.full_filter.as_ref() {
+            let filter_columns = Planner::column_names_in_expr(filter_expr);
+            if filter_columns.iter().any(|col| col != &column_name) {
+                return Ok(None);
+            }
+        }
 
         // Find a matching scalar index for the column.
         let criteria = ScalarIndexCriteria::default().for_column(column_name.as_str());
