@@ -275,13 +275,7 @@ pub async fn maybe_sample_training_data(
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
         if is_nullable {
-            // Use Lance's planner to parse the column expression to support nested fields
-            use lance_datafusion::planner::Planner;
-
-            let full_schema: arrow_schema::Schema = dataset.schema().into();
-            let planner = Planner::new(Arc::new(full_schema));
-            let column_expr = planner.parse_expr(column)?;
-            scanner.filter_expr(column_expr.is_not_null());
+            scanner.filter_non_null(column)?;
         }
         let batch = scanner.try_into_batch().await?;
         info!(

@@ -55,7 +55,6 @@ impl LanceField {
         Ok(self.0.metadata.clone())
     }
 
-    /// Convert the field to a PyArrow field
     pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
         PyArrowType((&self.0).into())
     }

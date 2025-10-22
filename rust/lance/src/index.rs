@@ -1416,8 +1416,6 @@ impl DatasetIndexInternalExt for Dataset {
             };
 
             let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
-
-            // Skip vector indices - scalar_index_info is only for scalar indices
             if index_details.is_vector() {
                 continue;
             }

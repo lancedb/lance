@@ -2341,8 +2341,6 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-
-        # Use LanceSchema to validate nested field paths
         lance_field = self._ds.lance_schema.field(column)
         if lance_field is None:
             raise KeyError(f"{column} not found in schema")
@@ -2368,7 +2366,6 @@ class LanceDataset(pa.dataset.Dataset):
                     )
                 )
 
-            # Convert LanceField to PyArrow field for type checking
             field = lance_field.to_arrow()
 
             field_type = field.type
@@ -4356,6 +4353,7 @@ class ScannerBuilder:
         lance_field = self.ds._ds.lance_schema.field(column)
         if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
+
         column_field = lance_field.to_arrow()
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
