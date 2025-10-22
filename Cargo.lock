@@ -4740,6 +4740,7 @@ dependencies = [
  "lance-core",
  "lance-namespace",
  "log",
+ "mock_instant",
  "mockall",
  "object_store",
  "object_store_opendal",
