@@ -136,7 +136,7 @@ jsonb = { version = "0.5.3", default-features = false, features = ["databend"]}
 libm = "0.2.15"
 log = "0.4"
 mockall = { version = "0.13.1" }
-mock_instant = { version = "0.3.1", features = ["sync"] }
+mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
