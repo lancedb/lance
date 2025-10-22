@@ -675,8 +675,11 @@ impl Dataset {
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-
-                let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+                let field_paths = idx
+                    .fields
+                    .iter()
+                    .map(|field_id| schema.field_path(*field_id).unwrap())
+                    .collect::<Vec<_>>();
 
                 let ds = self_.ds.clone();
                 let idx_type = match rt().block_on(Some(self_.py()), async {
@@ -685,7 +688,7 @@ impl Dataset {
                     } else {
                         let idx = ds
                             .open_generic_index(
-                                &idx_schema.fields[0].name,
+                                &field_paths[0],
                                 &idx.uuid.to_string(),
                                 &NoOpMetricsCollector,
                             )
@@ -701,12 +704,6 @@ impl Dataset {
                     }
                 };
 
-                let field_names = idx_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .collect::<Vec<_>>();
-
                 let fragment_set = PySet::empty(py).unwrap();
                 if let Some(bitmap) = &idx.fragment_bitmap {
                     for fragment_id in bitmap.iter() {
@@ -720,7 +717,7 @@ impl Dataset {
                 // 2. Use the new field from idx instead of hard coding it to Vector
                 dict.set_item("type", idx_type).unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                dict.set_item("fields", field_names).unwrap();
+                dict.set_item("fields", field_paths).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
                 dict.set_item("base_id", idx.base_id.map(|id| id as i64))
