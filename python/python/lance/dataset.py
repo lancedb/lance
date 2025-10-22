@@ -2619,7 +2619,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            # Use LanceSchema to validate nested field paths
             lance_field = self._ds.lance_schema.field(c)
             if lance_field is None:
                 raise KeyError(f"{c} not found in schema")

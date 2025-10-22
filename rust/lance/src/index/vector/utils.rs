@@ -275,7 +275,8 @@ pub async fn maybe_sample_training_data(
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
         if is_nullable {
-            scanner.filter_non_null(column)?;
+            let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+            scanner.filter_expr(column_expr.is_not_null());
         }
         let batch = scanner.try_into_batch().await?;
         info!(

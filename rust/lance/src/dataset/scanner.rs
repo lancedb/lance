@@ -824,32 +824,6 @@ impl Scanner {
         self
     }
 
-    /// Filter out null values for a given column.
-    ///
-    /// This method properly handles nested field paths (e.g., "data.embedding")
-    /// and backtick-escaped field names (e.g., "parent.`field.with.dots`").
-    ///
-    /// # Arguments
-    ///
-    /// * `column` - The column path to filter. Supports:
-    ///   - Simple columns: "column"
-    ///   - Nested paths: "parent.child"
-    ///   - Backtick-escaped: "parent.`field.with.dots`"
-    ///
-    /// # Returns
-    ///
-    /// Returns `Result<&mut Self>` - Ok if the filter was successfully applied,
-    /// Err if the column path could not be parsed.
-    pub fn filter_non_null(&mut self, column: &str) -> Result<&mut Self> {
-        use lance_datafusion::planner::Planner;
-
-        let schema: arrow_schema::Schema = self.dataset.schema().into();
-        let planner = Planner::new(Arc::new(schema));
-        let column_expr = planner.parse_expr(column)?;
-        self.filter_expr(column_expr.is_not_null());
-        Ok(self)
-    }
-
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
