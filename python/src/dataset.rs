@@ -675,11 +675,10 @@ impl Dataset {
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-                let field_paths = idx.fields
+                let field_paths = idx
+                    .fields
                     .iter()
-                    .map(|field_id| {
-                        schema.field_path(*field_id).unwrap()
-                    })
+                    .map(|field_id| schema.field_path(*field_id).unwrap())
                     .collect::<Vec<_>>();
 
                 let ds = self_.ds.clone();
