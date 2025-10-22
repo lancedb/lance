@@ -541,7 +541,7 @@ macro_rules! impl_common_protobuf_utils {
                 )>,
                 def_meaning: &[DefinitionInterpretation],
                 num_items: u64,
-                support_large_chunk: bool,
+                has_large_chunk: bool,
     ) -> crate::format::$module::PageLayout {
                 assert!(!def_meaning.is_empty());
                 let (dictionary, num_dictionary_items) = dictionary_encoding
@@ -563,7 +563,7 @@ macro_rules! impl_common_protobuf_utils {
                                     .map(|&def| Self::def_inter_to_repdef_layer(def))
                                     .collect(),
                                 num_items,
-                                support_large_chunk,
+                                has_large_chunk,
                 },
                         ),
                     ),

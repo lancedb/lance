@@ -335,21 +335,21 @@ impl DefaultCompressionStrategy {
             }
         }
 
-        // Parse binary minichunk size
+        // Parse minichunk size
         if let Some(minichunk_size_str) = field
             .metadata
-            .get(super::constants::BINARY_MINICHUNK_SIZE_META_KEY)
+            .get(super::constants::MINICHUNK_SIZE_META_KEY)
         {
             if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
                 // for lance v2.1, only 32kb or smaller is supported
                 if minichunk_size >= 32 * 1024 && *version <= LanceFileVersion::V2_1 {
                     log::warn!(
-                        "Binary minichunk_size '{}' too large for version '{}', using default",
+                        "minichunk_size '{}' too large for version '{}', using default",
                         minichunk_size,
                         version
                     );
                 } else {
-                    params.binary_minichunk_size = Some(minichunk_size);
+                    params.minichunk_size = Some(minichunk_size);
                 }
             } else {
                 log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
@@ -398,12 +398,12 @@ impl DefaultCompressionStrategy {
 
         // 1. Check for explicit "none" compression
         if params.compression.as_deref() == Some("none") {
-            return Ok(Box::new(BinaryMiniBlockEncoder::default()));
+            return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 2. Check for explicit "fsst" compression
         if params.compression.as_deref() == Some("fsst") {
-            return Ok(Box::new(FsstMiniBlockEncoder::default()));
+            return Ok(Box::new(FsstMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 3. Choose base encoder (FSST or Binary) based on data characteristics
@@ -411,9 +411,9 @@ impl DefaultCompressionStrategy {
             >= FSST_LEAST_INPUT_MAX_LENGTH
             && data_size >= FSST_LEAST_INPUT_SIZE as u64
         {
-            Box::new(FsstMiniBlockEncoder::default())
+            Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
         } else {
-            Box::new(BinaryMiniBlockEncoder::new(params.binary_minichunk_size))
+            Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
         };
 
         // 4. Apply general compression if configured
@@ -1126,7 +1126,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
-                binary_minichunk_size: None,
+                minichunk_size: None,
             },
         );
 
@@ -1158,7 +1158,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
-                binary_minichunk_size: None,
+                minichunk_size: None,
             },
         );
 
@@ -1282,7 +1282,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
-                binary_minichunk_size: None,
+                minichunk_size: None,
             },
         );
 
@@ -1425,7 +1425,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
-                binary_minichunk_size: None,
+                minichunk_size: None,
             },
         );
 

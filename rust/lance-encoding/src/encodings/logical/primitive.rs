@@ -155,7 +155,7 @@ struct DecodeMiniBlockTask {
     num_buffers: u64,
     max_visible_level: u16,
     instructions: Vec<(ChunkDrainInstructions, LoadedChunk)>,
-    support_large_chunk: bool,
+    has_large_chunk: bool,
 }
 
 impl DecodeMiniBlockTask {
@@ -427,6 +427,28 @@ impl DecodeMiniBlockTask {
         }
     }
 
+    // read `num_buffers` buffer sizes from `buf` starting at `offset`
+    fn read_buffer_sizes<const LARGE: bool>(
+        buf: &[u8],
+        offset: &mut usize,
+        num_buffers: u64,
+    ) -> Vec<u32> {
+        let read_size = if LARGE { 4 } else { 2 };
+        (0..num_buffers)
+            .map(|_| {
+                let bytes = &buf[*offset..*offset + read_size];
+                let size = if LARGE {
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    // the buffer size is read from u16 but is stored as u32 after decoding for consistency
+                    u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+                };
+                *offset += read_size;
+                size
+            })
+            .collect()
+    }
+
     // Unserialize a miniblock into a collection of vectors
     fn decode_miniblock_chunk(
         &self,
@@ -452,20 +474,11 @@ impl DecodeMiniBlockTask {
             None
         };
 
-        let read_size = if self.support_large_chunk { 4 } else { 2 };
-        let read_fn: fn(&[u8]) -> u32 = if self.support_large_chunk {
-            |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        let buffer_sizes = if self.has_large_chunk {
+            Self::read_buffer_sizes::<true>(buf, &mut offset, self.num_buffers)
         } else {
-            |bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+            Self::read_buffer_sizes::<false>(buf, &mut offset, self.num_buffers)
         };
-
-        let buffer_sizes = (0..self.num_buffers)
-            .map(|_| {
-                let size = read_fn(&buf[offset..offset + read_size]);
-                offset += read_size;
-                size
-            })
-            .collect::<Vec<_>>();
 
         offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
 
@@ -674,7 +687,7 @@ struct MiniBlockDecoder {
     num_rows: u64,
     num_buffers: u64,
     dictionary: Option<Arc<DataBlock>>,
-    support_large_chunk: bool,
+    has_large_chunk: bool,
 }
 
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
@@ -722,7 +735,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             def_meaning: self.def_meaning.clone(),
             num_buffers: self.num_buffers,
             max_visible_level,
-            support_large_chunk: self.support_large_chunk,
+            has_large_chunk: self.has_large_chunk,
         }))
     }
 
@@ -1224,7 +1237,7 @@ pub struct MiniBlockScheduler {
     dictionary: Option<MiniBlockSchedulerDictionary>,
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
-    support_large_chunk: bool,
+    has_large_chunk: bool,
 }
 
 impl MiniBlockScheduler {
@@ -1310,7 +1323,7 @@ impl MiniBlockScheduler {
             dictionary,
             def_meaning: def_meaning.into(),
             page_meta: None,
-            support_large_chunk: layout.support_large_chunk,
+            has_large_chunk: layout.has_large_chunk,
         })
     }
 
@@ -1664,14 +1677,13 @@ impl Words {
         }
     }
 
-    pub fn from_bytes(bytes: Bytes, support_large_chunk: bool) -> Result<Self> {
-        if support_large_chunk {
-            assert_eq!(bytes.len() % 4, 0);
-            let buffer = LanceBuffer::from_bytes(bytes, 4);
+    pub fn from_bytes(bytes: Bytes, has_large_chunk: bool) -> Result<Self> {
+        let bytes_per_value = if has_large_chunk { 4 } else { 2 };
+        assert_eq!(bytes.len() % bytes_per_value, 0);
+        let buffer = LanceBuffer::from_bytes(bytes, bytes_per_value as u64);
+        if has_large_chunk {
             Ok(Self::U32(buffer.borrow_to_typed_slice::<u32>()))
         } else {
-            assert_eq!(bytes.len() % 2, 0);
-            let buffer = LanceBuffer::from_bytes(bytes, 2);
             Ok(Self::U16(buffer.borrow_to_typed_slice::<u16>()))
         }
     }
@@ -1724,7 +1736,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let rep_index_bytes = buffers.next();
 
             // Parse the metadata and build the chunk meta
-            let words = Words::from_bytes(meta_bytes, self.support_large_chunk)?;
+            let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
             let mut chunk_meta = Vec::with_capacity(words.len());
 
             let mut rows_counter = 0;
@@ -1834,7 +1846,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
         let num_buffers = self.num_buffers;
-        let support_large_chunk = self.support_large_chunk;
+        let has_large_chunk = self.has_large_chunk;
         let dictionary = page_meta
             .dictionary
             .as_ref()
@@ -1858,7 +1870,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 dictionary,
                 num_rows,
                 num_buffers,
-                support_large_chunk,
+                has_large_chunk,
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed();
@@ -3440,7 +3452,7 @@ impl PrimitiveStructuralEncoder {
                 column_index,
                 options.keep_original_array,
             ),
-            support_large_chunk: options.support_large_chunk,
+            support_large_chunk: options.support_large_chunk(),
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
             column_index,
@@ -3637,7 +3649,7 @@ impl PrimitiveStructuralEncoder {
 
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = if support_large_chunk {
-                2 * 1024 * 1024 * 1024 // 2GB limit with u32 metadata
+                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
             } else {
                 32 * 1024 // 32KiB limit with u16 metadata
             };
@@ -5612,28 +5624,22 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 
-    #[tokio::test]
-    async fn test_binary_minichunk_size_roundtrip() {
-        use crate::constants::BINARY_MINICHUNK_SIZE_META_KEY;
+    async fn test_minichunk_size_helper(
+        string_data: Vec<Option<String>>,
+        minichunk_size: u64,
+        file_version: LanceFileVersion,
+    ) {
+        use crate::constants::MINICHUNK_SIZE_META_KEY;
         use crate::testing::{check_round_trip_encoding_of_data, TestCases};
         use arrow_array::{ArrayRef, StringArray};
         use std::sync::Arc;
 
-        // Test that binary minichunk size can be configured and works correctly in round-trip encoding
-        let string_data = vec![
-            Some("hello".to_string()),
-            Some("world".to_string()),
-            Some("lance".to_string()),
-            Some("encoding".to_string()),
-            Some("test".to_string()),
-        ];
         let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
 
-        // Create field with binary minichunk size specified in metadata
         let mut metadata = HashMap::new();
         metadata.insert(
-            BINARY_MINICHUNK_SIZE_META_KEY.to_string(),
-            "64".to_string(), // 64 bytes minichunk size
+            MINICHUNK_SIZE_META_KEY.to_string(),
+            minichunk_size.to_string(),
         );
         metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -5641,45 +5647,42 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_min_file_version(file_version)
             .with_batch_size(1000);
 
-        // This should work without errors and respect the minichunk size parameter
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
     }
 
     #[tokio::test]
-    async fn test_binary_minichunk_size_128kb_v2_2() {
-        use crate::constants::BINARY_MINICHUNK_SIZE_META_KEY;
-        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
-        use arrow_array::{ArrayRef, StringArray};
-        use std::sync::Arc;
-
-        // Test that binary minichunk size can be configured to 128KB and works correctly with Lance 2.2
-        // Create larger string data to better test the chunk size configuration
+    async fn test_minichunk_size_roundtrip() {
+        // Test that minichunk size can be configured and works correctly in round-trip encoding
         let mut string_data = Vec::new();
         for i in 0..100 {
-            string_data.push(Some(format!("test_string_{}", i).repeat(50))); // Create larger strings
+            string_data.push(Some(format!("test_string_{}", i).repeat(50)));
         }
-        let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
+        // configure minichunk size to 64 bytes (smaller than the default 4kb) for Lance 2.1
+        test_minichunk_size_helper(string_data, 64, LanceFileVersion::V2_1).await;
+    }
 
-        // Create field with binary minichunk size specified in metadata (128KB = 131072 bytes)
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            BINARY_MINICHUNK_SIZE_META_KEY.to_string(),
-            (128 * 1024).to_string(),
-        );
-        metadata.insert(
-            STRUCTURAL_ENCODING_META_KEY.to_string(),
-            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
-        );
+    #[tokio::test]
+    async fn test_minichunk_size_128kb_v2_2() {
+        // Test that minichunk size can be configured to 128KB and works correctly with Lance 2.2
+        let mut string_data = Vec::new();
+        // create a 500kb string array
+        for i in 0..10000 {
+            string_data.push(Some(format!("test_string_{}", i).repeat(50)));
+        }
+        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+    }
 
-        let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_batch_size(1000);
-
-        // This should work without errors and respect the 128KB minichunk size parameter with Lance 2.2
-        check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
+    #[tokio::test]
+    async fn test_binary_large_minichunk_size_over_max_miniblock_values() {
+        let mut string_data = Vec::new();
+        // 128kb/chunk / 6 bytes (t_9999) = 21845 > max 4096 items per chunk
+        for i in 0..10000 {
+            string_data.push(Some(format!("t_{}", i)));
+        }
+        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
     }
 
     #[tokio::test]
