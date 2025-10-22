@@ -2653,6 +2653,7 @@ mod tests {
 
     use crate::datafusion::LanceTableProvider;
     use crate::dataset::refs::branch_contents_path;
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
@@ -9496,5 +9497,149 @@ mod tests {
 
         // Should have both data writes (10 rows total)
         assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
+    }
+
+    async fn prepare_list_json_dataset() -> (Dataset, String) {
+        let string_values = vec![
+            r#"{"Title": "Harry Potter", "Content": "The boy who lived"}"#,
+            r#"{"Title": "Lord of the Rings", "Content": "One ring to rule them all"}"#,
+            r#"{"Title": "The Hobbit", "Content": "In a hole in the ground"}"#,
+            r#"{"Title": "Chamber of Secrets", "Content": "The chamber has been opened"}"#,
+        ];
+
+        let string_array = Arc::new(StringArray::from(string_values));
+
+        // 2 json values per row
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4]));
+        let list_json_col = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            offsets,
+            string_array,
+            None,
+        ));
+
+        let json_col = "list_json_field".to_string();
+
+        // Prepare dataset
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+
+        let field = Field::new(
+            &json_col,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        )
+        .with_metadata(metadata);
+
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![field]).into(),
+            vec![list_json_col as ArrayRef],
+        )
+        .unwrap();
+
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(stream, "memory://test/list_table", None)
+            .await
+            .unwrap();
+
+        (dataset, json_col)
+    }
+
+    #[tokio::test]
+    async fn test_list_json_inverted_match_query() {
+        let (mut dataset, json_col) = prepare_list_json_dataset().await;
+
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(true)
+                    .lower_case(true)
+                    .remove_stop_words(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match test
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,harry".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+        assert_eq!(
+            0,
+            batch
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0)
+        );
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,chamber".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+        assert_eq!(
+            1,
+            batch
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0)
+        );
+
+        // Match test non-existent title
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,nonexistent".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
     }
 }
