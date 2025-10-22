@@ -3,6 +3,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+/// Bits per value for FixedWidth dictionary values (currently only 128-bit is supported)
+pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
+/// Bits per index for dictionary indices (always i32)
+pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
+
 use arrow_array::{
     cast::AsArray,
     types::{
@@ -138,13 +143,13 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> (DataBlock, DataBlock) {
             });
             let dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                bits_per_value: 128,
+                bits_per_value: DICT_FIXED_WIDTH_BITS_PER_VALUE,
                 num_values: curr_idx as u64,
                 block_info: BlockInfo::default(),
             });
             let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(indices_buffer),
-                bits_per_value: 32,
+                bits_per_value: DICT_INDICES_BITS_PER_VALUE,
                 num_values: fixed_width_data_block.num_values,
                 block_info: BlockInfo::default(),
             });
