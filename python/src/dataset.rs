@@ -587,27 +587,6 @@ impl Dataset {
         LanceSchema(self_.ds.schema().clone())
     }
 
-    /// Get the PyArrow field for a given column path (supports nested fields like "data.embedding")
-    fn get_field_by_path(self_: PyRef<'_, Self>, column: &str) -> PyResult<PyObject> {
-        let schema = self_.ds.schema();
-
-        // Use Lance's resolve method to handle nested paths properly
-        let fields = schema.resolve(column).ok_or_else(|| {
-            PyValueError::new_err(format!("Column '{}' not found in schema", column))
-        })?;
-
-        // Get the last field in the path (the actual field we want)
-        let field = fields.last().ok_or_else(|| {
-            PyValueError::new_err(format!("Column '{}' resolved to empty path", column))
-        })?;
-
-        // Convert the Lance field to an Arrow field
-        let arrow_field: arrow_schema::Field = (*field).into();
-
-        // Convert to PyArrow
-        arrow_field.to_pyarrow(self_.py())
-    }
-
     fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let metadata_options: HashMap<String, Option<String>> =

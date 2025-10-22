@@ -4353,12 +4353,10 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        # Use Rust-side method to get the field (handles nested paths properly)
-        try:
-            column_field = self.ds._ds.get_field_by_path(column)
-        except ValueError as e:
-            raise ValueError(f"Embedding column {column} is not in the dataset") from e
-
+        lance_field = self.ds._ds.lance_schema.field(column)
+        if lance_field is None:
+            raise ValueError(f"Embedding column {column} is not in the dataset")
+        column_field = lance_field.to_arrow()
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
