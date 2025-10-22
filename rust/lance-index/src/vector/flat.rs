@@ -36,13 +36,57 @@ pub async fn compute_distance(
         // Ignore the distance calculated from inner vector index.
         batch = batch.drop_column(DIST_COL)?;
     }
-    let vectors = batch
-        .column_by_name(column)
-        .ok_or_else(|| Error::Schema {
-            message: format!("column {} does not exist in dataset", column),
-            location: location!(),
-        })?
-        .clone();
+
+    // Try to get the column directly first
+    let vectors = if let Some(col) = batch.column_by_name(column) {
+        col.clone()
+    } else {
+        // If not found, check if it's a nested field path (e.g., "data.embedding")
+        if column.contains('.') {
+            let parts: Vec<&str> = column.split('.').collect();
+            let mut current_array: ArrayRef = batch
+                .column_by_name(parts[0])
+                .ok_or_else(|| Error::Schema {
+                    message: format!(
+                        "column {} does not exist in dataset (looking for parent field {})",
+                        column, parts[0]
+                    ),
+                    location: location!(),
+                })?
+                .clone();
+
+            // Navigate through nested struct fields
+            for part in &parts[1..] {
+                let struct_array = current_array
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| Error::Schema {
+                        message: format!(
+                            "column {} is not a struct, cannot access nested field {}",
+                            parts[0], part
+                        ),
+                        location: location!(),
+                    })?;
+
+                current_array = struct_array
+                    .column_by_name(part)
+                    .ok_or_else(|| Error::Schema {
+                        message: format!(
+                            "nested field {} does not exist in struct column {}",
+                            part, parts[0]
+                        ),
+                        location: location!(),
+                    })?
+                    .clone();
+            }
+            current_array
+        } else {
+            return Err(Error::Schema {
+                message: format!("column {} does not exist in dataset", column),
+                location: location!(),
+            });
+        }
+    };
 
     let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
         NullBuffer::union(rowids.nulls(), vectors.nulls())

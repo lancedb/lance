@@ -587,6 +587,27 @@ impl Dataset {
         LanceSchema(self_.ds.schema().clone())
     }
 
+    /// Get the PyArrow field for a given column path (supports nested fields like "data.embedding")
+    fn get_field_by_path(self_: PyRef<'_, Self>, column: &str) -> PyResult<PyObject> {
+        let schema = self_.ds.schema();
+
+        // Use Lance's resolve method to handle nested paths properly
+        let fields = schema.resolve(column).ok_or_else(|| {
+            PyValueError::new_err(format!("Column '{}' not found in schema", column))
+        })?;
+
+        // Get the last field in the path (the actual field we want)
+        let field = fields.last().ok_or_else(|| {
+            PyValueError::new_err(format!("Column '{}' resolved to empty path", column))
+        })?;
+
+        // Convert the Lance field to an Arrow field
+        let arrow_field: arrow_schema::Field = (*field).into();
+
+        // Convert to PyArrow
+        arrow_field.to_pyarrow(self_.py())
+    }
+
     fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let metadata_options: HashMap<String, Option<String>> =
@@ -675,8 +696,12 @@ impl Dataset {
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-
-                let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+                let field_paths = idx.fields
+                    .iter()
+                    .map(|field_id| {
+                        schema.field_path(*field_id).unwrap()
+                    })
+                    .collect::<Vec<_>>();
 
                 let ds = self_.ds.clone();
                 let idx_type = match rt().block_on(Some(self_.py()), async {
@@ -685,7 +710,7 @@ impl Dataset {
                     } else {
                         let idx = ds
                             .open_generic_index(
-                                &idx_schema.fields[0].name,
+                                &field_paths[0],
                                 &idx.uuid.to_string(),
                                 &NoOpMetricsCollector,
                             )
@@ -701,12 +726,6 @@ impl Dataset {
                     }
                 };
 
-                let field_names = idx_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .collect::<Vec<_>>();
-
                 let fragment_set = PySet::empty(py).unwrap();
                 if let Some(bitmap) = &idx.fragment_bitmap {
                     for fragment_id in bitmap.iter() {
@@ -720,7 +739,7 @@ impl Dataset {
                 // 2. Use the new field from idx instead of hard coding it to Vector
                 dict.set_item("type", idx_type).unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                dict.set_item("fields", field_names).unwrap();
+                dict.set_item("fields", field_paths).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
                 dict.set_item("base_id", idx.base_id.map(|id| id as i64))

@@ -1415,7 +1415,13 @@ impl DatasetIndexInternalExt for Dataset {
                 field.name.clone()
             };
 
-            let index_details = IndexDetails(fetch_index_details(self, &field.name, index).await?);
+            let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
+
+            // Skip vector indices - scalar_index_info is only for scalar indices
+            if index_details.is_vector() {
+                continue;
+            }
+
             let plugin = index_details.get_plugin()?;
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
@@ -4177,6 +4183,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(search_results_v2.num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_on_simple_nested_field() {
+        // This test reproduces the Python test scenario from test_nested_field_vector_index
+        // where the nested field path is simple (data.embedding) without dots in field names
+        let dimensions = 16;
+        let num_rows = 256;
+
+        // Create schema with simple nested field (no dots in field names)
+        let struct_field = Field::new(
+            "data",
+            DataType::Struct(
+                vec![
+                    Field::new(
+                        "embedding",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            dimensions,
+                        ),
+                        false,
+                    ),
+                    Field::new("label", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            struct_field,
+        ]));
+
+        // Generate test data
+        let float_arr = generate_random_array(num_rows * dimensions as usize);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let labels = StringArray::from_iter_values((0..num_rows).map(|i| format!("label_{}", i)));
+
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "embedding",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dimensions,
+                    ),
+                    false,
+                )),
+                Arc::new(vectors) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("label", DataType::Utf8, false)),
+                Arc::new(labels) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(struct_array)])
+                .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test creating index on nested field
+        let nested_column_path = "data.embedding";
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10);
+
+        dataset
+            .create_index(
+                &[nested_column_path],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "vec_idx");
+
+        // Verify the correct field was indexed
+        let field_id = indices[0].fields[0];
+        let field_path = dataset.schema().field_path(field_id).unwrap();
+        assert_eq!(field_path, "data.embedding");
+
+        // Test querying with the index
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let plan = dataset
+            .scan()
+            .nearest(nested_column_path, &query_vector, 5)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Verify the vector index is being used
+        assert!(
+            plan.contains("ANNSubIndex") || plan.contains("ANNIvfPartition"),
+            "Query plan should use vector index for nested field. Plan: {}",
+            plan
+        );
+
+        let search_results = dataset
+            .scan()
+            .nearest(nested_column_path, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(search_results.num_rows(), 5);
     }
 
     #[tokio::test]

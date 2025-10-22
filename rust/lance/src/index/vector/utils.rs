@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, FixedSizeListArray};
+use arrow_array::{cast::AsArray, ArrayRef, FixedSizeListArray, RecordBatch};
 use futures::StreamExt;
 use lance_arrow::{interleave_batches, DataTypeExt};
 use lance_core::datatypes::Schema;
@@ -16,6 +16,61 @@ use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
+
+/// Helper function to extract a column from a RecordBatch, supporting nested field paths.
+/// For example, if column is "data.embedding", it will navigate through the struct fields.
+fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+    // Try to get the column directly first
+    if let Some(col) = batch.column_by_name(column) {
+        return Ok(col.clone());
+    }
+
+    // If not found, check if it's a nested field path (e.g., "data.embedding")
+    if column.contains('.') {
+        let parts: Vec<&str> = column.split('.').collect();
+        let mut current_array: ArrayRef = batch
+            .column_by_name(parts[0])
+            .ok_or_else(|| Error::Index {
+                message: format!(
+                    "column {} does not exist in dataset (looking for parent field {})",
+                    column, parts[0]
+                ),
+                location: location!(),
+            })?
+            .clone();
+
+        // Navigate through nested struct fields
+        for part in &parts[1..] {
+            let struct_array = current_array
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| Error::Index {
+                    message: format!(
+                        "column {} is not a struct, cannot access nested field {}",
+                        parts[0], part
+                    ),
+                    location: location!(),
+                })?;
+
+            current_array = struct_array
+                .column_by_name(part)
+                .ok_or_else(|| Error::Index {
+                    message: format!(
+                        "nested field {} does not exist in struct column {}",
+                        part, parts[0]
+                    ),
+                    location: location!(),
+                })?
+                .clone();
+        }
+        return Ok(current_array);
+    }
+
+    Err(Error::Index {
+        message: format!("column {} does not exist in dataset", column),
+        location: location!(),
+    })
+}
 
 /// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
@@ -168,13 +223,7 @@ pub async fn maybe_sample_training_data(
         while let Some(batch) = scan.next().await {
             let batch = batch?;
 
-            let array = batch.column_by_name(column).ok_or(Error::Index {
-                message: format!(
-                    "Sample training data: column {} does not exist in return",
-                    column
-                ),
-                location: location!(),
-            })?;
+            let array = get_column_from_batch(&batch, column)?;
             let null_count = array.logical_null_count();
             if null_count < array.len() {
                 num_non_null += array.len() - null_count;
@@ -215,7 +264,13 @@ pub async fn maybe_sample_training_data(
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
         if is_nullable {
-            scanner.filter_expr(datafusion_expr::col(column).is_not_null());
+            // Use Lance's planner to parse the column expression to support nested fields
+            use lance_datafusion::planner::Planner;
+
+            let full_schema: arrow_schema::Schema = dataset.schema().into();
+            let planner = Planner::new(Arc::new(full_schema));
+            let column_expr = planner.parse_expr(column)?;
+            scanner.filter_expr(column_expr.is_not_null());
         }
         let batch = scanner.try_into_batch().await?;
         info!(
@@ -225,13 +280,7 @@ pub async fn maybe_sample_training_data(
         batch
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
+    let array = get_column_from_batch(&batch, column)?;
 
     match array.data_type() {
         arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),

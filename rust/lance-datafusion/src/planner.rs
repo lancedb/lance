@@ -857,10 +857,9 @@ impl Planner {
     /// Note: the returned expression must be passed through [optimize_filter()]
     /// before being passed to [create_physical_expr()].
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
-        if self.schema.field_with_name(expr).is_ok() {
-            return Ok(col(expr));
-        }
-
+        // Always parse as SQL expression to handle both simple columns and nested field paths
+        // (e.g., "column_name" and "data.embedding")
+        // The SQL parser will handle backquoted field names that contain dots
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;

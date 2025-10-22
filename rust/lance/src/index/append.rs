@@ -167,7 +167,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .with_row_id()
                     .project(&[&field_path])?;
                 if column.nullable {
-                    scanner.filter_expr(datafusion_expr::col(&field_path).is_not_null());
+                    // Use Lance's planner to parse the column expression to support nested fields
+                    use lance_datafusion::planner::Planner;
+
+                    let full_schema: arrow_schema::Schema = dataset.schema().into();
+                    let planner = Planner::new(Arc::new(full_schema));
+                    let column_expr = planner.parse_expr(&field_path)?;
+                    scanner.filter_expr(column_expr.is_not_null());
                 }
                 Some(scanner.try_into_stream().await?)
             };
