@@ -1238,9 +1238,17 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 16,
                     num_dictionary_items,
                 }),
-                _ => {
-                    unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
-                }
+                Compression::General(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 1,
+                    num_dictionary_items,
+                }),
+                _ => unreachable!(
+                    "Mini-block dictionary encoding must use Variable, Flat, or General compression"
+                ),
             }
         } else {
             None
@@ -4291,15 +4299,28 @@ impl PrimitiveStructuralEncoder {
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
-            if let DataBlock::Struct(ref struct_data_block) = data_block {
-                if struct_data_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                {
-                    panic!("packed struct encoding currently only supports fixed-width fields.")
-                }
+            let requires_full_zip_packed_struct =
+                if let DataBlock::Struct(ref struct_data_block) = data_block {
+                    struct_data_block.has_variable_width_child()
+                } else {
+                    false
+                };
+
+            if requires_full_zip_packed_struct {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip packed struct layout",
+                    column_idx,
+                    num_values
+                );
+                return Self::encode_full_zip(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdefs,
+                    row_number,
+                    num_rows,
+                );
             }
 
             if let DataBlock::Dictionary(dict) = data_block {
