@@ -1,7 +1,7 @@
 # Migration Guides
 
 Lance aims to avoid breaking changes when possible.  Currently, we are refining the Rust public API so that we can move
-it out of experimental status and make stronger committments to backwards compatibility.  The python API is considered
+it out of experimental status and make stronger commitments to backwards compatibility.  The python API is considered
 stable and breaking changes should generally be communicated (via warnings) for 1-2 months prior to being finalized to
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
