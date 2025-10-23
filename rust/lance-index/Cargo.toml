@@ -64,7 +64,6 @@ tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
 uuid.workspace = true
-fastbloom = "0.14.0"
 twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
@@ -73,13 +72,11 @@ lance-datagen.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
-clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 env_logger = "0.11.6"
 lance-datagen.workspace = true
 lance-testing.workspace = true
 test-log.workspace = true
-datafusion-sql.workspace = true
 rstest.workspace = true
 chrono.workspace = true
 
