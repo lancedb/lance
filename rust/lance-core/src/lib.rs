@@ -60,6 +60,11 @@ pub static ROW_DELETED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 pub fn is_system_column(column_name: &str) -> bool {
     matches!(
         column_name,
-        ROW_ID | ROW_ADDR | ROW_OFFSET | ROW_LAST_UPDATED_AT_VERSION | ROW_CREATED_AT_VERSION | ROW_DELETED_AT_VERSION
+        ROW_ID
+            | ROW_ADDR
+            | ROW_OFFSET
+            | ROW_LAST_UPDATED_AT_VERSION
+            | ROW_CREATED_AT_VERSION
+            | ROW_DELETED_AT_VERSION
     )
 }

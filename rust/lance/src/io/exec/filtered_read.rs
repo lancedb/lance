@@ -374,7 +374,7 @@ impl FilteredReadStream {
                 Result::Ok(Self::load_fragment(
                     dataset.clone(),
                     frag.clone(),
-                    options.with_deleted_rows,
+                    // options.with_deleted_rows,
                 ))
             })
             .collect::<Vec<_>>();
@@ -436,7 +436,7 @@ impl FilteredReadStream {
     async fn load_fragment(
         dataset: Arc<Dataset>,
         frag: Fragment,
-        include_deleted_rows: bool,
+        // include_deleted_rows: bool,
     ) -> Result<LoadedFragment> {
         let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
         // Always load the deletion vector; when including deleted rows we will widen
@@ -1401,7 +1401,10 @@ impl FilteredReadExec {
             // Ensure we have the row id column and deleted version column if with_deleted_rows is set
             // Deleted rows are included by widening physical ranges, and `_row_deleted_at_version`
             // must be materialized to support filters and counting semantics.
-            options.projection = options.projection.with_row_id().with_row_deleted_at_version();
+            options.projection = options
+                .projection
+                .with_row_id()
+                .with_row_deleted_at_version();
         }
 
         if options.projection.is_empty() {
