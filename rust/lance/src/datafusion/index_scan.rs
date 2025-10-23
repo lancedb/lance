@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, SchemaRef};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     error::DataFusionError,
@@ -21,7 +21,7 @@ use datafusion_physical_plan::{
 use futures::executor::block_on;
 use itertools::Itertools;
 use lance_core::{
-    datatypes::format_field_path, Error as LanceError, Result as LanceResult, ROW_ADDR,
+    datatypes::format_field_path, Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_ID,
 };
 use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
@@ -435,34 +435,51 @@ impl ScanIndexRule {
         let read_schema = read.schema();
         let needs_row_addr = projection.with_row_addr;
 
-        let index_schema = if needs_row_addr {
-            let fields: Vec<_> = read_schema
-                .fields()
-                .iter()
-                .filter(|f| f.name() != ROW_ADDR)
-                .cloned()
-                .collect();
-            Arc::new(arrow_schema::Schema::new(fields))
-        } else {
-            read_schema.clone()
-        };
-
+        let arrow_field: ArrowField = field.into();
+        let mut value_field_arrow = ArrowField::new(
+            "values",
+            arrow_field.data_type().clone(),
+            arrow_field.is_nullable(),
+        );
+        if !arrow_field.metadata().is_empty() {
+            value_field_arrow = value_field_arrow.with_metadata(arrow_field.metadata().clone());
+        }
+        let ids_field = ArrowField::new("ids", ArrowDataType::UInt64, true);
+        let index_schema = Arc::new(arrow_schema::Schema::new(vec![
+            value_field_arrow,
+            ids_field,
+        ]));
         let mut result_plan: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
             column_context.index_name.clone(),
             column_context.ids.clone(),
             vec![column_context.index.clone()],
-            index_schema.clone(),
+            index_schema,
             None,
             dataset.clone(),
             vec![column_context.fragment_bitmap.clone()],
         ));
 
-        if !needs_row_addr && !projection.with_row_id {
-            let value_field = index_schema.field(0);
-            let column_expr = Column::new_with_schema(value_field.name(), index_schema.as_ref())
-                .map_err(|err| DataFusionError::External(Box::new(err)))?;
-            let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
-                vec![(Arc::new(column_expr), column_context.column_name.clone())];
+        let index_output_schema = result_plan.schema();
+        let mut projection_expr = Vec::with_capacity(read_schema.fields().len());
+        for field in read_schema.fields() {
+            let expr = if field.name() == &column_context.column_name {
+                Column::new_with_schema(
+                    index_output_schema.field(0).name(),
+                    index_output_schema.as_ref(),
+                )
+            } else if field.name() == ROW_ID {
+                Column::new_with_schema(
+                    index_output_schema.field(1).name(),
+                    index_output_schema.as_ref(),
+                )
+            } else {
+                Column::new_with_schema(field.name(), index_output_schema.as_ref())
+            }
+            .map_err(|err| DataFusionError::External(Box::new(err)))?;
+            let expr_arc: Arc<dyn PhysicalExpr> = Arc::new(expr);
+            projection_expr.push((expr_arc, field.name().clone()));
+        }
+        if !projection_expr.is_empty() {
             result_plan = Arc::new(
                 ProjectionExec::try_new(projection_expr, result_plan.clone())
                     .map_err(|err| DataFusionError::External(Box::new(err)))?,
@@ -522,11 +539,14 @@ impl PhysicalOptimizerRule for ScanIndexRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::record_batch::RecordBatch;
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::types::Int32Type;
     use datafusion::{
         config::ConfigOptions, execution::context::SessionContext,
         physical_optimizer::optimizer::PhysicalOptimizer,
     };
+    use futures::StreamExt;
     use lance_datagen::array;
     use lance_index::{
         scalar::{BuiltinIndexType, ScalarIndexParams},
@@ -549,6 +569,28 @@ mod tests {
             current = rule.optimize(current, &config).unwrap();
         }
         current
+    }
+
+    async fn collect_plan(
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> datafusion::error::Result<Vec<RecordBatch>> {
+        let session = SessionContext::new();
+        let task_ctx = session.task_ctx();
+        let mut results = Vec::new();
+        let partition_count = plan.properties().partitioning.partition_count();
+        for partition in 0..partition_count {
+            let mut stream = plan.execute(partition, task_ctx.clone())?;
+            while let Some(batch) = stream.next().await {
+                results.push(batch?);
+            }
+        }
+        Ok(results)
+    }
+
+    fn batches_to_string(batches: &[RecordBatch]) -> String {
+        pretty_format_batches(batches)
+            .expect("format batches")
+            .to_string()
     }
 
     #[tokio::test]
@@ -576,9 +618,14 @@ mod tests {
         scanner.project(&["value"]).unwrap();
         let plan = scanner.create_plan().await.unwrap();
 
+        let expected = collect_plan(plan.clone()).await.unwrap();
+        let plan = plan.reset_state().unwrap();
+
         let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
         let optimizer = get_physical_optimizer(contexts);
         let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let actual = collect_plan(optimized_plan.clone()).await.unwrap();
 
         let mut found_index_scan = false;
         optimized_plan
@@ -591,6 +638,69 @@ mod tests {
             .unwrap();
 
         assert!(found_index_scan, "index scan not found in optimized plan");
+        assert_eq!(
+            batches_to_string(&expected),
+            batches_to_string(&actual),
+            "optimized results differed from original plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_scan_optimizer_rewrite_index_column_only() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let plan = dataset
+            .scan()
+            .project(&["value"])
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+
+        let expected = collect_plan(plan.clone()).await.unwrap();
+        let plan = plan.reset_state().unwrap();
+
+        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
+        let optimizer = get_physical_optimizer(contexts);
+        let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let actual = collect_plan(optimized_plan.clone()).await.unwrap();
+
+        let mut found_index_scan = false;
+        optimized_plan
+            .apply(|node| {
+                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                    found_index_scan = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert!(found_index_scan, "index scan not found in optimized plan");
+        assert_eq!(optimized_plan.schema().fields().len(), 1);
+        assert_eq!(optimized_plan.schema().field(0).name(), "value");
+        assert_eq!(
+            batches_to_string(&expected),
+            batches_to_string(&actual),
+            "optimized results differed from original plan"
+        );
     }
 
     #[tokio::test]
@@ -619,9 +729,14 @@ mod tests {
         scanner.with_row_id();
         let plan = scanner.create_plan().await.unwrap();
 
+        let expected = collect_plan(plan.clone()).await.unwrap();
+        let plan = plan.reset_state().unwrap();
+
         let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
         let optimizer = get_physical_optimizer(contexts);
         let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let actual = collect_plan(optimized_plan.clone()).await.unwrap();
 
         let mut found_index_scan = false;
         let mut found_add_row_addr = false;
@@ -639,6 +754,11 @@ mod tests {
 
         assert!(found_index_scan, "index scan not found in optimized plan");
         assert!(!found_add_row_addr, "AddRowAddrExec unexpectedly present");
+        assert_eq!(
+            batches_to_string(&expected),
+            batches_to_string(&actual),
+            "optimized results differed from original plan"
+        );
     }
 
     #[tokio::test]
@@ -687,9 +807,14 @@ mod tests {
             .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
+        let expected = collect_plan(plan.clone()).await.unwrap();
+        let plan = plan.reset_state().unwrap();
+
         let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
         let optimizer = get_physical_optimizer(contexts);
         let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let actual = collect_plan(optimized_plan.clone()).await.unwrap();
 
         let mut found_index_scan = false;
         optimized_plan
@@ -704,6 +829,11 @@ mod tests {
         assert!(
             found_index_scan,
             "index scan not found in optimized join plan"
+        );
+        assert_eq!(
+            batches_to_string(&expected),
+            batches_to_string(&actual),
+            "optimized results differed from original plan"
         );
     }
 }
