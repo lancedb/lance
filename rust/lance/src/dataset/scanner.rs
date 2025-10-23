@@ -3874,6 +3874,7 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
     use std::vec;
 
     use arrow::array::as_primitive_array;
@@ -3892,7 +3893,9 @@ mod test {
     use half::f16;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
+    use lance_datagen::{
+        array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
+    };
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -3905,6 +3908,7 @@ mod test {
     use lance_io::utils::tracking_store::IOTracker;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+    use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
 
     use super::*;
@@ -3914,7 +3918,7 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
+        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
     };
 
     #[tokio::test]
@@ -4279,6 +4283,61 @@ mod test {
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
         Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_limit_cancel() {
+        // If there is a filter and a limit and we can't use the index to satisfy
+        // the filter, then we have to read until we have enough matching rows and
+        // then cancel the scan.
+        //
+        // This test regresses the case where we fail to cancel the scan for whatever
+        // reason.
+
+        // Make the store slow so that if we don't cancel the scan, it will take a loooong time.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_get_per_call: Duration::from_secs(1),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled.clone()),
+                ..Default::default()
+            }),
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+
+        // Make a dataset with lots of tiny fragments, that will make it more obvious if we fail to cancel the scan.
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>().with_random_nulls(0.1))
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2000),
+                FragmentRowCount::from(1),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.filter("i IS NOT NULL").unwrap();
+        scan.limit(Some(10), None).unwrap();
+
+        let start = Instant::now();
+        scan.try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let duration = start.elapsed();
+
+        // This test is a timing test, which is unfortunate, as it may be flaky.  I'm hoping
+        // we have enough wiggle room here.  The failure case is 30s on my machine and the pass
+        // case is 2-3s.
+        assert!(duration < Duration::from_secs(10));
     }
 
     #[rstest]

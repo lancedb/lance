@@ -167,7 +167,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .with_row_id()
                     .project(&[&field_path])?;
                 if column.nullable {
-                    scanner.filter_expr(datafusion_expr::col(&field_path).is_not_null());
+                    let column_expr =
+                        lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
+                    scanner.filter_expr(column_expr.is_not_null());
                 }
                 Some(scanner.try_into_stream().await?)
             };
