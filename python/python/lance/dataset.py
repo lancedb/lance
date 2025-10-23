@@ -2341,7 +2341,8 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        if column not in self.schema.names:
+        lance_field = self._ds.lance_schema.field(column)
+        if lance_field is None:
             raise KeyError(f"{column} not found in schema")
 
         # TODO: Add documentation of IndexConfig approach for creating
@@ -2365,7 +2366,7 @@ class LanceDataset(pa.dataset.Dataset):
                     )
                 )
 
-            field = self.schema.field(column)
+            field = lance_field.to_arrow()
 
             field_type = field.type
             if hasattr(field_type, "storage_type"):
@@ -2618,9 +2619,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            if c not in self.schema.names:
+            lance_field = self._ds.lance_schema.field(c)
+            if lance_field is None:
                 raise KeyError(f"{c} not found in schema")
-            field = self.schema.field(c)
+            field = lance_field.to_arrow()
             is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
@@ -4347,10 +4349,11 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        if self.ds.schema.get_field_index(column) < 0:
+        lance_field = self.ds._ds.lance_schema.field(column)
+        if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
 
-        column_field = self.ds.schema.field(column)
+        column_field = lance_field.to_arrow()
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type

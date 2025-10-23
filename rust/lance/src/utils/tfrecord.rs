@@ -22,8 +22,8 @@ use prost_old::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::{Error, Result};
 use crate::io::ObjectStore;
+use crate::{Error, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,

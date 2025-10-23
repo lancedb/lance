@@ -345,23 +345,7 @@ struct StructDataBlockBuilder {
 }
 
 impl StructDataBlockBuilder {
-    // Currently only Struct with fixed-width fields are supported.
-    // And the assumption that all fields have `bits_per_value % 8 == 0` is made here.
-    fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
-        let mut children = vec![];
-
-        debug_assert!(bits_per_values.iter().all(|bpv| bpv % 8 == 0));
-
-        let bytes_per_row: u32 = bits_per_values.iter().sum::<u32>() / 8;
-        let bytes_per_row = bytes_per_row as u64;
-
-        for bits_per_value in bits_per_values.iter() {
-            let this_estimated_size_bytes =
-                estimated_size_bytes / bytes_per_row * (*bits_per_value as u64) / 8;
-            let child =
-                FixedWidthDataBlockBuilder::new(*bits_per_value as u64, this_estimated_size_bytes);
-            children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
-        }
+    fn new(children: Vec<Box<dyn DataBlockBuilderImpl>>) -> Self {
         Self { children }
     }
 }
@@ -695,6 +679,12 @@ impl StructDataBlock {
             .into_iter()
             .flat_map(|c| c.into_buffers())
             .collect()
+    }
+
+    pub fn has_variable_width_child(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
     }
 
     pub fn data_size(&self) -> u64 {
@@ -1059,16 +1049,18 @@ impl DataBlock {
                 ))
             }
             Self::Struct(struct_data_block) => {
-                let mut bits_per_values = vec![];
-                for child in struct_data_block.children.iter() {
-                    let child = child.as_fixed_width_ref().
-                        expect("Currently StructDataBlockBuilder is only used in packed-struct encoding, and currently in packed-struct encoding, only fixed-width fields are supported.");
-                    bits_per_values.push(child.bits_per_value as u32);
-                }
-                Box::new(StructDataBlockBuilder::new(
-                    bits_per_values,
-                    estimated_size_bytes,
-                ))
+                let num_children = struct_data_block.children.len();
+                let per_child_estimate = if num_children == 0 {
+                    0
+                } else {
+                    estimated_size_bytes / num_children as u64
+                };
+                let child_builders = struct_data_block
+                    .children
+                    .iter()
+                    .map(|child| child.make_builder(per_child_estimate))
+                    .collect();
+                Box::new(StructDataBlockBuilder::new(child_builders))
             }
             Self::AllNull(_) => Box::new(AllNullDataBlockBuilder::default()),
             _ => todo!("make_builder for {:?}", self),

@@ -110,7 +110,7 @@ schema = pa.schema([
 ## Deletion
 
 Rows can be marked deleted by adding a deletion file next to the data in the `_deletions` folder.
-These files contain the indices of rows that have between deleted for some fragment.
+These files contain the indices of rows that have been deleted for some fragments.
 For a given version of the dataset, each fragment can have up to one deletion file.
 Fragments that have no deleted rows have no deletion file.
 
@@ -248,7 +248,7 @@ The respective parts of these indices are stored in the respective fragment's me
 
 Row IDs are assigned in a monotonically increasing sequence. The next row ID is stored in the manifest as the field `next_row_id`. This starts at zero. When making a commit, the writer uses that field to assign row IDs to new fragments. If the commit fails, the writer will re-read the new `next_row_id`, update the new row IDs, and then try again. This is similar to how the `max_fragment_id` is used to assign new fragment IDs.
 
-When a row ID updated, it is typically assigned a new row ID rather than reusing the old one. This is because this feature doesn't have a mechanism to update secondary indices that may reference the old values for the row ID. By deleting the old row ID and creating a new one, the secondary indices will avoid referencing stale data.
+When a row updated, it is typically assigned a new row ID rather than reusing the old one. This is because this feature doesn't have a mechanism to update secondary indices that may reference the old values for the row ID. By deleting the old row ID and creating a new one, the secondary indices will avoid referencing stale data.
 
 ### Row ID Sequences
 

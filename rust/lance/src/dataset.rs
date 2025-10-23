@@ -95,7 +95,6 @@ use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::error::box_error;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
@@ -106,6 +105,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
+use lance_core::box_error;
 pub use lance_core::ROW_ID;
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
@@ -1416,6 +1416,13 @@ impl Dataset {
         &self.object_store
     }
 
+    /// Returns the storage options used when opening this dataset, if any.
+    pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref())
+    }
+
     pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -2598,12 +2605,13 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::copy_test_data_to_tmp;
+    use lance_arrow::FixedSizeListArrayExt;
+    use mock_instant::thread_local::MockClock;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -7711,9 +7719,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_skip_auto_cleanup() {
-        use lance_core::utils::testing::MockClock;
-        let clock = MockClock::new();
-
         let test_uri = TempStrDir::default();
 
         // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
@@ -7731,7 +7736,7 @@ mod tests {
         };
 
         // Start at 1 second after epoch
-        clock.set_system_time(chrono::Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let dataset = Dataset::write(data, &test_uri, Some(write_params))
             .await
@@ -7739,7 +7744,7 @@ mod tests {
         assert_eq!(dataset.version().version, 1);
 
         // Advance time by 1 second
-        clock.set_system_time(chrono::Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         // First append WITHOUT skip_auto_cleanup - should trigger cleanup
         let data1 = gen_batch()
@@ -7761,7 +7766,7 @@ mod tests {
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
         let data1_extra = gen_batch()
@@ -7788,7 +7793,7 @@ mod tests {
         );
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
         let data2 = gen_batch()

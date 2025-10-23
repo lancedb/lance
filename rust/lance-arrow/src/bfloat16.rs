@@ -17,9 +17,13 @@ use half::bf16;
 
 use crate::{FloatArray, ARROW_EXT_NAME_KEY};
 
+/// The name of the bfloat16 extension in Arrow metadata
 pub const BFLOAT16_EXT_NAME: &str = "lance.bfloat16";
 
-/// Check whether the given field is a bfloat16 field.
+/// Check whether the given field is a bfloat16 field
+///
+/// A field is a bfloat16 field if it has a data type of `FixedSizeBinary(2)` and the metadata
+/// contains the bfloat16 extension name.
 pub fn is_bfloat16_field(field: &ArrowField) -> bool {
     field.data_type() == &DataType::FixedSizeBinary(2)
         && field
@@ -29,9 +33,17 @@ pub fn is_bfloat16_field(field: &ArrowField) -> bool {
             .unwrap_or_default()
 }
 
+/// The bfloat16 data type
+///
+/// This implements the [`ArrowFloatType`](crate::floats::ArrowFloatType) trait for bfloat16 values.
 #[derive(Debug)]
 pub struct BFloat16Type {}
 
+/// An array of bfloat16 values
+///
+/// This implements the [`Array`](arrow_array::Array) trait for bfloat16 values.  Note that
+/// bfloat16 is not the same thing as fp16 which is supported natively
+/// by arrow-rs.
 #[derive(Clone)]
 pub struct BFloat16Array {
     inner: FixedSizeBinaryArray,

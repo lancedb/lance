@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -46,7 +47,7 @@ use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::io::exec::knn::KNN_INDEX_SCHEMA;
-use crate::{arrow::*, Dataset};
+use crate::Dataset;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
