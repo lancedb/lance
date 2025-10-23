@@ -1641,9 +1641,8 @@ enum Words {
     U32(ScalarBuffer<u32>),
 }
 
-enum WordsIter<'a> {
-    U16(std::slice::Iter<'a, u16>),
-    U32(std::slice::Iter<'a, u32>),
+struct WordsIter<'a> {
+    iter: Box<dyn Iterator<Item = u32> + 'a>,
 }
 
 impl Words {
@@ -1656,8 +1655,12 @@ impl Words {
 
     pub fn iter(&self) -> WordsIter<'_> {
         match self {
-            Self::U16(buf) => WordsIter::U16(buf.iter()),
-            Self::U32(buf) => WordsIter::U32(buf.iter()),
+            Self::U16(buf) => WordsIter {
+                iter: Box::new(buf.iter().map(|&x| x as u32)),
+            },
+            Self::U32(buf) => WordsIter {
+                iter: Box::new(buf.iter().copied()),
+            },
         }
     }
 
@@ -1678,10 +1681,7 @@ impl<'a> Iterator for WordsIter<'a> {
     type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::U16(it) => it.next().map(|&x| x as u32),
-            Self::U32(it) => it.next().copied(),
-        }
+        self.iter.next()
     }
 }
 
