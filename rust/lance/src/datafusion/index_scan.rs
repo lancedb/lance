@@ -9,10 +9,13 @@ use datafusion::{
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
 };
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{
+    expressions::Column, EquivalenceProperties, Partitioning, PhysicalExpr,
+};
 use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     metrics::ExecutionPlanMetricsSet,
+    projection::ProjectionExec,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
 use futures::executor::block_on;
@@ -398,8 +401,7 @@ impl ScanIndexRule {
 
         let projection = &options.projection;
 
-        if !projection.with_row_id
-            || projection.with_row_last_updated_at_version
+        if projection.with_row_last_updated_at_version
             || projection.with_row_created_at_version
             || projection.field_ids.len() != 1
         {
@@ -445,15 +447,27 @@ impl ScanIndexRule {
             read_schema.clone()
         };
 
-        let index_exec: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
+        let mut result_plan: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
             column_context.index_name.clone(),
             column_context.ids.clone(),
             vec![column_context.index.clone()],
-            index_schema,
+            index_schema.clone(),
             None,
             dataset.clone(),
             vec![column_context.fragment_bitmap.clone()],
         ));
+
+        if !needs_row_addr && !projection.with_row_id {
+            let value_field = index_schema.field(0);
+            let column_expr = Column::new_with_schema(value_field.name(), index_schema.as_ref())
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+            let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
+                vec![(Arc::new(column_expr), column_context.column_name.clone())];
+            result_plan = Arc::new(
+                ProjectionExec::try_new(projection_expr, result_plan.clone())
+                    .map_err(|err| DataFusionError::External(Box::new(err)))?,
+            );
+        }
 
         if needs_row_addr {
             let Some(rowaddr_pos) = read_schema
@@ -463,11 +477,11 @@ impl ScanIndexRule {
             else {
                 return Ok(None);
             };
-            let add_row_addr = AddRowAddrExec::try_new(index_exec, dataset.clone(), rowaddr_pos)
+            let add_row_addr = AddRowAddrExec::try_new(result_plan, dataset.clone(), rowaddr_pos)
                 .map_err(|err| DataFusionError::External(Box::new(err)))?;
             Ok(Some(Arc::new(add_row_addr)))
         } else {
-            Ok(Some(index_exec))
+            Ok(Some(result_plan))
         }
     }
 }
@@ -508,14 +522,188 @@ impl PhysicalOptimizerRule for ScanIndexRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::types::Int32Type;
+    use datafusion::{
+        config::ConfigOptions, execution::context::SessionContext,
+        physical_optimizer::optimizer::PhysicalOptimizer,
+    };
+    use lance_datagen::array;
+    use lance_index::{
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+        IndexType,
+    };
 
-    #[tokio::test]
-    async fn test_optimize_limit_scan() {
-        todo!("validate operations get same result either way");
+    use crate::{
+        datafusion::LanceTableProvider,
+        io::exec::get_physical_optimizer,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+    };
+
+    fn run_optimizer(
+        optimizer: &PhysicalOptimizer,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let config = ConfigOptions::new();
+        let mut current = plan;
+        for rule in optimizer.rules.iter() {
+            current = rule.optimize(current, &config).unwrap();
+        }
+        current
     }
 
     #[tokio::test]
-    async fn test_optimize_join_index_cols() {
-        todo!("validate operations get same result either way");
+    async fn test_index_scan_optimizer_rewrite() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let mut scanner = dataset.scan();
+        scanner.project(&["value"]).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+
+        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
+        let optimizer = get_physical_optimizer(contexts);
+        let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let mut found_index_scan = false;
+        optimized_plan
+            .apply(|node| {
+                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                    found_index_scan = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert!(found_index_scan, "index scan not found in optimized plan");
+    }
+
+    #[tokio::test]
+    async fn test_index_scan_optimizer_rewrite_no_rowaddr() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let mut scanner = dataset.scan();
+        scanner.project(&["value"]).unwrap();
+        scanner.with_row_id();
+        let plan = scanner.create_plan().await.unwrap();
+
+        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
+        let optimizer = get_physical_optimizer(contexts);
+        let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let mut found_index_scan = false;
+        let mut found_add_row_addr = false;
+        optimized_plan
+            .apply(|node| {
+                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                    found_index_scan = true;
+                }
+                if node.as_any().downcast_ref::<AddRowAddrExec>().is_some() {
+                    found_add_row_addr = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert!(found_index_scan, "index scan not found in optimized plan");
+        assert!(!found_add_row_addr, "AddRowAddrExec unexpectedly present");
+    }
+
+    #[tokio::test]
+    async fn test_index_scan_optimizer_rewrite_join() {
+        let mut dataset_a = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+        let dataset_b = lance_datagen::gen_batch()
+            .col("value", array::cycle::<Int32Type>(vec![0, 2, 4, 6, 8]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset_a
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset_a = Arc::new(dataset_a);
+        let dataset_b = Arc::new(dataset_b);
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "a",
+            Arc::new(LanceTableProvider::new(dataset_a.clone(), true, false)),
+        )
+        .unwrap();
+        ctx.register_table(
+            "b",
+            Arc::new(LanceTableProvider::new(dataset_b.clone(), false, false)),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT a._rowid, a.value FROM a LEFT ANTI JOIN b ON a.value = b.value")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
+        let optimizer = get_physical_optimizer(contexts);
+        let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let mut found_index_scan = false;
+        optimized_plan
+            .apply(|node| {
+                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                    found_index_scan = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert!(
+            found_index_scan,
+            "index scan not found in optimized join plan"
+        );
     }
 }
