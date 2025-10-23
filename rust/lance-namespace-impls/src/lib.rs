@@ -14,6 +14,21 @@
 //!
 //! - `DirectoryNamespace`: Directory-based implementation (always available)
 //! - `RestNamespace`: REST API-based implementation (requires `rest` feature)
+//!
+//! ## Usage
+//!
+//! The recommended way to connect to a namespace is using [`ConnectBuilder`]:
+//!
+//! ```no_run
+//! # use lance_namespace_impls::ConnectBuilder;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let namespace = ConnectBuilder::new("dir")
+//!     .property("root", "/path/to/data")
+//!     .connect()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod connect;
 pub mod dir;
@@ -21,8 +36,8 @@ pub mod dir;
 #[cfg(feature = "rest")]
 pub mod rest;
 
-// Re-export connect function
-pub use connect::connect;
+// Re-export connect function and builder
+pub use connect::{connect, ConnectBuilder};
 pub use dir::{connect_dir, DirectoryNamespace, DirectoryNamespaceConfig};
 
 #[cfg(feature = "rest")]

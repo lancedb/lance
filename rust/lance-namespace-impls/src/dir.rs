@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
+use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 
@@ -31,8 +32,16 @@ use lance_namespace::LanceNamespace;
 ///
 /// This is a convenience wrapper around DirectoryNamespace::new that returns
 /// the same type as connect for API consistency.
-pub async fn connect_dir(properties: HashMap<String, String>) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties)
+///
+/// # Arguments
+///
+/// * `properties` - Configuration properties for the namespace
+/// * `session` - Optional Lance session to reuse object store registry
+pub async fn connect_dir(
+    properties: HashMap<String, String>,
+    session: Option<Arc<Session>>,
+) -> Result<Arc<dyn LanceNamespace>> {
+    DirectoryNamespace::new(properties, session)
         .await
         .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
 }
@@ -44,6 +53,8 @@ pub struct DirectoryNamespaceConfig {
     root: String,
     /// Storage options for the backend
     storage_options: HashMap<String, String>,
+    /// Optional Lance session to reuse object store registry
+    session: Option<Arc<Session>>,
 }
 
 impl DirectoryNamespaceConfig {
@@ -52,8 +63,8 @@ impl DirectoryNamespaceConfig {
     /// Prefix for storage options
     pub const STORAGE_OPTIONS_PREFIX: &'static str = "storage.";
 
-    /// Create a new configuration from properties
-    pub fn new(properties: HashMap<String, String>) -> Self {
+    /// Create a new configuration from properties and optional session
+    pub fn new(properties: HashMap<String, String>, session: Option<Arc<Session>>) -> Self {
         let root = properties
             .get(Self::ROOT)
             .cloned()
@@ -77,6 +88,7 @@ impl DirectoryNamespaceConfig {
         Self {
             root,
             storage_options,
+            session,
         }
     }
 
@@ -103,8 +115,16 @@ pub struct DirectoryNamespace {
 
 impl DirectoryNamespace {
     /// Create a new DirectoryNamespace instance
-    pub async fn new(properties: HashMap<String, String>) -> Result<Self> {
-        let config = DirectoryNamespaceConfig::new(properties);
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - Configuration properties for the namespace
+    /// * `session` - Optional Lance session to reuse object store registry
+    pub async fn new(
+        properties: HashMap<String, String>,
+        session: Option<Arc<Session>>,
+    ) -> Result<Self> {
+        let config = DirectoryNamespaceConfig::new(properties, session);
         let (object_store, base_path) = Self::initialize_object_store(&config).await?;
 
         Ok(Self {
@@ -131,8 +151,12 @@ impl DirectoryNamespace {
             ..Default::default()
         };
 
-        // Create object store registry (shared across operations)
-        let registry = Arc::new(ObjectStoreRegistry::default());
+        // Use object store registry from session if provided, otherwise create a new one
+        let registry = if let Some(session) = &config.session {
+            session.store_registry()
+        } else {
+            Arc::new(ObjectStoreRegistry::default())
+        };
 
         // Use Lance's object store factory to create from URI
         let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
@@ -622,7 +646,7 @@ mod tests {
             temp_dir.path().to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).await.unwrap();
+        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
         (namespace, temp_dir)
     }
 
@@ -999,7 +1023,7 @@ mod tests {
             custom_path.to_string_lossy().to_string(),
         );
 
-        let namespace = DirectoryNamespace::new(properties).await.unwrap();
+        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1028,7 +1052,7 @@ mod tests {
         properties.insert("storage.option1".to_string(), "value1".to_string());
         properties.insert("storage.option2".to_string(), "value2".to_string());
 
-        let namespace = DirectoryNamespace::new(properties).await.unwrap();
+        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1108,7 +1132,7 @@ mod tests {
             temp_dir.path().to_string_lossy().to_string(),
         );
 
-        let namespace = connect_dir(properties).await.unwrap();
+        let namespace = connect_dir(properties, None).await.unwrap();
 
         // Test basic operation through the trait object
         let request = ListTablesRequest::new();
