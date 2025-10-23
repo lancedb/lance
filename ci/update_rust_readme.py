@@ -66,7 +66,7 @@ def generate_mermaid_diagram(crates: Dict[str, dict]) -> str:
     lines = [
         "<!-- This section is auto-generated. Run `python ci/update_rust_readme.py` to update. -->",
         "```mermaid",
-        "graph TD",
+        "flowchart LR",
     ]
 
     # Sort crates by name for consistent output

@@ -11,7 +11,7 @@ The Lance project is organized as a Rust workspace with multiple crates that wor
 <!-- BEGIN_CARGO_DIAGRAM -->
 <!-- This section is auto-generated. Run `python ci/update_rust_readme.py` to update. -->
 ```mermaid
-graph TD
+flowchart LR
     fsst["fsst"]
     lance["lance"]
     lance-arrow["arrow"]
