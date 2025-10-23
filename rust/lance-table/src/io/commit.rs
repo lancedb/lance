@@ -383,12 +383,14 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
         let path = Path::from_filesystem_path(entry.path())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         let metadata = entry.metadata()?;
+        // Derive ETag from filesystem metadata; on Windows historically commit returned None.
+        let e_tag = Some(get_etag(&metadata));
         Ok(Some(ManifestLocation {
             version,
             path,
             size: Some(metadata.len()),
             naming_scheme: scheme.unwrap(),
-            e_tag: Some(get_etag(&metadata)),
+            e_tag,
         }))
     } else {
         Ok(None)
@@ -424,6 +426,7 @@ fn get_inode(metadata: &std::fs::Metadata) -> u64 {
 fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
+
 
 fn list_manifests<'a>(
     base_path: &Path,
@@ -979,7 +982,7 @@ impl CommitHandler for RenameCommitHandler {
                     path,
                     size: Some(res.size as u64),
                     naming_scheme,
-                    e_tag: None, // Re-name can change e-tag.
+                    e_tag: None,
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1191,5 +1194,74 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_etag_tests {
+    use super::*;
+    use lance_core::utils::tempfile::TempObjDir;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use futures::future::BoxFuture;
+
+    // Minimal writer that writes small bytes to provided path, without reading them back.
+    fn test_writer<'a>(
+        object_store: &'a ObjectStore,
+        _manifest: &'a mut crate::format::Manifest,
+        _indices: Option<Vec<IndexMetadata>>, 
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        Box::pin(async move {
+            let bytes = b"dummy-manifest";
+            object_store.put(path, bytes).await
+        })
+    }
+
+    #[tokio::test]
+    async fn windows_etag_consistency_commit_and_read() {
+        // This test ensures commit produces a concrete e_tag and the fast local resolver
+        // reads the same e_tag. Before this fix, e_tag on Windows was None after commit,
+        // and this assertion would fail; now it passes.
+        let tempdir = TempObjDir::default();
+        let base: Path = (*tempdir).clone();
+        let object_store = ObjectStore::local();
+
+        // Create a minimal manifest with a valid version; content is irrelevant for this test.
+        // We keep schema tiny to avoid heavy IO.
+        use arrow::datatypes::{DataType, Field};
+        use lance_core::datatypes::Schema;
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let mut manifest = crate::format::Manifest::new(
+            schema,
+            Arc::new(Vec::new()),
+            crate::format::DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+        manifest.version = 1;
+
+        let naming_scheme = ManifestNamingScheme::V1;
+
+        // Commit manifest via RenameCommitHandler
+        let loc_commit = RenameCommitHandler
+            .commit(&mut manifest, None, &base, &object_store, test_writer, naming_scheme)
+            .await
+            .unwrap();
+
+        assert!(loc_commit.e_tag.is_some(), "commit e_tag should be Some on Windows");
+
+        // Read latest manifest via fast local resolver
+        let loc_read = current_manifest_local(&base)
+            .unwrap()
+            .expect("latest manifest should exist");
+
+        assert!(loc_read.e_tag.is_some(), "read e_tag should be Some on Windows");
+        assert_eq!(
+            loc_commit.e_tag,
+            loc_read.e_tag,
+            "commit and read e_tag should match for cache key consistency"
+        );
     }
 }
