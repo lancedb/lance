@@ -25,6 +25,7 @@ use crate::{
 };
 use lance_index::{
     metrics::NoOpMetricsCollector,
+    pbold,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
 
@@ -114,7 +115,44 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = self.name.take().unwrap_or_else(|| {
+            // Default name generation
+            if self.index_type == IndexType::Vector
+                && self.params.index_name() == LANCE_VECTOR_INDEX
+            {
+                if let Some(vec_params) = self.params.as_any().downcast_ref::<VectorIndexParams>() {
+                    let vec_type = vec_params.index_type().to_string().to_lowercase();
+                    format!("{}_{}_idx", column, vec_type)
+                } else {
+                    // Fallback for unknown vector params
+                    format!("{}_vector_idx", column)
+                }
+            } else {
+                // Scalar indices: name based on concrete index type
+                let scalar_type_opt = match self.index_type {
+                    IndexType::Bitmap => Some("bitmap"),
+                    IndexType::BTree => Some("btree"),
+                    IndexType::Inverted => Some("inverted"),
+                    IndexType::NGram => None,
+                    IndexType::LabelList => Some("label_list"),
+                    IndexType::ZoneMap => Some("zonemap"),
+                    IndexType::BloomFilter => Some("bloomfilter"),
+                    IndexType::Scalar => {
+                        // If generic Scalar, try to downcast params to fetch concrete type name
+                        self.params
+                            .as_any()
+                            .downcast_ref::<ScalarIndexParams>()
+                            .map(|sp| sp.index_type.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(scalar_type) = scalar_type_opt {
+                    format!("{}_{}_idx", column, scalar_type)
+                } else {
+                    format!("{}_idx", column)
+                }
+            }
+        });
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -349,11 +387,54 @@ impl<'a> CreateIndexBuilder<'a> {
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<()> {
         let new_idx = self.execute_uncommitted().await?;
+
+        // Honor replace semantics: remove only when fields and type_url match
+        let new_type_url = new_idx.index_details.as_ref().map(|d| d.type_url.as_str());
+
+        let removed_indices = if self.replace {
+            let existing = self.dataset.load_indices().await?;
+            let total_frags = self.dataset.get_fragments().len() as u32;
+            existing
+                .iter()
+                .filter(|idx| {
+                    let type_match =
+                        idx.index_details.as_ref().map(|d| d.type_url.as_str()) == new_type_url;
+                    let fields_match = idx.fields == new_idx.fields;
+                    let is_base = match &idx.fragment_bitmap {
+                        Some(bm) => bm.len() as u32 == total_frags,
+                        None => true,
+                    };
+                    // For inverted index, ensure positions setting is preserved
+                    let positions_match =
+                        match (new_idx.index_details.as_ref(), idx.index_details.as_ref()) {
+                            (Some(new_any), Some(old_any))
+                                if new_any.type_url.ends_with("InvertedIndexDetails")
+                                    && old_any.type_url.ends_with("InvertedIndexDetails") =>
+                            {
+                                let new_details =
+                                    new_any.to_msg::<pbold::InvertedIndexDetails>().ok();
+                                let old_details =
+                                    old_any.to_msg::<pbold::InvertedIndexDetails>().ok();
+                                match (new_details, old_details) {
+                                    (Some(nd), Some(od)) => nd.with_position == od.with_position,
+                                    _ => true,
+                                }
+                            }
+                            _ => true,
+                        };
+                    fields_match && type_match && is_base && positions_match
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
         let transaction = Transaction::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
-                removed_indices: vec![],
+                removed_indices,
             },
             /*blobs_op= */ None,
             None,
@@ -390,6 +471,7 @@ mod tests {
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
@@ -602,7 +684,7 @@ mod tests {
             .create_index(
                 &["vector"],
                 IndexType::Vector,
-                None, // Will auto-generate name "vector_idx"
+                None, // Will auto-generate name "vector_ivf_pq_idx"
                 &vector_params,
                 false,
             )
@@ -611,7 +693,7 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1, "Should have 1 index");
-        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].name, "vector_ivf_pq_idx");
         assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
 
@@ -632,7 +714,7 @@ mod tests {
             .create_index(
                 &["vector"],
                 IndexType::Vector,
-                None, // Will auto-generate name "vector_idx"
+                None, // Will auto-generate name "vector_ivf_pq_idx"
                 &vector_params,
                 true,
             )
@@ -640,7 +722,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1, "Should have 1 index");
-        assert_eq!(indices[0].name, "vector_idx");
+        assert_eq!(indices[0].name, "vector_ivf_pq_idx");
         assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 1);
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
 
@@ -698,17 +780,17 @@ mod tests {
         let indices_after = dataset.load_indices().await.unwrap();
 
         // There should be 3 indices:
-        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
-        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
-        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
+        // 1. one scalar index with name "id_btree_idx", and the bitmap is [0,1]
+        // 2. one delta vector index with name "vector_ivf_pq_idx", and the bitmap is [0]
+        // 3. one delta vector index with name "vector_ivf_pq_idx", and the bitmap is [1]
         assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
         let id_idx = indices_after
             .iter()
-            .find(|idx| idx.name == "id_idx")
+            .find(|idx| idx.name == "id_btree_idx")
             .unwrap();
         let vector_indices = indices_after
             .iter()
-            .filter(|idx| idx.name == "vector_idx")
+            .filter(|idx| idx.name == "vector_ivf_pq_idx")
             .collect::<Vec<_>>();
         assert!(
             id_idx
@@ -727,5 +809,40 @@ mod tests {
             .iter()
             .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
                 && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+    }
+
+    #[tokio::test]
+    async fn test_auto_generated_index_name() {
+        // Test that when no index name is provided, the auto-generated name follows the expected pattern
+        use lance_index::scalar::BuiltinIndexType;
+
+        let tmpdir = tempdir().unwrap();
+        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+
+        // Create test data
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Test for Inverted index (original test)
+        let params = InvertedIndexParams::default();
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_inverted_idx");
+
+        // Test for BloomFilter index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BloomFilter, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_bloomfilter_idx");
+
+        // Test for ZoneMap index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::ZoneMap, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_zonemap_idx");
     }
 }

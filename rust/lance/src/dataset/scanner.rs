@@ -6298,7 +6298,7 @@ mod test {
             range_before=None, range_after=None, row_id=false, row_addr=false, \
             full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50), \
             refine_filter=--
-              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
+              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_btree_idx)",
         )
         .await
         .unwrap();
@@ -6313,7 +6313,7 @@ mod test {
   LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, range_before=None, \
   range_after=None, row_id=true, row_addr=false, full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50) AND no_index > UInt32(100), \
   refine_filter=no_index > UInt32(100)
-    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
+    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_btree_idx)",
         )
         .await
         .unwrap();
@@ -6963,16 +6963,31 @@ mod test {
         // Make sure both indices are up-to-date to start
         dataset.make_vector_index().await?;
         dataset.make_scalar_index().await?;
+        // Resolve scalar index name for column "i" to avoid hardcoded expectations
+        let i_idx_name = dataset
+            .dataset
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column("i")
+                    .supports_exact_equality(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+            .clone();
+        let replace_i_idx = |s: &str| s.replace("@i_idx", &format!("@{}", i_idx_name));
 
         log::info!("Test case: ANN with scalar index");
-        let expected =
+        let expected = &replace_i_idx(
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
           ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-          ScalarIndexQuery: query=[i > 10]@i_idx";
+          ScalarIndexQuery: query=[i > 10]@i_idx",
+        );
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7021,7 +7036,7 @@ mod test {
         dataset.append_new_data().await?;
 
         log::info!("Test case: Combined KNN/ANN with scalar index");
-        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        let expected = &replace_i_idx("ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -7040,7 +7055,7 @@ mod test {
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx";
+                        ScalarIndexQuery: query=[i > 10]@i_idx");
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7086,7 +7101,7 @@ mod test {
                     .filter("i > 10")?
                     .prefilter(true))
             },
-            expected,
+            &replace_i_idx(expected),
         )
         .await?;
 
@@ -7094,14 +7109,16 @@ mod test {
         // ---------------------------------------------------------------------
         log::info!("Test case: Filtered read with scalar index");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[s@1 as s]
+            &replace_i_idx(
+                "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      MaterializeIndex: query=[i > 10]@i_idx"
+      MaterializeIndex: query=[i > 10]@i_idx",
+            )
         } else {
-            "LanceRead: uri=..., projection=[s], num_fragments=4, range_before=None, \
+            &replace_i_idx("LanceRead: uri=..., projection=[s], num_fragments=4, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx")
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7132,13 +7149,15 @@ mod test {
 
         log::info!("Test case: Empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
+            &replace_i_idx(
+                "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   AddRowAddrExec
-    MaterializeIndex: query=[i > 10]@i_idx"
+    MaterializeIndex: query=[i > 10]@i_idx",
+            )
         } else {
-            "LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
+            &replace_i_idx("LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx")
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7155,7 +7174,7 @@ mod test {
         dataset.append_new_data().await?;
         log::info!("Test case: Combined Scalar/non-scalar filtered read");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[s@1 as s]
+            &replace_i_idx("ProjectionExec: expr=[s@1 as s]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       Take: columns=\"_rowid, (s)\"
@@ -7163,11 +7182,11 @@ mod test {
           MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
+          LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None")
         } else {
-            "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
+            &replace_i_idx("LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx")
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7178,18 +7197,18 @@ mod test {
 
         log::info!("Test case: Combined Scalar/non-scalar filtered read with empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
+            &replace_i_idx("ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       AddRowAddrExec
         MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
+          LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None")
         } else {
-            "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
+            &replace_i_idx("LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx")
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7207,7 +7226,8 @@ mod test {
         // When an expression is specified in the projection, the plan should include a ProjectionExec
         log::info!("Test case: Dynamic projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
+            &replace_i_idx(
+                "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       Take: columns=\"_rowid, (s)\"
@@ -7215,12 +7235,15 @@ mod test {
           MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
         FilterExec: i@0 > 10
-          LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
+          LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None",
+            )
         } else {
-            "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
+            &replace_i_idx(
+                "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
   range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx"
+    ScalarIndexQuery: query=[i > 10]@i_idx",
+            )
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7294,7 +7317,8 @@ mod test {
 
         log::info!("Test case: Full text search with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            &replace_i_idx(
+                r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
@@ -7303,14 +7327,17 @@ mod test {
             MaterializeIndex: query=[i > 10]@i_idx
             ProjectionExec: expr=[_rowid@1 as _rowid]
               FilterExec: i@0 > 10
-                LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#,
+            )
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            &replace_i_idx(
+                r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-          ScalarIndexQuery: query=[i > 10]@i_idx"#
+          ScalarIndexQuery: query=[i > 10]@i_idx"#,
+            )
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -7349,7 +7376,8 @@ mod test {
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            &replace_i_idx(
+                r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -7364,9 +7392,11 @@ mod test {
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#,
+            )
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            &replace_i_idx(
+                r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -7377,7 +7407,8 @@ mod test {
                 ScalarIndexQuery: query=[i > 10]@i_idx
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#,
+            )
         };
         assert_plan_equals(
             &dataset.dataset,

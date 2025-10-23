@@ -841,9 +841,20 @@ mod tests {
             _tmp_dir_guard,
         } = test_fixture().await;
 
+        let ordered_field_id = dataset.schema().field("ordered").unwrap().id;
+        let idx_name = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| m.fields[0] == ordered_field_id)
+            .unwrap()
+            .name
+            .clone();
+
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "ordered".to_string(),
-            index_name: "ordered_idx".to_string(),
+            index_name: idx_name,
             query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),

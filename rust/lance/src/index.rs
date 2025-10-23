@@ -1687,14 +1687,20 @@ mod tests {
             .unwrap();
 
         // Can not overwrite an index on different columns.
+        // Use the actual index name of column "o"
+        let o_field_id = dataset.schema().field("o").unwrap().id;
+        let o_index_name = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| m.fields[0] == o_field_id)
+            .unwrap()
+            .name
+            .clone();
+
         assert!(dataset
-            .create_index(
-                &["v"],
-                IndexType::Vector,
-                Some("o_idx".to_string()),
-                &params,
-                true,
-            )
+            .create_index(&["v"], IndexType::Vector, Some(o_index_name), &params, true,)
             .await
             .is_err());
     }
@@ -2124,7 +2130,7 @@ mod tests {
             .unwrap();
 
         async fn assert_indexed_rows(dataset: &Dataset, expected_indexed_rows: usize) {
-            let stats = dataset.index_statistics("text_idx").await.unwrap();
+            let stats = dataset.index_statistics("text_inverted_idx").await.unwrap();
             let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
             let indexed_rows = stats["num_indexed_rows"].as_u64().unwrap() as usize;
             let unindexed_rows = stats["num_unindexed_rows"].as_u64().unwrap() as usize;
@@ -3740,7 +3746,7 @@ mod tests {
             .create_index(
                 &["text"],
                 IndexType::Inverted,
-                Some("text_idx".to_string()),
+                Some("text_inverted_idx".to_string()),
                 &fts_params,
                 false,
             )

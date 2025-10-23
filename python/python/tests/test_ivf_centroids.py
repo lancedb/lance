@@ -24,7 +24,7 @@ def test_ivf_centroids_exposed(tmp_path):
     )
 
     # arrow view via explicit index name
-    arrow_centroids = ds.centroids(index_name="vector_idx")
+    arrow_centroids = ds.centroids(index_name="vector_ivf_pq_idx")
     assert arrow_centroids is not None
     assert len(arrow_centroids) == parts
     assert arrow_centroids.type.list_size == dim
