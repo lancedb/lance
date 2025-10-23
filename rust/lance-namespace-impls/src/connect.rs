@@ -115,106 +115,55 @@ impl ConnectBuilder {
     /// - Required configuration properties are missing
     /// - Connection to the backend fails
     pub async fn connect(self) -> Result<Arc<dyn LanceNamespace>> {
-        connect(&self.impl_name, self.properties, self.session).await
-    }
-}
-
-/// Connect to a Lance namespace implementation.
-///
-/// **Note:** Consider using [`ConnectBuilder`] for a more ergonomic API.
-///
-/// This function creates a connection to a Lance namespace backend based on
-/// the specified implementation type and configuration properties.
-///
-/// # Arguments
-///
-/// * `impl_name` - Implementation identifier. Supported values:
-///   - "rest": REST API implementation (requires "rest" feature)
-///   - "dir": Directory-based implementation (always available)
-///
-/// * `properties` - Configuration properties specific to the implementation.
-///   Common properties:
-///   - For REST: "uri" (base URL), "delimiter", "header.*" (custom headers)
-///   - For DIR: "root" (directory path), "storage.*" (storage options)
-///
-/// * `session` - Optional Lance session to reuse object store registry
-///
-/// # Returns
-///
-/// Returns a boxed trait object implementing the `LanceNamespace` trait.
-///
-/// # Examples
-///
-/// ```no_run
-/// use lance_namespace_impls::connect;
-/// use std::collections::HashMap;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Connect to REST implementation
-/// let mut props = HashMap::new();
-/// props.insert("uri".to_string(), "http://localhost:8080".to_string());
-/// let namespace = connect("rest", props, None).await?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// ```no_run
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// use lance_namespace_impls::connect;
-/// use std::collections::HashMap;
-///
-/// // Connect to directory implementation
-/// let mut props = HashMap::new();
-/// props.insert("root".to_string(), "/path/to/data".to_string());
-/// let namespace = connect("dir", props, None).await?;
-/// # Ok(())
-/// # }
-/// ```
-pub async fn connect(
-    impl_name: &str,
-    properties: HashMap<String, String>,
-    session: Option<Arc<Session>>,
-) -> Result<Arc<dyn LanceNamespace>> {
-    match impl_name {
-        #[cfg(feature = "rest")]
-        "rest" => {
-            // Create REST implementation (REST doesn't use session)
-            Ok(Arc::new(crate::rest::RestNamespace::new(properties)))
+        match self.impl_name.as_str() {
+            #[cfg(feature = "rest")]
+            "rest" => {
+                // Create REST implementation (REST doesn't use session)
+                crate::rest::RestNamespaceBuilder::from_properties(self.properties)
+                    .map(|builder| Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
+            }
+            #[cfg(not(feature = "rest"))]
+            "rest" => Err(Error::Namespace {
+                source: "REST namespace implementation requires 'rest' feature to be enabled"
+                    .into(),
+                location: snafu::location!(),
+            }),
+            "dir" => {
+                // Create directory implementation (always available)
+                crate::dir::DirectoryNamespaceBuilder::from_properties(
+                    self.properties,
+                    self.session,
+                )?
+                .build()
+                .await
+                .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
+            }
+            _ => Err(Error::Namespace {
+                source: format!(
+                    "Implementation '{}' is not available. Supported: dir{}",
+                    self.impl_name,
+                    if cfg!(feature = "rest") { ", rest" } else { "" }
+                )
+                .into(),
+                location: snafu::location!(),
+            }),
         }
-        #[cfg(not(feature = "rest"))]
-        "rest" => Err(Error::Namespace {
-            source: "REST namespace implementation requires 'rest' feature to be enabled".into(),
-            location: snafu::location!(),
-        }),
-        "dir" => {
-            // Create directory implementation (always available)
-            crate::dir::connect_dir(properties, session).await
-        }
-        _ => Err(Error::Namespace {
-            source: format!(
-                "Implementation '{}' is not available. Supported: dir{}",
-                impl_name,
-                if cfg!(feature = "rest") { ", rest" } else { "" }
-            )
-            .into(),
-            location: snafu::location!(),
-        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::ListTablesRequest;
     use std::collections::HashMap;
-    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_connect_builder_basic() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempStdDir::default();
 
         let namespace = ConnectBuilder::new("dir")
-            .property("root", temp_dir.path().to_string_lossy().to_string())
+            .property("root", temp_dir.to_str().unwrap())
             .connect()
             .await
             .unwrap();
@@ -227,12 +176,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_builder_with_properties() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempStdDir::default();
         let mut props = HashMap::new();
         props.insert("storage.option1".to_string(), "value1".to_string());
 
         let namespace = ConnectBuilder::new("dir")
-            .property("root", temp_dir.path().to_string_lossy().to_string())
+            .property("root", temp_dir.to_str().unwrap())
             .properties(props)
             .connect()
             .await
@@ -246,11 +195,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_builder_with_session() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempStdDir::default();
         let session = Arc::new(Session::default());
 
         let namespace = ConnectBuilder::new("dir")
-            .property("root", temp_dir.path().to_string_lossy().to_string())
+            .property("root", temp_dir.to_str().unwrap())
             .session(session.clone())
             .connect()
             .await
@@ -272,22 +221,5 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("not available"));
-    }
-
-    #[tokio::test]
-    async fn test_connect_function_backwards_compat() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut props = HashMap::new();
-        props.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
-
-        let namespace = connect("dir", props, None).await.unwrap();
-
-        // Verify we can use the namespace
-        let request = ListTablesRequest::new();
-        let response = namespace.list_tables(request).await.unwrap();
-        assert_eq!(response.tables.len(), 0);
     }
 }

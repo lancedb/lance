@@ -28,107 +28,191 @@ use lance_namespace::models::{
 use lance_core::{box_error, Error, Result};
 use lance_namespace::LanceNamespace;
 
-/// Connect to a directory-based namespace implementation.
+/// Builder for creating a DirectoryNamespace.
 ///
-/// This is a convenience wrapper around DirectoryNamespace::new that returns
-/// the same type as connect for API consistency.
+/// This builder provides a fluent API for configuring and establishing
+/// connections to directory-based Lance namespaces.
 ///
-/// # Arguments
+/// # Examples
 ///
-/// * `properties` - Configuration properties for the namespace
-/// * `session` - Optional Lance session to reuse object store registry
-pub async fn connect_dir(
-    properties: HashMap<String, String>,
-    session: Option<Arc<Session>>,
-) -> Result<Arc<dyn LanceNamespace>> {
-    DirectoryNamespace::new(properties, session)
-        .await
-        .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
-}
-
-/// Configuration for DirectoryNamespace.
+/// ```no_run
+/// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create a local directory namespace
+/// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ```no_run
+/// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+/// # use lance::session::Session;
+/// # use std::sync::Arc;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create with custom storage options and session
+/// let session = Arc::new(Session::default());
+/// let namespace = DirectoryNamespaceBuilder::new("s3://bucket/path")
+///     .storage_option("region", "us-west-2")
+///     .storage_option("access_key_id", "key")
+///     .session(session)
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
-pub struct DirectoryNamespaceConfig {
-    /// Root directory for the namespace
+pub struct DirectoryNamespaceBuilder {
     root: String,
-    /// Storage options for the backend
-    storage_options: HashMap<String, String>,
-    /// Optional Lance session to reuse object store registry
+    storage_options: Option<HashMap<String, String>>,
     session: Option<Arc<Session>>,
 }
 
-impl DirectoryNamespaceConfig {
-    /// Property key for the root directory
-    pub const ROOT: &'static str = "root";
-    /// Prefix for storage options
-    pub const STORAGE_OPTIONS_PREFIX: &'static str = "storage.";
+impl DirectoryNamespaceBuilder {
+    /// Create a new DirectoryNamespaceBuilder with the specified root path.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Root directory path (local path or cloud URI like s3://bucket/path)
+    pub fn new(root: impl Into<String>) -> Self {
+        Self {
+            root: root.into().trim_end_matches('/').to_string(),
+            storage_options: None,
+            session: None,
+        }
+    }
 
-    /// Create a new configuration from properties and optional session
-    pub fn new(properties: HashMap<String, String>, session: Option<Arc<Session>>) -> Self {
+    /// Create a DirectoryNamespaceBuilder from properties HashMap.
+    ///
+    /// This method parses a properties map into builder configuration.
+    /// It expects:
+    /// - `root`: The root directory path (required)
+    /// - `storage.*`: Storage options (optional, prefix will be stripped)
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - Configuration properties
+    /// * `session` - Optional Lance session to reuse object store registry
+    ///
+    /// # Returns
+    ///
+    /// Returns a `DirectoryNamespaceBuilder` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `root` property is missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # use std::collections::HashMap;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut properties = HashMap::new();
+    /// properties.insert("root".to_string(), "/path/to/data".to_string());
+    /// properties.insert("storage.region".to_string(), "us-west-2".to_string());
+    ///
+    /// let namespace = DirectoryNamespaceBuilder::from_properties(properties, None)?
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_properties(
+        properties: HashMap<String, String>,
+        session: Option<Arc<Session>>,
+    ) -> Result<Self> {
+        // Extract root from properties (required)
         let root = properties
-            .get(Self::ROOT)
+            .get("root")
             .cloned()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .trim_end_matches('/')
-            .to_string();
+            .ok_or_else(|| Error::Namespace {
+                source: "Missing required property 'root' for directory namespace".into(),
+                location: snafu::location!(),
+            })?;
 
+        // Extract storage options (properties prefixed with "storage.")
         let storage_options: HashMap<String, String> = properties
             .iter()
             .filter_map(|(k, v)| {
-                k.strip_prefix(Self::STORAGE_OPTIONS_PREFIX)
+                k.strip_prefix("storage.")
                     .map(|key| (key.to_string(), v.clone()))
             })
             .collect();
 
-        Self {
-            root,
+        let storage_options = if storage_options.is_empty() {
+            None
+        } else {
+            Some(storage_options)
+        };
+
+        Ok(Self {
+            root: root.trim_end_matches('/').to_string(),
             storage_options,
             session,
-        }
+        })
     }
 
-    /// Get the root directory
-    pub fn root(&self) -> &str {
-        &self.root
-    }
-
-    /// Get the storage options
-    pub fn storage_options(&self) -> &HashMap<String, String> {
-        &self.storage_options
-    }
-}
-
-/// Directory-based implementation of Lance Namespace.
-///
-/// This implementation stores tables as Lance datasets in a directory structure.
-/// It supports local filesystems and cloud storage backends through Lance's object store.
-pub struct DirectoryNamespace {
-    config: DirectoryNamespaceConfig,
-    object_store: Arc<ObjectStore>,
-    base_path: Path,
-}
-
-impl DirectoryNamespace {
-    /// Create a new DirectoryNamespace instance
+    /// Add a storage option.
     ///
     /// # Arguments
     ///
-    /// * `properties` - Configuration properties for the namespace
-    /// * `session` - Optional Lance session to reuse object store registry
-    pub async fn new(
-        properties: HashMap<String, String>,
-        session: Option<Arc<Session>>,
-    ) -> Result<Self> {
-        let config = DirectoryNamespaceConfig::new(properties, session);
-        let (object_store, base_path) = Self::initialize_object_store(&config).await?;
+    /// * `key` - Storage option key (e.g., "region", "access_key_id")
+    /// * `value` - Storage option value
+    pub fn storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.storage_options
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
 
-        Ok(Self {
-            config,
+    /// Add multiple storage options.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - HashMap of storage options to add
+    pub fn storage_options(mut self, options: HashMap<String, String>) -> Self {
+        self.storage_options
+            .get_or_insert_with(HashMap::new)
+            .extend(options);
+        self
+    }
+
+    /// Set the Lance session to use for this namespace.
+    ///
+    /// When a session is provided, the namespace will reuse the session's
+    /// object store registry, allowing multiple namespaces and datasets
+    /// to share the same underlying storage connections.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Arc-wrapped Lance session
+    pub fn session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Build the DirectoryNamespace.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `DirectoryNamespace` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The root path is invalid
+    /// - Connection to the storage backend fails
+    /// - Storage options are invalid
+    pub async fn build(self) -> Result<DirectoryNamespace> {
+        let (object_store, base_path) =
+            Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
+
+        Ok(DirectoryNamespace {
+            root: self.root,
+            storage_options: self.storage_options,
+            session: self.session,
             object_store,
             base_path,
         })
@@ -136,23 +220,18 @@ impl DirectoryNamespace {
 
     /// Initialize the Lance ObjectStore based on the configuration
     async fn initialize_object_store(
-        config: &DirectoryNamespaceConfig,
+        root: &str,
+        storage_options: &Option<HashMap<String, String>>,
+        session: &Option<Arc<Session>>,
     ) -> Result<(Arc<ObjectStore>, Path)> {
-        let root = config.root();
-        let storage_options = config.storage_options().clone();
-
         // Build ObjectStoreParams from storage options
         let params = ObjectStoreParams {
-            storage_options: if storage_options.is_empty() {
-                None
-            } else {
-                Some(storage_options)
-            },
+            storage_options: storage_options.clone(),
             ..Default::default()
         };
 
         // Use object store registry from session if provided, otherwise create a new one
-        let registry = if let Some(session) = &config.session {
+        let registry = if let Some(session) = session {
             session.store_registry()
         } else {
             Arc::new(ObjectStoreRegistry::default())
@@ -168,7 +247,22 @@ impl DirectoryNamespace {
 
         Ok((object_store, base_path))
     }
+}
 
+/// Directory-based implementation of Lance Namespace.
+///
+/// This implementation stores tables as Lance datasets in a directory structure.
+/// It supports local filesystems and cloud storage backends through Lance's object store.
+pub struct DirectoryNamespace {
+    root: String,
+    storage_options: Option<HashMap<String, String>>,
+    #[allow(dead_code)]
+    session: Option<Arc<Session>>,
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+}
+
+impl DirectoryNamespace {
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
         if let Some(id) = id {
@@ -208,7 +302,7 @@ impl DirectoryNamespace {
 
     /// Get the full URI path for a table (for returning in responses)
     fn table_full_uri(&self, table_name: &str) -> String {
-        format!("{}/{}.lance", self.config.root(), table_name)
+        format!("{}/{}.lance", &self.root, table_name)
     }
 
     /// Get the object store path for a table (relative to base_path)
@@ -411,7 +505,7 @@ impl LanceNamespace for DirectoryNamespace {
             location: Some(table_uri),
             schema: None,
             properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
+            storage_options: self.storage_options.clone(),
         })
     }
 
@@ -450,6 +544,29 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         Ok(())
+    }
+
+    async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+
+        // Remove the entire table directory
+        let table_path = self.table_path(&table_name);
+
+        self.object_store
+            .remove_dir_all(table_path)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to drop table {}: {}", table_name, e).into(),
+                location: snafu::location!(),
+            })?;
+
+        Ok(DropTableResponse {
+            id: request.id,
+            location: Some(table_uri),
+            properties: None,
+            transaction_id: None,
+        })
     }
 
     async fn create_table(
@@ -519,14 +636,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Set up write parameters for creating a new dataset
         // Populate store_params with storage options to ensure they're forwarded to Dataset::write
-        let store_params = if !self.config.storage_options.is_empty() {
-            Some(ObjectStoreParams {
-                storage_options: Some(self.config.storage_options.clone()),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
+        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options: Some(opts.clone()),
+            ..Default::default()
+        });
 
         let write_params = WriteParams {
             mode: lance::dataset::WriteMode::Create,
@@ -546,7 +659,7 @@ impl LanceNamespace for DirectoryNamespace {
             version: Some(1),
             location: Some(table_uri),
             properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
+            storage_options: self.storage_options.clone(),
         })
     }
 
@@ -600,30 +713,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(CreateEmptyTableResponse {
             location: Some(table_uri),
             properties: None,
-            storage_options: Some(self.config.storage_options.clone()),
-        })
-    }
-
-    async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
-
-        // Remove the entire table directory
-        let table_path = self.table_path(&table_name);
-
-        self.object_store
-            .remove_dir_all(table_path)
-            .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to drop table {}: {}", table_name, e).into(),
-                location: snafu::location!(),
-            })?;
-
-        Ok(DropTableResponse {
-            id: request.id,
-            location: Some(table_uri),
-            properties: None,
-            transaction_id: None,
+            storage_options: self.storage_options.clone(),
         })
     }
 }
@@ -631,22 +721,19 @@ impl LanceNamespace for DirectoryNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
     use lance_namespace::schema::convert_json_arrow_schema;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use tempfile::TempDir;
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
-    async fn create_test_namespace() -> (DirectoryNamespace, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
+    async fn create_test_namespace() -> (DirectoryNamespace, TempStdDir) {
+        let temp_dir = TempStdDir::default();
 
-        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
         (namespace, temp_dir)
     }
 
@@ -1013,17 +1100,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_custom_root() {
-        let temp_dir = TempDir::new().unwrap();
-        let custom_path = temp_dir.path().join("custom");
+        let temp_dir = TempStdDir::default();
+        let custom_path = temp_dir.join("custom");
         std::fs::create_dir(&custom_path).unwrap();
 
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            custom_path.to_string_lossy().to_string(),
-        );
-
-        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(custom_path.to_string_lossy().to_string())
+            .build()
+            .await
+            .unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1043,16 +1127,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_storage_options() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
-        properties.insert("storage.option1".to_string(), "value1".to_string());
-        properties.insert("storage.option2".to_string(), "value2".to_string());
+        let temp_dir = TempStdDir::default();
 
-        let namespace = DirectoryNamespace::new(properties, None).await.unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .storage_option("option1", "value1")
+            .storage_option("option2", "value2")
+            .build()
+            .await
+            .unwrap();
 
         // Create test IPC data
         let schema = create_test_schema();
@@ -1125,16 +1207,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_dir() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "root".to_string(),
-            temp_dir.path().to_string_lossy().to_string(),
-        );
+        let temp_dir = TempStdDir::default();
 
-        let namespace = connect_dir(properties, None).await.unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
 
-        // Test basic operation through the trait object
+        // Test basic operation through the concrete type
         let request = ListTablesRequest::new();
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
@@ -1205,7 +1285,7 @@ mod tests {
         assert!(response.location.unwrap().ends_with("empty_table.lance"));
 
         // Verify the .lance-reserved file was created in the correct location
-        let table_dir = temp_dir.path().join("empty_table.lance");
+        let table_dir = temp_dir.join("empty_table.lance");
         assert!(table_dir.exists());
         assert!(table_dir.is_dir());
 
@@ -1263,7 +1343,7 @@ mod tests {
         assert!(create_response.location.is_some());
 
         // Verify it exists
-        let table_dir = temp_dir.path().join("empty_table_to_drop.lance");
+        let table_dir = temp_dir.join("empty_table_to_drop.lance");
         assert!(table_dir.exists());
         let reserved_file = table_dir.join(".lance-reserved");
         assert!(reserved_file.exists());

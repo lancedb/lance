@@ -36,9 +36,9 @@ pub mod dir;
 #[cfg(feature = "rest")]
 pub mod rest;
 
-// Re-export connect function and builder
-pub use connect::{connect, ConnectBuilder};
-pub use dir::{connect_dir, DirectoryNamespace, DirectoryNamespaceConfig};
+// Re-export connect builder
+pub use connect::ConnectBuilder;
+pub use dir::{DirectoryNamespace, DirectoryNamespaceBuilder};
 
 #[cfg(feature = "rest")]
-pub use rest::RestNamespace;
+pub use rest::{RestNamespace, RestNamespaceBuilder};
