@@ -12,13 +12,13 @@ categories.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = []
 rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
-# Cloud storage features - align with lance-io
-gcp = ["lance-io/gcp"]
-aws = ["lance-io/aws"]
-azure = ["lance-io/azure"]
-oss = ["lance-io/oss"]
+# Cloud storage features for directory implementation - align with lance-io
+dir-gcp = ["lance-io/gcp"]
+dir-aws = ["lance-io/aws"]
+dir-azure = ["lance-io/azure"]
+dir-oss = ["lance-io/oss"]
 
 [dependencies]
 lance-namespace.workspace = true

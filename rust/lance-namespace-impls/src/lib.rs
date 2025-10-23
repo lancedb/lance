@@ -8,7 +8,7 @@
 //! ## Features
 //!
 //! - `rest`: REST API-based namespace implementation
-//! - `aws`, `azure`, `gcp`, `oss`: Cloud storage backend support (via lance-io)
+//! - `dir-aws`, `dir-azure`, `dir-gcp`, `dir-oss`: Cloud storage backend support for directory namespace (via lance-io)
 //!
 //! ## Implementations
 //!
