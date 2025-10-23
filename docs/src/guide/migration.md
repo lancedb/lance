@@ -16,5 +16,14 @@ do not expect `lance-arrow` to ever be stable, and you may want to consider fork
 this to just `lance::Error`.  We have also removed some internal error utilities (such as `OptionExt`) from the public
 API and do not plan on reintroducing these.
 
+* The Python and Rust `dataset::diff_meta` API has been removed in favor of `dataset::delta`, 
+which returns a `DatasetDelta` that offers both metadata diff through `list_transactions` and data diff 
+through `get_inserted_rows` and `get_updated_rows`.
+
 * Some other minor utilities which had previously been public are now private.  It is unlikely anyone was utilizing'
 these.  Please open an issue if you were relying on any of these.
+
+* The `lance-namespace` Rust crate now splits into `lance-namespace` that contains the main `LanceNamespace` trait 
+and data models, and `lance-namespace-impls` that has different implementations of the namespace. 
+The `DirectoryNamespace` and `RestNamespace` interfaces have been refactored to be more user friendly.
+The `DirectoryNamespace` also now uses Lance ObjectStore for IO instead of directly depending on Apache OpenDAL.
