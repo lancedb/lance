@@ -120,7 +120,10 @@ public class TestUtils {
                 datasetPath,
                 allocator,
                 root,
-                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+                new WriteParams.Builder()
+                    .withMaxRowsPerFile(maxRowsPerFile)
+                    .withMode(WriteParams.WriteMode.APPEND)
+                    .build());
       }
       return fragmentMetas;
     }
@@ -179,7 +182,10 @@ public class TestUtils {
                 datasetPath,
                 allocator,
                 root,
-                new WriteParams.Builder().withMaxRowsPerFile(Integer.MAX_VALUE).build());
+                new WriteParams.Builder()
+                    .withMaxRowsPerFile(Integer.MAX_VALUE)
+                    .withMode(WriteParams.WriteMode.APPEND)
+                    .build());
       }
       FragmentOperation.Append appendOp = new FragmentOperation.Append(fragmentMetas);
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
@@ -369,6 +375,39 @@ public class TestUtils {
     }
   }
 
+  public static class UnmatchedSchemaDataset extends TestDataset {
+    private static final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+    private static final Schema unmatchedSchema =
+        new Schema(Arrays.asList(Field.nullable("trash", new ArrowType.Int(32, true))), null);
+
+    public UnmatchedSchemaDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return schema;
+    }
+
+    public Dataset createUnmatchedDataset(String datasetPath) throws Exception {
+      Dataset dataset =
+          Dataset.create(
+              allocator, datasetPath, unmatchedSchema, new WriteParams.Builder().build());
+      assertEquals(0, dataset.countRows());
+      assertEquals(unmatchedSchema, dataset.getSchema());
+      List<Fragment> fragments = dataset.getFragments();
+      assertEquals(0, fragments.size());
+      assertEquals(1, dataset.version());
+      assertEquals(1, dataset.latestVersion());
+      return dataset;
+    }
+  }
+
   public static class MergeColumnTestDataset extends TestDataset {
     private static final Schema schema =
         new Schema(
@@ -526,7 +565,10 @@ public class TestUtils {
                 datasetPath,
                 allocator,
                 root,
-                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+                new WriteParams.Builder()
+                    .withMaxRowsPerFile(maxRowsPerFile)
+                    .withMode(WriteParams.WriteMode.APPEND)
+                    .build());
       }
       return fragmentMetas;
     }
