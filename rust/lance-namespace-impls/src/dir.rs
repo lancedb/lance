@@ -262,6 +262,15 @@ pub struct DirectoryNamespace {
     base_path: Path,
 }
 
+impl std::fmt::Debug for DirectoryNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryNamespace")
+            .field("root", &self.root)
+            .field("storage_options", &self.storage_options)
+            .finish()
+    }
+}
+
 impl DirectoryNamespace {
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {

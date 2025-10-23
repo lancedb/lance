@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
@@ -38,6 +39,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::object_store::StorageOptionsProvider;
 use std::collections::HashMap;
 use std::iter::empty;
 use std::str::FromStr;
@@ -77,6 +79,7 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
         version: Option<i32>,
@@ -85,6 +88,7 @@ impl BlockingDataset {
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
+        storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
@@ -105,6 +109,10 @@ impl BlockingDataset {
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
+
+        if let Some(provider) = storage_options_provider {
+            builder = builder.with_storage_options_provider(provider);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -697,6 +705,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
     serialized_manifest: JObject, // Optional<ByteBuffer>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -708,7 +717,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj,
-            serialized_manifest
+            serialized_manifest,
+            storage_options_provider_obj
         )
     )
 }
@@ -721,14 +731,43 @@ fn inner_open_native<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject, // Map<String, String>
-    serialized_manifest: JObject, // Optional<ByteBuffer>
+    storage_options_obj: JObject,          // Map<String, String>
+    serialized_manifest: JObject,          // Optional<ByteBuffer>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+
+    // Extract storage options provider first (before get_bytes_opt which borrows env)
+    let storage_options_provider = if !storage_options_provider_obj.is_null() {
+        // Check if it's an Optional.empty()
+        let is_present = env
+            .call_method(&storage_options_provider_obj, "isPresent", "()Z", &[])?
+            .z()?;
+        if is_present {
+            // Get the value from Optional
+            let provider_obj = env
+                .call_method(
+                    &storage_options_provider_obj,
+                    "get",
+                    "()Ljava/lang/Object;",
+                    &[],
+                )?
+                .l()?;
+            Some(JavaStorageOptionsProvider::new(env, provider_obj)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let storage_options_provider_arc =
+        storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
+
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
         &path_str,
@@ -738,6 +777,7 @@ fn inner_open_native<'local>(
         metadata_cache_size_bytes,
         storage_options,
         serialized_manifest,
+        storage_options_provider_arc,
     )?;
     dataset.into_java(env)
 }

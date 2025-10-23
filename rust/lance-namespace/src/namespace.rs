@@ -30,7 +30,7 @@ use lance_namespace_reqwest_client::models::{
 /// must provide. Each method corresponds to a specific operation on namespaces
 /// or tables.
 #[async_trait]
-pub trait LanceNamespace: Send + Sync {
+pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// List namespaces.
     async fn list_namespaces(
         &self,

@@ -34,6 +34,7 @@ use url::Url;
 use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
+pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
@@ -61,6 +62,9 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use storage_options::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+};
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -189,6 +193,8 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Dynamic storage options provider for automatic credential refresh
+    pub storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
     /// Use constant size upload parts for multipart uploads. Only necessary
     /// for Cloudflare R2, which doesn't support variable size parts. When this
     /// is false, max upload size is 2.5TB. When this is true, the max size is
@@ -208,6 +214,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            storage_options_provider: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
         }
@@ -699,6 +706,13 @@ impl StorageOptions {
 
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.get(key)
+    }
+
+    /// Get the expiration time in milliseconds since epoch, if present
+    pub fn expires_at_millis(&self) -> Option<u64> {
+        self.0
+            .get(EXPIRES_AT_MILLIS_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
     }
 }
 

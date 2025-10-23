@@ -8,7 +8,7 @@ import os
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
-from . import log
+from . import io, log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
@@ -61,20 +61,20 @@ __all__ = [
     "ScanStatistics",
     "Transaction",
     "__version__",
-    "bytes_read_counter",
-    "iops_counter",
-    "write_dataset",
-    "schema_to_json",
-    "json_to_schema",
-    "dataset",
     "batch_udf",
+    "bytes_read_counter",
+    "dataset",
+    "iops_counter",
+    "json_to_schema",
+    "schema_to_json",
     "set_logger",
+    "write_dataset",
     "FFILanceTableProvider",
 ]
 
 
 def dataset(
-    uri: Union[str, Path],
+    uri: Optional[Union[str, Path]] = None,
     version: Optional[int | str] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
@@ -86,15 +86,19 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
+    namespace: Optional[any] = None,
+    table_id: Optional[list] = None,
+    refresh_storage_options: bool = False,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
 
     Parameters
     ----------
-    uri : str
+    uri : str, optional
         Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
         or a cloud object store URI, i.e., `s3://bucket/data.lance`.
+        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -143,7 +147,61 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
+    namespace : optional
+        A namespace instance from which to fetch table location and storage options.
+        This can be any object with a describe_table(table_id, version) method
+        that returns a dict with 'location' and 'storage_options' keys.
+        For example, use lance_namespace.connect() from the lance_namespace package.
+        Must be provided together with `table_id`. Cannot be used with `uri`.
+        When provided, the table location will be fetched automatically from the
+        namespace via describe_table().
+    table_id : optional, list of str
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace`. Cannot be used with `uri`.
+    refresh_storage_options : bool, default False
+        Only applicable when using `namespace` and `table_id`. If True, storage options
+        will be automatically refreshed from the namespace before they expire. This is
+        currently only used for refreshing AWS temporary access credentials. When enabled,
+        the namespace will be queried periodically to fetch new temporary credentials before
+        the current ones expire. The new storage options will contain updated AWS access
+        credentials with a new expiration time. If False (default), only the initial
+        storage options from describe_table() will be used.
+
+    Notes
+    -----
+    When using `namespace` and `table_id`:
+    - The `uri` parameter is optional and will be fetched from the namespace
+    - A `LanceNamespaceStorageOptionsProvider` will be created automatically only
+      if `refresh_storage_options=True`
+    - Initial storage options from describe_table() will be merged with
+      any provided `storage_options`
     """
+    # Validate that user provides either uri OR (namespace + table_id), not both
+    has_uri = uri is not None
+    has_namespace = namespace is not None or table_id is not None
+
+    if has_uri and has_namespace:
+        raise ValueError(
+            "Cannot specify both 'uri' and 'namespace/table_id'. "
+            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+        )
+    elif not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+        )
+
+    # Validate namespace parameters
+    if namespace is not None:
+        if table_id is None:
+            raise ValueError(
+                "Both 'namespace' and 'table_id' must be provided together."
+            )
+        # URI will be fetched from namespace in Rust layer
+        if uri is None:
+            uri = ""  # Placeholder, will be replaced by namespace location
+    elif table_id is not None:
+        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+
     ds = LanceDataset(
         uri,
         version,
@@ -156,6 +214,9 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
+        namespace=namespace,
+        table_id=table_id,
+        refresh_storage_options=refresh_storage_options,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -179,6 +240,9 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
+                namespace=namespace,
+                table_id=table_id,
+                refresh_storage_options=refresh_storage_options,
             )
     else:
         return ds
