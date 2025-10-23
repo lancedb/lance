@@ -4152,7 +4152,7 @@ impl PrimitiveStructuralEncoder {
 
         let avg_value_size = match data_block {
             DataBlock::FixedWidth(_) => DICT_FIXED_WIDTH_BITS_PER_VALUE / 8,
-            DataBlock::VariableWidth(var) => data_block.data_size() / num_values,
+            DataBlock::VariableWidth(_) => data_block.data_size() / num_values,
             _ => unreachable!("Variable width offsets can only be 32 or 64 bits"),
         };
 
