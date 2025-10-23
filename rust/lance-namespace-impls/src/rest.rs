@@ -703,10 +703,9 @@ mod tests {
 
     /// Create a test REST namespace instance
     fn create_test_namespace() -> RestNamespace {
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), "http://localhost:8080".to_string());
-        properties.insert("delimiter".to_string(), ".".to_string());
-        RestNamespace::new(properties)
+        RestNamespaceBuilder::new("http://localhost:8080")
+            .delimiter(".")
+            .build()
     }
 
     #[test]
@@ -720,7 +719,9 @@ mod tests {
         );
         properties.insert("header.X-Custom".to_string(), "value".to_string());
 
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         // Successfully created the namespace - test passes if no panic
     }
@@ -759,7 +760,9 @@ mod tests {
             "custom-value".to_string(),
         );
 
-        let namespace = RestNamespace::new(properties);
+        let namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -775,8 +778,11 @@ mod tests {
 
     #[test]
     fn test_default_configuration() {
-        let properties = HashMap::new();
-        let _namespace = RestNamespace::new(properties);
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "http://localhost:8080".to_string());
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         // The default delimiter should be "." - test passes if no panic
     }
@@ -786,7 +792,9 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert("uri".to_string(), "https://api.example.com/v1".to_string());
 
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
         // Test passes if no panic
     }
 
@@ -799,33 +807,38 @@ mod tests {
         properties.insert("tls.ssl_ca_cert".to_string(), "/path/to/ca.pem".to_string());
         properties.insert("tls.assert_hostname".to_string(), "true".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
-        assert_eq!(config.cert_file, Some("/path/to/cert.pem".to_string()));
-        assert_eq!(config.key_file, Some("/path/to/key.pem".to_string()));
-        assert_eq!(config.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
-        assert!(config.assert_hostname);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.cert_file, Some("/path/to/cert.pem".to_string()));
+        assert_eq!(builder.key_file, Some("/path/to/key.pem".to_string()));
+        assert_eq!(builder.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
+        assert!(builder.assert_hostname);
     }
 
     #[test]
     fn test_tls_config_default_assert_hostname() {
         let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
         properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
         properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
         // Default should be true
-        assert!(config.assert_hostname);
+        assert!(builder.assert_hostname);
     }
 
     #[test]
     fn test_tls_config_disable_hostname_verification() {
         let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
         properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
         properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
         properties.insert("tls.assert_hostname".to_string(), "false".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
-        assert!(!config.assert_hostname);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert!(!builder.assert_hostname);
     }
 
     #[test]
@@ -846,7 +859,9 @@ mod tests {
         );
 
         // Should not panic even with nonexistent files (they're just ignored)
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
     }
 
     #[tokio::test]
@@ -867,14 +882,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-        properties.insert("delimiter".to_string(), ".".to_string());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -910,13 +921,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -965,13 +973,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
@@ -1004,13 +1009,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -1045,13 +1047,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = InsertIntoTableRequest {
             id: Some(vec![
