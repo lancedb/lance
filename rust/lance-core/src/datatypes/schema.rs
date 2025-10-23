@@ -16,7 +16,7 @@ use lance_arrow::*;
 use snafu::location;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -1499,6 +1499,9 @@ pub fn format_field_path(fields: &[&str]) -> String {
 /// - "parent.child" -> “`parent`.`child`”
 /// - "parent.`child.with.dot`" -> “`parent`.`child.with.dot`”
 pub fn escape_field_path_for_project(name: &str) -> String {
+    if name == WILDCARD {
+        return name.to_string();
+    }
     let segments = parse_field_path(name).unwrap_or_else(|_| vec![name.to_string()]);
     segments
         .iter()
