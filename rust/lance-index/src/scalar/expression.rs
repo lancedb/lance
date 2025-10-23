@@ -738,8 +738,7 @@ impl ScalarQueryParser for GeoQueryParser {
                     if let Some(metadata) = metadata {
                         field = field.with_metadata(metadata.to_hashmap());
                     }
-                    let query = GeoQuery::RelationQuery(RelationQuery {
-                        func_name: func.name().to_string(),
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
                         value: left_value.clone(),
                         field,
                     });
@@ -755,8 +754,7 @@ impl ScalarQueryParser for GeoQueryParser {
                     if let Some(metadata) = metadata {
                         field = field.with_metadata(metadata.to_hashmap());
                     }
-                    let query = GeoQuery::RelationQuery(RelationQuery {
-                        func_name: func.name().to_string(),
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
                         value: right_value.clone(),
                         field,
                     });

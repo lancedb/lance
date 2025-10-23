@@ -739,7 +739,6 @@ impl AnyQuery for TokenQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationQuery {
-    pub func_name: String,
     pub value: ScalarValue,
     pub field: Field,
 }
@@ -747,7 +746,7 @@ pub struct RelationQuery {
 /// A query that a Geo index can satisfy
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeoQuery {
-    RelationQuery(RelationQuery),
+    IntersectQuery(RelationQuery),
     IsNull,
 }
 
@@ -758,10 +757,10 @@ impl AnyQuery for GeoQuery {
 
     fn format(&self, col: &str) -> String {
         match self {
-            GeoQuery::RelationQuery(query) => {
-                format!("{} {} {}", col, query.func_name, query.value)
+            Self::IntersectQuery(query) => {
+                format!("Intersect({} {})", col, query.value)
             }
-            GeoQuery::IsNull => {
+            Self::IsNull => {
                 format!("{} IS NULL", col)
             }
         }
@@ -769,14 +768,14 @@ impl AnyQuery for GeoQuery {
 
     fn to_expr(&self, col: String) -> Expr {
         match self {
-            GeoQuery::RelationQuery(query) => {
+            Self::IntersectQuery(query) => {
                 // TODO recheck here
                 Expr::Literal(
                     query.value.clone(),
                     Some(FieldMetadata::from(query.field.metadata())),
                 )
             }
-            GeoQuery::IsNull => {
+            Self::IsNull => {
                 let col_expr = Expr::Column(Column::new_unqualified(col));
                 col_expr.is_null()
             }

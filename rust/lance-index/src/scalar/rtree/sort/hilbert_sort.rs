@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 const HILBERT_FIELD_NAME: &str = "_hilbert";
 
-pub(crate) struct HilbertSorter {
+pub struct HilbertSorter {
     bbox: BoundingBox,
 }
 
@@ -39,7 +39,7 @@ impl HilbertSorter {
 #[async_trait]
 impl Sorter for HilbertSorter {
     async fn sort(&self, data: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
-        let data_schema = data.schema().clone();
+        let data_schema = data.schema();
         let bbox_field = data_schema.field(0).clone();
         let source = Arc::new(OneShotExec::new(data));
 
@@ -52,12 +52,12 @@ impl Sorter for HilbertSorter {
             .map(|(idx, field_name)| {
                 (
                     Arc::new(DFColumn::new(field_name, idx)) as Arc<dyn PhysicalExpr>,
-                    field_name.to_string(),
+                    field_name.clone(),
                 )
             })
             .collect::<Vec<_>>();
         projection_exprs.push((
-            HilbertUDF::new(self.bbox, bbox_field.clone()).into_physical_expr(),
+            HilbertUDF::new(self.bbox, bbox_field).into_physical_expr(),
             HILBERT_FIELD_NAME.to_string(),
         ));
 
@@ -174,8 +174,7 @@ impl ScalarUDFImpl for HilbertUDF {
             )),
         }?;
 
-        let rect_array =
-            bounding_box(value.as_ref()).map_err(|e| DataFusionError::from(ArrowError::from(e)))?;
+        let rect_array = bounding_box(value.as_ref()).map_err(DataFusionError::from)?;
 
         let hilbert_max = ((1 << 16) - 1) as f64;
         let len = rect_array.len();
@@ -255,59 +254,4 @@ fn hilbert_curve(x: u32, y: u32) -> u32 {
     i1 = (i1 | (i1 << 1)) & 0x5555_5555;
 
     (i1 << 1) | i0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scalar::rtree::bbox::update_total_bounds;
-    use arrow_array::{RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Schema};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{stream, StreamExt};
-    use geo_types::{coord, Rect};
-    use geoarrow_array::builder::RectBuilder;
-    use geoarrow_schema::{Dimension, RectType};
-
-    #[tokio::test]
-    async fn test_hilbert_sort() {
-        let rect_type = RectType::new(Dimension::XY, Default::default());
-
-        let schema = Arc::new(Schema::new(vec![
-            rect_type.clone().to_field("bbox", true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let mut rect_builder = RectBuilder::new(rect_type.clone());
-        rect_builder.push_rect(Some(&Rect::new(
-            coord! { x: 10., y: 20. },
-            coord! { x: 30., y: 10. },
-        )));
-        rect_builder.push_rect(Some(&Rect::new(
-            coord! { x: 20., y: 30. },
-            coord! { x: 50., y: 20. },
-        )));
-        let rect_arr = rect_builder.finish();
-        let row_ids = (0..rect_arr.len() as u64).collect::<Vec<_>>();
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                rect_arr.to_array_ref(),
-                Arc::new(UInt64Array::from(row_ids.clone())),
-            ],
-        )
-        .unwrap();
-
-        let stream = stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
-
-        let mut bbox = BoundingBox::new();
-        update_total_bounds(&mut bbox, &rect_arr).unwrap();
-        let mut sorted = HilbertSorter::new(bbox).sort(stream).await.unwrap();
-
-        while let Some(batch) = sorted.next().await {
-            println!("{:?}", batch.unwrap());
-        }
-    }
 }

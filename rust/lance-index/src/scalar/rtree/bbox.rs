@@ -28,7 +28,7 @@ pub struct BoundingBox {
 impl BoundingBox {
     /// New
     pub fn new() -> Self {
-        BoundingBox {
+        Self {
             minx: f64::INFINITY,
             miny: f64::INFINITY,
             maxx: -f64::INFINITY,
@@ -37,7 +37,7 @@ impl BoundingBox {
     }
 
     pub fn new_with_coords(coords: &[impl CoordTrait<T = f64>]) -> Self {
-        let mut new_rect = BoundingBox::new();
+        let mut new_rect = Self::new();
         for coord in coords {
             new_rect.add_coord(coord);
         }
@@ -45,7 +45,7 @@ impl BoundingBox {
     }
 
     pub fn new_with_rect(rect: &impl RectTrait<T = f64>) -> Self {
-        let mut new_rect = BoundingBox::new();
+        let mut new_rect = Self::new();
         new_rect.add_rect(rect);
         new_rect
     }

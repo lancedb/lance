@@ -18,6 +18,8 @@ use lance_index::scalar::rtree::{BoundingBox, RTreeIndex, RTreeIndexPlugin, RTre
 use lance_index::scalar::{GeoQuery, RelationQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+#[cfg(target_os = "linux")]
+use pprof::criterion::{Output, PProfProfiler};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -97,8 +99,7 @@ async fn rect_search_rtree(
     let scalar_value =
         ScalarValue::try_from_array(builder.finish().to_array_ref().as_ref(), 0).unwrap();
 
-    let geo_query = GeoQuery::RelationQuery(RelationQuery {
-        func_name: "st_intersects".to_string(),
+    let geo_query = GeoQuery::IntersectQuery(RelationQuery {
         value: scalar_value,
         field,
     });

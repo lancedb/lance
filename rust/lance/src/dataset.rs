@@ -9584,7 +9584,7 @@ mod tests {
 
         dataset
             .create_index(
-                &vec!["linestring"],
+                &["linestring"],
                 IndexType::RTree,
                 Some("rtree_index".to_string()),
                 &ScalarIndexParams::new("RTree".to_string()),

@@ -20,7 +20,7 @@ use crate::vector::VectorIndex;
 use crate::{pb, Index, IndexType};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::BooleanArray;
+use arrow_array::UInt32Array;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -33,6 +33,7 @@ use geoarrow_array::array::{from_arrow_array, RectArray};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
+use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
@@ -59,9 +60,7 @@ const RTREE_NULLS_NAME: &str = "nulls.lance";
 
 static BBOX_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
-    Arc::new(ArrowSchema::new(vec![bbox_type
-        .clone()
-        .to_field("bbox", false)]))
+    Arc::new(ArrowSchema::new(vec![bbox_type.to_field("bbox", false)]))
 });
 static BBOX_ROWID_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
     let mut fields = BBOX_SCHEMA.fields().iter().cloned().collect::<Vec<_>>();
@@ -131,7 +130,7 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
         let page_offsets: Vec<usize> = metadata
             .get("page_offsets")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
-            .unwrap_or(vec![]);
+            .unwrap_or_default();
         let num_items = metadata
             .get("num_items")
             .map(|bs| bs.parse().unwrap_or(0))
@@ -139,7 +138,7 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
         let bbox = metadata
             .get("bbox")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
-            .unwrap_or(BoundingBox::new());
+            .unwrap_or_default();
         Self::new(page_size, num_pages, page_offsets, num_items, bbox)
     }
 }
@@ -185,8 +184,8 @@ impl CacheKey for RTreeCacheKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            RTreeCacheKey::Page(page_id) => format!("page-{}", page_id).into(),
-            RTreeCacheKey::Nulls => "nulls".into(),
+            Self::Page(page_id) => format!("page-{}", page_id).into(),
+            Self::Nulls => "nulls".into(),
         }
     }
 }
@@ -455,7 +454,7 @@ impl Index for RTreeIndex {
             let mut page_frag_ids = page
                 .column_by_name(ROW_ID)
                 .ok_or_else(|| Error::Index {
-                    message: format!("RTree page lacks {} column", ROW_ID).to_owned(),
+                    message: format!("RTree page lacks {} column", ROW_ID),
                     location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
@@ -485,7 +484,7 @@ impl ScalarIndex for RTreeIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<GeoQuery>().unwrap();
         match query {
-            GeoQuery::RelationQuery(query) => {
+            GeoQuery::IntersectQuery(query) => {
                 let geo_array =
                     extract_bounding_boxes(query.value.to_array()?.as_ref(), &query.field)?;
                 let bbox = bounding_box_single_scalar(&geo_array)?;
@@ -703,27 +702,24 @@ impl RTreeIndexPlugin {
 
             let num_rows = bbox_array.len();
 
-            let mut mask = vec![false; num_rows];
-            let mut non_null_count = 0;
+            let mut non_null_indexes = vec![];
 
             for i in 0..num_rows {
                 if bbox_array.is_null(i) {
                     let rowid = rowid_array.value(i);
                     null_rowids.insert(rowid);
                 } else {
-                    mask[i] = true;
-                    non_null_count += 1;
+                    non_null_indexes.push(i as u32);
                 }
             }
 
-            let new_batch = if non_null_count == 0 {
+            let new_batch = if non_null_indexes.is_empty() {
                 // all nulls, skip write
                 continue;
-            } else if non_null_count == num_rows {
+            } else if non_null_indexes.len() == num_rows {
                 batch
             } else {
-                let mask_array = BooleanArray::from(mask);
-                arrow::compute::filter_record_batch(&batch, &mask_array)?
+                batch.take(&UInt32Array::from(non_null_indexes))?
             };
 
             num_non_null_rows += new_batch.num_rows();
@@ -733,7 +729,7 @@ impl RTreeIndexPlugin {
         let reader = spill_store.open_index_file("analyze.tmp").await?;
         let stream = IndexReaderStream::new(reader, page_size as u64)
             .await
-            .map(|fut| fut.map_err(|e| DataFusionError::from(e)))
+            .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(spill_store.io_parallelism())
             .boxed();
         let new_data = RecordBatchStreamAdapter::new(schema.clone(), stream);
@@ -971,7 +967,7 @@ async fn train_rtree_page(
     page_id: u64,
     writer: &mut dyn IndexWriter,
 ) -> Result<EncodedBatch> {
-    let geo_array = extract_bounding_boxes(batch.column(0).as_ref(), &batch.schema().field(0))?;
+    let geo_array = extract_bounding_boxes(batch.column(0).as_ref(), batch.schema().field(0))?;
     let bbox = total_bounds(&geo_array)?;
     writer.write_record_batch(batch).await?;
     Ok(EncodedBatch { bbox, page_id })
@@ -1223,7 +1219,6 @@ mod tests {
             }
         }
 
-        println!("row_ids: {:?}", row_ids);
         assert_eq!(row_ids, expected_row_ids);
     }
 }
