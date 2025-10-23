@@ -135,13 +135,12 @@ impl DirectoryNamespace {
         let registry = Arc::new(ObjectStoreRegistry::default());
 
         // Use Lance's object store factory to create from URI
-        let (object_store, base_path) =
-            ObjectStore::from_uri_and_params(registry, root, &params)
-                .await
-                .map_err(|e| Error::Namespace {
-                    source: format!("Failed to create object store: {}", e).into(),
-                    location: snafu::location!(),
-                })?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!("Failed to create object store: {}", e).into(),
+                location: snafu::location!(),
+            })?;
 
         Ok((object_store, base_path))
     }
@@ -190,7 +189,8 @@ impl DirectoryNamespace {
 
     /// Get the object store path for a table (relative to base_path)
     fn table_path(&self, table_name: &str) -> Path {
-        self.base_path.child(format!("{}.lance", table_name).as_str())
+        self.base_path
+            .child(format!("{}.lance", table_name).as_str())
     }
 
     /// Get the versions directory path for a table
@@ -494,8 +494,19 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         // Set up write parameters for creating a new dataset
+        // Populate store_params with storage options to ensure they're forwarded to Dataset::write
+        let store_params = if !self.config.storage_options.is_empty() {
+            Some(ObjectStoreParams {
+                storage_options: Some(self.config.storage_options.clone()),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let write_params = WriteParams {
             mode: lance::dataset::WriteMode::Create,
+            store_params,
             ..Default::default()
         };
 
