@@ -209,18 +209,22 @@ pub trait IndexReader: Send + Sync {
 pub struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
     batch_size: u64,
-    num_batches: u32,
-    batch_idx: u32,
+    offset: u64,
+    limit: u64,
 }
 
 impl IndexReaderStream {
     async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
-        let num_batches = reader.num_batches(batch_size).await;
+        let limit = reader.num_rows() as u64;
+        Self::new_with_limit(reader, batch_size, limit).await
+    }
+
+    async fn new_with_limit(reader: Arc<dyn IndexReader>, batch_size: u64, limit: u64) -> Self {
         Self {
             reader,
             batch_size,
-            num_batches,
-            batch_idx: 0,
+            offset: 0,
+            limit,
         }
     }
 }
@@ -233,16 +237,17 @@ impl Stream for IndexReaderStream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.batch_idx >= this.num_batches {
+        if this.offset >= this.limit {
             return std::task::Poll::Ready(None);
         }
-        let batch_num = this.batch_idx;
-        this.batch_idx += 1;
+        let read_start = this.offset;
+        let read_end = this.limit.min(this.offset + this.batch_size);
+        this.offset = read_end;
         let reader_copy = this.reader.clone();
-        let batch_size = this.batch_size;
+
         let read_task = async move {
             reader_copy
-                .read_record_batch(batch_num as u64, batch_size)
+                .read_range(read_start as usize..read_end as usize, None)
                 .await
         }
         .boxed();

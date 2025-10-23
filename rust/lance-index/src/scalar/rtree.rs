@@ -324,6 +324,43 @@ impl RTreeIndex {
         };
         Ok(null_map)
     }
+
+    /// Create a stream of all the data in the index, in the same format used to train the index
+    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(RTREE_PAGES_NAME).await?;
+        let reader_stream = IndexReaderStream::new_with_limit(
+            reader,
+            self.metadata.page_size as u64,
+            self.metadata.num_items as u64,
+        )
+        .await;
+        let batches = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(self.store.io_parallelism())
+            .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            RTREE_PAGE_SCHEMA.clone(),
+            batches,
+        )))
+    }
+
+    async fn combine_old_new(
+        self,
+        new_input: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let old_input = self.into_data_stream().await?;
+        debug_assert_eq!(
+            old_input.schema().flattened_fields().len(),
+            new_input.schema().flattened_fields().len()
+        );
+
+        let merged = futures::stream::select(old_input, new_input);
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            RTREE_PAGE_SCHEMA.clone(),
+            merged,
+        )))
+    }
 }
 
 impl DeepSizeOf for RTreeIndex {
@@ -412,11 +449,7 @@ impl Index for RTreeIndex {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = RoaringBitmap::default();
 
-        let sub_index_reader = self.store.open_index_file(RTREE_PAGES_NAME).await?;
-        let mut reader_stream =
-            IndexReaderStream::new(sub_index_reader, self.metadata.page_size as u64)
-                .await
-                .buffered(self.store.io_parallelism());
+        let mut reader_stream = self.clone().into_data_stream().await?;
         let mut read_rows = 0;
         while let Some(page) = reader_stream.try_next().await? {
             let mut page_frag_ids = page
@@ -501,12 +534,14 @@ impl ScalarIndex for RTreeIndex {
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let (bbox_data, analyze) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
+        let (new_bbox_data, analyze) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
             bbox_data,
             self.metadata.page_size,
             spill_store.clone(),
         )
         .await?;
+
+        let merged_bbox_data = self.clone().combine_old_new(new_bbox_data).await?;
 
         let null_map = self.search_null(&NoOpMetricsCollector).await?;
 
@@ -521,7 +556,7 @@ impl ScalarIndex for RTreeIndex {
         };
 
         RTreeIndexPlugin::train_rtree_index(
-            bbox_data,
+            merged_bbox_data,
             merge_analyze,
             self.metadata.page_size,
             dest_store,
@@ -946,6 +981,8 @@ async fn train_rtree_page(
 mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use arrow_array::ArrayRef;
     use arrow_schema::Schema;
     use geo_types::{coord, Rect};
     use geoarrow_array::builder::{PointBuilder, RectBuilder};
@@ -975,6 +1012,23 @@ mod tests {
         expected_page_offsets(num_items, page_size).len() as u64
     }
 
+    fn convert_bbox_rowid_batch_stream(
+        geo_array: &dyn GeoArrowArray,
+        row_id_array: ArrayRef,
+    ) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![
+            geo_array.data_type().to_field(VALUE_COLUMN_NAME, true),
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+        ]));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![geo_array.to_array_ref(), row_id_array])
+                .unwrap();
+
+        let stream = stream::once(async move { Ok(batch) });
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
+
     async fn train_index(
         geo_array: &dyn GeoArrowArray,
         page_size: Option<u32>,
@@ -994,24 +1048,12 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let schema = Arc::new(Schema::new(vec![
-            geo_array.data_type().to_field("value", true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-
-        let row_ids = (0..geo_array.len() as u64).collect::<Vec<_>>();
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                geo_array.to_array_ref(),
-                Arc::new(UInt64Array::from(row_ids.clone())),
-            ],
-        )
-        .unwrap();
-
-        let stream = stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        let stream = convert_bbox_rowid_batch_stream(
+            geo_array,
+            Arc::new(UInt64Array::from(
+                (0..geo_array.len() as u64).collect::<Vec<_>>(),
+            )),
+        );
 
         let plugin = RTreeIndexPlugin;
         plugin
@@ -1106,5 +1148,82 @@ mod tests {
                 RowAddress::new_from_parts(0, 4),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_and_search() {
+        let bbox_type = RectType::new(Dimension::XY, Default::default());
+
+        let page_size = 16;
+        let mut rect_builder = RectBuilder::new(bbox_type.clone());
+        let num_items = 10000;
+        for i in 0..num_items {
+            let i = i as f64;
+            rect_builder.push_rect(Some(&Rect::new(
+                coord! { x: i, y: i },
+                coord! { x: i + 1.0, y: i + 1.0 },
+            )));
+        }
+        let rect_arr = rect_builder.finish();
+        let (rtree_index, _tmpdir) = train_index(&rect_arr, Some(page_size)).await;
+
+        let tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut rect_builder = RectBuilder::new(bbox_type.clone());
+        let num_items = 10000;
+        for i in 0..num_items {
+            let i = i as f64;
+            rect_builder.push_rect(Some(&Rect::new(
+                coord! { x: i + 0.5, y: i + 0.5 },
+                coord! { x: i + 1.5, y: i + 1.5 },
+            )));
+        }
+        let new_rect_arr = rect_builder.finish();
+        let new_rowid_arr = (rect_arr.len() as u64..(rect_arr.len() + new_rect_arr.len()) as u64)
+            .collect::<Vec<_>>();
+        let stream = convert_bbox_rowid_batch_stream(
+            &new_rect_arr,
+            Arc::new(UInt64Array::from(new_rowid_arr.clone())),
+        );
+        rtree_index
+            .update(stream, new_store.as_ref())
+            .await
+            .unwrap();
+
+        let new_rtree_index = RTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let mut search_bbox = BoundingBox::new();
+        search_bbox.add_rect(&Rect::new(
+            coord! { x: 10.5, y: 1.5 },
+            coord! { x: 99.5, y: 200.5 },
+        ));
+        let row_ids = new_rtree_index
+            .search_bbox(search_bbox, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let mut expected_row_ids = RowIdTreeMap::new();
+        for i in 0..rect_arr.len() {
+            let bbox = BoundingBox::new_with_rect(&rect_arr.value(i).unwrap());
+            if search_bbox.rect_intersects(&bbox) {
+                expected_row_ids.insert(i as u64);
+            }
+        }
+        for i in 0..new_rect_arr.len() {
+            let bbox = BoundingBox::new_with_rect(&new_rect_arr.value(i).unwrap());
+            if search_bbox.rect_intersects(&bbox) {
+                expected_row_ids.insert(new_rowid_arr.get(i).copied().unwrap());
+            }
+        }
+
+        println!("row_ids: {:?}", row_ids);
+        assert_eq!(row_ids, expected_row_ids);
     }
 }
