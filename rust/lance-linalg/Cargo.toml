@@ -22,6 +22,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
 proptest.workspace = true
 
