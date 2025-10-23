@@ -4325,57 +4325,64 @@ impl PrimitiveStructuralEncoder {
                     Some(dictionary_data_block),
                     num_rows
                 )
-            } else if Self::should_dictionary_encode(&data_block, &field) {
-                log::debug!(
-                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                    column_idx,
-                    num_values
-                );
-                let (indices_data_block, dictionary_data_block) =
-                    dict::dictionary_encode(data_block);
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    indices_data_block,
-                    repdefs,
-                    row_number,
-                    Some(dictionary_data_block),
-                    num_rows,
-                )
-            } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
-                log::debug!(
-                    "Encoding column {} with {} items using mini-block layout",
-                    column_idx,
-                    num_values
-                );
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdefs,
-                    row_number,
-                    None,
-                    num_rows,
-                )
-            } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip layout",
-                    column_idx,
-                    num_values
-                );
-                Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdefs,
-                    row_number,
-                    num_rows,
-                )
             } else {
-                Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                // Try dictionary encoding first if applicable
+                let dict_result = if Self::should_dictionary_encode(&data_block, &field) {
+                    log::debug!(
+                        "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                        column_idx,
+                        num_values
+                    );
+                    dict::dictionary_encode(data_block.clone())
+                } else {
+                    None
+                };
+
+                if let Some((indices_data_block, dictionary_data_block)) = dict_result {
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        indices_data_block,
+                        repdefs,
+                        row_number,
+                        Some(dictionary_data_block),
+                        num_rows,
+                    )
+                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+                    log::debug!(
+                        "Encoding column {} with {} items using mini-block layout",
+                        column_idx,
+                        num_values
+                    );
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdefs,
+                        row_number,
+                        None,
+                        num_rows,
+                    )
+                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                    log::debug!(
+                        "Encoding column {} with {} items using full-zip layout",
+                        column_idx,
+                        num_values
+                    );
+                    Self::encode_full_zip(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdefs,
+                        row_number,
+                        num_rows,
+                    )
+                } else {
+                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                }
             }
         })
         .boxed();
