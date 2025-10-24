@@ -13,9 +13,12 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.index.Index;
+import com.lancedb.lance.index.IndexOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.index.scalar.ScalarIndexParams;
+import com.lancedb.lance.operation.CreateIndex;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -28,8 +31,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
@@ -61,7 +69,7 @@ public class ScalarIndexTest {
             IndexType.BTREE,
             Optional.of("btree_id_index"),
             indexParams,
-            false);
+            true);
 
         // Verify index was created and is in the list
         assertTrue(
@@ -72,6 +80,80 @@ public class ScalarIndexTest {
         // Currently the Java API doesn't expose index configuration details,
         // but we could add a getIndexDetails() method in the future to verify
         // that the zone_size parameter was correctly set to 2048
+      }
+    }
+  }
+
+  @Test
+  public void testCreateBTreeIndexDistributedly() throws Exception {
+    String datasetPath = tempDir.resolve("build_index_distributedly").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // 1. write two fragments
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, dataset.getFragments().size());
+
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        UUID uuid = UUID.randomUUID();
+
+        // 2. partially create index
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
+                .withIndexUUID(uuid.toString())
+                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                .build());
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
+                .withIndexUUID(uuid.toString())
+                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                .build());
+
+        // then no index should have been created
+        assertFalse(
+            dataset.listIndexes().contains("test_index"),
+            "Partially created index should not present");
+
+        // 3. merge metadata, which will still not be committed
+        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
+
+        // 4. commit the index
+        int fieldId =
+            dataset.getLanceSchema().fields().stream()
+                .filter(f -> f.getName().equals("name"))
+                .findAny()
+                .orElseThrow(() -> new RuntimeException("Cannot find 'name' field for TestDataset"))
+                .getId();
+
+        long datasetVersion = dataset.version();
+
+        Index index =
+            Index.builder()
+                .uuid(uuid)
+                .name("test_index")
+                .fields(Collections.singletonList(fieldId))
+                .datasetVersion(datasetVersion)
+                .indexVersion(0)
+                .fragments(fragments.stream().map(Fragment::getId).collect(Collectors.toList()))
+                .build();
+
+        CreateIndex createIndexOp =
+            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
+
+        Transaction createIndexTx =
+            dataset.newTransactionBuilder().operation(createIndexOp).build();
+
+        try (Dataset newDataset = createIndexTx.commit()) {
+          // new dataset should contain that index
+          assertEquals(datasetVersion + 1, newDataset.version());
+          assertTrue(newDataset.listIndexes().contains("test_index"));
+        }
       }
     }
   }
@@ -102,7 +184,7 @@ public class ScalarIndexTest {
             IndexType.ZONEMAP,
             Optional.of("zonemap_value_index"),
             indexParams,
-            false);
+            true);
 
         // Verify index was created
         assertTrue(
