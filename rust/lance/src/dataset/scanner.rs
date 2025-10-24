@@ -59,7 +59,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
+    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
@@ -2502,12 +2502,10 @@ impl Scanner {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
-            FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
+            FtsQuery::Phrase(query) => {
+                self.plan_phrase_query(query, params, prefilter_source)
+                    .await?
+            }
 
             FtsQuery::Boost(query) => {
                 // for boost query, we need to erase the limit so that we can find
@@ -2688,6 +2686,51 @@ impl Scanner {
         };
 
         Ok(plan)
+    }
+
+    async fn plan_phrase_query(
+        &self,
+        query: &PhraseQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query.column.clone().ok_or(Error::invalid_input(
+            "the column must be specified in the query".to_string(),
+            location!(),
+        ))?;
+
+        let index_meta = self
+            .dataset
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts(),
+            )
+            .await?
+            .ok_or(Error::invalid_input(
+                format!("No Inverted index found for column {}", column),
+                location!(),
+            ))?;
+
+        let details_any =
+            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
+        let details = details_any
+            .as_ref()
+            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
+        if !details.with_position {
+            return Err(Error::invalid_input(
+                "position is not found but required for phrase queries, try recreating the index with position"
+                    .to_string(),
+                location!(),
+            ));
+        }
+
+        Ok(Arc::new(PhraseQueryExec::new(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+        )))
     }
 
     async fn plan_match_query(
@@ -3833,14 +3876,9 @@ pub mod test_dataset {
         }
 
         pub async fn make_fts_index(&mut self) -> Result<()> {
+            let params = InvertedIndexParams::default().with_position(true);
             self.dataset
-                .create_index(
-                    &["s"],
-                    IndexType::Inverted,
-                    None,
-                    &InvertedIndexParams::default(),
-                    true,
-                )
+                .create_index(&["s"], IndexType::Inverted, None, &params, true)
                 .await
         }
 
