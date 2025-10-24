@@ -374,15 +374,15 @@ pub(crate) async fn infer_scalar_index_details(
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
-        {
+        let parse_params = async || {
             let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).ok()?;
             let reader = index_store.open_index_file(METADATA_FILE).await.ok()?;
             let params_str = reader.schema().metadata.get("params")?;
             let params = ::serde_json::from_str::<InvertedIndexParams>(params_str).ok()?;
             let details = InvertedIndexDetails::try_from(&params).ok()?;
             Some(prost_types::Any::from_msg(&details).unwrap())
-        }
-        .unwrap_or(default_details)
+        };
+        parse_params().await.unwrap_or(default_details)
     } else if dataset
         .object_store
         .exists(&legacy_inverted_list_lookup)
