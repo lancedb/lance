@@ -360,7 +360,7 @@ def compute_pq_codes(
                 )
                 pq_codes = pq_codes.to(torch.uint8)
 
-                addrs = batch["row_id"].reshape(-1)
+                addrs = batch["row_addr"].reshape(-1)
                 partitions = batch["partition"].reshape(-1)
 
                 addrs = addrs.cpu()

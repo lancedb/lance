@@ -1193,7 +1193,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
 
-                // max-reduce for the same row id
+                // max-reduce for the same row addr
                 let min_sim = dists
                     .values()
                     .last()
@@ -1204,7 +1204,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                 let mut visited_row_addrs = HashSet::with_capacity(row_addrs.len());
 
                 for (row_addr, dist) in row_addrs.values().iter().zip(dists.values().iter()) {
-                    // the results are sorted by distance, so we can skip if we have seen this row id before
+                    // the results are sorted by distance, so we can skip if we have seen this row addr before
                     if visited_row_addrs.contains(row_addr) {
                         continue;
                     }
