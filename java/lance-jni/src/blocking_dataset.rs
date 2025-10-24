@@ -210,11 +210,6 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn checkout_branch(&mut self, branch: &str) -> Result<Self> {
-        let inner = RT.block_on(self.inner.checkout_branch(branch))?;
-        Ok(Self { inner })
-    }
-
     pub fn checkout_reference(
         &mut self,
         branch: Option<String>,
