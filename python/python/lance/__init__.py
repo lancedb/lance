@@ -32,6 +32,7 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
+from .namespace import LanceNamespaceStorageOptionsProvider
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -57,6 +58,7 @@ __all__ = [
     "LanceFragment",
     "LanceOperation",
     "LanceScanner",
+    "LanceNamespaceStorageOptionsProvider",
     "MergeInsertBuilder",
     "ScanStatistics",
     "Transaction",
@@ -190,15 +192,37 @@ def dataset(
             "Must specify either 'uri' or both 'namespace' and 'table_id'."
         )
 
-    # Validate namespace parameters
+    # Handle namespace resolution in Python
+    storage_options_provider = None
     if namespace is not None:
         if table_id is None:
             raise ValueError(
                 "Both 'namespace' and 'table_id' must be provided together."
             )
-        # URI will be fetched from namespace in Rust layer
+
+        table_info = namespace.describe_table(table_id=table_id, version=version)
+        uri = table_info.get("location")
         if uri is None:
-            uri = ""  # Placeholder, will be replaced by namespace location
+            raise ValueError("Namespace did not return a 'location' for the table")
+
+        # Extract storage options from namespace
+        namespace_storage_options = table_info.get("storage_options", {})
+
+        # Merge with user-provided storage options (namespace options take precedence)
+        if storage_options is None:
+            storage_options = namespace_storage_options
+        else:
+            # Merge: user options first, then override with namespace options
+            merged_options = dict(storage_options)
+            merged_options.update(namespace_storage_options)
+            storage_options = merged_options
+
+        # Create storage options provider if refresh is enabled
+        if refresh_storage_options:
+            storage_options_provider = LanceNamespaceStorageOptionsProvider(
+                namespace=namespace,
+                table_id=table_id
+            )
     elif table_id is not None:
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
 
@@ -214,9 +238,7 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
-        namespace=namespace,
-        table_id=table_id,
-        refresh_storage_options=refresh_storage_options,
+        storage_options_provider=storage_options_provider,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -240,9 +262,7 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
-                namespace=namespace,
-                table_id=table_id,
-                refresh_storage_options=refresh_storage_options,
+                storage_options_provider=storage_options_provider,
             )
     else:
         return ds

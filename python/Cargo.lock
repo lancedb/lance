@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "0.38.3-beta.9"
+version = "0.38.3-beta.10"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4237,10 +4237,10 @@ dependencies = [
  "bytes",
  "lance",
  "lance-core",
+ "lance-io",
  "lance-namespace",
- "opendal",
+ "object_store",
  "snafu",
- "url",
 ]
 
 [[package]]

@@ -455,7 +455,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace=None, table_id=None, refresh_storage_options=false))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
     fn new(
         py: Python,
         uri: String,
@@ -470,9 +470,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        namespace: Option<Py<PyAny>>,
-        table_id: Option<Vec<String>>,
-        refresh_storage_options: bool,
+        storage_options_provider: Option<PyObject>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -525,22 +523,7 @@ impl Dataset {
             params.file_reader_options = Some(file_reader_options);
         }
 
-        // If namespace is provided, use from_namespace instead of from_uri
-        let mut builder = if let (Some(ns), Some(tid)) = (namespace, table_id) {
-            // Convert Python namespace to Rust namespace
-            use lance_namespace::LanceNamespace;
-            use lance_namespace_impls::PyLanceNamespace;
-
-            let rust_namespace: Arc<dyn LanceNamespace> = Arc::new(PyLanceNamespace::new(ns));
-
-            rt().block_on(Some(py),
-                DatasetBuilder::from_namespace(rust_namespace, tid, refresh_storage_options)
-            )?.infer_error()?
-        } else {
-            DatasetBuilder::from_uri(&uri)
-        };
-
-        builder = builder.with_read_params(params);
+        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
 
         if let Some(ver) = version {
             if let Ok(i) = ver.downcast_bound::<PyInt>(py) {
@@ -575,8 +558,12 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Note: storage_options_provider is set internally by from_namespace when refresh_storage_options=true
-        // Users should not set it directly
+        // Add storage options provider if provided
+        if let Some(provider_obj) = storage_options_provider {
+            use crate::storage_options::py_object_to_storage_options_provider;
+            let provider = py_object_to_storage_options_provider(provider_obj)?;
+            builder = builder.with_storage_options_provider(provider);
+        }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
 

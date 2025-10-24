@@ -417,9 +417,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
-        namespace: Optional[Any] = None,
-        table_id: Optional[list] = None,
-        refresh_storage_options: bool = False,
+        storage_options_provider: Optional[Any] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -450,9 +448,7 @@ class LanceDataset(pa.dataset.Dataset):
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
             session=session,
-            namespace=namespace,
-            table_id=table_id,
-            refresh_storage_options=refresh_storage_options,
+            storage_options_provider=storage_options_provider,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
