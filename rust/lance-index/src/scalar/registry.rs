@@ -16,8 +16,8 @@ use crate::{
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
-        CreatedIndex, IndexStore, ScalarIndex,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, rtree::RTreeIndexPlugin,
+        zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore, ScalarIndex,
     },
 };
 
@@ -204,6 +204,7 @@ impl ScalarIndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+        registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
         let registry = Arc::new(registry);
         for plugin in registry.plugins.values() {
