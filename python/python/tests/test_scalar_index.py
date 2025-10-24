@@ -3977,7 +3977,7 @@ def test_json_inverted_match_query(tmp_path):
     # Convert to JSON strings
     json_strings = pa.array([json.dumps(doc) for doc in json_data], type=pa.json_())
     table = pa.table({"json_col": json_strings, "id": range(len(json_data))})
-    dataset = lance.write_dataset(table, tmp_path, data_storage_version="2.2")
+    dataset = lance.write_dataset(table, tmp_path)
 
     # Create inverted index with JSON tokenizer
     dataset.create_scalar_index(
@@ -3990,7 +3990,7 @@ def test_json_inverted_match_query(tmp_path):
         remove_stop_words=True,
     )
 
-    # Test match query
+    # Test match query with token exceeding max_token_length
     results = dataset.to_table(
         full_text_query=MatchQuery("Title,str,harrypotter", "json_col")
     )

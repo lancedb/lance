@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use serde_json::Value;
 use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
-use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_arrow::json::JSON_EXT_NAME;
 
 /// Document type for full text search.
 pub enum DocType {
@@ -30,14 +30,12 @@ impl TryFrom<&Field> for DocType {
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
             DataType::List(field) | DataType::LargeList(field)
-            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
-                {
-                    Ok(Self::Text)
-                }
+                if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                Ok(Self::Text)
+            }
             DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
-                Some(name) if name.as_str() == JSON_EXT_NAME => {
-                    Ok(Self::Json)
-                }
+                Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
                 _ => Err(lance_core::Error::InvalidInput {
                     source: format!("field {} is not json", field.name()).into(),
                     location: location!(),

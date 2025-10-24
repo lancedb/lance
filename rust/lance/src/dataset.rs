@@ -9517,8 +9517,7 @@ mod tests {
         // Match query succeed only when lance tokenizer is 'json'
         let query = FullTextSearchQuery {
             query: FtsQuery::Match(
-                MatchQuery::new("Content,str,once".to_string())
-                    .with_column(Some(json_col.clone())),
+                MatchQuery::new("Content,str,once".to_string()).with_column(Some(json_col.clone())),
             ),
             limit: None,
             wand_factor: None,

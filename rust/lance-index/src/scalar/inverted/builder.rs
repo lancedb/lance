@@ -7,6 +7,7 @@ use super::{
     InvertedIndexParams,
 };
 use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
@@ -36,7 +37,6 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
-use crate::scalar::inverted::lance_tokenizer::DocType;
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
