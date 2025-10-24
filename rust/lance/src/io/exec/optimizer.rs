@@ -169,18 +169,13 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     }
 }
 
-pub fn get_physical_optimizer(
-    index_contexts: HashMap<usize, Arc<DatasetIndexScanContext>>,
-) -> PhysicalOptimizer {
+pub fn get_physical_optimizer() -> PhysicalOptimizer {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = Vec::new();
     rules.push(Arc::new(crate::io::exec::optimizer::CoalesceTake)
         as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
     rules.push(Arc::new(crate::io::exec::optimizer::SimplifyProjection)
         as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
-    if !index_contexts.is_empty() {
-        rules.push(Arc::new(ScanIndexRule::new(index_contexts))
-            as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
-    }
+    rules.push(Arc::new(ScanIndexRule) as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
     rules.push(
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new())
             as Arc<dyn PhysicalOptimizerRule + Send + Sync>,

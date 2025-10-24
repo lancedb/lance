@@ -20,7 +20,7 @@ use datafusion::{
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
-use crate::Dataset;
+use crate::{dataset::scanner::Scanner, Dataset};
 
 #[derive(Debug)]
 pub struct LanceTableProvider {
@@ -88,7 +88,7 @@ impl TableProvider for LanceTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let mut scan = self.dataset.scan();
+        let mut scan = Scanner::new(self.dataset.clone());
         match projection {
             Some(projection) if projection.is_empty() => {
                 scan.empty_project()?;

@@ -1,205 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    common::tree_node::{Transformed, TreeNode},
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
 };
-use datafusion_physical_expr::{
-    expressions::Column, EquivalenceProperties, Partitioning, PhysicalExpr,
-};
+use datafusion_expr::Expr;
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
+    filter::FilterExec,
     metrics::ExecutionPlanMetricsSet,
-    projection::ProjectionExec,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
-use futures::executor::block_on;
+use futures::{executor::block_on, FutureExt};
 use itertools::Itertools;
-use lance_core::{
-    datatypes::format_field_path, Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_ID,
-};
+use lance_core::ROW_ID;
 use lance_index::{
-    metrics::{MetricsCollector, NoOpMetricsCollector},
-    scalar::{AnyQuery, ScalarIndex},
-    DatasetIndexExt, ScalarIndexCriteria,
+    metrics::MetricsCollector,
+    scalar::{
+        expression::{apply_scalar_indices, IndexedExpression, MultiQueryParser, ScalarIndexExpr},
+        registry::ScalarIndexPlugin,
+        AnyQuery, ScalarIndex,
+    },
+    DatasetIndexExt,
 };
-use roaring::RoaringBitmap;
-use snafu::location;
+use lance_table::format::IndexMetadata;
 use tokio::task::block_in_place;
-use uuid::Uuid;
 
 use crate::{
-    index::prefilter::DatasetPreFilter,
-    index::DatasetIndexInternalExt,
+    index::{
+        prefilter::DatasetPreFilter, scalar::IndexDetails, DatasetIndexInternalExt, ScalarIndexInfo,
+    },
     io::exec::{
         filtered_read::FilteredReadExec,
         utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter},
-        AddRowAddrExec, Planner,
+        AddRowAddrExec,
     },
     Dataset,
 };
 
-#[derive(Debug, Clone)]
-pub struct ColumnIndexContext {
-    column_name: String,
-    index_name: String,
-    ids: Vec<Uuid>,
-    index: Arc<dyn ScalarIndex>,
-    fragment_bitmap: Option<RoaringBitmap>,
-}
-
-#[derive(Debug)]
-pub struct DatasetIndexScanContext {
-    columns: HashMap<i32, ColumnIndexContext>,
-}
-
-impl DatasetIndexScanContext {
-    fn column_context(&self, field_id: i32) -> Option<&ColumnIndexContext> {
-        self.columns.get(&field_id)
-    }
-
-    async fn prepare(
-        dataset: Arc<Dataset>,
-        columns: HashMap<i32, String>,
-    ) -> LanceResult<Option<Self>> {
-        let mut column_map = HashMap::new();
-        for (field_id, column_name) in columns {
-            let criteria = ScalarIndexCriteria::default().for_column(column_name.as_str());
-            let Some(index_meta) = dataset.load_scalar_index(criteria).await? else {
-                continue;
-            };
-            let index_uuid = index_meta.uuid.to_string();
-            let index = dataset
-                .open_scalar_index(column_name.as_str(), &index_uuid, &NoOpMetricsCollector)
-                .await?;
-            column_map.insert(
-                field_id,
-                ColumnIndexContext {
-                    column_name: column_name.clone(),
-                    index_name: index_meta.name.clone(),
-                    ids: vec![index_meta.uuid],
-                    index,
-                    fragment_bitmap: index_meta.fragment_bitmap.clone(),
-                },
-            );
-        }
-        if column_map.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Self {
-                columns: column_map,
-            }))
-        }
-    }
-}
-
-struct Candidate {
-    dataset: Arc<Dataset>,
-    field_id: i32,
-    column_name: String,
-}
-
-fn detect_candidate(read: &FilteredReadExec) -> Option<Candidate> {
-    let options = read.options();
-    let projection = &options.projection;
-    if options.with_deleted_rows
-        || options.refine_filter.is_some()
-        || options.scan_range_before_filter.is_some()
-        || options.scan_range_after_filter.is_some()
-        || read.index_input().is_some()
-        || projection.with_row_last_updated_at_version
-        || projection.with_row_created_at_version
-        || projection.field_ids.len() != 1
-    {
-        return None;
-    }
-    let dataset = Arc::clone(read.dataset());
-    let schema = dataset.schema();
-    let field_id = *projection.field_ids.iter().next()?;
-    let field = schema.field_by_id(field_id)?;
-    let column_name = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-        let segments: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-        format_field_path(&segments)
-    } else {
-        field.name.clone()
-    };
-    if let Some(filter_expr) = options.full_filter.as_ref() {
-        let filter_columns = Planner::column_names_in_expr(filter_expr);
-        if filter_columns.iter().any(|col| col != &column_name) {
-            return None;
-        }
-    }
-    Some(Candidate {
-        dataset,
-        field_id,
-        column_name,
-    })
-}
-
-pub async fn prepare_index_scan_contexts(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> LanceResult<HashMap<usize, Arc<DatasetIndexScanContext>>> {
-    let mut requests: HashMap<usize, (Arc<Dataset>, HashMap<i32, String>)> = HashMap::new();
-
-    plan.apply(|node| {
-        if let Some(read) = node.as_any().downcast_ref::<FilteredReadExec>() {
-            if let Some(candidate) = detect_candidate(read) {
-                let key = Arc::as_ptr(&candidate.dataset) as usize;
-                let Candidate {
-                    dataset,
-                    field_id,
-                    column_name,
-                } = candidate;
-                let entry = requests
-                    .entry(key)
-                    .or_insert_with(|| (dataset.clone(), HashMap::new()));
-                entry.1.entry(field_id).or_insert(column_name);
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .map_err(|err| LanceError::Execution {
-        message: err.to_string(),
-        location: location!(),
-    })?;
-
-    let mut contexts = HashMap::new();
-    for (key, (dataset, columns)) in requests {
-        if let Some(context) = DatasetIndexScanContext::prepare(dataset.clone(), columns).await? {
-            contexts.insert(key, Arc::new(context));
-        }
-    }
-    Ok(contexts)
-}
-
+/// A physical node that satisfies a scan with just indexed data. This can
+/// completely avoid IO when the index is in cache.
 #[derive(Clone, Debug)]
-pub struct IndexScanExec {
+pub struct IndexOnlyScanExec {
     index_name: String,
-    ids: Vec<Uuid>,
-    indexes: Vec<Arc<dyn ScalarIndex>>,
-    properties: PlanProperties,
-    query: Option<Arc<dyn AnyQuery>>,
+    with_row_id: bool,
+    indexes: Vec<IndexMetadata>,
+    index_expr: Option<ScalarIndexExpr>,
     dataset: Arc<Dataset>,
-    fragment_bitmaps: Vec<Option<RoaringBitmap>>,
+    properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl IndexScanExec {
+impl IndexOnlyScanExec {
     fn new(
         index_name: String,
-        ids: Vec<Uuid>,
-        indexes: Vec<Arc<dyn ScalarIndex>>,
+        indexes: Vec<IndexMetadata>,
         output_schema: SchemaRef,
-        query: Option<Arc<dyn AnyQuery>>,
+        index_expr: Option<ScalarIndexExpr>,
         dataset: Arc<Dataset>,
-        fragment_bitmaps: Vec<Option<RoaringBitmap>>,
     ) -> Self {
         let eq_properties = EquivalenceProperties::new(output_schema);
+        let with_row_id = eq_properties.schema().fields().find(ROW_ID).is_some();
         let partitioning = Partitioning::UnknownPartitioning(indexes.len());
         let properties = PlanProperties::new(
             eq_properties,
@@ -208,26 +75,27 @@ impl IndexScanExec {
             Boundedness::Bounded,
         );
 
-        assert_eq!(indexes.len(), fragment_bitmaps.len());
-
         Self {
             index_name,
-            ids,
+            with_row_id,
             indexes,
+            index_expr,
             properties,
-            query,
             dataset,
-            fragment_bitmaps,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
 
-impl DisplayAs for IndexScanExec {
+impl DisplayAs for IndexOnlyScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let ids = self.ids.iter().map(|id| format!("\"{id}\"",)).join(", ");
+                let ids = self
+                    .indexes
+                    .iter()
+                    .map(|index| format!("\"{}\"", index.uuid))
+                    .join(", ");
                 write!(
                     f,
                     "IndexScanExec: name=\"{}\", ids=[{}]",
@@ -236,8 +104,8 @@ impl DisplayAs for IndexScanExec {
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "name=\"{}\"", self.index_name)?;
-                for (i, id) in self.ids.iter().enumerate() {
-                    write!(f, "ids[{}]=\"{}\"", i, id)?;
+                for (i, index) in self.indexes.iter().enumerate() {
+                    write!(f, "ids[{}]=\"{}\"", i, index.uuid)?;
                 }
                 Ok(())
             }
@@ -245,7 +113,7 @@ impl DisplayAs for IndexScanExec {
     }
 }
 
-impl ExecutionPlan for IndexScanExec {
+impl ExecutionPlan for IndexOnlyScanExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -303,22 +171,8 @@ impl ExecutionPlan for IndexScanExec {
             })?
             .clone();
         let batch_size = context.session_config().options().execution.batch_size;
-        let query = self
-            .query
-            .as_ref()
-            .map(|query| query.as_ref() as &dyn AnyQuery);
-        let fragment_bitmap = self
-            .fragment_bitmaps
-            .get(partition)
-            .cloned()
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Partition metadata out of bounds {} versus len {}",
-                    partition,
-                    self.fragment_bitmaps.len()
-                ))
-            })?;
-        let deletion_mask = match fragment_bitmap {
+        let query = self.index_expr.as_ref().map(|query| query as &dyn AnyQuery);
+        let deletion_mask = match index.fragment_bitmap {
             Some(bitmap) => DatasetPreFilter::create_deletion_mask(self.dataset.clone(), bitmap)
                 .map(|fut| block_in_place(|| block_on(fut)))
                 .transpose()
@@ -327,14 +181,29 @@ impl ExecutionPlan for IndexScanExec {
         };
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let collector: Arc<dyn MetricsCollector> = metrics.clone();
-        let stream = index
-            .scan(query, batch_size, deletion_mask, collector)?
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "Index {} does not support scanning.",
-                    index.index_type()
-                ))
-            })?;
+
+        let dataset = self.dataset.clone();
+        let stream = futures::stream::once(async move {
+            let index = dataset
+                .open_scalar_index(
+                    "dummy", // TODO: can we avoid having to pass this.
+                    &index.uuid.to_string(),
+                    collector.as_ref(),
+                )
+                .await?;
+
+            // TODO: push down projection.s
+            index
+                .scan(query, batch_size, deletion_mask, collector)?
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Index {} does not support scanning.",
+                        index.index_type()
+                    ))
+                })
+        })
+        .try_flatten();
+
         let schema = stream.schema();
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
@@ -372,134 +241,101 @@ impl ExecutionPlan for IndexScanExec {
 /// it is replaced with `IndexScanExec`. When `_rowaddr` is also requested,
 /// an `AddRowAddrExec` is appended after the scan so the public schema remains unchanged.
 #[derive(Debug)]
-pub struct ScanIndexRule {
-    contexts: Arc<HashMap<usize, Arc<DatasetIndexScanContext>>>,
-}
+pub struct ScanIndexRule;
 
 impl ScanIndexRule {
-    pub fn new(contexts: HashMap<usize, Arc<DatasetIndexScanContext>>) -> Self {
-        Self {
-            contexts: Arc::new(contexts),
+    fn index_scan_supported(read: &FilteredReadExec) -> bool {
+        let options = read.options();
+        if options.fragments.is_some()
+            || options.scan_range_after_filter.is_some()
+            || options.scan_range_before_filter.is_some()
+        {
+            return false;
         }
+        let projection = &options.projection;
+        if projection.field_ids.len() > 1
+            || projection.with_row_created_at_version
+            || projection.with_row_last_updated_at_version
+        {
+            return false;
+        }
+        return true;
+    }
+
+    /// Look for an index on the given field_id that is scannable and can satisfy
+    /// the filter the best.
+    fn scannable_index(
+        dataset: &Dataset,
+        field_id: i32,
+        predicate: Option<&Expr>,
+    ) -> Option<(Vec<IndexMetadata>, IndexedExpression)> {
+        let index_metas = dataset.load_indices().now_or_never()?.ok()?;
+
+        let mut parts = Vec::new();
+        let mut index_name = None;
+        let mut indexed_expr = IndexedExpression::default();
+
+        for index_metadata in index_metas.iter() {
+            if index_name.as_ref() == Some(&index_metadata.name) {
+                parts.push(index_metadata.clone());
+                continue;
+            } else if index_name.is_some() {
+                // We already found an index.
+                continue;
+            };
+            if !(&index_metadata.fields == &[field_id]) {
+                continue;
+            }
+            let index_details = IndexDetails(index_metadata.index_details.clone()?);
+            let plugin = index_details.get_plugin().ok()?;
+
+            if !plugin.supports_scan() {
+                continue;
+            }
+
+            if let Some(predicate) = predicate {
+                let parser =
+                    plugin.new_query_parser(index_metadata.name.clone(), index_details.as_ref())?;
+                let mut index_info = ScalarIndexInfo::default();
+                index_info.insert(
+                    index_metadata.name.clone(),
+                    dataset.schema().field_by_id(field_id)?.data_type().clone(),
+                    Box::new(MultiQueryParser::single(parser)),
+                );
+                indexed_expr = apply_scalar_indices(predicate.clone(), &index_info).ok()?;
+            }
+
+            index_name = Some(index_metadata.name.clone());
+            parts.push(index_metadata.clone());
+        }
+
+        index_name.map(|_| (parts, indexed_expr))
     }
 
     fn rewrite_filtered_read(
-        &self,
         read: &FilteredReadExec,
-        context: &DatasetIndexScanContext,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        // Only consider scans with no filters or index inputs.
-        let options = read.options();
-        if options.with_deleted_rows
-            || options.refine_filter.is_some()
-            || options.scan_range_before_filter.is_some()
-            || options.scan_range_after_filter.is_some()
-            || read.index_input().is_some()
-        {
-            return Ok(None);
-        }
-
-        let projection = &options.projection;
-
-        if projection.with_row_last_updated_at_version
-            || projection.with_row_created_at_version
-            || projection.field_ids.len() != 1
-        {
-            return Ok(None);
-        }
-
-        // Determine the indexed column.
-        let field_id = *projection.field_ids.iter().next().unwrap();
-        let dataset = read.dataset().clone();
-        let schema = dataset.schema();
-        let field = match schema.field_by_id(field_id) {
-            Some(field) => field,
-            None => return Ok(None),
-        };
-
-        let Some(column_context) = context.column_context(field.id) else {
-            return Ok(None);
-        };
-
-        if let Some(filter_expr) = options.full_filter.as_ref() {
-            let filter_columns = Planner::column_names_in_expr(filter_expr);
-            if filter_columns
-                .iter()
-                .any(|col| col != &column_context.column_name)
-            {
-                return Ok(None);
-            }
-        }
-
-        // Determine the schema produced by the index scan.
-        let read_schema = read.schema();
-        let needs_row_addr = projection.with_row_addr;
-
-        let arrow_field: ArrowField = field.into();
-        let mut value_field_arrow = ArrowField::new(
-            "values",
-            arrow_field.data_type().clone(),
-            arrow_field.is_nullable(),
-        );
-        if !arrow_field.metadata().is_empty() {
-            value_field_arrow = value_field_arrow.with_metadata(arrow_field.metadata().clone());
-        }
-        let ids_field = ArrowField::new("ids", ArrowDataType::UInt64, true);
-        let index_schema = Arc::new(arrow_schema::Schema::new(vec![
-            value_field_arrow,
-            ids_field,
-        ]));
-        let mut result_plan: Arc<dyn ExecutionPlan> = Arc::new(IndexScanExec::new(
-            column_context.index_name.clone(),
-            column_context.ids.clone(),
-            vec![column_context.index.clone()],
-            index_schema,
-            None,
-            dataset.clone(),
-            vec![column_context.fragment_bitmap.clone()],
+        indexes: Vec<IndexMetadata>,
+        indexed_expr: IndexedExpression,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(IndexOnlyScanExec::new(
+            indexes[0].name.clone(),
+            indexes,
+            read.schema(), // TODO: this doesn't work if row_addr was requested, since it needs to be added later.
+            indexed_expr.scalar_query,
+            read.dataset().clone(),
         ));
 
-        let index_output_schema = result_plan.schema();
-        let mut projection_expr = Vec::with_capacity(read_schema.fields().len());
-        for field in read_schema.fields() {
-            let expr = if field.name() == &column_context.column_name {
-                Column::new_with_schema(
-                    index_output_schema.field(0).name(),
-                    index_output_schema.as_ref(),
-                )
-            } else if field.name() == ROW_ID {
-                Column::new_with_schema(
-                    index_output_schema.field(1).name(),
-                    index_output_schema.as_ref(),
-                )
-            } else {
-                Column::new_with_schema(field.name(), index_output_schema.as_ref())
-            }
-            .map_err(|err| DataFusionError::External(Box::new(err)))?;
-            let expr_arc: Arc<dyn PhysicalExpr> = Arc::new(expr);
-            projection_expr.push((expr_arc, field.name().clone()));
-        }
-        if !projection_expr.is_empty() {
-            result_plan = Arc::new(
-                ProjectionExec::try_new(projection_expr, result_plan.clone())
-                    .map_err(|err| DataFusionError::External(Box::new(err)))?,
-            );
+        if let Some(expr) = indexed_expr.refine_expr {
+            let physical_expr = todo!("Create physical expression");
+            plan = Arc::new(FilterExec::try_new(physical_expr, plan))
         }
 
-        if needs_row_addr {
-            let Some(rowaddr_pos) = read_schema
-                .fields()
-                .iter()
-                .position(|f| f.name() == ROW_ADDR)
-            else {
-                return Ok(None);
-            };
-            let add_row_addr = AddRowAddrExec::try_new(result_plan, dataset.clone(), rowaddr_pos)
-                .map_err(|err| DataFusionError::External(Box::new(err)))?;
-            Ok(Some(Arc::new(add_row_addr)))
-        } else {
-            Ok(Some(result_plan))
+        if read.options().projection.with_row_addr {
+            // Index only contains row ids, so we need to add row addr if requested
+            plan = Arc::new(AddRowAddrExec::try_new(plan, read.dataset().clone(), 2)?)
         }
+
+        Ok(plan)
     }
 }
 
@@ -509,16 +345,20 @@ impl PhysicalOptimizerRule for ScanIndexRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &datafusion::config::ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        if self.contexts.is_empty() {
-            return Ok(plan);
-        }
-
         plan.transform_down(|plan| {
             if let Some(read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
-                let key = Arc::as_ptr(read.dataset()) as usize;
-                if let Some(context) = self.contexts.get(&key) {
-                    if let Some(new_plan) = self.rewrite_filtered_read(read, context)? {
-                        return Ok(Transformed::yes(new_plan));
+                if Self::index_scan_supported(read) {
+                    let projection = &read.options().projection;
+                    let field_id = projection.field_ids.iter().next().cloned().unwrap();
+                    let predicate = read.options().full_filter.as_ref();
+                    if let Some((indexes, indexed_expr)) =
+                        Self::scannable_index(&read.dataset(), field_id, predicate)
+                    {
+                        if let Ok(mut plan) =
+                            Self::rewrite_filtered_read(read, indexes, indexed_expr)
+                        {
+                            return Ok(Transformed::yes(plan));
+                        }
                     }
                 }
             }
@@ -542,6 +382,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::types::Int32Type;
+    use arrow_array::{ArrayRef, StringArray};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use datafusion::{
         config::ConfigOptions, execution::context::SessionContext,
         physical_optimizer::optimizer::PhysicalOptimizer,
@@ -555,9 +397,12 @@ mod tests {
 
     use crate::{
         datafusion::LanceTableProvider,
+        dataset::scanner::Scanner,
         io::exec::get_physical_optimizer,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, TestDatasetGenerator},
     };
+    use lance_core::utils::tempfile::TempDir;
+    use lance_file::version::LanceFileVersion;
 
     fn run_optimizer(
         optimizer: &PhysicalOptimizer,
@@ -612,17 +457,43 @@ mod tests {
             )
             .await
             .unwrap();
-
         let dataset = Arc::new(dataset);
-        let mut scanner = dataset.scan();
+        let indices = dataset.load_indices().await.unwrap();
+        let schema_field_info: Vec<_> = dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.id))
+            .collect();
+        let loaded = dataset
+            .load_scalar_index(ScalarIndexCriteria::default().for_column("value"))
+            .await
+            .unwrap()
+            .is_some();
+        eprintln!("load_scalar_index before scan: {}", loaded);
+        let mut scanner = Scanner::new(dataset.clone());
         scanner.project(&["value"]).unwrap();
+        scanner.filter("value > 10").unwrap();
         let plan = scanner.create_plan().await.unwrap();
-
+        // eprintln!("plan:\n{}", plan.display_indent().unwrap());
+        let debug_info = std::cell::RefCell::new(Vec::new());
+        plan.apply(|node| {
+            if let Some(read) = node.as_any().downcast_ref::<FilteredReadExec>() {
+                let options = read.options();
+                debug_info.borrow_mut().push((
+                    options.with_deleted_rows,
+                    options.projection.field_ids.clone(),
+                    options.full_filter.clone(),
+                    options.refine_filter.clone(),
+                ));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        eprintln!("filtered_debug: {:?}", debug_info.borrow());
         let expected = collect_plan(plan.clone()).await.unwrap();
         let plan = plan.reset_state().unwrap();
-
-        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
-        let optimizer = get_physical_optimizer(contexts);
+        let optimizer = get_physical_optimizer();
         let optimized_plan = run_optimizer(&optimizer, plan);
 
         let actual = collect_plan(optimized_plan.clone()).await.unwrap();
@@ -630,7 +501,7 @@ mod tests {
         let mut found_index_scan = false;
         optimized_plan
             .apply(|node| {
-                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                if node.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
                     found_index_scan = true;
                 }
                 Ok(TreeNodeRecursion::Continue)
@@ -666,19 +537,14 @@ mod tests {
             .unwrap();
 
         let dataset = Arc::new(dataset);
-        let plan = dataset
-            .scan()
-            .project(&["value"])
-            .unwrap()
-            .create_plan()
-            .await
-            .unwrap();
+        let mut scanner = Scanner::new(dataset.clone());
+        scanner.project(&["value"]).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
 
         let expected = collect_plan(plan.clone()).await.unwrap();
         let plan = plan.reset_state().unwrap();
 
-        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
-        let optimizer = get_physical_optimizer(contexts);
+        let optimizer = get_physical_optimizer();
         let optimized_plan = run_optimizer(&optimizer, plan);
 
         let actual = collect_plan(optimized_plan.clone()).await.unwrap();
@@ -686,7 +552,7 @@ mod tests {
         let mut found_index_scan = false;
         optimized_plan
             .apply(|node| {
-                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                if node.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
                     found_index_scan = true;
                 }
                 Ok(TreeNodeRecursion::Continue)
@@ -724,7 +590,7 @@ mod tests {
             .unwrap();
 
         let dataset = Arc::new(dataset);
-        let mut scanner = dataset.scan();
+        let mut scanner = Scanner::new(dataset.clone());
         scanner.project(&["value"]).unwrap();
         scanner.with_row_id();
         let plan = scanner.create_plan().await.unwrap();
@@ -732,8 +598,7 @@ mod tests {
         let expected = collect_plan(plan.clone()).await.unwrap();
         let plan = plan.reset_state().unwrap();
 
-        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
-        let optimizer = get_physical_optimizer(contexts);
+        let optimizer = get_physical_optimizer();
         let optimized_plan = run_optimizer(&optimizer, plan);
 
         let actual = collect_plan(optimized_plan.clone()).await.unwrap();
@@ -742,7 +607,7 @@ mod tests {
         let mut found_add_row_addr = false;
         optimized_plan
             .apply(|node| {
-                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                if node.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
                     found_index_scan = true;
                 }
                 if node.as_any().downcast_ref::<AddRowAddrExec>().is_some() {
@@ -754,6 +619,86 @@ mod tests {
 
         assert!(found_index_scan, "index scan not found in optimized plan");
         assert!(!found_add_row_addr, "AddRowAddrExec unexpectedly present");
+        assert_eq!(
+            batches_to_string(&expected),
+            batches_to_string(&actual),
+            "optimized results differed from original plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_scan_optimizer_rewrite_refine_filter() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["football", "apple", "soccer"])) as ArrayRef],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["basketball", "balloon", "car"])) as ArrayRef],
+        )
+        .unwrap();
+
+        let temp_dir = TempDir::default();
+        let dataset_uri = format!("{}/refine_filter", temp_dir.path_str());
+        let mut dataset = TestDatasetGenerator::new(vec![batch1, batch2], LanceFileVersion::Stable)
+            .make_hostile(&dataset_uri)
+            .await;
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let mut scanner = Scanner::new(dataset.clone());
+        scanner.project(&["value"]).unwrap();
+        scanner.filter("value LIKE '%ball%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+
+        let expected = collect_plan(plan.clone()).await.unwrap();
+        let plan = plan.reset_state().unwrap();
+
+        let optimizer = get_physical_optimizer();
+        let optimized_plan = run_optimizer(&optimizer, plan);
+
+        let actual = collect_plan(optimized_plan.clone()).await.unwrap();
+
+        let mut found_index_scan = false;
+        let mut filter_on_index = false;
+        optimized_plan
+            .apply(|node| {
+                if let Some(filter) = node.as_any().downcast_ref::<FilterExec>() {
+                    if let Some(child) = filter.children().first() {
+                        if child.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
+                            filter_on_index = true;
+                        }
+                    }
+                }
+                if node.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
+                    found_index_scan = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        assert!(found_index_scan, "index scan not found in optimized plan");
+        assert!(
+            filter_on_index,
+            "refine filter was not applied after index scan"
+        );
         assert_eq!(
             batches_to_string(&expected),
             batches_to_string(&actual),
@@ -810,8 +755,7 @@ mod tests {
         let expected = collect_plan(plan.clone()).await.unwrap();
         let plan = plan.reset_state().unwrap();
 
-        let contexts = prepare_index_scan_contexts(&plan).await.unwrap();
-        let optimizer = get_physical_optimizer(contexts);
+        let optimizer = get_physical_optimizer();
         let optimized_plan = run_optimizer(&optimizer, plan);
 
         let actual = collect_plan(optimized_plan.clone()).await.unwrap();
@@ -819,7 +763,7 @@ mod tests {
         let mut found_index_scan = false;
         optimized_plan
             .apply(|node| {
-                if node.as_any().downcast_ref::<IndexScanExec>().is_some() {
+                if node.as_any().downcast_ref::<IndexOnlyScanExec>().is_some() {
                     found_index_scan = true;
                 }
                 Ok(TreeNodeRecursion::Continue)
