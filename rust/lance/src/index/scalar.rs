@@ -29,6 +29,7 @@ use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::{
     bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
@@ -375,7 +376,30 @@ pub(crate) async fn infer_scalar_index_details(
             .exists(&legacy_inverted_list_lookup)
             .await?
     {
-        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+        // Try to infer inverted index details from metadata file to capture with_position and other params
+        // Fall back to defaults if anything goes wrong
+        match LanceIndexStore::from_dataset_for_existing(dataset, index) {
+            Ok(index_store) => match index_store.open_index_file(METADATA_FILE).await {
+                Ok(reader) => {
+                    let metadata = reader.schema().metadata.clone();
+                    if let Some(params_str) = metadata.get("params") {
+                        match ::serde_json::from_str::<InvertedIndexParams>(params_str) {
+                            Ok(params) => {
+                                let details =
+                                    InvertedIndexDetails::try_from(&params).unwrap_or_default();
+                                prost_types::Any::from_msg(&details).unwrap()
+                            }
+                            Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default())
+                                .unwrap(),
+                        }
+                    } else {
+                        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+                    }
+                }
+                Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap(),
+            },
+            Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap(),
+        }
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
