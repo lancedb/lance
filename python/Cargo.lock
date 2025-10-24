@@ -4048,7 +4048,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "roaring",
  "snafu",
  "tokio",
  "tracing",

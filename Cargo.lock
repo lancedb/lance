@@ -4619,7 +4619,6 @@ dependencies = [
  "prost-types 0.13.5",
  "protobuf-src",
  "rand 0.9.2",
- "roaring",
  "rstest",
  "snafu",
  "test-log",
