@@ -8,6 +8,7 @@ use std::{
 };
 
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrowPrimitiveType, UInt64Array};
+use arrow_buffer::ArrowNativeType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
@@ -102,7 +103,7 @@ impl ComputeStat for FixedWidthDataBlock {
         let max_len = self.bits_per_value / 8;
         let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
 
-        let cardidinality_array = if self.bits_per_value == 128 {
+        let cardidinality_array = if matches!(self.bits_per_value, 64 | 128) {
             Some(self.cardinality())
         } else {
             None
@@ -380,21 +381,28 @@ impl FixedWidthDataBlock {
         }
     }
 
+    fn compute_cardinality<T>(&mut self) -> Arc<dyn Array>
+    where
+        T: ArrowNativeType + std::hash::Hash + Eq,
+    {
+        let slice = self.data.borrow_to_typed_slice::<T>();
+        let slice = slice.as_ref();
+
+        const PRECISION: u8 = 4;
+
+        let mut hll: HyperLogLogPlus<T, RandomState> =
+            HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+        for val in slice {
+            hll.insert(val);
+        }
+        let cardinality = hll.count() as u64;
+        Arc::new(UInt64Array::from(vec![cardinality]))
+    }
+
     fn cardinality(&mut self) -> Arc<dyn Array> {
         match self.bits_per_value {
-            128 => {
-                let u128_slice_ref = self.data.borrow_to_typed_slice::<u128>();
-                let u128_slice = u128_slice_ref.as_ref();
-
-                const PRECISION: u8 = 4;
-                let mut hll: HyperLogLogPlus<u128, RandomState> =
-                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
-                for val in u128_slice {
-                    hll.insert(val);
-                }
-                let cardinality = hll.count() as u64;
-                Arc::new(UInt64Array::from(vec![cardinality]))
-            }
+            64 => self.compute_cardinality::<u64>(),
+            128 => self.compute_cardinality::<u128>(),
             _ => unreachable!(),
         }
     }
