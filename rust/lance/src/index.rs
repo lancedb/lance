@@ -1966,10 +1966,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[1]), vec![1]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 1, // merge the index with new data
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
 
@@ -1984,10 +1981,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0, 1]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats = get_stats(&dataset, "other_vec_idx").await;
@@ -2071,10 +2065,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
 
@@ -2087,10 +2078,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 2);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats: serde_json::Value =
@@ -3486,7 +3474,7 @@ mod tests {
 
             // Optimize indices
             round_cloned_dataset
-                .optimize_indices(&OptimizeOptions::default())
+                .optimize_indices(&OptimizeOptions::merge(indices_before_optimize.len()))
                 .await
                 .unwrap();
 
