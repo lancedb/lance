@@ -74,7 +74,6 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
-use crate::datafusion::index_scan::prepare_index_scan_contexts;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::wrap_json_stream_for_reading;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -1952,8 +1951,7 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
-        let index_contexts = prepare_index_scan_contexts(&plan).await?;
-        let optimizer = get_physical_optimizer(index_contexts);
+        let optimizer = get_physical_optimizer();
         let options = Default::default();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;

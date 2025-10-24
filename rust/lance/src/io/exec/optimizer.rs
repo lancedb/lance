@@ -3,10 +3,10 @@
 
 //! Lance Physical Optimizer Rules
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use super::TakeExec;
-use crate::datafusion::index_scan::{DatasetIndexScanContext, ScanIndexRule};
+use crate::datafusion::index_scan::ScanIndexRule;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},

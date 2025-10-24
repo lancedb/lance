@@ -10,22 +10,21 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
 };
 use datafusion_expr::Expr;
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     filter::FilterExec,
     metrics::ExecutionPlanMetricsSet,
+    union::UnionExec,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
-use futures::{executor::block_on, FutureExt};
+use futures::{executor::block_on, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_index::{
     metrics::MetricsCollector,
-    scalar::{
-        expression::{apply_scalar_indices, IndexedExpression, MultiQueryParser, ScalarIndexExpr},
-        registry::ScalarIndexPlugin,
-        AnyQuery, ScalarIndex,
+    scalar::expression::{
+        apply_scalar_indices, IndexedExpression, MultiQueryParser, ScalarIndexExpr,
     },
     DatasetIndexExt,
 };
@@ -171,7 +170,21 @@ impl ExecutionPlan for IndexOnlyScanExec {
             })?
             .clone();
         let batch_size = context.session_config().options().execution.batch_size;
-        let query = self.index_expr.as_ref().map(|query| query as &dyn AnyQuery);
+
+        // Extract the query from the index expression
+        // For now, we only support simple Query variants, not complex And/Or/Not expressions
+        let query_arc = match self.index_expr.as_ref() {
+            Some(lance_index::scalar::expression::ScalarIndexExpr::Query(search)) => {
+                Some(Arc::clone(&search.query))
+            }
+            Some(_) => {
+                return Err(DataFusionError::Internal(
+                    "Complex index expressions (And/Or/Not) are not yet supported for index-only scans".to_string()
+                ));
+            }
+            None => None,
+        };
+
         let deletion_mask = match index.fragment_bitmap {
             Some(bitmap) => DatasetPreFilter::create_deletion_mask(self.dataset.clone(), bitmap)
                 .map(|fut| block_in_place(|| block_on(fut)))
@@ -192,7 +205,8 @@ impl ExecutionPlan for IndexOnlyScanExec {
                 )
                 .await?;
 
-            // TODO: push down projection.s
+            // TODO: push down projection
+            let query = query_arc.as_ref().map(|q| q.as_ref());
             index
                 .scan(query, batch_size, deletion_mask, collector)?
                 .ok_or_else(|| {
@@ -204,7 +218,7 @@ impl ExecutionPlan for IndexOnlyScanExec {
         })
         .try_flatten();
 
-        let schema = stream.schema();
+        let schema = self.schema();
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream,
@@ -295,7 +309,7 @@ impl ScanIndexRule {
 
             if let Some(predicate) = predicate {
                 let parser =
-                    plugin.new_query_parser(index_metadata.name.clone(), index_details.as_ref())?;
+                    plugin.new_query_parser(index_metadata.name.clone(), &index_details.0)?;
                 let mut index_info = ScalarIndexInfo::default();
                 index_info.insert(
                     index_metadata.name.clone(),
@@ -317,6 +331,17 @@ impl ScanIndexRule {
         indexes: Vec<IndexMetadata>,
         indexed_expr: IndexedExpression,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let mut unindexed_fragments = read.dataset().fragment_bitmap.as_ref().clone();
+        for index in &indexes {
+            let index_bitmap = index.fragment_bitmap.as_ref().ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Index {} does not have fragment bitmap",
+                    index.uuid
+                ))
+            })?;
+            unindexed_fragments -= index_bitmap;
+        }
+
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(IndexOnlyScanExec::new(
             indexes[0].name.clone(),
             indexes,
@@ -326,13 +351,36 @@ impl ScanIndexRule {
         ));
 
         if let Some(expr) = indexed_expr.refine_expr {
-            let physical_expr = todo!("Create physical expression");
-            plan = Arc::new(FilterExec::try_new(physical_expr, plan))
+            // Create a planner to convert the logical expression to a physical expression
+            use crate::io::exec::Planner;
+            let planner = Planner::new(Arc::new(read.dataset().schema().into()));
+            let physical_expr = planner.create_physical_expr(&expr).map_err(|e| {
+                DataFusionError::Plan(format!("Failed to create physical expression: {}", e))
+            })?;
+            plan = Arc::new(FilterExec::try_new(physical_expr, plan)?)
         }
 
         if read.options().projection.with_row_addr {
             // Index only contains row ids, so we need to add row addr if requested
             plan = Arc::new(AddRowAddrExec::try_new(plan, read.dataset().clone(), 2)?)
+        }
+
+        if !unindexed_fragments.is_empty() {
+            let mut options = read.options().clone();
+            let unindexed_fragments = read
+                .dataset()
+                .fragments()
+                .iter()
+                .filter(|frag| unindexed_fragments.contains(frag.id as u32))
+                .cloned()
+                .collect::<Vec<_>>();
+            options.fragments = Some(Arc::new(unindexed_fragments));
+            let filtered_read = Arc::new(FilteredReadExec::try_new(
+                read.dataset().clone(),
+                options,
+                read.index_input().cloned(),
+            )?);
+            plan = Arc::new(UnionExec::new(vec![filtered_read, plan]));
         }
 
         Ok(plan)
@@ -354,9 +402,7 @@ impl PhysicalOptimizerRule for ScanIndexRule {
                     if let Some((indexes, indexed_expr)) =
                         Self::scannable_index(&read.dataset(), field_id, predicate)
                     {
-                        if let Ok(mut plan) =
-                            Self::rewrite_filtered_read(read, indexes, indexed_expr)
-                        {
+                        if let Ok(plan) = Self::rewrite_filtered_read(read, indexes, indexed_expr) {
                             return Ok(Transformed::yes(plan));
                         }
                     }
