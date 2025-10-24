@@ -3876,14 +3876,9 @@ pub mod test_dataset {
         }
 
         pub async fn make_fts_index(&mut self) -> Result<()> {
+            let params = InvertedIndexParams::default().with_position(true);
             self.dataset
-                .create_index(
-                    &["s"],
-                    IndexType::Inverted,
-                    None,
-                    &InvertedIndexParams::default(),
-                    true,
-                )
+                .create_index(&["s"], IndexType::Inverted, None, &params, true)
                 .await
         }
 
