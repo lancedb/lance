@@ -370,36 +370,27 @@ pub(crate) async fn infer_scalar_index_details(
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&inverted_list_lookup).await?
-        || dataset
-            .object_store
-            .exists(&legacy_inverted_list_lookup)
-            .await?
-    {
+    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
-        match LanceIndexStore::from_dataset_for_existing(dataset, index) {
-            Ok(index_store) => match index_store.open_index_file(METADATA_FILE).await {
-                Ok(reader) => {
-                    let metadata = reader.schema().metadata.clone();
-                    if let Some(params_str) = metadata.get("params") {
-                        match ::serde_json::from_str::<InvertedIndexParams>(params_str) {
-                            Ok(params) => {
-                                let details =
-                                    InvertedIndexDetails::try_from(&params).unwrap_or_default();
-                                prost_types::Any::from_msg(&details).unwrap()
-                            }
-                            Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default())
-                                .unwrap(),
-                        }
-                    } else {
-                        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
-                    }
-                }
-                Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap(),
-            },
-            Err(_) => prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap(),
+        let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
+
+        async {
+            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).ok()?;
+            let reader = index_store.open_index_file(METADATA_FILE).await.ok()?;
+            let params_str = reader.schema().metadata.get("params")?;
+            let params = ::serde_json::from_str::<InvertedIndexParams>(params_str).ok()?;
+            let details = InvertedIndexDetails::try_from(&params).ok()?;
+            Some(prost_types::Any::from_msg(&details).unwrap())
         }
+        .await
+        .unwrap_or(default_details)
+    } else if dataset
+        .object_store
+        .exists(&legacy_inverted_list_lookup)
+        .await?
+    {
+        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
