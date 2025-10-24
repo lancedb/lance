@@ -59,7 +59,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
+    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
@@ -2503,46 +2503,8 @@ impl Scanner {
                     .await?
             }
             FtsQuery::Phrase(query) => {
-                // Pre-check: phrase queries require indices with positions
-                let column = query.column.clone().ok_or(Error::invalid_input(
-                    "the column must be specified in the query".to_string(),
-                    location!(),
-                ))?;
-
-                let index_meta = self
-                    .dataset
-                    .load_scalar_index(
-                        ScalarIndexCriteria::default()
-                            .for_column(&column)
-                            .supports_fts(),
-                    )
+                self.plan_phrase_query(query, params, prefilter_source)
                     .await?
-                    .ok_or(Error::invalid_input(
-                        format!("No Inverted index found for column {}", column),
-                        location!(),
-                    ))?;
-
-                // Fetch index details and validate with_position
-                let details_any =
-                    crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta)
-                        .await?;
-                let details = details_any
-                    .as_ref()
-                    .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
-                if !details.with_position {
-                    return Err(Error::invalid_input(
-                        "position is not found but required for phrase queries, try recreating the index with position"
-                            .to_string(),
-                        location!(),
-                    ));
-                }
-
-                Arc::new(PhraseQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                ))
             }
 
             FtsQuery::Boost(query) => {
@@ -2724,6 +2686,51 @@ impl Scanner {
         };
 
         Ok(plan)
+    }
+
+    async fn plan_phrase_query(
+        &self,
+        query: &PhraseQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query.column.clone().ok_or(Error::invalid_input(
+            "the column must be specified in the query".to_string(),
+            location!(),
+        ))?;
+
+        let index_meta = self
+            .dataset
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts(),
+            )
+            .await?
+            .ok_or(Error::invalid_input(
+                format!("No Inverted index found for column {}", column),
+                location!(),
+            ))?;
+
+        let details_any =
+            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
+        let details = details_any
+            .as_ref()
+            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
+        if !details.with_position {
+            return Err(Error::invalid_input(
+                "position is not found but required for phrase queries, try recreating the index with position"
+                    .to_string(),
+                location!(),
+            ));
+        }
+
+        Ok(Arc::new(PhraseQueryExec::new(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+        )))
     }
 
     async fn plan_match_query(
