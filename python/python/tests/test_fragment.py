@@ -514,3 +514,282 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_fragment_update_columns_basic(tmp_path):
+    """Test basic fragment update columns functionality."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "name": ["Alice", "Bob", "Charlie", "David"],
+            "value": [10, 20, 30, 40],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_basic"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Prepare update data with _rowid (must be UInt64 to match Lance's internal type)
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "name": ["Alice_Updated", "Charlie_Updated"],
+            "value": [100, 300],
+        }
+    )
+
+    # Get the fragment and update columns
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    # Verify fields_modified is returned
+    assert isinstance(fields_modified, list)
+    assert len(fields_modified) > 0
+
+    # Commit the changes using Update operation
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # Verify the update
+    result = updated_dataset.to_table().to_pydict()
+    assert result["name"] == ["Alice_Updated", "Bob", "Charlie_Updated", "David"]
+    assert result["value"] == [100, 20, 300, 40]
+    assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
+
+
+def test_fragment_update_columns_with_custom_join_key(tmp_path):
+    """Test fragment update columns with custom join key."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "name": ["Alice", "Bob", "Charlie", "David"],
+            "score": [85, 90, 75, 80],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_custom_join_key"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Prepare update data using 'id' as join key
+    # Note: We only update 'score', not 'id' itself
+    update_data = pa.table(
+        {
+            "id": [1, 3],
+            "name": ["Alan", "Chase"],
+            "score": [95, 85],
+        }
+    )
+
+    # Get the fragment and update columns
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        update_data, left_on="id", right_on="id"
+    )
+
+    # Commit the changes
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # Verify the update
+    result = updated_dataset.to_table().to_pydict()
+    assert result["score"][0] == 95  # id=1 should have score 95
+    assert result["score"][2] == 85  # id=3 should have score 85
+    assert result["name"][0] == "Alan"  # id=1 should have name Alan
+    assert result["name"][2] == "Chase"  # id=3 should have name Chase
+
+
+def test_fragment_update_columns_with_nulls(tmp_path):
+    """Test fragment update columns with null values."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "name": ["Alice", "Bob", "Charlie", "David"],
+            "optional_field": ["A", "B", "C", "D"],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_nulls"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Prepare update data with null values
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([1, 3], type=pa.uint64()),
+            "optional_field": [None, "D_Updated"],
+        }
+    )
+
+    # Get the fragment and update columns
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    # Commit the changes
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # Verify the update
+    result = updated_dataset.to_table().to_pydict()
+    assert result["optional_field"] == ["A", None, "C", "D_Updated"]
+
+
+def test_fragment_update_columns_partial_update(tmp_path):
+    """Test updating only some columns."""
+    # Create initial dataset with multiple columns
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "name": ["Alice", "Bob", "Charlie"],
+            "age": [25, 30, 35],
+            "city": ["NYC", "LA", "SF"],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_partial_update"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Update only 'age' column, leaving 'name' and 'city' unchanged
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "age": [26, 36],
+        }
+    )
+
+    # Get the fragment and update columns
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    # Commit the changes
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # Verify only age was updated
+    result = updated_dataset.to_table().to_pydict()
+    assert result["age"] == [26, 30, 36]
+    assert result["name"] == ["Alice", "Bob", "Charlie"]  # Unchanged
+    assert result["city"] == ["NYC", "LA", "SF"]  # Unchanged
+
+
+def test_fragment_update_columns_no_match(tmp_path):
+    """Test update when no rows match the join condition."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "value": [10, 20, 30],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_no_match"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Update data with non-existent _rowid
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(
+                [100, 200], type=pa.uint64()
+            ),  # These rowids don't exist
+            "value": [999, 888],
+        }
+    )
+
+    # Get the fragment and update columns
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    # Commit the changes
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # Verify nothing was updated (fallback to original values)
+    result = updated_dataset.to_table().to_pydict()
+    assert result["value"] == [10, 20, 30]  # Unchanged
+
+
+def test_fragment_update_columns_error_on_nonexistent_column(tmp_path):
+    """Test that updating a non-existent column raises an error."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "value": [10, 20, 30],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_error_on_nonexistent_column"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Try to update a column that doesn't exist
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 1], type=pa.uint64()),
+            "nonexistent_column": [100, 200],
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+
+    # Should raise an error
+    with pytest.raises(Exception) as exc_info:
+        fragment.update_columns(update_data)
+
+    assert "does not exist" in str(exc_info.value).lower()
+
+
+def test_fragment_update_columns_error_on_metadata_column(tmp_path):
+    """Test that updating metadata columns raises an error."""
+    # Create initial dataset
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "value": [10, 20, 30],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_error_on_metadata_column"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Try to update _rowid column (metadata column)
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 1], type=pa.uint64()),
+            "_rowaddr": pa.array([999, 888], type=pa.uint64()),  # This should fail
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+
+    # Should raise an error
+    with pytest.raises(Exception) as exc_info:
+        fragment.update_columns(update_data)
+
+    assert (
+        "metadata column" in str(exc_info.value).lower()
+        or "cannot be updated" in str(exc_info.value).lower()
+    )
