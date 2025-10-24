@@ -89,14 +89,24 @@ impl BlockingDataset {
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> Result<Self> {
+        let mut store_params = ObjectStoreParams {
+            block_size: block_size.map(|size| size as usize),
+            storage_options: Some(storage_options.clone()),
+            ..Default::default()
+        };
+        if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
+            store_params.s3_credentials_refresh_offset =
+                std::time::Duration::from_secs(offset_seconds);
+        }
+        if let Some(provider) = storage_options_provider.clone() {
+            store_params.storage_options_provider = Some(provider);
+        }
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
             metadata_cache_size_bytes: metadata_cache_size_bytes as usize,
-            store_options: Some(ObjectStoreParams {
-                block_size: block_size.map(|size| size as usize),
-                ..Default::default()
-            }),
+            store_options: Some(store_params),
             ..Default::default()
         };
 
@@ -106,13 +116,15 @@ impl BlockingDataset {
             builder = builder.with_version(ver as u64);
         }
         builder = builder.with_storage_options(storage_options);
+        if let Some(provider) = storage_options_provider {
+            builder = builder.with_storage_options_provider(provider)
+        }
+        if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
+            builder = builder.with_s3_credentials_refresh_offset(std::time::Duration::from_secs(offset_seconds));
+        }
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
-        }
-
-        if let Some(provider) = storage_options_provider {
-            builder = builder.with_storage_options_provider(provider);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -703,9 +715,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject, // Map<String, String>
-    serialized_manifest: JObject, // Optional<ByteBuffer>
+    storage_options_obj: JObject,          // Map<String, String>
+    serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -718,7 +731,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             metadata_cache_size_bytes,
             storage_options_obj,
             serialized_manifest,
-            storage_options_provider_obj
+            storage_options_provider_obj,
+            s3_credentials_refresh_offset_seconds_obj
         )
     )
 }
@@ -734,6 +748,7 @@ fn inner_open_native<'local>(
     storage_options_obj: JObject,          // Map<String, String>
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
@@ -768,6 +783,35 @@ fn inner_open_native<'local>(
     let storage_options_provider_arc =
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
+    // Extract s3_credentials_refresh_offset_seconds
+    let s3_credentials_refresh_offset_seconds =
+        if !s3_credentials_refresh_offset_seconds_obj.is_null() {
+            let is_present = env
+                .call_method(
+                    &s3_credentials_refresh_offset_seconds_obj,
+                    "isPresent",
+                    "()Z",
+                    &[],
+                )?
+                .z()?;
+            if is_present {
+                let value = env
+                    .call_method(
+                        &s3_credentials_refresh_offset_seconds_obj,
+                        "get",
+                        "()Ljava/lang/Object;",
+                        &[],
+                    )?
+                    .l()?;
+                let long_value = env.call_method(&value, "longValue", "()J", &[])?.j()?;
+                Some(long_value as u64)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
         &path_str,
@@ -778,6 +822,7 @@ fn inner_open_native<'local>(
         storage_options,
         serialized_manifest,
         storage_options_provider_arc,
+        s3_credentials_refresh_offset_seconds,
     )?;
     dataset.into_java(env)
 }

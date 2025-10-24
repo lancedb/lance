@@ -222,7 +222,8 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider());
+            options.getStorageOptionsProvider(),
+            options.getS3CredentialsRefreshOffsetSeconds());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -236,7 +237,8 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider);
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
 
   /**
    * Creates a builder for opening a dataset from a LanceNamespace.

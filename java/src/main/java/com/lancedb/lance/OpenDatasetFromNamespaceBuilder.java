@@ -93,7 +93,7 @@ public class OpenDatasetFromNamespaceBuilder {
    * @param options Read options
    * @return this builder instance
    */
-  public OpenDatasetFromNamespaceBuilder options(ReadOptions options) {
+  public OpenDatasetFromNamespaceBuilder readOptions(ReadOptions options) {
     this.options = options;
     return this;
   }
@@ -165,6 +165,9 @@ public class OpenDatasetFromNamespaceBuilder {
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
+    options
+        .getS3CredentialsRefreshOffsetSeconds()
+        .ifPresent(optionsBuilder::setS3CredentialsRefreshOffsetSeconds);
 
     // Add initial storage options from describe_table response if present
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());

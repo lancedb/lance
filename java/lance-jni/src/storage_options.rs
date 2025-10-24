@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
-use lance_io::object_store::{StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY};
+use lance_io::object_store::StorageOptionsProvider;
 
 use crate::error::Result;
 

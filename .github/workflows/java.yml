@@ -56,6 +56,21 @@ jobs:
       matrix:
         java-version: [8, 11, 17]
     name: Build and Test with Java ${{ matrix.java-version }}
+    services:
+      localstack:
+        image: localstack/localstack:4.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,dynamodb,kms
+          AWS_ACCESS_KEY_ID: ACCESS_KEY
+          AWS_SECRET_ACCESS_KEY: SECRET_KEY
+        options: >-
+          --health-cmd "curl -s http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 3
+          --health-start-period 10s
     steps:
       - name: Install dependencies
         run: |
@@ -87,5 +102,7 @@ jobs:
           mvn spotless:check
       - name: Running tests with Java ${{ matrix.java-version }}
         working-directory: java
+        env:
+          LANCE_INTEGRATION_TEST: "1"
         run: |
           mvn install
