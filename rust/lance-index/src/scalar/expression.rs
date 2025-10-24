@@ -57,7 +57,7 @@ const MAX_DEPTH: usize = 500;
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
     pub scalar_query: Option<ScalarIndexExpr>,

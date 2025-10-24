@@ -3,9 +3,10 @@
 
 //! Lance Physical Optimizer Rules
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use super::TakeExec;
+use crate::datafusion::index_scan::{DatasetIndexScanContext, ScanIndexRule};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
@@ -169,10 +170,15 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 }
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
-    PhysicalOptimizer::with_rules(vec![
-        Arc::new(crate::io::exec::optimizer::CoalesceTake),
-        Arc::new(crate::io::exec::optimizer::SimplifyProjection),
-        // Push down limit into FilteredReadExec and other Execs via with_fetch()
-        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
-    ])
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = Vec::new();
+    rules.push(Arc::new(crate::io::exec::optimizer::CoalesceTake)
+        as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+    rules.push(Arc::new(crate::io::exec::optimizer::SimplifyProjection)
+        as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+    rules.push(Arc::new(ScanIndexRule) as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+    rules.push(
+        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new())
+            as Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    );
+    PhysicalOptimizer::with_rules(rules)
 }

@@ -155,6 +155,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<ScalarIndexPluginRegistry>) {}
+
+    /// Supports scanning back original data
+    fn supports_scan(&self) -> bool {
+        true
+    }
 }
 
 /// A registry of scalar index plugins
