@@ -2364,6 +2364,7 @@ pub fn flat_bm25_search(
     query_tokens: &HashSet<String>,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     scorer: &mut MemBM25Scorer,
+    schema: SchemaRef,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
@@ -2401,7 +2402,7 @@ pub fn flat_bm25_search(
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
         .try_with_column(SCORE_FIELD.clone(), score_col)?
-        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
+        .project_by_schema(&schema)?;
     Ok(batch)
 }
 
@@ -2410,6 +2411,7 @@ pub fn flat_bm25_search_stream(
     doc_col: String,
     query: String,
     index: &Option<InvertedIndex>,
+    schema: SchemaRef,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
@@ -2447,10 +2449,18 @@ pub fn flat_bm25_search_stream(
         None => MemBM25Scorer::new(0, 0, HashMap::new()),
     };
 
+    let batch_schema = schema.clone();
     let stream = input.map(move |batch| {
         let batch = batch?;
 
-        let batch = flat_bm25_search(batch, &doc_col, &tokens, &mut tokenizer, &mut bm25_scorer)?;
+        let batch = flat_bm25_search(
+            batch,
+            &doc_col,
+            &tokens,
+            &mut tokenizer,
+            &mut bm25_scorer,
+            batch_schema.clone(),
+        )?;
 
         // filter out rows with score 0
         let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
@@ -2464,7 +2474,7 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
