@@ -10,5 +10,5 @@ Use the makefile for most actions:
 
 If you want to run python tests after changes to the rust code, you need first build the rust code by:
 ```
-maturin develop --profile release-with-debug
+maturin develop
 ```
