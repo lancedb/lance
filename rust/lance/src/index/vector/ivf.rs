@@ -1444,14 +1444,14 @@ impl RemapPageTask {
             .expect("Generic index writing not supported yet");
         ivf.offsets.push(writer.tell().await?);
         ivf.lengths
-            .push(page.row_ids.as_ref().unwrap().len() as u32);
+            .push(page.row_addrs.as_ref().unwrap().len() as u32);
         let original_pq = transpose(
             page.code.as_ref().unwrap(),
             page.pq.code_dim(),
-            page.row_ids.as_ref().unwrap().len(),
+            page.row_addrs.as_ref().unwrap().len(),
         );
         PlainEncoder::write(writer, &[&original_pq]).await?;
-        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
+        PlainEncoder::write(writer, &[page.row_addrs.as_ref().unwrap().as_ref()]).await?;
         Ok(())
     }
 }

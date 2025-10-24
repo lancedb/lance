@@ -27,7 +27,7 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
-/// A flat index is just a batch of value/row-id pairs
+/// A flat index is just a batch of value/row-addr pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
 /// the values.  The second column "row_addrs" contains the row ids

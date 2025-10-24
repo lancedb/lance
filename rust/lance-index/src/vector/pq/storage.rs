@@ -402,7 +402,7 @@ impl ProductQuantizationStorage {
         self.batch.schema()
     }
 
-    pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
+    pub fn get_row_addrs(&self, ids: &[u32]) -> Vec<u64> {
         ids.iter()
             .map(|&id| self.row_addrs.value(id as usize))
             .collect()

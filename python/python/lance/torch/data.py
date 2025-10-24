@@ -221,6 +221,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
+        with_row_address : bool, optional
+            If set true, the returned batch will have an additional column named
+            `_rowaddr` that contains the row address of the batch.
         rank: int, optional (deprecated)
             If set, the rank (idx) of this process in distributed training / inference.
         world_size: int, optional (deprecated)

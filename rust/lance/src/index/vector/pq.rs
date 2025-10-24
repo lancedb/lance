@@ -62,8 +62,8 @@ pub struct PQIndex {
     /// call `Self::get_pq_codes` to get the PQ code for a specific vector.
     pub code: Option<Arc<UInt8Array>>,
 
-    /// ROW Id used to refer to the actual row in dataset.
-    pub row_ids: Option<Arc<UInt64Array>>,
+    /// ROW addr used to refer to the actual row in dataset.
+    pub row_addrs: Option<Arc<UInt64Array>>,
 
     /// Metric type.
     metric_type: MetricType,
@@ -80,7 +80,7 @@ impl DeepSizeOf for PQIndex {
                 .map(|code| code.get_array_memory_size())
                 .unwrap_or(0)
             + self
-                .row_ids
+                .row_addrs
                 .as_ref()
                 .map(|row_ids| row_ids.get_array_memory_size())
                 .unwrap_or(0)
@@ -108,7 +108,7 @@ impl PQIndex {
     ) -> Self {
         Self {
             code: None,
-            row_ids: None,
+            row_addrs: None,
             pq,
             metric_type,
             frag_reuse_index,
@@ -193,7 +193,7 @@ impl Index for PQIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        if let Some(row_ids) = &self.row_ids {
+        if let Some(row_ids) = &self.row_addrs {
             let mut frag_ids = row_ids
                 .values()
                 .iter()
@@ -222,7 +222,7 @@ impl VectorIndex for PQIndex {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if self.code.is_none() || self.row_ids.is_none() {
+        if self.code.is_none() || self.row_addrs.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
                 location: location!(),
@@ -231,7 +231,7 @@ impl VectorIndex for PQIndex {
         pre_filter.wait_for_ready().await?;
 
         let code = self.code.as_ref().unwrap().clone();
-        let row_ids = self.row_ids.as_ref().unwrap().clone();
+        let row_ids = self.row_addrs.as_ref().unwrap().clone();
 
         metrics.record_comparisons(row_ids.len());
 
@@ -381,7 +381,7 @@ impl VectorIndex for PQIndex {
 
         Ok(Box::new(Self {
             code: Some(transposed_pq_codes),
-            row_ids: Some(primitive_row_ids),
+            row_addrs: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
             frag_reuse_index: self.frag_reuse_index.clone(),
@@ -389,7 +389,7 @@ impl VectorIndex for PQIndex {
     }
 
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
-        let row_ids = self.row_ids.clone().ok_or(Error::Index {
+        let row_ids = self.row_addrs.clone().ok_or(Error::Index {
             message: "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
             location: location!(),
         })?;
@@ -426,7 +426,7 @@ impl VectorIndex for PQIndex {
     }
 
     fn num_rows(&self) -> u64 {
-        self.row_ids
+        self.row_addrs
             .as_ref()
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
@@ -436,8 +436,8 @@ impl VectorIndex for PQIndex {
     }
 
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let num_vectors = self.row_ids.as_ref().unwrap().len();
-        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let num_vectors = self.row_addrs.as_ref().unwrap().len();
+        let row_ids = self.row_addrs.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
             .enumerate()
@@ -454,7 +454,7 @@ impl VectorIndex for PQIndex {
             })
             .collect::<Vec<_>>();
 
-        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+        self.row_addrs = Some(Arc::new(UInt64Array::from_iter_values(
             remapped.iter().map(|(row_id, _)| *row_id),
         )));
 
@@ -462,7 +462,7 @@ impl VectorIndex for PQIndex {
             UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
         let transposed_codes = transpose(
             &pq_codes,
-            self.row_ids.as_ref().unwrap().len(),
+            self.row_addrs.as_ref().unwrap().len(),
             self.pq.num_sub_vectors,
         );
         self.code = Some(Arc::new(transposed_codes));

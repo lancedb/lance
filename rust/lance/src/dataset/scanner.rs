@@ -3584,7 +3584,6 @@ impl Scanner {
             "prefilter is a filtered read of {} fragments",
             fragments.len()
         );
-
         let PlannedFilteredScan { plan, .. } = self
             .filtered_read(
                 filter_plan,

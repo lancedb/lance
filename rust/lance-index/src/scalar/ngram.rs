@@ -38,8 +38,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::Result;
-use lance_core::{utils::mask::RowIdTreeMap, Error, ROW_ADDR};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result, ROW_ADDR};
 use lance_io::object_store::ObjectStore;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -844,22 +843,22 @@ impl NGramIndexBuilder {
         num_workers: usize,
     ) -> Result<Vec<Vec<(u32, u64)>>> {
         let text_iter = iter_str_array(batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?);
-        let row_id_col = batch
+        let row_addr_col = batch
             .column_by_name(ROW_ADDR)
             .expect_ok()?
             .as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
         let mut partitions = vec![Vec::with_capacity(batch.num_rows() * 1000); num_workers];
         let divisor = (MAX_TOKEN - MIN_TOKEN) / num_workers;
-        for (text, row_id) in text_iter.zip(row_id_col.values()) {
+        for (text, row_addr) in text_iter.zip(row_addr_col.values()) {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
                     let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
-                    partitions[partition_id % num_workers].push((token, *row_id));
+                    partitions[partition_id % num_workers].push((token, *row_addr));
                 });
             } else {
-                partitions[0].push((0, *row_id));
+                partitions[0].push((0, *row_addr));
             }
         }
         Ok(partitions)

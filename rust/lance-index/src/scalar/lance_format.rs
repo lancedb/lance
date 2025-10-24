@@ -1453,7 +1453,7 @@ pub mod tests {
                 assert!(result.is_exact());
                 let row_ids = result.row_ids();
 
-                let row_ids_set = row_ids
+                let row_addrs_set = row_ids
                     .row_addrs()
                     .unwrap()
                     .map(u64::from)
@@ -1468,7 +1468,7 @@ pub mod tests {
                     let list = list.unwrap();
                     let row_id = row_id.unwrap();
                     let vals = list.as_primitive::<UInt8Type>().values();
-                    if row_ids_set.contains(&row_id) {
+                    if row_addrs_set.contains(&row_id) {
                         assert!(match_fn(vals));
                     } else {
                         assert!(no_match_fn(vals));

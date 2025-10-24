@@ -765,9 +765,9 @@ impl FilteredReadStream {
 
     /// Extract row address offsets for the given fragment from a RowIdMask (if iterable)
     fn mask_offsets_for_fragment(mask: &RowIdMask, fragment_id: u32) -> Option<Vec<u64>> {
-        if let Some(ids_iter) = mask.iter_ids() {
+        if let Some(addrs_iter) = mask.iter_addrs() {
             let mut offsets = Vec::new();
-            for addr in ids_iter {
+            for addr in addrs_iter {
                 if addr.fragment_id() == fragment_id {
                     offsets.push(addr.row_offset() as u64);
                 }

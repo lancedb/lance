@@ -71,7 +71,6 @@ impl DatasetPreFilter {
             Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
-
         Self {
             deleted_ids,
             filtered_ids,

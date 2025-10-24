@@ -135,11 +135,11 @@ impl IvfSubIndex for FlatIndex {
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_addrs.enumerate() {
-                        if !selected_set.contains(&(id as u64)) {
+                    for (idx, &row_addr) in row_addrs.enumerate() {
+                        if !selected_set.contains(&(idx as u64)) {
                             continue;
                         }
-                        let dist = dist_calc.distance(id as u32).into();
+                        let dist = dist_calc.distance(idx as u32).into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
@@ -152,12 +152,12 @@ impl IvfSubIndex for FlatIndex {
                         }
                     }
                 } else {
-                    for (id, &row_addr) in row_addrs.enumerate() {
-                        if !selected_set.contains(&(id as u64)) {
+                    for (idx, &row_addr) in row_addrs.enumerate() {
+                        if !selected_set.contains(&(idx as u64)) {
                             continue;
                         }
 
-                        let dist = dist_calc.distance(id as u32).into();
+                        let dist = dist_calc.distance(idx as u32).into();
                         if res.len() < k {
                             res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {

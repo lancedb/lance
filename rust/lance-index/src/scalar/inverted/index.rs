@@ -44,10 +44,9 @@ use lance_core::utils::{
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{
-    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, ROW_ADDR,
-    ROW_ADDR_FIELD,
+    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
+    ROW_ADDR, ROW_ADDR_FIELD,
 };
-use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;

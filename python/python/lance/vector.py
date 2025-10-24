@@ -489,7 +489,7 @@ def compute_partitions(
         progress.set_description("Assigning partitions")
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
-        id_offset = 0
+        addr_offset = 0
         with torch.no_grad():
             for batch in loader:
                 if sample_size is None:
@@ -498,8 +498,8 @@ def compute_partitions(
                 else:
                     # No row addrs with sampling
                     vecs = batch
-                    addrs = torch.arange(id_offset, id_offset + vecs.size(0))
-                    id_offset += vecs.size(0)
+                    addrs = torch.arange(addr_offset, addr_offset + vecs.size(0))
+                    addr_offset += vecs.size(0)
 
                 vecs = vecs.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
 

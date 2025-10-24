@@ -670,12 +670,12 @@ impl BitmapIndexPlugin {
             let row_addrs = batch.column_by_name(ROW_ADDR).expect_ok()?;
             debug_assert_eq!(row_addrs.data_type(), &DataType::UInt64);
 
-            let row_id_column = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let row_addr_column = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
 
             for i in 0..values.len() {
-                let row_id = row_id_column.value(i);
+                let row_addr = row_addr_column.value(i);
                 let key = ScalarValue::try_from_array(values.as_ref(), i)?;
-                state.entry(key.clone()).or_default().insert(row_id);
+                state.entry(key.clone()).or_default().insert(row_addr);
             }
         }
 

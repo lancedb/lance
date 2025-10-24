@@ -51,14 +51,14 @@ use crate::Result;
 static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
     LazyLock::new(get_num_compute_intensive_cpus);
 
-/// Merge streams with the same partition id and collect PQ codes and row IDs.
+/// Merge streams with the same partition id and collect PQ codes and row addrs.
 async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
     new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
     code_column: Option<&str>,
     code_array: &mut Vec<Arc<dyn Array>>,
-    row_id_array: &mut Vec<Arc<dyn Array>>,
+    row_addr_array: &mut Vec<Arc<dyn Array>>,
 ) -> Result<()> {
     while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
         if stream_part_id != part_id {
@@ -83,14 +83,14 @@ async fn merge_streams(
             }
         };
 
-        let row_ids: Arc<dyn Array> = Arc::new(
+        let row_addrs: Arc<dyn Array> = Arc::new(
             batch
                 .column_by_name(ROW_ADDR)
                 .expect("row addr column not found")
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
-        row_id_array.push(row_ids);
+        row_addr_array.push(row_addrs);
 
         if let Some(column) = code_column {
             let codes = Arc::new(
@@ -184,7 +184,7 @@ pub(super) async fn write_pq_partitions(
     for part_id in 0..ivf.num_partitions() as u32 {
         let start = Instant::now();
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
-        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_addr_array: Vec<Arc<dyn Array>> = vec![];
 
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
@@ -213,7 +213,7 @@ pub(super) async fn write_pq_partitions(
                         .unwrap(),
                     );
                     pq_array.push(fsl);
-                    row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
+                    row_addr_array.push(pq_index.row_addrs.as_ref().unwrap().clone());
                 }
             }
         }
@@ -225,17 +225,20 @@ pub(super) async fn write_pq_partitions(
             part_id,
             Some(PQ_CODE_COLUMN),
             &mut pq_array,
-            &mut row_id_array,
+            &mut row_addr_array,
         )
         .await?;
 
-        let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        let total_records = row_addr_array.iter().map(|a| a.len()).sum::<usize>();
         ivf.add_partition_with_offset(writer.tell().await?, total_records as u32);
         if total_records > 0 {
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, &pq_refs).await?;
 
-            let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            let row_ids_refs = row_addr_array
+                .iter()
+                .map(|a| a.as_ref())
+                .collect::<Vec<_>>();
             PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
         }
         log::info!(
