@@ -9529,4 +9529,38 @@ mod tests {
         // Should have both data writes (10 rows total)
         assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
     }
+
+    #[tokio::test]
+    async fn test_auto_infer_lance_tokenizer() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col. Expect auto-infer 'json' for lance tokenizer.
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query succeed only when lance tokenizer is 'json'
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,once".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+    }
 }

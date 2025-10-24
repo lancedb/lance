@@ -2369,6 +2369,7 @@ class LanceDataset(pa.dataset.Dataset):
             field = lance_field.to_arrow()
 
             field_type = field.type
+            field_meta = field.metadata
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
@@ -2397,12 +2398,17 @@ class LanceDataset(pa.dataset.Dataset):
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
-                if not pa.types.is_string(value_type) and not pa.types.is_large_string(
-                    value_type
+                if (
+                    not pa.types.is_string(value_type)
+                    and not pa.types.is_large_string(value_type)
+                    and not (
+                        pa.types.is_large_binary(value_type)
+                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
+                    )
                 ):
                     raise TypeError(
                         f"INVERTED index column {column} must be string, large string"
-                        " or list of strings, but got {value_type}"
+                        f" or list of strings, or json, but got {value_type}"
                     )
 
             if pa.types.is_duration(field_type):

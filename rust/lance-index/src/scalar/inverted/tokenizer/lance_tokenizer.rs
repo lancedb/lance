@@ -1,9 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_schema::{DataType, Field};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use serde_json::Value;
 use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
+
+/// Document type for full text search.
+pub enum DocType {
+    Text,
+    Json,
+}
+
+impl AsRef<str> for DocType {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl TryFrom<&Field> for DocType {
+    type Error = lance_core::Error;
+
+    fn try_from(field: &Field) -> Result<Self, Self::Error> {
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
+            DataType::List(field) | DataType::LargeList(field)
+                if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                Ok(Self::Text)
+            }
+            DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
+                Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
+                _ => Err(lance_core::Error::InvalidInput {
+                    source: format!("field {} is not json", field.name()).into(),
+                    location: location!(),
+                }),
+            },
+            _ => Err(lance_core::Error::InvalidInput {
+                source: format!("field {} is not json", field.name()).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
 
 /// Lance full text search tokenizer.
 ///
