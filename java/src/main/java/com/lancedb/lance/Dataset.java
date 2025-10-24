@@ -957,30 +957,17 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Checkout using a unified {@link Reference} which can be a tag or a branch/version.
+   * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
+   * specified (branch_name, version_number).
    *
-   * @param reference the checkout reference
+   * @param ref the checkout reference
    * @return a new Dataset instance checked out to the specified reference
    */
-  public Dataset checkout(Reference reference) {
-    Preconditions.checkNotNull(reference);
+  public Dataset checkout(Ref ref) {
+    Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCheckoutReference(reference);
-    }
-  }
-
-  /**
-   * Checkout the latest version of a branch.
-   *
-   * @param branch branch name
-   * @return a new Dataset instance checked out to the branch's latest version
-   */
-  public Dataset checkoutBranch(String branch) {
-    Preconditions.checkArgument(branch != null, "Branch cannot be null");
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCheckoutBranch(branch);
+      return nativeCheckout(ref);
     }
   }
 
@@ -1225,9 +1212,7 @@ public class Dataset implements Closeable {
   private native long nativeGetVersionByTag(String tag);
 
   // ===== Branch native methods =====
-  private native Dataset nativeCheckoutReference(Reference reference);
-
-  private native Dataset nativeCheckoutBranch(String branch);
+  private native Dataset nativeCheckout(Ref ref);
 
   private native Dataset nativeCreateBranch(
       String branch, long versionNumber, Optional<String> sourceBranch);
@@ -1238,8 +1223,8 @@ public class Dataset implements Closeable {
 
   private native List<Branch> nativeListBranches();
 
-  public Dataset shallowClone(String targetPath, Reference version) {
-    return shallowClone(targetPath, version, null);
+  public Dataset shallowClone(String targetPath, Ref ref) {
+    return shallowClone(targetPath, ref, null);
   }
 
   /**
@@ -1249,19 +1234,17 @@ public class Dataset implements Closeable {
    * copying them. Only metadata is written at the destination.
    *
    * @param targetPath the URI to clone the dataset into
-   * @param reference the referred version of the current dataset
+   * @param ref the referred version of the current dataset
    * @param storageOptions Optional object store options for the destination dataset; empty uses
    *     default store parameters
    * @return a new Dataset instance at the target path
    */
-  public Dataset shallowClone(
-      String targetPath, Reference reference, Map<String, String> storageOptions) {
+  public Dataset shallowClone(String targetPath, Ref ref, Map<String, String> storageOptions) {
     Preconditions.checkArgument(targetPath != null, "Target path can not be null");
-    Preconditions.checkArgument(reference != null, "globalVersion can not be null");
+    Preconditions.checkArgument(ref != null, "globalVersion can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset =
-          nativeShallowClone(targetPath, reference, Optional.ofNullable(storageOptions));
+      Dataset newDataset = nativeShallowClone(targetPath, ref, Optional.ofNullable(storageOptions));
       if (selfManagedAllocator) {
         newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -1272,5 +1255,5 @@ public class Dataset implements Closeable {
   }
 
   private native Dataset nativeShallowClone(
-      String targetPath, Reference reference, Optional<Map<String, String>> storageOptions);
+      String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 }

@@ -1412,7 +1412,7 @@ public class DatasetTest {
         Schema srcSchema = src.getSchema();
 
         // shallow clone by version
-        try (Dataset clone = src.shallowClone(dstPathByVersion, Reference.ofMain(src.version()))) {
+        try (Dataset clone = src.shallowClone(dstPathByVersion, Ref.ofMain(src.version()))) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());
@@ -1430,7 +1430,7 @@ public class DatasetTest {
 
         // shallow clone by tag
         src.tags().create("tag", src.version());
-        try (Dataset clone = src.shallowClone(dstPathByTag, Reference.ofTag("tag"))) {
+        try (Dataset clone = src.shallowClone(dstPathByTag, Ref.ofTag("tag"))) {
           // Validate the tag cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByTag, clone.uri());
@@ -1490,8 +1490,9 @@ public class DatasetTest {
                   assertEquals(4, branch2V4.version());
                   assertEquals(10, branch2V4.countRows()); // A(5) + B(3) + C(2)
 
-                  // Step 5. Validate branch listing metadata; delete branch1; validate listing
-                  // again
+                  // Step 5. Validate branch listing metadata;
+                  // delete branch1;
+                  // validate listing again
                   List<Branch> branches = branch2V4.branches().list();
                   Optional<Branch> b1 =
                       branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
@@ -1505,14 +1506,13 @@ public class DatasetTest {
                   // Metadata fields and consistency checks
                   assertEquals("branch1", branch1Meta.getName());
                   assertEquals(2, branch1Meta.getParentVersion());
-                  assertTrue(
-                      branch1Meta.getParentBranch() == null
-                          || branch1Meta.getParentBranch().isEmpty()); // main branch is null
+                  assertFalse(branch1Meta.getParentBranch().isPresent());
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
 
                   assertEquals("branch2", branch2Meta.getName());
-                  assertEquals("branch1", branch2Meta.getParentBranch());
+                  assertTrue(branch2Meta.getParentBranch().isPresent());
+                  assertEquals("branch1", branch2Meta.getParentBranch().get());
                   assertEquals(3, branch2Meta.getParentVersion());
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
@@ -1536,15 +1536,15 @@ public class DatasetTest {
                   assertEquals(branch2Meta, branch2AfterDelete.get());
 
                   // Step 6. use checkout_branch to checkout branch2
-                  try (Dataset branch2V4New = mainV2.checkoutBranch("branch2")) {
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2"))) {
                     assertEquals(4, branch2V4New.version());
                     assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
                   }
 
                   // Step 7. use checkout reference to checkout branch2
-                  try (Dataset branch2V4New = mainV2.checkout(Reference.ofBranch("branch2", 4))) {
-                    assertEquals(4, branch2V4New.version());
-                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2", 3))) {
+                    assertEquals(3, branch2V4New.version());
+                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
                   }
                 }
               }

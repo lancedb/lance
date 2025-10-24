@@ -17,14 +17,13 @@ import com.google.common.base.MoreObjects;
 
 import java.util.Optional;
 
-public class Reference {
+public class Ref {
 
   private final Optional<Long> versionNumber;
   private final Optional<String> branchName;
   private final Optional<String> tagName;
 
-  public Reference(
-      Optional<Long> versionNumber, Optional<String> branchName, Optional<String> tagName) {
+  public Ref(Optional<Long> versionNumber, Optional<String> branchName, Optional<String> tagName) {
     this.versionNumber = versionNumber;
     this.branchName = branchName;
     this.tagName = tagName;
@@ -42,24 +41,24 @@ public class Reference {
     return tagName;
   }
 
-  public static Reference ofMain(long versionNumber) {
-    return new Reference(Optional.of(versionNumber), Optional.empty(), Optional.empty());
+  public static Ref ofMain(long versionNumber) {
+    return new Ref(Optional.of(versionNumber), Optional.empty(), Optional.empty());
   }
 
-  public static Reference ofMain() {
-    return new Reference(Optional.empty(), Optional.empty(), Optional.empty());
+  public static Ref ofMain() {
+    return new Ref(Optional.empty(), Optional.empty(), Optional.empty());
   }
 
-  public static Reference ofBranch(String branchName) {
-    return new Reference(Optional.empty(), Optional.of(branchName), Optional.empty());
+  public static Ref ofBranch(String branchName) {
+    return new Ref(Optional.empty(), Optional.of(branchName), Optional.empty());
   }
 
-  public static Reference ofBranch(String branchName, long versionNumber) {
-    return new Reference(Optional.of(versionNumber), Optional.of(branchName), Optional.empty());
+  public static Ref ofBranch(String branchName, long versionNumber) {
+    return new Ref(Optional.of(versionNumber), Optional.of(branchName), Optional.empty());
   }
 
-  public static Reference ofTag(String tagName) {
-    return new Reference(Optional.empty(), Optional.empty(), Optional.of(tagName));
+  public static Ref ofTag(String tagName) {
+    return new Ref(Optional.empty(), Optional.empty(), Optional.of(tagName));
   }
 
   @Override

@@ -1946,59 +1946,41 @@ fn inner_delete_branch(env: &mut JNIEnv, java_dataset: JObject, jbranch: JString
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutBranch<'local>(
-    mut env: JNIEnv<'local>,
-    java_dataset: JObject,
-    jbranch: JString,
-) -> JObject<'local> {
-    ok_or_throw!(env, inner_checkout_branch(&mut env, java_dataset, jbranch))
-}
-
-fn inner_checkout_branch<'local>(
-    env: &mut JNIEnv<'local>,
-    java_dataset: JObject,
-    jbranch: JString,
-) -> Result<JObject<'local>> {
-    let branch_name: String = jbranch.extract(env)?;
-    let new_dataset = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.checkout_branch(branch_name.as_str())?
-    };
-    new_dataset.into_java(env)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutReference<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckout<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     reference_obj: JObject, // Reference
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_checkout_reference(&mut env, java_dataset, reference_obj)
+        inner_checkout_ref(&mut env, java_dataset, reference_obj)
     )
 }
 
-fn inner_checkout_reference<'local>(
+fn inner_checkout_ref<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     reference_obj: JObject, // Reference
 ) -> Result<JObject<'local>> {
     // Extract Optional fields from Reference
     let branch_opt_obj = env
-        .call_method(&reference_obj, "branchName", "()Ljava/util/Optional;", &[])?
+        .call_method(
+            &reference_obj,
+            "getBranchName",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
     let version_opt_obj = env
         .call_method(
             &reference_obj,
-            "versionNumber",
+            "getVersionNumber",
             "()Ljava/util/Optional;",
             &[],
         )?
         .l()?;
     let tag_opt_obj = env
-        .call_method(&reference_obj, "tagName", "()Ljava/util/Optional;", &[])?
+        .call_method(&reference_obj, "getTagName", "()Ljava/util/Optional;", &[])?
         .l()?;
 
     let branch_opt = env.get_string_opt(&branch_opt_obj)?;
