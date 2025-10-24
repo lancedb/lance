@@ -2502,12 +2502,48 @@ impl Scanner {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
-            FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
+            FtsQuery::Phrase(query) => {
+                // Pre-check: phrase queries require indices with positions
+                let column = query.column.clone().ok_or(Error::invalid_input(
+                    "the column must be specified in the query".to_string(),
+                    location!(),
+                ))?;
+
+                let index_meta = self
+                    .dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default()
+                            .for_column(&column)
+                            .supports_fts(),
+                    )
+                    .await?
+                    .ok_or(Error::invalid_input(
+                        format!("No Inverted index found for column {}", column),
+                        location!(),
+                    ))?;
+
+                // Fetch index details and validate with_position
+                let details_any =
+                    crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta)
+                        .await?;
+                let details = details_any
+                    .as_ref()
+                    .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
+                if !details.with_position {
+                    return Err(Error::invalid_input(
+                        "position is not found but required for phrase queries, try recreating the index with position"
+                            .to_string(),
+                        location!(),
+                    ));
+                }
+
+                Arc::new(PhraseQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                ))
+            }
 
             FtsQuery::Boost(query) => {
                 // for boost query, we need to erase the limit so that we can find

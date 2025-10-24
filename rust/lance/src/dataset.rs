@@ -6548,8 +6548,12 @@ mod tests {
         let mut doc_array = (0..4096)
             .map(|_| {
                 let mut rng = rand::rng();
-                let mut text = String::with_capacity(4);
-                for _ in 0..rng.random_range(127..512) {
+                let mut text = String::with_capacity(512);
+                let len = rng.random_range(127..512);
+                for i in 0..len {
+                    if i > 0 {
+                        text.push(' ');
+                    }
                     text.push_str(words[rng.random_range(0..words.len())]);
                 }
                 if text.contains("lance search") {
@@ -6561,10 +6565,16 @@ mod tests {
                 text
             })
             .collect_vec();
+        // Ensure at least one doc matches each phrase deterministically
+        doc_array.push("lance search".to_owned());
+        lance_search_count += 1;
+        doc_array.push("full text".to_owned());
+        full_text_count += 1;
         doc_array.push("position for phrase query".to_owned());
 
-        let params = InvertedIndexParams::default().with_position(true);
-        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array));
+        // 1) Build index without positions and assert phrase query errors
+        let params_no_pos = InvertedIndexParams::default().with_position(false);
+        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array.clone()));
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
@@ -6579,7 +6589,29 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
         dataset
-            .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+            .create_index(&["doc"], IndexType::Inverted, None, &params_no_pos, true)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"), "{}", err);
+        assert!(err.starts_with("Invalid user input: "), "{}", err);
+
+        // 2) Recreate index with positions and assert phrase query works
+        let params_with_pos = InvertedIndexParams::default().with_position(true);
+        dataset
+            .create_index(&["doc"], IndexType::Inverted, None, &params_with_pos, true)
             .await
             .unwrap();
 
