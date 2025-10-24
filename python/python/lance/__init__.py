@@ -66,6 +66,7 @@ __all__ = [
     "batch_udf",
     "bytes_read_counter",
     "dataset",
+    "io",
     "iops_counter",
     "json_to_schema",
     "schema_to_json",
@@ -91,6 +92,7 @@ def dataset(
     namespace: Optional[any] = None,
     table_id: Optional[list] = None,
     refresh_storage_options: bool = False,
+    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -161,13 +163,21 @@ def dataset(
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
     refresh_storage_options : bool, default False
-        Only applicable when using `namespace` and `table_id`. If True, storage options
-        will be automatically refreshed from the namespace before they expire. This is
-        currently only used for refreshing AWS temporary access credentials. When enabled,
-        the namespace will be queried periodically to fetch new temporary credentials before
-        the current ones expire. The new storage options will contain updated AWS access
-        credentials with a new expiration time. If False (default), only the initial
-        storage options from describe_table() will be used.
+        Only applicable when using `namespace` and `table_id`. If True, storage
+        options will be automatically refreshed from the namespace before they
+        expire. This is currently only used for refreshing AWS temporary access
+        credentials. When enabled, the namespace will be queried periodically to
+        fetch new temporary credentials before the current ones expire. The new
+        storage options will contain updated AWS access credentials with a new
+        expiration time. If False (default), only the initial storage options
+        from describe_table() will be used.
+    s3_credentials_refresh_offset_seconds : optional, int
+        The number of seconds before credential expiration to trigger a refresh.
+        Default is 60 seconds. Only applicable when using AWS S3 with temporary
+        credentials. For example, if set to 60, credentials will be refreshed
+        when they have less than 60 seconds remaining before expiration. This
+        should be set shorter than the credential lifetime to avoid using
+        expired credentials.
 
     Notes
     -----
@@ -208,21 +218,30 @@ def dataset(
         # Extract storage options from namespace
         namespace_storage_options = table_info.get("storage_options", {})
 
-        # Merge with user-provided storage options (namespace options take precedence)
-        if storage_options is None:
-            storage_options = namespace_storage_options
-        else:
-            # Merge: user options first, then override with namespace options
-            merged_options = dict(storage_options)
-            merged_options.update(namespace_storage_options)
-            storage_options = merged_options
-
         # Create storage options provider if refresh is enabled
         if refresh_storage_options:
             storage_options_provider = LanceNamespaceStorageOptionsProvider(
-                namespace=namespace,
-                table_id=table_id
+                namespace=namespace, table_id=table_id
             )
+            # Merge storage options (namespace takes precedence)
+            # Pass initial credentials to Rust so it can cache them and avoid
+            # immediately calling fetch_storage_options() during object store creation
+            if storage_options is None:
+                storage_options = namespace_storage_options
+            else:
+                # Merge: user options first, then override with namespace options
+                merged_options = dict(storage_options)
+                merged_options.update(namespace_storage_options)
+                storage_options = merged_options
+        else:
+            # Without refresh, merge storage options (namespace takes precedence)
+            if storage_options is None:
+                storage_options = namespace_storage_options
+            else:
+                # Merge: user options first, then override with namespace options
+                merged_options = dict(storage_options)
+                merged_options.update(namespace_storage_options)
+                storage_options = merged_options
     elif table_id is not None:
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
 
@@ -239,6 +258,7 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
+        s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -263,6 +283,7 @@ def dataset(
                 read_params=read_params,
                 session=session,
                 storage_options_provider=storage_options_provider,
+                s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
             )
     else:
         return ds

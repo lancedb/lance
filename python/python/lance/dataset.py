@@ -418,6 +418,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
+        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -449,6 +450,7 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
+            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params

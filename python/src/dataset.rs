@@ -455,7 +455,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
     fn new(
         py: Python,
         uri: String,
@@ -471,6 +471,7 @@ impl Dataset {
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
         storage_options_provider: Option<PyObject>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -487,12 +488,16 @@ impl Dataset {
             let index_cache_size_bytes = index_cache_size * 20 * 1024 * 1024;
             params.index_cache_size_bytes(index_cache_size_bytes);
         }
+        // Set up store options (block size and S3 credentials refresh offset)
+        let mut store_params = params.store_options.take().unwrap_or_default();
         if let Some(block_size) = block_size {
-            params.store_options = Some(ObjectStoreParams {
-                block_size: Some(block_size),
-                ..Default::default()
-            });
-        };
+            store_params.block_size = Some(block_size);
+        }
+        if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
+            store_params.s3_credentials_refresh_offset =
+                std::time::Duration::from_secs(offset_seconds);
+        }
+        params.store_options = Some(store_params);
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));

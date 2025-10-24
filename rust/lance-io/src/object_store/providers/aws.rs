@@ -593,7 +593,7 @@ impl DynamicStorageOptionsCredentialProvider {
                 return Ok(Some(cached_cred.credential.clone()));
             }
         }
-        
+
         let storage_options_map = self
             .provider
             .fetch_storage_options()
@@ -819,7 +819,10 @@ mod tests {
 
             let mut options = HashMap::from([
                 ("aws_access_key_id".to_string(), format!("AKID_{}", count)),
-                ("aws_secret_access_key".to_string(), format!("SECRET_{}", count)),
+                (
+                    "aws_secret_access_key".to_string(),
+                    format!("SECRET_{}", count),
+                ),
                 ("aws_session_token".to_string(), format!("TOKEN_{}", count)),
             ]);
 

@@ -10,7 +10,12 @@ use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM};
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM,
+};
+use lance_namespace::models::DescribeTableRequest;
+use lance_namespace::LanceNamespace;
 use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler},
@@ -22,8 +27,6 @@ use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
-use lance_namespace::LanceNamespace;
-use lance_namespace::models::DescribeTableRequest;
 
 /// builder for loading a [`Dataset`].
 #[derive(Clone)]
@@ -56,7 +59,10 @@ impl std::fmt::Debug for DatasetBuilder {
             .field("version", &self.version)
             .field("table_uri", &self.table_uri)
             .field("file_reader_options", &self.file_reader_options)
-            .field("storage_options_override", &self.storage_options_override.is_some())
+            .field(
+                "storage_options_override",
+                &self.storage_options_override.is_some(),
+            )
             .finish()
     }
 }

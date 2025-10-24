@@ -26,10 +26,10 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
     Parameters
     ----------
     namespace : any
-        The namespace instance to fetch storage options from. This can be any object
-        with a describe_table(table_id, version) method that returns a dict with
-        'location' and 'storage_options' keys. For example, use lance_namespace.connect()
-        from the lance_namespace PyPI package.
+        The namespace instance to fetch storage options from. This can be any
+        object with a describe_table(table_id, version) method that returns a
+        dict with 'location' and 'storage_options' keys. For example, use
+        lance_namespace.connect() from the lance_namespace PyPI package.
     table_id : List[str]
         The table identifier (e.g., ["workspace", "table_name"])
 

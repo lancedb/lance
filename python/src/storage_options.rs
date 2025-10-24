@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_io::object_store::{StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY};
+use lance_io::object_store::StorageOptionsProvider;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 

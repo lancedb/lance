@@ -43,9 +43,10 @@ class StorageOptionsProvider(ABC):
 
     Error Handling
     --------------
-    If fetch_storage_options() raises an exception, operations requiring credentials will
-    fail. Implementations should handle recoverable errors internally (e.g., retry
-    token refresh) and only raise exceptions for unrecoverable errors.
+    If fetch_storage_options() raises an exception, operations requiring
+    credentials will fail. Implementations should handle recoverable errors
+    internally (e.g., retry token refresh) and only raise exceptions for
+    unrecoverable errors.
     """
 
     @abstractmethod
@@ -61,9 +62,9 @@ class StorageOptionsProvider(ABC):
             Dictionary of string key-value pairs containing cloud storage credentials
             and expiration time. Required keys:
 
-            - "expires_at_millis" (str): Unix timestamp in milliseconds (as string) when
-              credentials expire. Lance will automatically call fetch_storage_options() again
-              before this time.
+            - "expires_at_millis" (str): Unix timestamp in milliseconds (as string)
+              when credentials expire. Lance will automatically call
+              fetch_storage_options() again before this time.
 
             Plus provider-specific credential keys:
 
