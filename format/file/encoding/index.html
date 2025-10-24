@@ -1,0 +1,7088 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Modern columnar data format for ML and LLMs">
+      
+      
+      
+        <link rel="canonical" href="https://lancedb.github.io/lance/format/file/encoding/">
+      
+      
+        <link rel="prev" href="../">
+      
+      
+        <link rel="next" href="../versioning/">
+      
+      
+      <link rel="icon" href="../../../logo/logo.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.22">
+    
+    
+      
+        <title>Encoding Strategy - Lance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.84d31ad4.min.css">
+      
+        
+        <link rel="stylesheet" href="../../../assets/stylesheets/palette.06af60db.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#lance-encoding-strategy" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Lance" class="md-header__button md-logo" aria-label="Lance" data-md-component="logo">
+      
+  <img src="../../../logo/white.png" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Lance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Encoding Strategy
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/lancedb/lance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    lancedb/lance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../quickstart/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../guide/read_and_write/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Specification
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../examples/python/llm_dataset_creation/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Examples
+
+        </a>
+      </li>
+    
+  
+
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../integrations/datafusion/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Integrations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../community/contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Community
+
+        </a>
+      </li>
+    
+  
+
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../../sdk_docs/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  SDK Docs
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Lance" class="md-nav__button md-logo" aria-label="Lance" data-md-component="logo">
+      
+  <img src="../../../logo/white.png" alt="logo">
+
+    </a>
+    Lance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/lancedb/lance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    lancedb/lance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../../quickstart/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Getting Started
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Getting Started
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../quickstart/versioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Versioning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../quickstart/vector-search/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Vector Search
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    User Guide
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            User Guide
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/read_and_write/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Read and Write
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/data_evolution/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Data Evolution
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/blob/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Blob API
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/json/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    JSON Support
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/tags/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tags
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/object_store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Object Store Configuration
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/distributed_write/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Distributed Write
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/migration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Migration Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Performance Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/tokenizer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tokenizer
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../guide/arrays/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Extension Arrays
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Specification
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Specification
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    File Format
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_2" id="__nav_4_2_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_2_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4_2">
+            <span class="md-nav__icon md-icon"></span>
+            File Format
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    Encoding Strategy
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    Encoding Strategy
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#older-encoding-strategies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Older Encoding Strategies
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#terminology" class="md-nav__link">
+    <span class="md-ellipsis">
+      Terminology
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Terminology">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#data-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Data Types
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      Search Cache
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#structural-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Structural Encoding
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Structural Encoding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#repetition-and-definition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition and Definition Levels
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Repetition and Definition Levels">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#definition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Definition Levels
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#repetition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition Levels
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mini-block-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Mini Block Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Mini Block Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#buffer-1-mini-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 1 (Mini Blocks)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-0-mini-block-metadata" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 0 (Mini Block Metadata)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-2-dictionary-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 2 (Dictionary, optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-2-or-3-repetition-index-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 2 (or 3) (Repetition Index, optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mini-block-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      Mini Block Compression
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#full-zip-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Full Zip Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Full Zip Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#data-buffer-buffer-0" class="md-nav__link">
+    <span class="md-ellipsis">
+      Data Buffer (Buffer 0)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#repetition-index-buffer-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition Index (Buffer 1)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#all-null-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      All Null Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="All Null Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#repetition-and-definition-levels-buffers-0-and-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition and Definition Levels (Buffers 0 and 1)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#blob-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Blob Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Blob Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#semi-structural-transformations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Semi-Structural Transformations
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Semi-Structural Transformations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#dictionary-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dictionary Encoding
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#struct-packing" class="md-nav__link">
+    <span class="md-ellipsis">
+      Struct Packing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed-size-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fixed Size List
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Compression">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#flat" class="md-nav__link">
+    <span class="md-ellipsis">
+      Flat
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#variable" class="md-nav__link">
+    <span class="md-ellipsis">
+      Variable
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#constant" class="md-nav__link">
+    <span class="md-ellipsis">
+      Constant
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bitpacking" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bitpacking
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fsst" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fsst
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#run-length-encoding-rle" class="md-nav__link">
+    <span class="md-ellipsis">
+      Run Length Encoding (RLE)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#byte-stream-split-bss" class="md-nav__link">
+    <span class="md-ellipsis">
+      Byte Stream Split (BSS)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#general" class="md-nav__link">
+    <span class="md-ellipsis">
+      General
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compression-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Configuration
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Compression Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#configuration-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Details
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Details">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#compression-scheme" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Scheme
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#compression-level" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Level
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#run-length-encoding-rle-threshold" class="md-nav__link">
+    <span class="md-ellipsis">
+      Run Length Encoding (RLE) Threshold
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#byte-stream-split-bss_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Byte Stream Split (BSS)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dictionary-divisor" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dictionary Divisor
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#packed-struct-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Packed Struct Encoding
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../versioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Versioning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../table/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Table Format
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_3" id="__nav_4_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3">
+            <span class="md-nav__icon md-icon"></span>
+            Table Format
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../table/index/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Index
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_3_2" id="__nav_4_3_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_3_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3_2">
+            <span class="md-nav__icon md-icon"></span>
+            Index
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3_2_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_3_2_2" id="__nav_4_3_2_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Scalar Indices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_4_3_2_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3_2_2">
+            <span class="md-nav__icon md-icon"></span>
+            Scalar Indices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/btree/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    BTree
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/bitmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Bitmap
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/label_list/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Label List
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/zonemap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Zone Map
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/bloom_filter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Bloom Filter
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/fts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Full Text Search
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/scalar/ngram/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    N-gram
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3_2_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../table/index/vector/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Vector Indices
+    
+  </span>
+  
+
+            </a>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_4_3_2_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3_2_3">
+            <span class="md-nav__icon md-icon"></span>
+            Vector Indices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3_2_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_3_2_4" id="__nav_4_3_2_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    System Indices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_4_3_2_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3_2_4">
+            <span class="md-nav__icon md-icon"></span>
+            System Indices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/system/frag_reuse/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Fragment Reuse
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../table/index/system/memwal/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    MemWAL
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../namespace/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Namespace Spec
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_4" id="__nav_4_4_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_4">
+            <span class="md-nav__icon md-icon"></span>
+            Namespace Spec
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/concepts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Concepts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../namespace/operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Operations
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_4_3" id="__nav_4_4_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_4_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_4_3">
+            <span class="md-nav__icon md-icon"></span>
+            Operations
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/create-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CreateNamespace
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/list-namespaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListNamespaces
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/describe-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DescribeNamespace
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/drop-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DropNamespace
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/namespace-exists/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    NamespaceExists
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/list-tables/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTables
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/register-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    RegisterTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/describe-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DescribeTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/table-exists/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    TableExists
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/drop-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DropTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/deregister-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DeregisterTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/restore-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    RestoreTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/list-table-versions/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTableVersions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/alter-table-alter-columns/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AlterTableAlterColumns
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/alter-table-drop-columns/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AlterTableDropColumns
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/get-table-stats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    GetTableStats
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/insert-into-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    InsertIntoTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/merge-insert-into-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    MergeInsertIntoTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/update-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    UpdateTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/delete-from-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DeleteFromTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/query-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    QueryTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/count-table-rows/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CountTableRows
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/create-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CreateTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/explain-table-query-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ExplainTableQueryPlan
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/analyze-table-query-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AnalyzeTableQueryPlan
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/alter-table-add-columns/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AlterTableAddColumns
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/create-table-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CreateTableIndex
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/list-table-indices/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTableIndices
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/describe-table-index-stats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DescribeTableIndexStats
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/drop-table-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DropTableIndex
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/list-table-tags/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTableTags
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/get-table-tag-version/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    GetTableTagVersion
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/create-table-tag/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CreateTableTag
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/delete-table-tag/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DeleteTableTag
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/update-table-tag/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    UpdateTableTag
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/describe-transaction/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DescribeTransaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/operations/alter-transaction/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AlterTransaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../namespace/impls/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Implementations
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_4_4" id="__nav_4_4_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_4_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_4_4">
+            <span class="md-nav__icon md-icon"></span>
+            Implementations
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4_4_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../namespace/impls/rest/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    REST
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4_4_4_2" id="__nav_4_4_4_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_4_4_4_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_4_4_2">
+            <span class="md-nav__icon md-icon"></span>
+            REST
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4_4_2_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_4_4_2_2" id="__nav_4_4_4_2_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Non-Standard Operations
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="5" aria-labelledby="__nav_4_4_4_2_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_4_4_2_2">
+            <span class="md-nav__icon md-icon"></span>
+            Non-Standard Operations
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/list-namespaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListNamespaces
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/list-tables/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTables
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/insert-into-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    InsertIntoTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/merge-insert-into-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    MergeInsertIntoTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/create-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CreateTable
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/rest/list-table-tags/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    ListTableTags
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/dir/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Directory
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/hive/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Apache Hive MetaStore
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/gravitino/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Apache Gravitino
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/polaris/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Apache Polaris
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/glue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    AWS Glue
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/onelake/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Azure OneLake
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/dataproc/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Google Dataproc
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../namespace/impls/unity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Unity Catalog
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Examples
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Examples
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_1" id="__nav_5_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Python
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_1">
+            <span class="md-nav__icon md-icon"></span>
+            Python
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/python/llm_dataset_creation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    LLM Dataset Creation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/python/llm_training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    LLM Training
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/python/flickr8k_dataset_creation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Multimodal Dataset Creation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/python/clip_training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Multimodal Training
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/python/artifact_management/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Deep Learning Artifact Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Rust
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            Rust
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/rust/write_read_dataset/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Write/Read Dataset
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/rust/hnsw/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    HNSW Vector Index
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../examples/rust/llm_dataset_creation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    LLM Dataset Creation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Integrations
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            Integrations
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/datafusion/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Apache DataFusion
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/duckdb/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DuckDB
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/huggingface/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Huggingface
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="https://github.com/lancedb/pglance" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    PostgreSQL
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/pytorch/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    PyTorch
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/tensorflow/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tensorflow
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="https://github.com/lancedb/lance-trino" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Trino
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../../integrations/spark/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Apache Spark
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_6_8" id="__nav_6_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_6_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_8">
+            <span class="md-nav__icon md-icon"></span>
+            Apache Spark
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/install/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Install
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Config
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_8_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_8_4" id="__nav_6_8_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Operations
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_6_8_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_8_4">
+            <span class="md-nav__icon md-icon"></span>
+            Operations
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_8_4_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_8_4_1" id="__nav_6_8_4_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    DDL
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_6_8_4_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_8_4_1">
+            <span class="md-nav__icon md-icon"></span>
+            DDL
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/create-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CREATE NAMESPACE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/drop-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DROP NAMESPACE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/show-namespaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    SHOW NAMESPACES
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/describe-namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DESCRIBE NAMESPACE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/create-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CREATE TABLE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/dataframe-create-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DataFrame Create Table
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/show-tables/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    SHOW TABLES
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/describe-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DESCRIBE TABLE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/ddl/drop-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DROP TABLE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_8_4_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_8_4_2" id="__nav_6_8_4_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    DQL
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_6_8_4_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_8_4_2">
+            <span class="md-nav__icon md-icon"></span>
+            DQL
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dql/select/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    SELECT
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dql/dataframe-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DataFrame Read
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_8_4_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_8_4_3" id="__nav_6_8_4_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    DML
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_6_8_4_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_8_4_3">
+            <span class="md-nav__icon md-icon"></span>
+            DML
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dml/insert-into/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    INSERT INTO
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dml/update/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    UPDATE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dml/delete/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DELETE
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/spark/operations/dml/dataframe-write/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    DataFrame Write
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6_9" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../../integrations/ray/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Ray
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_6_9" id="__nav_6_9_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_6_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_9">
+            <span class="md-nav__icon md-icon"></span>
+            Ray
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/ray/read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Read
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/ray/write/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Write
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/ray/distributed-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Index
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/ray/data-evolution/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Data Evolution
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../integrations/ray/examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Examples
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Community
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            Community
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7_1" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../../community/contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    Contributing
+    
+  </span>
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7_1" id="__nav_7_1_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_7_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7_1">
+            <span class="md-nav__icon md-icon"></span>
+            Contributing
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Rust
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Python
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Documentation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/namespace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Namespace
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/spark/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Apache Spark
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/contributing/ray/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Ray
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../community/lancelot/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Lancelot Program
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../sdk_docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    SDK Docs
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#older-encoding-strategies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Older Encoding Strategies
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#terminology" class="md-nav__link">
+    <span class="md-ellipsis">
+      Terminology
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Terminology">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#data-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Data Types
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      Search Cache
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#structural-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Structural Encoding
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Structural Encoding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#repetition-and-definition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition and Definition Levels
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Repetition and Definition Levels">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#definition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Definition Levels
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#repetition-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition Levels
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mini-block-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Mini Block Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Mini Block Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#buffer-1-mini-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 1 (Mini Blocks)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-0-mini-block-metadata" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 0 (Mini Block Metadata)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-2-dictionary-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 2 (Dictionary, optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#buffer-2-or-3-repetition-index-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Buffer 2 (or 3) (Repetition Index, optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mini-block-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      Mini Block Compression
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#full-zip-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Full Zip Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Full Zip Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#data-buffer-buffer-0" class="md-nav__link">
+    <span class="md-ellipsis">
+      Data Buffer (Buffer 0)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#repetition-index-buffer-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition Index (Buffer 1)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#all-null-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      All Null Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="All Null Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#repetition-and-definition-levels-buffers-0-and-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Repetition and Definition Levels (Buffers 0 and 1)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#blob-page-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      Blob Page Layout
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Blob Page Layout">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#protobuf_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      Protobuf
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#semi-structural-transformations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Semi-Structural Transformations
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Semi-Structural Transformations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#dictionary-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dictionary Encoding
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#struct-packing" class="md-nav__link">
+    <span class="md-ellipsis">
+      Struct Packing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed-size-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fixed Size List
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Compression">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#flat" class="md-nav__link">
+    <span class="md-ellipsis">
+      Flat
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#variable" class="md-nav__link">
+    <span class="md-ellipsis">
+      Variable
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#constant" class="md-nav__link">
+    <span class="md-ellipsis">
+      Constant
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bitpacking" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bitpacking
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fsst" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fsst
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#run-length-encoding-rle" class="md-nav__link">
+    <span class="md-ellipsis">
+      Run Length Encoding (RLE)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#byte-stream-split-bss" class="md-nav__link">
+    <span class="md-ellipsis">
+      Byte Stream Split (BSS)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#general" class="md-nav__link">
+    <span class="md-ellipsis">
+      General
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compression-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Configuration
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Compression Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#configuration-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Details
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Details">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#compression-scheme" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Scheme
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#compression-level" class="md-nav__link">
+    <span class="md-ellipsis">
+      Compression Level
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#run-length-encoding-rle-threshold" class="md-nav__link">
+    <span class="md-ellipsis">
+      Run Length Encoding (RLE) Threshold
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#byte-stream-split-bss_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Byte Stream Split (BSS)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dictionary-divisor" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dictionary Divisor
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#packed-struct-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Packed Struct Encoding
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="lance-encoding-strategy">Lance Encoding Strategy<a class="headerlink" href="#lance-encoding-strategy" title="Permanent link">&para;</a></h1>
+<p>The encoding strategy determines how array data is encoded into a disk page. The encoding strategy tends to evolve
+more quickly than the file format itself.</p>
+<h2 id="older-encoding-strategies">Older Encoding Strategies<a class="headerlink" href="#older-encoding-strategies" title="Permanent link">&para;</a></h2>
+<p>The 0.1 and 2.0 encoding strategies are no longer documented. They were significantly different from future encoding
+strategies and describing them in detail would be a distraction.</p>
+<h2 id="terminology">Terminology<a class="headerlink" href="#terminology" title="Permanent link">&para;</a></h2>
+<p>An array is a sequence of values. An array has a data type which describes the semantic interpretation of the values.
+A layout is a way to encode an array into a set of buffers and child arrays. A buffer is a contiguous sequence of
+bytes. An encoding describes how the semantic interpretation of data is mapped to the layout. An encoder converts
+data from one layout to another.</p>
+<p>Data types and layouts are orthogonal concepts. An integer array might be encoded into two completely different
+layouts which represent the same data.</p>
+<p><img alt="Multiple Encodings" src="../../../images/encoding_v_array.png" /></p>
+<h3 id="data-types">Data Types<a class="headerlink" href="#data-types" title="Permanent link">&para;</a></h3>
+<p>Lance uses a subset of Arrow's type system for data types. An Arrow data type is is both a data type and an encoding.
+When writing data Lance will often normalize Arrow data types. For example, a string array and a large string array
+might end up traveling down the same path (variable width data). In fact, most types fall into two general paths. One
+for fixed-width data and one for variable-width data (where we recognize both 32-bit and 64-bit offsets).</p>
+<p>At read time, the Arrow data type is used to determine the target encoding. For example, a string array and large
+string array might both be stored in the same layout but, at read time, we will use the Arrow data type to determine
+the size of the offsets returned to the user. There is no requirement the output Arrow type matches the input Arrow
+type. For example, it is acceptable to write an array as "large string" and then read it back as "string".</p>
+<h2 id="search-cache">Search Cache<a class="headerlink" href="#search-cache" title="Permanent link">&para;</a></h2>
+<p>The search cache is a key component of the Lance file reader. Random access requires that we locate the physical
+location of the data in the file. To do so we need to know information such as the encoding used for a column,
+the location of the page, and potentially other information. This information is collectively known as the "search
+cache" and is implemented as a basic LRU cache. We define a "initialization phase" which is when we load the various indexing information into the search cache. The cost of initialization is assumed to be amortized over the lifetime
+of the reader.</p>
+<p>When performing full scans (i.e. not random access), we should be able to ignore the search cache and sometimes
+can avoid loading it entirely. We <em>do</em> want to optimize for cold scans as the initialization phase is often not
+amortized over the lifetime of the reader.</p>
+<h2 id="structural-encoding">Structural Encoding<a class="headerlink" href="#structural-encoding" title="Permanent link">&para;</a></h2>
+<p>The first step in encoding an array is to determine the structural encoding of the array. A structural encoding
+breaks the data into smaller units which can be independently decoded. Structural encodings are also responsible
+for encoding the "structure" (struct validity, list validity, list offsets, etc.) typically utilizing repetition
+levels and definition levels.</p>
+<p>Structural encoding is fairly complicated! However, the goal is to suck out all the details related to I/O
+scheduling so that compression libraries can focus on compression. This keeps our compression traits simple
+without sacrificing our ability to perform random access.</p>
+<p>There are only a few structural encodings. The structural encoding is described by the <code>PageLayout</code> message and
+is the top-level message for the encoding.</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">PageLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">layout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="c1">// A layout used for pages where the data is small</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">MiniBlockLayout</span><span class="w"> </span><span class="na">mini_block_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="c1">// A layout used for pages where all values are null</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="n">AllNullLayout</span><span class="w"> </span><span class="na">all_null_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="c1">// A layout used for pages where the data is large</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="n">FullZipLayout</span><span class="w"> </span><span class="na">full_zip_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="c1">// A layout where large binary data is encoded externally</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="c1">// and only the descriptions are put in the page</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="n">BlobLayout</span><span class="w"> </span><span class="na">blob_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="repetition-and-definition-levels">Repetition and Definition Levels<a class="headerlink" href="#repetition-and-definition-levels" title="Permanent link">&para;</a></h3>
+<p>Repetition and definition levels are an alternative to validity bitmaps and offset arrays for expressing struct
+and list information. They have a significant advantage in that they combine all of these buffers into a single
+buffer which allows us to avoid multiple IOPS.</p>
+<p>A more extensive explanation of repetition and definition levels can be found in the code. One particular note
+is that we use 0 to represent the "inner-most" item and Parquet uses 0 to represent the "outer-most" item. Here
+is an example:</p>
+<h4 id="definition-levels">Definition Levels<a class="headerlink" href="#definition-levels" title="Permanent link">&para;</a></h4>
+<p>Consider the following array:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>[{&quot;middle&quot;: {&quot;inner&quot;: 1]}}, NULL, {&quot;middle&quot;: NULL}, {&quot;middle&quot;: {&quot;inner&quot;: NULL}}]
+</span></code></pre></div>
+<p>In Arrow we would have the following validity arrays:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Outer validity : 1, 0, 1, 1
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>Middle validity: 1, ?, 0, 1
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>Inner validity : 1, ?, ?, 0
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>Values         : 1, ?, ?, ?
+</span></code></pre></div>
+<p>The ? values are undefined in the Arrow format. We can convert these into definition levels as follows:</p>
+<table>
+<thead>
+<tr>
+<th>Values</th>
+<th>Definition</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>Valid at all levels</td>
+</tr>
+<tr>
+<td>?</td>
+<td>3</td>
+<td>Null at outer level</td>
+</tr>
+<tr>
+<td>?</td>
+<td>2</td>
+<td>Null at middle level</td>
+</tr>
+<tr>
+<td>?</td>
+<td>1</td>
+<td>Null at inner level</td>
+</tr>
+</tbody>
+</table>
+<h4 id="repetition-levels">Repetition Levels<a class="headerlink" href="#repetition-levels" title="Permanent link">&para;</a></h4>
+<p>Consider the following list array with 3 rows</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>[{&lt;0,1&gt;, &lt;&gt;, &lt;2&gt;}, {&lt;3&gt;}, {}], [], [{&lt;4&gt;}]
+</span></code></pre></div>
+<p>We would have three offsets arrays in Arrow:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Outer-most ([]): [0, 3, 3, 4]
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>Middle     ({}): [0, 3, 4, 4, 5]
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>Inner      (&lt;&gt;): [0, 2, 2, 3, 4, 5]
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>Values         : [0, 1, 2, 3, 4]
+</span></code></pre></div>
+<p>We can convert these into repetition levels as follows:</p>
+<table>
+<thead>
+<tr>
+<th>Values</th>
+<th>Repetition</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>3</td>
+<td>Start of outer-most list</td>
+</tr>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>Continues inner-most list (no new lists)</td>
+</tr>
+<tr>
+<td>?</td>
+<td>1</td>
+<td>Start of new inner-most list (empty list)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>1</td>
+<td>Start of new inner-most list</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2</td>
+<td>Start of new middle list</td>
+</tr>
+<tr>
+<td>?</td>
+<td>2</td>
+<td>Start of new inner-most list (empty list)</td>
+</tr>
+<tr>
+<td>?</td>
+<td>3</td>
+<td>Start of new outer-most list (empty list)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>0</td>
+<td>Start of new outer-most list</td>
+</tr>
+</tbody>
+</table>
+<h3 id="mini-block-page-layout">Mini Block Page Layout<a class="headerlink" href="#mini-block-page-layout" title="Permanent link">&para;</a></h3>
+<p>The mini block page layout is the default layout for smallish types. This fits most of the classical data types
+(integers, floats, booleans, small strings, etc.) that Parquet and related formats already handle well. As is no
+surprise, the approach used is pretty similar to those formats.</p>
+<p><img alt="Mini Block Layout" src="../../../images/miniblock.png" /></p>
+<p>The data is divided into small mini-blocks. Each mini-block should contain a power-of-two number of values (except
+for the last mini-block) and should be less than 32KiB of compressed data. We have to read an entire mini-block to
+get a single value so we want to keep the mini-block size small. Mini blocks are padded to 8 byte boundaries. This
+helps to avoid alignment issues. Each mini-block starts with a small header which helps us figure out how much
+padding has been applied.</p>
+<p>The repetition and definition levels are sliced up and stored in the mini-blocks along with the compressed buffers.
+Since we need to read an entire mini-block there is no need to zip up the various buffers and they are stored
+one after the other (repetition, definition, values, ...).</p>
+<h4 id="buffer-1-mini-blocks">Buffer 1 (Mini Blocks)<a class="headerlink" href="#buffer-1-mini-blocks" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Number of buffers in the mini-block</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer 0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer N</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer 0</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer N</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+</tbody>
+</table>
+<p>Note: It is natural to explain this buffer first but it is actually the second buffer in the page.</p>
+<h4 id="buffer-0-mini-block-metadata">Buffer 0 (Mini Block Metadata)<a class="headerlink" href="#buffer-0-mini-block-metadata" title="Permanent link">&para;</a></h4>
+<p><img alt="Mini Block Layout" src="../../../images/miniblock_meta.png" /></p>
+<p>To enable random access we have a small metadata lookup which contains two bytes per mini-block. This lookup
+tells us how many bytes are in each mini block and how many items are in the mini block. This metadata lookup
+must be loaded at initialization time and placed in the search cache.</p>
+<table>
+<thead>
+<tr>
+<th>Bits (not bytes)</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block 0</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block 0</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block 1</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block N</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block N</td>
+</tr>
+</tbody>
+</table>
+<p>The last 4 bits are special and we just store 0 today. This is because the protobuf contains the number of
+values (not required to be a power of 2) in the entire disk page. We can subtract the values in the other blocks
+to get the number of values in the last block.</p>
+<h4 id="buffer-2-dictionary-optional">Buffer 2 (Dictionary, optional)<a class="headerlink" href="#buffer-2-dictionary-optional" title="Permanent link">&para;</a></h4>
+<p>Dictionary encoding is an encoding that can be applied at many different levels throughout a file. For example,
+it could be used as a compressive encoding or it could even be entirely external to the file. We've found the
+most convenient simple place to apply dictionary encoding is at the structural level. Since dictionary indices are
+small we always use the mini block layout for dictionary encoding. When we use dictionary encoding we store the
+dictionary in the buffer at index 2. We require the dictionary to be full loaded and decoded at initialization time.
+This means we don't have to load the dictionary during random access but it does require the dictionary be placed
+in the search cache.</p>
+<p>Dictionary encoding is one of the few spots today where we have no rules on how it is encoded and compressed. We
+treat the entire dictionary as a single opaque buffer. As a result we rely on the block compression trait to handle
+dictionary compression.</p>
+<h4 id="buffer-2-or-3-repetition-index-optional">Buffer 2 (or 3) (Repetition Index, optional)<a class="headerlink" href="#buffer-2-or-3-repetition-index-optional" title="Permanent link">&para;</a></h4>
+<p>If there is repetition (list levels) then we need some way to translate row offsets into item offsets. The mini
+blocks always store items. During a full scan the list offsets are restored when we decode the repetition levels.
+However, to support random access, we don't have the repetition levels available. Instead we store a repetition
+index in the next available buffer (index 2 or 3 depending on whether the dictionary is present).</p>
+<p>The repetition index is a flat buffer of u64 values. We have N * D values where N is the number of mini blocks
+and D Is the desired depth of random access plus one. For example, to support 1-dimensional lookups (random access
+by rows) then D is 2. To support two-dimensional lookups (e.g. rows[50][17]) then we could set D to 3.</p>
+<p>Currently we only support 1-dimensional random access.
+Currently we do not compress the repetition index.</p>
+<p>This may change in future versions.</p>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8</td>
+<td>Number of rows in block 0</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block 0</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of rows in block 1</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of rows in block N</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block N</td>
+</tr>
+</tbody>
+</table>
+<p>The last 8 bytes of each block stores the number of "partial" items. These are items leftover after the last
+complete row. We don't require rows to be bounded by mini-blocks so we need to keep track of this. For example,
+if we have 10,000 items per row then we might have several mini-blocks with only partial items and 0 rows.</p>
+<p>At read time we can use this repetition index to translate row offsets into item offsets.</p>
+<h4 id="mini-block-compression">Mini Block Compression<a class="headerlink" href="#mini-block-compression" title="Permanent link">&para;</a></h4>
+<p>The mini block layout relies on the compression algorithm to handle the splitting of data into mini-blocks. This
+is because the number of values per block will depend on the compressibility of the data. As a result, there is
+a special trait for mini block compression.</p>
+<p>The data compression algorithm is the algorithm that decides chunk boundaries. The repetition and definition levels
+are then sliced appropriately and sent to a block compressor. This means there are no constraints on how the repetition
+and definition levels are compressed.</p>
+<p>Beyond splitting the data into mini-blocks, there are no additional constraints. We expect to fully decode mini
+blocks as opaque chunks. This means we can use any compression algorithm that we deem suitable.</p>
+<h4 id="protobuf">Protobuf<a class="headerlink" href="#protobuf" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">MiniBlockLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="c1">// Description of the compression of repetition levels (e.g. how many bits per rep)</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span><span class="c1">// Optional, if there is no repetition then this field is not present</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">rep_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">  </span><span class="c1">// Description of the compression of definition levels (e.g. how many bits per def)</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">  </span><span class="c1">// Optional, if there is no definition then this field is not present</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">def_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">  </span><span class="c1">// Description of the compression of values</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">value_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">  </span><span class="c1">// Description of the compression of the dictionary data</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">  </span><span class="c1">// Optional, if there is no dictionary then this field is not present</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">dictionary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="w">  </span><span class="c1">// Number of items in the dictionary</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_dictionary_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="w">  </span><span class="c1">// The number of buffers in each mini-block, this is determined by the compression and does</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">  </span><span class="c1">// NOT include the repetition or definition buffers (the presence of these buffers can be determined</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="w">  </span><span class="c1">// by looking at the rep_compression and def_compression fields)</span>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_buffers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="w">  </span><span class="c1">// The depth of the repetition index.</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="w">  </span><span class="c1">// If there is repetition then the depth must be at least 1.  If there are many layers</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="w">  </span><span class="c1">// of repetition then deeper repetition indices will support deeper nested random access.  For</span>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="w">  </span><span class="c1">// example, given 5 layers of repetition then the repetition index depth must be at least</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="w">  </span><span class="c1">// 3 to support access like rows[50][17][3].</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="w">  </span><span class="c1">// We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a><span class="w">  </span><span class="c1">// index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a><span class="w">  </span><span class="c1">// the number of &quot;leftover items&quot; at the end of the chunk.  Otherwise, we wouldn&#39;t have any way</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="w">  </span><span class="c1">// to know if the final item in a chunk is valid or not.</span>
+</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">repetition_index_depth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a><span class="w">  </span><span class="c1">// The page already records how many rows are in the page.  For mini-block we also need to know how</span>
+</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a><span class="w">  </span><span class="c1">// many &quot;items&quot; are in the page.  A row and an item are the same thing unless the page has lists.</span>
+</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-5-39"><a id="__codelineno-5-39" name="__codelineno-5-39" href="#__codelineno-5-39"></a>
+</span><span id="__span-5-40"><a id="__codelineno-5-40" name="__codelineno-5-40" href="#__codelineno-5-40"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The protobuf for the mini block layout describes the cmopression of the various buffers. It also tells us
+some information about the dictionary (if present) and the repetition index (if present).</p>
+<h3 id="full-zip-page-layout">Full Zip Page Layout<a class="headerlink" href="#full-zip-page-layout" title="Permanent link">&para;</a></h3>
+<p>The full zip page layout is a layout for larger values (e.g. vector embeddings) which are large but not so large
+that we can justify a single IOP per value. In this case we are trying to avoid storing a large amount of "chunk
+overhead" (both in terms of buffer space and the RAM space in the search cache that we would need to store the
+repetition index). As a tradeoff, we are introducing a second IOP per-range for random access reads (unless the
+data is fixed-width such as vector embeddings).</p>
+<p>We currently use 256 bytes as the cutoff for the full zip layout. At this point we would only be fitting 16 values
+in a 4KiB disk sector and so creating a mini-block descriptor for every 16 values would be too much overhead.</p>
+<p>As a further consequence, we must ensure that the compression algorithm is "transparent" so that we can index
+individual values after compression has been applied. This prevents us from using compression algorithms such
+as delta encoding. If we want to apply general compression we have to apply them on a per-value basis. The way
+we enforce this is by requiring the compression to return either a flat fixed-width or variable-width layout
+so that we know the location of each element.</p>
+<p>The repetition and definition levels, along with all compressed buffers, are all zipped together into a single
+buffer.</p>
+<h4 id="data-buffer-buffer-0">Data Buffer (Buffer 0)<a class="headerlink" href="#data-buffer-buffer-0" title="Permanent link">&para;</a></h4>
+<p><img alt="Full Zip Layout" src="../../../images/fullzip.png" /></p>
+<p>The data buffer is a single buffer that contains the repetition, definition, and value data, all zipped into a
+single buffer. The repetition and definition information are combined and byte packed. This is referred to as
+a control word. If the value is null or an empty list, then the control word is all that is serialized. If there
+is no validity or repetition information then control words are not serialized. If the value is variable-width
+then we encode the size of the value. This is either a 4-byte or 8-byte integer depending on the width used in
+the offsets returned by the compression (in future versions this will likely be encoded with some kind of
+variable-width integer encoding). Finally the value buffers themselves are appended.</p>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0-4</td>
+<td>Control word 0</td>
+</tr>
+<tr>
+<td>0/4/8</td>
+<td>Value 0 size</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Value 0 data</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>0-4</td>
+<td>Control word N</td>
+</tr>
+<tr>
+<td>0/4/8</td>
+<td>Value N size</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Value N data</td>
+</tr>
+</tbody>
+</table>
+<p>Note: a fixed-width data type that has no validity information (e.g. non-nullable vector embeddings) is simply a
+flat buffer of data.</p>
+<h4 id="repetition-index-buffer-1">Repetition Index (Buffer 1)<a class="headerlink" href="#repetition-index-buffer-1" title="Permanent link">&para;</a></h4>
+<p><img alt="Full Zip Layout" src="../../../images/fullzip_rep.png" /></p>
+<p>If there is repetition information or the values are variable width then we need additional help to locate values
+in the disk page. The repetition index is an array of u64 values. There is one value per row and the value is an
+offset to the start of that row in the data buffer. To perform random access we require two IOPS. First we issue
+an IOP into the repetition index to determine the location and then a second IOP into the data buffer to load the
+data. Alternatively, the entire repetition index can be loaded into memory in the initialization phase though this
+can lead to high RAM usage by the search cache.</p>
+<p>The repetition index must have a fixed width (or else we would need a repetition index to read the repetition
+index!) and be transparent. As a result the compression options are limited. That being said, there is little
+value (in terms of performance) in compressing the repetition index. It is never read in its entirety as it is
+not needed for full scans. Currently the repetition index is always compressed with simple (non-chunked) byte
+packing into 1,2,4, or 8 byte values.</p>
+<h4 id="protobuf_1">Protobuf<a class="headerlink" href="#protobuf_1" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">FullZipLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="c1">// The number of bits of repetition info (0 if there is no repetition)</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_rep</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span><span class="c1">// The number of bits of definition info (0 if there is no definition)</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_def</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span><span class="c1">// The number of bits of value info</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">  </span><span class="c1">// Note: we use bits here (and not bytes) for consistency with other encodings.  However, in practice,</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">  </span><span class="c1">// there is never a reason to use a bits per value that is not a multiple of 8.  The complexity is not</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">  </span><span class="c1">// worth the small savings in space since this encoding is typically used with large values already.</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">details</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="w">    </span><span class="c1">// If this is a fixed width block then we need to have a fixed number of bits per value</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_per_value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="w">    </span><span class="c1">// If this is a variable width block then we need to have a fixed number of bits per offset</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_per_offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a><span class="w">  </span><span class="c1">// The number of items in the page</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="w">  </span><span class="c1">// The number of visible items in the page</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_visible_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a><span class="w">  </span><span class="c1">// Description of the compression of values</span>
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">value_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-6-24"><a id="__codelineno-6-24" name="__codelineno-6-24" href="#__codelineno-6-24"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-6-25"><a id="__codelineno-6-25" name="__codelineno-6-25" href="#__codelineno-6-25"></a>
+</span><span id="__span-6-26"><a id="__codelineno-6-26" name="__codelineno-6-26" href="#__codelineno-6-26"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The protobuf for the full zip layout describes the compression of the data buffer. It also tells us the
+size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
+have per offset (for variable-width data).</p>
+<h3 id="all-null-page-layout">All Null Page Layout<a class="headerlink" href="#all-null-page-layout" title="Permanent link">&para;</a></h3>
+<p>This layout is used when all the values are null. Surprisingly, this does not mean there is no data. If there
+are any levels of struct or list then we need to store the rep/def levels so that we can distinguish between
+null structs, null lists, empty lists, and null values.</p>
+<h4 id="repetition-and-definition-levels-buffers-0-and-1">Repetition and Definition Levels (Buffers 0 and 1)<a class="headerlink" href="#repetition-and-definition-levels-buffers-0-and-1" title="Permanent link">&para;</a></h4>
+<p>Note: We currently store rep levels in the first buffer with a flat layout of 16-bit values and def levels
+in the second buffer with a flat layout of 16-bit values. This will likely change in future versions.</p>
+<h4 id="protobuf_2">Protobuf<a class="headerlink" href="#protobuf_2" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">AllNullLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>All we need to know is the meaning of each rep/def level.</p>
+<h3 id="blob-page-layout">Blob Page Layout<a class="headerlink" href="#blob-page-layout" title="Permanent link">&para;</a></h3>
+<p>The blob page layout is a layout for large binary values where we would only have a few values per disk page.
+The actual data is stored out-of-line in external buffers. The disk page stores a "description" which is a
+struct array of two fields: <code>position</code> and <code>size</code>. The <code>position</code> is the absolute file offset of the blob and
+the <code>size</code> is the size (in bytes) of the blob. The inner page layout describes how the descriptions are encoded.</p>
+<p>The validity information (definition levels) is smuggled into the descriptions. If the size and position are
+both zero then the value is empty. Otherwise, if the size is zero and the position is non-zero then the
+value is null and the position is the definition level.</p>
+<p>This layout is only recommended when you can justify a single IOP per value. For example, when values are 1MiB
+or larger.</p>
+<p>This layout has no buffers of its own and merely wraps an inner layout.</p>
+<h4 id="protobuf_3">Protobuf<a class="headerlink" href="#protobuf_3" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">BlobLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="c1">// The inner layout used to store the descriptions</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="n">PageLayout</span><span class="w"> </span><span class="na">inner_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">  </span><span class="c1">//</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">  </span><span class="c1">// The inner layout&#39;s repdef layers will always be 1 all valid item layer</span>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Since we smuggle the validity into the descriptions we don't need to store it in the inner layout and so the
+rep/def meaning is stored in the blob layout and the rep/def meaning in the inner layout will be 1 all valid item
+layer.</p>
+<h2 id="semi-structural-transformations">Semi-Structural Transformations<a class="headerlink" href="#semi-structural-transformations" title="Permanent link">&para;</a></h2>
+<p>There are some data transformations that are applied to the data before (or during) the structural encoding process.
+These are described here.</p>
+<h3 id="dictionary-encoding">Dictionary Encoding<a class="headerlink" href="#dictionary-encoding" title="Permanent link">&para;</a></h3>
+<p>Dictionary encoding is a technique that can be applied to any kind of array. It is useful when there are not very
+many unique values in the array. First, a "dictionary" of unique values is created. Then we create a second array
+of indices into the dictionary.</p>
+<p>Dictionary encoding is also known as "categorical encoding" in other contexts.</p>
+<p>Dictionary encoding could be treated as simply another compression technique but, when applied, it would be an
+opaque compression technique which would limit its usability (e.g. in a full zip context). As a result, we apply
+it before any structural encoding takes place. This allows us to place the dictionary in the search cache for
+random access.</p>
+<h3 id="struct-packing">Struct Packing<a class="headerlink" href="#struct-packing" title="Permanent link">&para;</a></h3>
+<p>Struct packing is an alternative representation to apply to struct values. Instead of storing that struct in a
+columnar fashion it will be stored in a row-major fashion. This will reduce the number of IOPS needed for random
+access but will prevent the ability to read a single field at a time. This is useful when all fields in the struct
+are always accessed together.</p>
+<p>Packed struct is always opt-in (see section on configuration below).</p>
+<p>Currently packed struct is limited to fixed-width data.</p>
+<h3 id="fixed-size-list">Fixed Size List<a class="headerlink" href="#fixed-size-list" title="Permanent link">&para;</a></h3>
+<p>Fixed size lists are an Arrow data type that needs specialized handling at the structural level. If the underlying
+data type is primitive then the fixed size list will be primitive (e.g. a tensor). If the underlying data type
+is structural (struct/list) then the fixed size list is structural and should be treated the same as a
+variable-size list.</p>
+<p>We don't want compression libraries to need to worry about the intricacies of fixed-size lists. As a result we
+flatten the list as part of structural encoding. This complicates random access as we must translate between
+rows (an entire fixed size list) and items (a single item in the list).</p>
+<p>If the items in a fixed size list are nullable then we do not treat that validity array as a repetition or
+definition level. Instead, we store the validity as a separate buffer. For example, when encoding nullable fixed
+size lists with mini-block encoding the validity buffer is another buffer in the mini-block. When encoding
+nullable fixed size lists with full-zip encoding the validity buffer is zipped together with the values.</p>
+<p>The good news is that fixed size lists are entirely a structural encoding concern. Compression techniques are
+free to pretend that the fixed-size list data type does not exist.</p>
+<h2 id="compression">Compression<a class="headerlink" href="#compression" title="Permanent link">&para;</a></h2>
+<p>Once a structural encoding is chosen we must determine how to compress the data. There are various buffers that
+might be compressed (e.g. data, repetition, definition, dictionary, etc.). The available compression algorithms
+are also constrained by the structural encoding chosen. For example, when using the full zip layout we require
+transparent compression. As a result, each encoding technique may or may not be usable in a given scenario. In
+addition, the same technique may be applied in a different way depending on the encoding chosen.</p>
+<p>In implementation terms we have a trait for each compression constraint. The techniques then implement the traits
+that they can be applied to. To start with, here is a summary of compression techniques which are implemented in
+at least one scenario and a list of which traits the technique implements. A ❓ is used to indicate that the
+technique should be usable in that context but we do not yet do so while a ❌ indicates that the technique is
+not usable because it is not transparent. Note, even though a technique is not transparent it can still be applied
+on a per-value basis. We use ☑️ to mark a technique that is applied on a per-value basis:</p>
+<table>
+<thead>
+<tr>
+<th>Compression</th>
+<th>Used in Block Context</th>
+<th>Used in Full Zip Context</th>
+<th>Used in Mini-Block Context</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Flat</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Variable</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Constant</td>
+<td>✅ (2.1)</td>
+<td>❓</td>
+<td>❓</td>
+</tr>
+<tr>
+<td>Bitpacking</td>
+<td>✅ (2.1)</td>
+<td>❓</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Fsst</td>
+<td>❓</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Rle</td>
+<td>❓</td>
+<td>❌</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>ByteStreamSplit</td>
+<td>❓</td>
+<td>❌</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>General</td>
+<td>❓</td>
+<td>☑️ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+</tbody>
+</table>
+<p>In the following sections we will describe each technique in a bit more detail and explain how it is utilized
+in various contexts.</p>
+<h3 id="flat">Flat<a class="headerlink" href="#flat" title="Permanent link">&para;</a></h3>
+<p>Flat compression is the uncompressed representation of fixed-width data. There is a single buffer of data
+with a fixed number of bits per value.</p>
+<p>When applied in a mini-block context we find the largest power of 2 number of values that will be less than
+8,186 bytes and use that as the block size.</p>
+<h3 id="variable">Variable<a class="headerlink" href="#variable" title="Permanent link">&para;</a></h3>
+<p>Variable compression is the uncompressed representation of variable-width data. There is a buffer of values and
+a buffer of offsets.</p>
+<p>When applied in a mini-block context each block may have a different number of values. We walk through the values
+until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
+we have passed.</p>
+<h3 id="constant">Constant<a class="headerlink" href="#constant" title="Permanent link">&para;</a></h3>
+<p>Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.</p>
+<p>This will likely change in future versions.</p>
+<h3 id="bitpacking">Bitpacking<a class="headerlink" href="#bitpacking" title="Permanent link">&para;</a></h3>
+<p>Bitpacking is a compression technique that removes the unused bits from a set of values. For example, if we have
+a u32 array and the maximum value is 5000 then we only need 13 bits to store each value.</p>
+<p>When used in a mini-block context we always use 1024 values per block. In addition, we store the compresesed bit
+width inline in the block itself.</p>
+<p>Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
+off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
+so we would have to remove at least 8 bits per value.</p>
+<h3 id="fsst">Fsst<a class="headerlink" href="#fsst" title="Permanent link">&para;</a></h3>
+<p>Fsst is a fast and transparent compression algorithm for variable-width data. It is the primary compression
+algorithm that we apply to variable-width data.</p>
+<p>Currently we use a single FSST symbol table per disk page and store that symbol table in the protobuf description.
+This is for historical reasons and is not ideal and will likely change in future versions.</p>
+<p>When FSST is applied in a mini-block context we simply compress the data and let the underlying compressor (always
+<code>Variable</code> at the moment) handle the chunking.</p>
+<h3 id="run-length-encoding-rle">Run Length Encoding (RLE)<a class="headerlink" href="#run-length-encoding-rle" title="Permanent link">&para;</a></h3>
+<p>Run length encoding is a compression technique that compresses large runs of identical values into an array
+of values and an array of run lengths. This is currently used in the mini-block context. To determine if we
+should apply run-length encoding we look at the number of runs divided by the number of values. If the ratio is
+below a threshold (by default 0.5) then we apply run-length encoding.</p>
+<h3 id="byte-stream-split-bss">Byte Stream Split (BSS)<a class="headerlink" href="#byte-stream-split-bss" title="Permanent link">&para;</a></h3>
+<p>Byte stream split is a compression technique that splits multi-byte values by byte position, creating separate streams
+for each byte position across all values. This is a rudimentary and simple form of translating floating point values
+into a more compressible format because it tends to cluster the mantissa bits together which are often consistent
+across a column of floating point values. It does not actually make the data smaller by itself. As a result, BSS is
+only applied if general compression is also applied on the column.</p>
+<p>We currently determine whether or not to apply BSS by looking at an entropy statistics. There is a configurable
+sensitivity parameter. A sensitivity of 0.0 means never apply BSS and a sensitivity of 1.0 means always apply BSS.</p>
+<h3 id="general">General<a class="headerlink" href="#general" title="Permanent link">&para;</a></h3>
+<p>General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
+etc. These techniques are typically back-referencing compressors which replace values with a "back reference" to
+a spot where we already saw the value.</p>
+<p>When applied in a mini-block context we run general compression after all other compression and compress the entire
+mini-block.</p>
+<p>When applied in a full zip context we run general compression on each value.</p>
+<p>The only time general compression is automatically applied is in a full-zip context when we have values that are at
+least 32KiB large. This is because general compression can be CPU intensive.</p>
+<p>However, general compression is highly effective and we allow it to be opted into in other contexts via configuration.</p>
+<h2 id="compression-configuration">Compression Configuration<a class="headerlink" href="#compression-configuration" title="Permanent link">&para;</a></h2>
+<p>The following section lists the available configuration options. These can be set programmatically through writer
+options. However, they can also be set in the field metadata in the schema.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Values</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance-encoding:compression</code></td>
+<td><code>lz4</code>, <code>zstd</code>, <code>none</code>, ...</td>
+<td><code>none</code></td>
+<td>Opt-in to general compression. The value indicates the scheme.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:compression-level</code></td>
+<td>Integers (range is scheme dependent)</td>
+<td>Varies by scheme</td>
+<td>Higher indicates more work should be done to compress the data.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:rle-threshold</code></td>
+<td><code>0.0-1.0</code></td>
+<td><code>0.5</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:bss</code></td>
+<td><code>off</code>, <code>on</code>, <code>auto</code></td>
+<td><code>auto</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:dict-divisor</code></td>
+<td>Integers greater than 1</td>
+<td><code>2</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:general</code></td>
+<td><code>off</code>, <code>on</code></td>
+<td><code>off</code></td>
+<td>Whether to apply general compression.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:packed</code></td>
+<td>Any string</td>
+<td>Not set</td>
+<td>Whether to apply packed struct encoding (see above).</td>
+</tr>
+<tr>
+<td><code>lance-encoding:structural-encoding</code></td>
+<td><code>miniblock</code>, <code>fullzip</code></td>
+<td>Not set</td>
+<td>Force a particular structural encoding to be applied (only useful for testing purposes)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="configuration-details">Configuration Details<a class="headerlink" href="#configuration-details" title="Permanent link">&para;</a></h3>
+<h4 id="compression-scheme">Compression Scheme<a class="headerlink" href="#compression-scheme" title="Permanent link">&para;</a></h4>
+<p>The <code>lance-encoding:compression</code> setting enables general-purpose compression algorithms to be applied. Available schemes:</p>
+<ul>
+<li><strong><code>lz4</code></strong>: Fast compression with good compression ratios. Default compression level is fast mode.</li>
+<li><strong><code>zstd</code></strong>: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.</li>
+<li><strong><code>none</code></strong>: No general compression applied (default).</li>
+<li><strong><code>fsst</code></strong>: Fast Static Symbol Table compression for string data.</li>
+</ul>
+<p>General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
+data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
+(≥32KiB), compression is automatically applied per-value.</p>
+<h4 id="compression-level">Compression Level<a class="headerlink" href="#compression-level" title="Permanent link">&para;</a></h4>
+<p>The compression level is scheme dependent. Currently the following schemes support the following levels:</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Crate Used</th>
+<th>Levels</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zstd</code></td>
+<td><a href="https://crates.io/crates/zstd"><code>zstd</code></a></td>
+<td><code>0-22</code></td>
+<td><code>crate dependent</code> (3 as of this writing)</td>
+</tr>
+<tr>
+<td><code>lz4</code></td>
+<td><a href="https://crates.io/crates/lz4"><code>lz4</code></a></td>
+<td>N/A</td>
+<td>The LZ4 crate has two modes (fast and high compression) and currently this is not exposed to configuration. The LZ4 crate wraps a C library and the default is dependent on the C library. The default as of this writing is fast</td>
+</tr>
+</tbody>
+</table>
+<p>Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
+is typically less affected by the compression level.</p>
+<h4 id="run-length-encoding-rle-threshold">Run Length Encoding (RLE) Threshold<a class="headerlink" href="#run-length-encoding-rle-threshold" title="Permanent link">&para;</a></h4>
+<p>The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
+calculated by dividing the number of runs by the number of values. If the ratio is less than the threshold then
+we apply run-length encoding. The default is 0.5 which means we apply run-length encoding if the number of runs
+is less than half the number of values.</p>
+<p><strong>Key points:</strong>
+- RLE is automatically selected when data has sufficient repetition (run_count / num_values &lt; threshold)
+- Supported types: All fixed-width primitives (u8, i8, u16, i16, u32, i32, f32, u64, i64, f64)
+- Maximum chunk size: 2048 values per mini-block
+- Setting threshold to <code>0.0</code> effectively disables RLE
+- Setting threshold to <code>1.0</code> makes RLE very aggressive (used whenever any runs exist)</p>
+<p>RLE is particularly effective for:
+- Sorted or partially sorted data
+- Columns with many repeated values (status codes, categories, etc.)
+- Low-cardinality columns</p>
+<h4 id="byte-stream-split-bss_1">Byte Stream Split (BSS)<a class="headerlink" href="#byte-stream-split-bss_1" title="Permanent link">&para;</a></h4>
+<p>The configuration variable for BSS is a simple enum. A value of <code>off</code> means to never apply BSS, a value of <code>on</code>
+means to always apply BSS, and a value of <code>auto</code> means to apply BSS based on an entropy calculation (see code for
+details).</p>
+<p><strong>Important:</strong> BSS is only applied when the <code>lance-encoding:compression</code> variable is also set (to a non-<code>none</code> value).
+BSS is a data transformation that makes floating-point data more compressible; it does not reduce size on its own.</p>
+<p><strong>Key points:</strong>
+- Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
+- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- <code>auto</code> mode: Uses entropy analysis with 0.5 sensitivity threshold
+- <code>on</code> mode: Always applies BSS for supported types
+- <code>off</code> mode: Never applies BSS</p>
+<p>BSS works by splitting multi-byte values by byte position, creating separate byte streams. This clusters similar
+bits together (especially mantissa bits in floating-point numbers), which general compression algorithms can then
+compress more effectively.</p>
+<p>BSS is particularly effective for:
+- Floating-point measurements with similar ranges
+- Time-series data with consistent precision
+- Scientific data with correlated mantissa patterns</p>
+<h4 id="dictionary-divisor">Dictionary Divisor<a class="headerlink" href="#dictionary-divisor" title="Permanent link">&para;</a></h4>
+<p>Currently this is used to determine whether or not we apply dictionary encoding. First, we use HLL to estimate
+the number of unique values in the column. Then we divide the number of total values by the divisor to get a
+threshold. If the number of unique values is less than the threshold then we apply dictionary encoding. The
+configuration variable defines the divisor that we apply and it defaults to 2 which means we apply dictionary
+encoding if we estimate that less than half the values are unique.</p>
+<p>Dictionary encoding is effective for columns with low cardinality where the same values repeat many times.
+The dictionary is stored once per page and indices are stored in place of the actual values.</p>
+<p>This is likely to change in future versions.</p>
+<h4 id="packed-struct-encoding">Packed Struct Encoding<a class="headerlink" href="#packed-struct-encoding" title="Permanent link">&para;</a></h4>
+<p>Packed struct encoding is a semi-structural transformation described above. When enabled, struct values are stored
+in row-major format rather than the default columnar format. This reduces the number of I/O operations needed for
+random access but prevents reading individual fields independently.</p>
+<p>This is always opt-in and should only be used when all struct fields are typically accessed together.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/lancedb/lance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://discord.gg/zMM32dvNtd" target="_blank" rel="noopener" title="discord.gg" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M492.5 69.8c-.2-.3-.4-.6-.8-.7-38.1-17.5-78.4-30-119.7-37.1-.4-.1-.8 0-1.1.1s-.6.4-.8.8c-5.5 9.9-10.5 20.2-14.9 30.6-44.6-6.8-89.9-6.8-134.4 0-4.5-10.5-9.5-20.7-15.1-30.6-.2-.3-.5-.6-.8-.8s-.7-.2-1.1-.2C162.5 39 122.2 51.5 84.1 69c-.3.1-.6.4-.8.7C7.1 183.5-13.8 294.6-3.6 404.2c0 .3.1.5.2.8s.3.4.5.6c44.4 32.9 94 58 146.8 74.2.4.1.8.1 1.1 0s.7-.4.9-.7c11.3-15.4 21.4-31.8 30-48.8.1-.2.2-.5.2-.8s0-.5-.1-.8-.2-.5-.4-.6-.4-.3-.7-.4c-15.8-6.1-31.2-13.4-45.9-21.9-.3-.2-.5-.4-.7-.6s-.3-.6-.3-.9 0-.6.2-.9.3-.5.6-.7c3.1-2.3 6.2-4.7 9.1-7.1.3-.2.6-.4.9-.4s.7 0 1 .1c96.2 43.9 200.4 43.9 295.5 0 .3-.1.7-.2 1-.2s.7.2.9.4c2.9 2.4 6 4.9 9.1 7.2.2.2.4.4.6.7s.2.6.2.9-.1.6-.3.9-.4.5-.6.6c-14.7 8.6-30 15.9-45.9 21.8-.2.1-.5.2-.7.4s-.3.4-.4.7-.1.5-.1.8.1.5.2.8c8.8 17 18.8 33.3 30 48.8.2.3.6.6.9.7s.8.1 1.1 0c52.9-16.2 102.6-41.3 147.1-74.2.2-.2.4-.4.5-.6s.2-.5.2-.8c12.3-126.8-20.5-236.9-86.9-334.5zm-302 267.7c-29 0-52.8-26.6-52.8-59.2s23.4-59.2 52.8-59.2c29.7 0 53.3 26.8 52.8 59.2 0 32.7-23.4 59.2-52.8 59.2m195.4 0c-29 0-52.8-26.6-52.8-59.2s23.4-59.2 52.8-59.2c29.7 0 53.3 26.8 52.8 59.2 0 32.7-23.2 59.2-52.8 59.2"/></svg>
+    </a>
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://twitter.com/lancedb" target="_blank" rel="noopener" title="twitter.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M459.4 151.7c.3 4.5.3 9.1.3 13.6 0 138.7-105.6 298.6-298.6 298.6-59.5 0-114.7-17.2-161.1-47.1 8.4 1 16.6 1.3 25.3 1.3 49.1 0 94.2-16.6 130.3-44.8-46.1-1-84.8-31.2-98.1-72.8 6.5 1 13 1.6 19.8 1.6 9.4 0 18.8-1.3 27.6-3.6-48.1-9.7-84.1-52-84.1-103v-1.3c14 7.8 30.2 12.7 47.4 13.3-28.3-18.8-46.8-51-46.8-87.4 0-19.5 5.2-37.4 14.3-53C87.4 130.8 165 172.4 252.1 176.9c-1.6-7.8-2.6-15.9-2.6-24C249.5 95.1 296.3 48 354.4 48c30.2 0 57.5 12.7 76.7 33.1 23.7-4.5 46.5-13.3 66.6-25.3-7.8 24.4-24.4 44.8-46.1 57.8 21.1-2.3 41.6-8.1 60.4-16.2-14.3 20.8-32.2 39.3-52.6 54.3"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      <script id="__config" type="application/json">{"base": "../../..", "features": ["navigation.tabs", "navigation.sections", "navigation.instant", "navigation.indexes", "navigation.tracking", "navigation.top", "search.highlight", "search.share", "content.code.copy", "content.code.annotate"], "search": "../../../assets/javascripts/workers/search.973d3a69.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.f55a23d4.min.js"></script>
+      
+    
+  </body>
+</html>
