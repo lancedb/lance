@@ -89,6 +89,37 @@ Tags can be checked out like versions:
 lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
 ```
 
+## Work with Branches
+
+Use branches to manage parallel lines of dataset evolution. Create a branch from a version or tag, write on that branch, and create a new tag on that branch.
+
+```python
+import lance
+
+# Open dataset
+ds = lance.dataset("/tmp/test.lance")
+
+# Create branch dataset from current latest version
+experiment_branch = ds.create_branch("experiment")
+
+# Write on the branch (affects only that branch's history)
+from pandas import DataFrame
+import pyarrow as pa
+
+tbl = pa.Table.from_pandas(DataFrame({"a": [42]}))
+lance.write_dataset(tbl, experiment_branch, mode="append")
+```
+
+## Cross-Branch Checkout and Tags per Branch
+
+```python
+# Checkout branch 'experiment' by using a global version tuple
+experiment_branch = ds.checkout_version(("experiment", 2))
+
+# Create a tag on the latest branch version and check out by tag
+ds.tags.create("experiment-stable", ("experiment", None))
+```
+
 ## Next Steps
 
 Now that you've mastered dataset versioning with Lance, check out **[Vector Indexing and Vector Search With Lance](vector-search.md)**. You can learn how to build high-performance vector search capabilities on top of your Lance tables.
