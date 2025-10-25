@@ -26,7 +26,6 @@ use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
     pybacked::PyBackedStr,
-    pyclass,
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
@@ -62,6 +61,7 @@ use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::scalar::expression::{IndexSelectionOptions, IndexTypeHint};
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -728,7 +728,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, index_selection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -757,6 +757,7 @@ impl Dataset {
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         disable_scoring_autoprojection: Option<bool>,
+        index_selection: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1078,11 +1079,69 @@ impl Dataset {
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
+        if let Some(index_sel) = index_selection {
+            let mut opts = IndexSelectionOptions::default();
+            // query-level hints: list[str]
+            if let Some(hints) = index_sel.get_item("hints")? {
+                if !hints.is_none() {
+                    if let Ok(list) = hints.downcast::<PyList>() {
+                        let mut qh = Vec::new();
+                        for item in list.iter() {
+                            let s: String = item.extract()?;
+                            qh.push(match s.to_lowercase().as_str() {
+                                "btree" => IndexTypeHint::BTree,
+                                "bloomfilter" | "bloom_filter" => IndexTypeHint::BloomFilter,
+                                "zonemap" | "zone_map" => IndexTypeHint::ZoneMap,
+                                "bitmap" => IndexTypeHint::Bitmap,
+                                "json" => IndexTypeHint::Json,
+                                "inverted" | "fts" => IndexTypeHint::Inverted,
+                                "label_list" => IndexTypeHint::LabelList,
+                                _ => IndexTypeHint::Unknown,
+                            });
+                        }
+                        opts.query_hints = qh;
+                    } else {
+                        return Err(PyValueError::new_err(
+                            "index_selection.hints must be a list of strings",
+                        ));
+                    }
+                }
+            }
+            // column-level hints: dict[str, list[str]]
+            if let Some(col_hints_obj) = index_sel.get_item("column_hints")? {
+                if !col_hints_obj.is_none() {
+                    let col_hints = col_hints_obj.downcast::<PyDict>()?;
+                    for (k, v) in col_hints.iter() {
+                        let col: String = k.extract()?;
+                        let vlist = v.downcast::<PyList>()?;
+                        let mut ch = Vec::new();
+                        for item in vlist.iter() {
+                            let s: String = item.extract()?;
+                            ch.push(match s.to_lowercase().as_str() {
+                                "btree" => IndexTypeHint::BTree,
+                                "bloomfilter" | "bloom_filter" => IndexTypeHint::BloomFilter,
+                                "zonemap" | "zone_map" => IndexTypeHint::ZoneMap,
+                                "bitmap" => IndexTypeHint::Bitmap,
+                                "json" => IndexTypeHint::Json,
+                                "inverted" | "fts" => IndexTypeHint::Inverted,
+                                "label_list" => IndexTypeHint::LabelList,
+                                _ => IndexTypeHint::Unknown,
+                            });
+                        }
+                        opts.column_hints.insert(col, ch);
+                    }
+                }
+            }
+            scanner.index_selection_options(opts);
+        }
+
         if let Some(orderings) = order_by {
+            let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
             scanner
-                .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
+                .order_by(col_orderings)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
+
         let scan = Arc::new(scanner);
         Ok(Scanner::new(scan))
     }
