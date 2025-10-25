@@ -143,6 +143,20 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_frag_reuse_indices: Vec::new(),
                 })
             }
+            Operation::OptimizeColumns { old_fragments, .. } => {
+                let modified_fragment_ids =
+                    old_fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+                let initial_fragments =
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await;
+                Ok(Self {
+                    transaction,
+                    affected_rows,
+                    initial_fragments,
+                    modified_fragment_ids,
+                    conflicting_frag_reuse_indices: Vec::new(),
+                })
+            }
         }
     }
 
@@ -201,6 +215,9 @@ impl<'a> TransactionRebase<'a> {
                 self.check_data_replacement_txn(other_transaction, other_version)
             }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
+            Operation::OptimizeColumns { .. } => {
+                self.check_optimize_columns_txn(other_transaction, other_version)
+            }
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
                 self.check_reserve_fragments_txn(other_transaction, other_version)
@@ -324,6 +341,21 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
+                Operation::OptimizeColumns { old_fragments, .. } => {
+                    if old_fragments
+                        .iter()
+                        .map(|f| f.id)
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
                 | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
@@ -445,6 +477,21 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
+                Operation::OptimizeColumns { old_fragments, .. } => {
+                    if old_fragments
+                        .iter()
+                        .map(|f| f.id)
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
                     self.incompatible_conflict_err(other_transaction, other_version, location!())
                 ),
@@ -510,7 +557,7 @@ impl<'a> TransactionRebase<'a> {
                 // row ids are still valid, so we allow this optimistically.
                 Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
                 // Merge, reserve, and project don't change row ids, so this should be fine.
-                Operation::Merge { .. } => Ok(()),
+                Operation::Merge { .. } | Operation::OptimizeColumns { .. } => Ok(()),
                 Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
@@ -673,6 +720,21 @@ impl<'a> TransactionRebase<'a> {
                     // TODO(rmeng): check that the fragments being replaced are not part of the groups
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
+                Operation::OptimizeColumns { old_fragments, .. } => {
+                    if old_fragments
+                        .iter()
+                        .map(|f| f.id)
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::CreateIndex {
                     new_indices,
                     removed_indices,
@@ -791,6 +853,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
@@ -821,6 +884,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::UpdateBases { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. } => Ok(()),
@@ -838,6 +902,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Update { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::UpdateConfig { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
@@ -879,9 +944,100 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::DataReplacement { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
             }
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+            }
+        }
+    }
+
+    fn check_optimize_columns_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        match &other_transaction.operation {
+            // OptimizeColumns only reorganizes data within existing fragments.
+            // It's compatible with operations that don't modify existing fragments.
+            Operation::Append { .. }
+            | Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Clone { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateBases { .. } => Ok(()),
+
+            // OptimizeColumns conflicts with operations that modify the same fragments
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => {
+                if updated_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(deleted_fragment_ids.iter().copied())
+                    .any(|id| self.modified_fragment_ids.contains(&id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                } else {
+                    Ok(())
+                }
+            }
+
+            Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                ..
+            } => {
+                if updated_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(removed_fragment_ids.iter().copied())
+                    .any(|id| self.modified_fragment_ids.contains(&id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                } else {
+                    Ok(())
+                }
+            }
+
+            Operation::Rewrite { groups, .. } => {
+                if groups
+                    .iter()
+                    .flat_map(|g| g.old_fragments.iter().map(|f| f.id))
+                    .any(|id| self.modified_fragment_ids.contains(&id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                } else {
+                    Ok(())
+                }
+            }
+
+            Operation::OptimizeColumns { old_fragments, .. } => {
+                // Two OptimizeColumns operations conflict if they touch the same fragments
+                if old_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .any(|id| self.modified_fragment_ids.contains(&id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                } else {
+                    Ok(())
+                }
+            }
+
+            // Merge and DataReplacement modify column structure, always conflict
+            Operation::Merge { .. } | Operation::DataReplacement { .. } => {
+                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+            }
+
+            // These operations invalidate the entire dataset state
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::Project { .. }
@@ -904,6 +1060,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateBases { .. }
@@ -932,6 +1089,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
@@ -959,7 +1117,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateBases { .. } => Ok(()),
-            Operation::Merge { .. } | Operation::Project { .. } => {
+            Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
+            | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
             }
@@ -1028,6 +1188,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Rewrite { .. }
                 | Operation::DataReplacement { .. }
                 | Operation::Merge { .. }
+                | Operation::OptimizeColumns { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Update { .. }
@@ -1119,6 +1280,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Delete { .. }
                 | Operation::DataReplacement { .. }
                 | Operation::Merge { .. }
+                | Operation::OptimizeColumns { .. }
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
                 | Operation::Project { .. } => Err(self.incompatible_conflict_err(
@@ -1243,6 +1405,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Overwrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
+            | Operation::OptimizeColumns { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
@@ -2115,6 +2278,10 @@ mod tests {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: lance_core::datatypes::Schema::default(),
             },
+            Operation::OptimizeColumns {
+                old_fragments: vec![fragment0.clone()],
+                new_fragments: vec![fragment0.clone()],
+            },
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: lance_core::datatypes::Schema::default(),
@@ -2175,6 +2342,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2194,6 +2362,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Retryable,     // merge
+                    Compatible,    // optimize columns different fragments
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2213,6 +2382,7 @@ mod tests {
                     Compatible,    // create index
                     Retryable,     // delete
                     Retryable,     // merge
+                    Retryable,     // optimize columns
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
@@ -2229,7 +2399,7 @@ mod tests {
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [Compatible; 9],
+                [Compatible; 10],
             ),
             (
                 Operation::CreateIndex {
@@ -2242,6 +2412,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
@@ -2264,6 +2435,7 @@ mod tests {
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
+                    Compatible,    // optimize columns different fragments
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2286,6 +2458,7 @@ mod tests {
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge
+                    Retryable,     // optimize columns
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
@@ -2304,10 +2477,29 @@ mod tests {
                     Compatible,    // create index
                     Retryable,     // delete
                     Retryable,     // merge
+                    Retryable,     // optimize columns
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
                     Retryable,     // update
+                    Compatible,    // update config
+                ],
+            ),
+            (
+                Operation::OptimizeColumns {
+                    old_fragments: vec![fragment0.clone()],
+                    new_fragments: vec![fragment0.clone()],
+                },
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Retryable,     // delete same fragment
+                    Retryable,     // merge
+                    Retryable,     // optimize columns same fragment
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite same fragment
+                    Compatible,    // reserve
+                    Retryable,     // update same fragment
                     Compatible,    // update config
                 ],
             ),
@@ -2319,6 +2511,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2342,6 +2535,7 @@ mod tests {
                     Compatible,    // create index
                     Retryable,     // delete
                     Retryable,     // merge
+                    Retryable,     // optimize columns
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
@@ -2360,7 +2554,7 @@ mod tests {
                     None,
                     None,
                 ),
-                [Compatible; 9],
+                [Compatible; 10],
             ),
             (
                 // Update config that conflicts with key being upserted by other UpdateConfig operation
@@ -2378,6 +2572,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     Compatible,    // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2401,6 +2596,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     Compatible,    // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2416,7 +2612,7 @@ mod tests {
                     None,
                     None,
                 ),
-                [Compatible; 9],
+                [Compatible; 10],
             ),
             (
                 // Delete config keys currently being upserted by other UpdateConfig operation
@@ -2431,6 +2627,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     Compatible,    // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2455,6 +2652,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2482,6 +2680,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2508,6 +2707,7 @@ mod tests {
                     Compatible,    // create index
                     Compatible,    // delete
                     Compatible,    // merge
+                    Compatible,    // optimize columns
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -2927,6 +3127,9 @@ mod tests {
                     .iter()
                     .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
             ),
+            Operation::OptimizeColumns { old_fragments, .. } => {
+                Box::new(old_fragments.iter().map(|f| f.id))
+            }
             Operation::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
             Operation::Update {
                 updated_fragments,

@@ -262,6 +262,14 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
+  // An operation that rewrites column groups within fragments while preserving row content.
+  message OptimizeColumns {
+    // The fragments replaced by this operation.
+    repeated DataFragment old_fragments = 1;
+    // The replacement fragments with reorganized optimize groups.
+    repeated DataFragment new_fragments = 2;
+  }
+
   // Update the state of the MemWal index
   message UpdateMemWalState {
 
@@ -296,6 +304,7 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    OptimizeColumns optimize_columns = 115;
   }
 
   // An operation to apply to the blob dataset

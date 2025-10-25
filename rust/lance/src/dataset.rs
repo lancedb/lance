@@ -69,6 +69,7 @@ mod hash_joiner;
 pub mod index;
 mod metadata;
 pub mod optimize;
+pub mod optimize_columns;
 pub mod progress;
 pub mod refs;
 pub(crate) mod rowids;

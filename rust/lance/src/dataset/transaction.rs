@@ -224,6 +224,11 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
     },
+    /// Reorganize column groupings within existing fragments without changing row content.
+    OptimizeColumns {
+        old_fragments: Vec<Fragment>,
+        new_fragments: Vec<Fragment>,
+    },
     /// Restore an old version of the database
     Restore { version: u64 },
     /// Reserves fragment ids for future use
@@ -321,6 +326,7 @@ impl std::fmt::Display for Operation {
             Self::CreateIndex { .. } => write!(f, "CreateIndex"),
             Self::Rewrite { .. } => write!(f, "Rewrite"),
             Self::Merge { .. } => write!(f, "Merge"),
+            Self::OptimizeColumns { .. } => write!(f, "OptimizeColumns"),
             Self::Restore { .. } => write!(f, "Restore"),
             Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
             Self::Update { .. } => write!(f, "Update"),
@@ -439,6 +445,16 @@ impl PartialEq for Operation {
                     schema: b_schema,
                 },
             ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            (
+                Self::OptimizeColumns {
+                    old_fragments: a_old,
+                    new_fragments: a_new,
+                },
+                Self::OptimizeColumns {
+                    old_fragments: b_old,
+                    new_fragments: b_new,
+                },
+            ) => compare_vec(a_old, b_old) && compare_vec(a_new, b_new),
             (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
             (
                 Self::ReserveFragments { num_fragments: a },
@@ -541,6 +557,9 @@ impl PartialEq for Operation {
             (Self::Append { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Append { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -579,6 +598,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Delete { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -621,6 +643,9 @@ impl PartialEq for Operation {
             (Self::Overwrite { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Overwrite { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::CreateIndex { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -659,6 +684,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::CreateIndex { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -701,6 +729,9 @@ impl PartialEq for Operation {
             (Self::Rewrite { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Rewrite { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Merge { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -739,6 +770,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Merge { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -781,6 +815,9 @@ impl PartialEq for Operation {
             (Self::Restore { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Restore { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::ReserveFragments { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -819,6 +856,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::ReserveFragments { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -861,6 +901,9 @@ impl PartialEq for Operation {
             (Self::Update { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Update { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Project { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -899,6 +942,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Project { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -941,6 +987,9 @@ impl PartialEq for Operation {
             (Self::UpdateConfig { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateConfig { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::DataReplacement { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -981,6 +1030,9 @@ impl PartialEq for Operation {
             (Self::DataReplacement { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::DataReplacement { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::UpdateMemWalState { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -1019,6 +1071,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::UpdateMemWalState { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::OptimizeColumns { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (
@@ -1076,6 +1131,9 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Clone { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::UpdateBases { new_bases: a }, Self::UpdateBases { new_bases: b }) => {
                 compare_vec(a, b)
@@ -1123,6 +1181,9 @@ impl PartialEq for Operation {
             (Self::UpdateBases { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateBases { .. }, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Append { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -1164,6 +1225,51 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::OptimizeColumns { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
         }
@@ -1307,6 +1413,7 @@ impl Operation {
             Self::CreateIndex { .. } => "CreateIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
+            Self::OptimizeColumns { .. } => "OptimizeColumns",
             Self::ReserveFragments { .. } => "ReserveFragments",
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
@@ -2023,6 +2130,22 @@ impl Transaction {
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+            }
+            Operation::OptimizeColumns {
+                // ref old_fragments,
+                ref new_fragments,
+                ..
+            } => {
+                let existing_fragments = maybe_existing_fragments?;
+                let new_by_id: HashMap<u64, &Fragment> =
+                    new_fragments.iter().map(|f| (f.id, f)).collect();
+
+                final_fragments.extend(existing_fragments.iter().map(|frag| {
+                    new_by_id
+                        .get(&frag.id)
+                        .map(|&new_frag| new_frag.clone())
+                        .unwrap_or_else(|| frag.clone())
+                }));
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -2890,6 +3013,21 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
                 schema: Schema::from(&Fields(schema)),
             },
+            Some(pb::transaction::Operation::OptimizeColumns(
+                pb::transaction::OptimizeColumns {
+                    old_fragments,
+                    new_fragments,
+                },
+            )) => Operation::OptimizeColumns {
+                old_fragments: old_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+                new_fragments: new_fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+            },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
             }
@@ -3259,6 +3397,13 @@ impl From<&Transaction> for pb::Transaction {
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
+            Operation::OptimizeColumns {
+                old_fragments,
+                new_fragments,
+            } => pb::transaction::Operation::OptimizeColumns(pb::transaction::OptimizeColumns {
+                old_fragments: old_fragments.iter().map(pb::DataFragment::from).collect(),
+                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+            }),
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
@@ -3476,6 +3621,15 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             merge_fragments_valid(manifest, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
+        Operation::OptimizeColumns {
+            old_fragments,
+            new_fragments,
+            ..
+        } => {
+            optimize_columns_fragments_valid(manifest, old_fragments, new_fragments)?;
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)?;
+            Ok(())
+        }
         Operation::Overwrite {
             fragments,
             schema,
@@ -3606,6 +3760,84 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
         ));
     }
 
+    Ok(())
+}
+
+/// Validates that OptimizeColumns operation maintains fragment integrity.
+///
+/// OptimizeColumns must preserve fragment IDs and row counts while only
+/// reorganizing the internal column layout. This ensures:
+/// - Fragment IDs remain the same
+/// - Row counts are preserved (no data loss/addition)
+/// - All referenced fragments exist in the manifest
+fn optimize_columns_fragments_valid(
+    manifest: &Manifest,
+    old_fragments: &[Fragment],
+    new_fragments: &[Fragment],
+) -> Result<()> {
+    if old_fragments.len() != new_fragments.len() {
+        return Err(Error::invalid_input(
+            format!(
+                "OptimizeColumns requires the same number of old and new fragments, got {} old and {} new",
+                old_fragments.len(),
+                new_fragments.len()
+            ),
+            location!(),
+        ));
+    }
+
+    let manifest_fragments: HashMap<u64, &Fragment> = manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+
+    for old_fragment in old_fragments {
+        if !manifest_fragments.contains_key(&old_fragment.id) {
+            return Err(Error::invalid_input(
+                format!(
+                    "OptimizeColumns referenced old fragment {} which doesnt exist",
+                    old_fragment.id
+                ),
+                location!(),
+            ));
+        }
+    }
+
+    for new_fragment in new_fragments {
+        if !manifest_fragments.contains_key(&new_fragment.id) {
+            return Err(Error::invalid_input(
+                format!(
+                    "OptimizeColumns new fragment {} doesnt exist in manifest",
+                    new_fragment.id
+                ),
+                location!(),
+            ));
+        }
+    }
+
+    for (old_fragment, new_fragment) in old_fragments.iter().zip(new_fragments.iter()) {
+        if old_fragment.id != new_fragment.id {
+            return Err(Error::invalid_input(
+                format!(
+                    "OptimizeColumns must preserve fragment IDs. Found {} -> {}",
+                    old_fragment.id, new_fragment.id
+                ),
+                location!(),
+            ));
+        }
+        if old_fragment.physical_rows != new_fragment.physical_rows {
+            return Err(Error::invalid_input(
+                format!(
+                    "OptimizeColumns must preserve row counts for fragment {}. Old row count {:?}, new row count {:?}",
+                    old_fragment.id,
+                    old_fragment.physical_rows,
+                    new_fragment.physical_rows
+                ),
+                location!(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4451,5 +4683,74 @@ mod tests {
 
         // Verify idx_e removed (bad field)
         assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
+    }
+
+    #[test]
+    fn test_optimize_columns_validation() {
+        let schema = create_test_schema(&[0, 1]);
+
+        let mut fragment0 = Fragment::new(0);
+        fragment0.physical_rows = Some(10);
+
+        let mut fragment1 = Fragment::new(1);
+        fragment1.physical_rows = Some(20);
+
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment0.clone(), fragment1.clone()]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            None,
+            HashMap::new(),
+        );
+
+        let valid_new = fragment0.clone();
+        let op = Operation::OptimizeColumns {
+            old_fragments: vec![fragment0.clone()],
+            new_fragments: vec![valid_new],
+        };
+        assert!(
+            validate_operation(Some(&manifest), &op).is_ok(),
+            "Expect operation to succeed with same id and row counts"
+        );
+
+        let op_missing = Operation::OptimizeColumns {
+            old_fragments: vec![Fragment::new(42)],
+            new_fragments: vec![fragment0.clone()],
+        };
+        assert!(
+            validate_operation(Some(&manifest), &op_missing).is_err(),
+            "Expect failure with replacing fragment that doesn't exist in manifest"
+        );
+
+        let mut wrong_rows = fragment0.clone();
+        wrong_rows.physical_rows = Some(5);
+        let op_rows = Operation::OptimizeColumns {
+            old_fragments: vec![fragment0.clone()],
+            new_fragments: vec![wrong_rows],
+        };
+        assert!(
+            validate_operation(Some(&manifest), &op_rows).is_err(),
+            "Expect failure with invalid replacement row count"
+        );
+
+        let mut wrong_id = fragment0.clone();
+        wrong_id.id = 1;
+        let op_id = Operation::OptimizeColumns {
+            old_fragments: vec![fragment0.clone()],
+            new_fragments: vec![wrong_id],
+        };
+        assert!(
+            validate_operation(Some(&manifest), &op_id).is_err(),
+            "Expect failure with invalid replacement frag id"
+        );
+
+        let op_count = Operation::OptimizeColumns {
+            old_fragments: vec![fragment0.clone()],
+            new_fragments: vec![fragment0.clone(), fragment1.clone()],
+        };
+        assert!(
+            validate_operation(Some(&manifest), &op_count).is_err(),
+            "Expect failure with invalid replacement frag count"
+        );
     }
 }
