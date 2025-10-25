@@ -319,7 +319,8 @@ def compute_pq_codes(
         dataset,
         batch_size=batch_size,
         with_row_id=False,
-        columns=["row_id", "partition"] + field_names,
+        with_row_address=True,
+        columns=["row_addr", "partition"] + field_names,
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
@@ -329,7 +330,7 @@ def compute_pq_codes(
     )
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -359,17 +360,17 @@ def compute_pq_codes(
                 )
                 pq_codes = pq_codes.to(torch.uint8)
 
-                ids = batch["row_id"].reshape(-1)
+                addrs = batch["row_addr"].reshape(-1)
                 partitions = batch["partition"].reshape(-1)
 
-                ids = ids.cpu()
+                addrs = addrs.cpu()
                 partitions = partitions.cpu()
                 pq_codes = pq_codes.cpu()
 
                 pq_values = pa.array(pq_codes.numpy().reshape(-1))
                 pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
                 part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions, pq_codes],
+                    [addrs, partitions, pq_codes],
                     schema=output_schema,
                 )
 
@@ -448,7 +449,8 @@ def compute_partitions(
     torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
-        with_row_id=True,
+        with_row_id=False,
+        with_row_address=True,
         columns=[column],
         samples=sample_size,
         filter=filt,
@@ -473,7 +475,7 @@ def compute_partitions(
 
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("partition", pa.uint32()),
         ]
         + fields
@@ -487,29 +489,29 @@ def compute_partitions(
         progress.set_description("Assigning partitions")
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
-        id_offset = 0
+        addr_offset = 0
         with torch.no_grad():
             for batch in loader:
                 if sample_size is None:
                     vecs = batch[column]
-                    ids = batch["_rowid"].reshape(-1)
+                    addrs = batch["_rowaddr"].reshape(-1)
                 else:
-                    # No row ids with sampling
+                    # No row addrs with sampling
                     vecs = batch
-                    ids = torch.arange(id_offset, id_offset + vecs.size(0))
-                    id_offset += vecs.size(0)
+                    addrs = torch.arange(addr_offset, addr_offset + vecs.size(0))
+                    addr_offset += vecs.size(0)
 
                 vecs = vecs.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
 
                 partitions = kmeans.transform(vecs)
 
                 # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+                assert vecs.shape[0] == addrs.shape[0]
 
                 # Ignore any invalid vectors.
                 mask_gpu = partitions.isfinite() & (partitions >= 0)
                 mask = mask_gpu.cpu()
-                ids = ids[mask]
+                addrs = addrs[mask]
                 partitions = partitions[mask_gpu]
 
                 partitions = partitions.cpu()
@@ -531,16 +533,16 @@ def compute_partitions(
 
                 part_batch = pa.RecordBatch.from_arrays(
                     [
-                        ids.numpy(),
+                        addrs.numpy(),
                         partitions.numpy(),
                     ]
                     + split_columns,
                     schema=output_schema,
                 )
-                if len(part_batch) < len(ids):
+                if len(part_batch) < len(addrs):
                     LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
+                        len(part_batch) - len(addrs),
                     )
 
                 progress.update(part_batch.num_rows)
@@ -641,7 +643,8 @@ def one_pass_assign_ivf_pq_on_accelerator(
     torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
-        with_row_id=True,
+        with_row_id=False,
+        with_row_address=True,
         columns=[column],
         filter=filt,
     )
@@ -658,7 +661,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -679,14 +682,14 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 )
 
                 partitions = ivf_kmeans.transform(vecs)
-                ids = batch["_rowid"].reshape(-1)
+                addrs = batch["_rowaddr"].reshape(-1)
 
                 # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+                assert vecs.shape[0] == addrs.shape[0]
 
                 # Ignore any invalid vectors.
                 mask_gpu = partitions.isfinite() & (partitions >= 0)
-                ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
+                addrs = addrs.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
                 partitions = partitions[mask_gpu].cpu()
                 vecs = vecs[mask_gpu]
 
@@ -716,14 +719,14 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 pq_values = pa.array(pq_codes.cpu().numpy().reshape(-1))
                 pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
                 part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions, pq_codes],
+                    [addrs, partitions, pq_codes],
                     schema=output_schema,
                 )
 
-                if len(part_batch) < len(ids):
+                if len(part_batch) < len(addrs):
                     LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
+                        len(part_batch) - len(addrs),
                     )
 
                 progress.update(part_batch.num_rows)

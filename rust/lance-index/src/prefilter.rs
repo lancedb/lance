@@ -41,13 +41,13 @@ pub trait PreFilter: Send + Sync {
     /// This method must be called after `wait_for_ready`
     fn mask(&self) -> Arc<RowIdMask>;
 
-    /// Check whether a slice of row ids should be included in a query.
+    /// Check whether a slice of row addrs should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
     /// also known as a selection vector.
     ///
     /// This method must be called after `wait_for_ready`
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
+    fn filter_row_addrs<'a>(&self, row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
 }
 
 /// A prefilter that does nothing
@@ -67,7 +67,7 @@ impl PreFilter for NoFilter {
         Arc::new(RowIdMask::all_rows())
     }
 
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        row_ids.enumerate().map(|(i, _)| i as u64).collect()
+    fn filter_row_addrs<'a>(&self, row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        row_addrs.enumerate().map(|(i, _)| i as u64).collect()
     }
 }

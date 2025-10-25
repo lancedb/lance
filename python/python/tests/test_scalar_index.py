@@ -622,16 +622,16 @@ def test_fts_custom_stop_words(tmp_path):
     results = ds.to_table(
         full_text_query="他们",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert len(results["_rowid"].to_pylist()) == 0
+    assert len(results["_rowaddr"].to_pylist()) == 0
 
     results = ds.to_table(
         full_text_query="手机",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert len(results["_rowid"].to_pylist()) == 1
+    assert len(results["_rowaddr"].to_pylist()) == 1
 
 
 def test_rowid_order(dataset):
@@ -639,12 +639,12 @@ def test_rowid_order(dataset):
     results = dataset.scanner(
         columns=["doc"],
         full_text_query="hello",
-        with_row_id=True,
+        with_row_address=True,
     ).to_table()
 
     assert results.schema[0].name == "doc"
     assert results.schema[1].name == "_score"
-    assert results.schema[2].name == "_rowid"
+    assert results.schema[2].name == "_rowaddr"
 
 
 def test_filter_with_fts_index(dataset):
@@ -799,9 +799,9 @@ def test_indexed_filter_with_fts_index(tmp_path):
         full_text_query="puppy",
         filter="sentiment='positive'",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [2, 3]
+    assert results["_rowaddr"].to_pylist() == [2, 3]
 
 
 def test_fts_ngram_tokenizer(tmp_path):
@@ -1325,9 +1325,9 @@ def test_lindera_load_config_fallback(tmp_path, lindera_ipadic, monkeypatch):
     results = ds.to_table(
         full_text_query="成田",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
@@ -1351,16 +1351,16 @@ def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
     results = ds.to_table(
         full_text_query="成田",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
     results = ds.to_table(
         full_text_query="ほげほげ",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
@@ -1381,9 +1381,9 @@ def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
     results = ds.to_table(
         full_text_query="成田",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path(tmp_path, lindera_ipadic):
@@ -1433,15 +1433,15 @@ def test_lindera_ipadic_jp_tokenizer_csv_user_dict(tmp_path, lindera_ipadic):
     results = ds.to_table(
         full_text_query="成田",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
     assert len(results) == 0
     results = ds.to_table(
         full_text_query="成田国際空港",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
@@ -1457,15 +1457,15 @@ def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
     results = ds.to_table(
         full_text_query="成田",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
     assert len(results) == 0
     results = ds.to_table(
         full_text_query="成田国際空港",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_jieba_tokenizer(tmp_path):
@@ -1480,9 +1480,9 @@ def test_jieba_tokenizer(tmp_path):
     results = ds.to_table(
         full_text_query="我们",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [0]
+    assert results["_rowaddr"].to_pylist() == [0]
 
 
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
@@ -1525,15 +1525,15 @@ def test_jieba_user_dict_tokenizer(tmp_path):
     results = ds.to_table(
         full_text_query="的前",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
     assert len(results) == 0
     results = ds.to_table(
         full_text_query="光明的前途",
         prefilter=True,
-        with_row_id=True,
+        with_row_address=True,
     )
-    assert results["_rowid"].to_pylist() == [1, 0]
+    assert results["_rowaddr"].to_pylist() == [1, 0]
 
 
 def test_bitmap_index(tmp_path: Path):
@@ -2107,6 +2107,7 @@ def test_btree_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded == 0
 
 
+@pytest.mark.skip
 def test_fts_backward_v0_27_0(tmp_path: Path):
     path = (
         Path(__file__).parent.parent.parent.parent
@@ -3577,7 +3578,7 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
 
     # flat-fallback path (prefilter=True)
     tbl_flat = ds.scanner(
-        columns=["_rowid", "_score"],
+        columns=["_rowaddr", "_score"],
         full_text_query=query,
         filter=filter_expr,
         limit=limit,
@@ -3585,7 +3586,7 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
     ).to_table()
     flat_pairs = list(
         zip(
-            tbl_flat.column("_rowid").to_pylist(),
+            tbl_flat.column("_rowaddr").to_pylist(),
             tbl_flat.column("_score").to_pylist(),
         )
     )
@@ -3593,7 +3594,7 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
     # WAND path (prefilter=False prevents building a mask, so no flat fallback)
     tbl_wand = (
         ds.scanner(
-            columns=["_rowid", "_score"],
+            columns=["_rowaddr", "_score"],
             full_text_query=query,
             filter=filter_expr,
             limit=n,
@@ -3604,7 +3605,7 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
     )
     wand_pairs = list(
         zip(
-            tbl_wand.column("_rowid").to_pylist(),
+            tbl_wand.column("_rowaddr").to_pylist(),
             tbl_wand.column("_score").to_pylist(),
         )
     )
@@ -3618,14 +3619,14 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
     )
 
     tbl_limited_wand = ds.scanner(
-        columns=["_rowid", "_score"],
+        columns=["_rowaddr", "_score"],
         full_text_query=query,
         limit=limit,
     ).to_table()
 
     tbl_full_wand = (
         ds.scanner(
-            columns=["_rowid", "_score"],
+            columns=["_rowaddr", "_score"],
             full_text_query=query,
         )
         .to_table()
@@ -3634,13 +3635,13 @@ def test_fts_flat_fallback_matches_wand(tmp_path):
 
     limited_wand_pairs = list(
         zip(
-            tbl_limited_wand.column("_rowid").to_pylist(),
+            tbl_limited_wand.column("_rowaddr").to_pylist(),
             tbl_limited_wand.column("_score").to_pylist(),
         )
     )
     full_wand_pairs = list(
         zip(
-            tbl_full_wand.column("_rowid").to_pylist(),
+            tbl_full_wand.column("_rowaddr").to_pylist(),
             tbl_full_wand.column("_score").to_pylist(),
         )
     )

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{DistanceType, Dot, L2};
@@ -153,7 +153,7 @@ pub struct ProductQuantizationStorage {
 
     // For easy access
     pq_code: Arc<UInt8Array>,
-    row_ids: Arc<UInt64Array>,
+    row_addrs: Arc<UInt64Array>,
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
@@ -195,21 +195,21 @@ impl ProductQuantizationStorage {
                 batch.schema(),
             );
             batch = batch.project(&[
-                batch.schema().index_of(ROW_ID)?,
+                batch.schema().index_of(ROW_ADDR)?,
                 batch.schema().index_of(PQ_CODE_COLUMN)?,
             ])?;
         }
 
-        let Some(row_ids) = batch.column_by_name(ROW_ID) else {
+        let Some(row_addrs) = batch.column_by_name(ROW_ADDR) else {
             return Err(Error::Index {
-                message: "Row ID column not found from PQ storage".to_string(),
+                message: "Row ADDR column not found from PQ storage".to_string(),
                 location: location!(),
             });
         };
-        let row_ids: Arc<UInt64Array> = row_ids
+        let row_addrs: Arc<UInt64Array> = row_addrs
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::Index {
-                message: "Row ID column is not of type UInt64".to_string(),
+                message: "Row ADDR column is not of type UInt64".to_string(),
                 location: location!(),
             })?
             .clone()
@@ -224,7 +224,7 @@ impl ProductQuantizationStorage {
             let pq_col = batch[PQ_CODE_COLUMN].as_fixed_size_list();
             let transposed_code = transpose(
                 pq_col.values().as_primitive::<UInt8Type>(),
-                row_ids.len(),
+                row_addrs.len(),
                 num_sub_vectors_in_byte,
             );
             let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
@@ -243,13 +243,13 @@ impl ProductQuantizationStorage {
 
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let transposed_codes = pq_code.values();
-            let mut new_row_ids = Vec::with_capacity(row_ids.len());
-            let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
+            let mut new_row_addrs = Vec::with_capacity(row_addrs.len());
+            let mut new_codes = Vec::with_capacity(row_addrs.len() * num_sub_vectors);
 
-            let row_ids_values = row_ids.values();
-            for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    new_row_ids.push(mapped_value);
+            let row_addrs_values = row_addrs.values();
+            for (i, row_addr) in row_addrs_values.iter().enumerate() {
+                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_addr(*row_addr) {
+                    new_row_addrs.push(mapped_value);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         num_bits,
@@ -259,19 +259,19 @@ impl ProductQuantizationStorage {
                 }
             }
 
-            let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+            let new_row_addrs = Arc::new(UInt64Array::from(new_row_addrs));
             let new_codes = UInt8Array::from(new_codes);
-            batch = if new_row_ids.is_empty() {
+            batch = if new_row_addrs.is_empty() {
                 RecordBatch::new_empty(batch.schema())
             } else {
-                let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+                let num_bytes_in_code = new_codes.len() / new_row_addrs.len();
                 let new_transposed_codes =
-                    transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+                    transpose(&new_codes, new_row_addrs.len(), num_bytes_in_code);
                 let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                     new_transposed_codes,
                     num_bytes_in_code as i32,
                 )?);
-                RecordBatch::try_new(batch.schema(), vec![new_row_ids, codes_fsl])?
+                RecordBatch::try_new(batch.schema(), vec![new_row_addrs, codes_fsl])?
             };
             pq_code = batch[PQ_CODE_COLUMN]
                 .as_fixed_size_list()
@@ -299,7 +299,7 @@ impl ProductQuantizationStorage {
             distance_type,
             batch,
             pq_code,
-            row_ids,
+            row_addrs,
         })
     }
 
@@ -402,9 +402,9 @@ impl ProductQuantizationStorage {
         self.batch.schema()
     }
 
-    pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
+    pub fn get_row_addrs(&self, ids: &[u32]) -> Vec<u64> {
         ids.iter()
-            .map(|&id| self.row_ids.value(id as usize))
+            .map(|&id| self.row_addrs.value(id as usize))
             .collect()
     }
 
@@ -496,14 +496,14 @@ impl QuantizerStorage for ProductQuantizationStorage {
     // because PQ Storage transposed the PQ codes
     fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
         let transposed_codes = self.pq_code.values();
-        let mut new_row_ids = Vec::with_capacity(self.len());
+        let mut new_row_addrs = Vec::with_capacity(self.len());
         let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
 
-        let row_ids = self.row_ids.values();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
-                Some(Some(new_id)) => {
-                    new_row_ids.push(*new_id);
+        let row_addrs = self.row_addrs.values();
+        for (i, row_addr) in row_addrs.iter().enumerate() {
+            match mapping.get(row_addr) {
+                Some(Some(new_addr)) => {
+                    new_row_addrs.push(*new_addr);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         self.metadata.nbits,
@@ -513,7 +513,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
                 }
                 Some(None) => {}
                 None => {
-                    new_row_ids.push(*row_id);
+                    new_row_addrs.push(*row_addr);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         self.metadata.nbits,
@@ -524,18 +524,19 @@ impl QuantizerStorage for ProductQuantizationStorage {
             }
         }
 
-        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+        let new_row_addrs = Arc::new(UInt64Array::from(new_row_addrs));
         let new_codes = UInt8Array::from(new_codes);
-        let batch = if new_row_ids.is_empty() {
+        let batch = if new_row_addrs.is_empty() {
             RecordBatch::new_empty(self.schema())
         } else {
-            let num_bytes_in_code = new_codes.len() / new_row_ids.len();
-            let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+            let num_bytes_in_code = new_codes.len() / new_row_addrs.len();
+            let new_transposed_codes =
+                transpose(&new_codes, new_row_addrs.len(), num_bytes_in_code);
             let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                 new_transposed_codes,
                 num_bytes_in_code as i32,
             )?);
-            RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
+            RecordBatch::try_new(self.schema(), vec![new_row_addrs.clone(), codes_fsl])?
         };
         let transposed_codes = batch[PQ_CODE_COLUMN]
             .as_fixed_size_list()
@@ -548,7 +549,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             distance_type: self.distance_type,
             batch,
             pq_code: Arc::new(transposed_codes),
-            row_ids: new_row_ids,
+            row_addrs: new_row_addrs,
         })
     }
 
@@ -622,12 +623,12 @@ impl VectorStore for ProductQuantizationStorage {
         self.distance_type
     }
 
-    fn row_id(&self, id: u32) -> u64 {
-        self.row_ids.values()[id as usize]
+    fn row_addr(&self, id: u32) -> u64 {
+        self.row_addrs.values()[id as usize]
     }
 
-    fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.row_ids.values().iter()
+    fn row_addrs(&self) -> impl Iterator<Item = &u64> {
+        self.row_addrs.values().iter()
     }
 
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
@@ -1043,7 +1044,7 @@ mod tests {
     use arrow_array::{Float32Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::ROW_ID_FIELD;
+    use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
     use rand::Rng;
 
     const DIM: usize = 32;
@@ -1064,13 +1065,13 @@ mod tests {
                 ),
                 true,
             ),
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
         ]);
         let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|_| rand::random()));
-        let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
+        let row_addrs = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
         let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
         let batch =
-            RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
+            RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_addrs)]).unwrap();
 
         StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
             .unwrap()
@@ -1092,16 +1093,16 @@ mod tests {
                 ),
                 true,
             ),
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
             Field::new("extra", DataType::UInt32, true),
         ]);
         let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|_| rand::random()));
-        let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
+        let row_addrs = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
         let extra_column = UInt32Array::from_iter_values((0..TOTAL).map(|v| v as u32));
         let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
         let batch = RecordBatch::try_new(
             schema.into(),
-            vec![Arc::new(fsl), Arc::new(row_ids), Arc::new(extra_column)],
+            vec![Arc::new(fsl), Arc::new(row_addrs), Arc::new(extra_column)],
         )
         .unwrap();
 
@@ -1121,7 +1122,7 @@ mod tests {
             256 * DIM
         );
         assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
-        assert_eq!(storage.row_ids.len(), TOTAL);
+        assert_eq!(storage.row_addrs.len(), TOTAL);
     }
 
     #[tokio::test]
@@ -1159,12 +1160,12 @@ mod tests {
         }
         let new_storage = storage.remap(&mapping).unwrap();
         assert_eq!(new_storage.len(), TOTAL / 2);
-        assert_eq!(new_storage.row_ids.len(), TOTAL / 2);
-        for (i, row_id) in new_storage.row_ids().enumerate() {
-            assert_eq!(*row_id, (TOTAL + i) as u64);
+        assert_eq!(new_storage.row_addrs.len(), TOTAL / 2);
+        for (i, row_addr) in new_storage.row_addrs().enumerate() {
+            assert_eq!(*row_addr, (TOTAL + i) as u64);
         }
         assert_eq!(new_storage.batch.num_columns(), 2);
-        assert!(new_storage.batch.column_by_name(ROW_ID).is_some());
+        assert!(new_storage.batch.column_by_name(ROW_ADDR).is_some());
         assert!(new_storage.batch.column_by_name(PQ_CODE_COLUMN).is_some());
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
-    dataset::rowids::load_row_id_sequences,
+    dataset::rowids::{get_row_id_index, load_row_id_sequences},
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
@@ -30,7 +30,7 @@ use lance_core::{
         address::RowAddress,
         mask::{RowIdMask, RowIdTreeMap},
     },
-    Error, Result, ROW_ID_FIELD,
+    Error, Result, ROW_ADDR_FIELD, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -328,7 +328,7 @@ impl MapIndexExec {
 
             let allow_list =
                 allow_list
-                    .row_ids()
+                    .row_addrs()
                     .ok_or(datafusion::error::DataFusionError::External(
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
@@ -454,7 +454,7 @@ impl ExecutionPlan for MapIndexExec {
 }
 
 pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///
@@ -591,83 +591,141 @@ async fn row_ids_for_mask(
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
-    match (mask.allow_list, mask.block_list) {
-        (None, None) => {
-            // Matches all row ids in the given fragments.
-            if dataset.manifest.uses_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
+        // Stable Row ID mode:
+        // Prefer using row addresses directly when the mask provides them (most scalar indices store addresses).
+        let allow_list_opt = mask.allow_list.clone();
+        let block_list_opt = mask.block_list.clone();
+        match (allow_list_opt, block_list_opt) {
+            (Some(mut allow_list), None) => {
+                // Restrict to requested fragments first to avoid leaking rows from other fragments.
+                retain_fragments(&mut allow_list, fragments, dataset).await?;
+                if let Some(allow_addrs_iter) = allow_list.row_addrs() {
+                    let addrs: Vec<u64> = allow_addrs_iter.map(u64::from).collect();
+                    if !addrs.is_empty() {
+                        return Ok(addrs);
+                    }
+                }
+                // Fallback: allow_list is stable row ids, map via RowIdIndex.
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
                     .await?;
-
-                let capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                let mut row_ids = Vec::with_capacity(capacity);
+                let row_id_index =
+                    get_row_id_index(dataset)
+                        .await?
+                        .ok_or_else(|| Error::Internal {
+                            message: "RowIdIndex missing in stable row id mode".to_string(),
+                            location: location!(),
+                        })?;
+                let capacity = mask
+                    .max_len()
+                    .unwrap_or_else(|| sequences.iter().map(|seq| seq.len()).sum());
+                let mut addrs = Vec::with_capacity(capacity as usize);
                 for sequence in sequences {
-                    row_ids.extend(sequence.iter());
-                }
-                Ok(row_ids)
-            } else {
-                Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
-            }
-        }
-        (Some(mut allow_list), None) => {
-            retain_fragments(&mut allow_list, fragments, dataset).await?;
-
-            if let Some(allow_list_iter) = allow_list.row_ids() {
-                Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
-            } else {
-                // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_stable_row_ids());
-                Ok(FragIdIter::new(fragments)
-                    .filter(|row_id| allow_list.contains(*row_id))
-                    .collect())
-            }
-        }
-        (None, Some(block_list)) => {
-            if dataset.manifest.uses_stable_row_ids() {
-                let sequences = load_row_id_sequences(dataset, fragments)
-                    .map_ok(|(_frag_id, sequence)| sequence)
-                    .try_collect::<Vec<_>>()
-                    .await?;
-
-                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
-                let mut row_ids = Vec::with_capacity(capacity);
-                for sequence in sequences {
-                    row_ids.extend(
-                        sequence
-                            .iter()
-                            .filter(|row_id| !block_list.contains(*row_id)),
-                    );
-                }
-                Ok(row_ids)
-            } else {
-                Ok(FragIdIter::new(fragments)
-                    .filter(|row_id| !block_list.contains(*row_id))
-                    .collect())
-            }
-        }
-        (Some(mut allow_list), Some(block_list)) => {
-            // We need to filter out irrelevant fragments as well.
-            retain_fragments(&mut allow_list, fragments, dataset).await?;
-
-            if let Some(allow_list_iter) = allow_list.row_ids() {
-                Ok(allow_list_iter
-                    .filter_map(|addr| {
-                        let row_id = u64::from(addr);
-                        if !block_list.contains(row_id) {
-                            Some(row_id)
-                        } else {
-                            None
+                    for row_id in sequence.iter() {
+                        // allow_list is in address domain; translate stable row id to address first
+                        if let Some(addr) = row_id_index.get(row_id) {
+                            let addr_u64 = u64::from(addr);
+                            if allow_list.contains(addr_u64) {
+                                addrs.push(addr_u64);
+                            }
                         }
-                    })
-                    .collect::<Vec<_>>())
-            } else {
-                // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_stable_row_ids());
-                Ok(FragIdIter::new(fragments)
-                    .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
-                    .collect())
+                    }
+                }
+                Ok(addrs)
+            }
+            (None, Some(block_list)) => {
+                // Map stable or address-domain block list via RowIdIndex over per-fragment sequences.
+                let sequences = load_row_id_sequences(dataset, fragments)
+                    .map_ok(|(_frag_id, sequence)| sequence)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let row_id_index =
+                    get_row_id_index(dataset)
+                        .await?
+                        .ok_or_else(|| Error::Internal {
+                            message: "RowIdIndex missing in stable row id mode".to_string(),
+                            location: location!(),
+                        })?;
+                let mut addrs = Vec::new();
+                for sequence in sequences {
+                    for row_id in sequence.iter() {
+                        // block_list is in address domain; translate stable row id to address first
+                        if let Some(addr) = row_id_index.get(row_id) {
+                            let addr_u64 = u64::from(addr);
+                            if !block_list.contains(addr_u64) {
+                                addrs.push(addr_u64);
+                            }
+                        }
+                    }
+                }
+                Ok(addrs)
+            }
+            // Mixed or both lists present: fall back to stable row-id domain mapping.
+            _ => {
+                let sequences = load_row_id_sequences(dataset, fragments)
+                    .map_ok(|(_frag_id, sequence)| sequence)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let row_id_index =
+                    get_row_id_index(dataset)
+                        .await?
+                        .ok_or_else(|| Error::Internal {
+                            message: "RowIdIndex missing in stable row id mode".to_string(),
+                            location: location!(),
+                        })?;
+                let mut addrs = Vec::new();
+                for sequence in sequences {
+                    for row_id in sequence.iter() {
+                        // mask.selected expects address domain when lists exist; translate first
+                        if let Some(addr) = row_id_index.get(row_id) {
+                            let addr_u64 = u64::from(addr);
+                            if mask.selected(addr_u64) {
+                                addrs.push(addr_u64);
+                            }
+                        }
+                    }
+                }
+                Ok(addrs)
+            }
+        }
+    } else {
+        match (mask.allow_list, mask.block_list) {
+            (None, None) => Ok(FragIdIter::new(fragments).collect::<Vec<_>>()),
+            (Some(mut allow_list), None) => {
+                retain_fragments(&mut allow_list, fragments, dataset).await?;
+                if let Some(allow_list_iter) = allow_list.row_addrs() {
+                    Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
+                } else {
+                    Ok(FragIdIter::new(fragments)
+                        .filter(|row_id| allow_list.contains(*row_id))
+                        .collect())
+                }
+            }
+            (None, Some(block_list)) => Ok(FragIdIter::new(fragments)
+                .filter(|row_id| !block_list.contains(*row_id))
+                .collect()),
+            (Some(mut allow_list), Some(block_list)) => {
+                retain_fragments(&mut allow_list, fragments, dataset).await?;
+                if let Some(allow_list_iter) = allow_list.row_addrs() {
+                    Ok(allow_list_iter
+                        .filter_map(|addr| {
+                            let row_id = u64::from(addr);
+                            if !block_list.contains(row_id) {
+                                Some(row_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>())
+                } else {
+                    Ok(FragIdIter::new(fragments)
+                        .filter(|row_id| {
+                            !block_list.contains(*row_id) && allow_list.contains(*row_id)
+                        })
+                        .collect())
+                }
             }
         }
     }
@@ -679,16 +737,20 @@ async fn retain_fragments(
     dataset: &Dataset,
 ) -> Result<()> {
     if dataset.manifest.uses_stable_row_ids() {
-        let fragment_ids = load_row_id_sequences(dataset, fragments)
-            .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
-            .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
-                acc |= tree;
-                Ok(acc)
-            })
-            .await?;
-        *allow_list &= &fragment_ids;
+        if allow_list.row_addrs().is_some() {
+            allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
+        } else {
+            let fragment_ids = load_row_id_sequences(dataset, fragments)
+                .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
+                .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
+                    acc |= tree;
+                    Ok(acc)
+                })
+                .await?;
+            *allow_list &= &fragment_ids;
+        }
     } else {
-        // Assume row ids are addresses, so we can filter out fragments by their ids.
+        // Legacy mode: row ids are addresses, filter out fragments by their ids.
         allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
     }
     Ok(())

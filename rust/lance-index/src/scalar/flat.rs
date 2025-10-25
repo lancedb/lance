@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use roaring::RoaringBitmap;
 use snafu::location;
 
@@ -27,10 +27,10 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
-/// A flat index is just a batch of value/row-id pairs
+/// A flat index is just a batch of value/row-addr pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
-/// the values.  The second column "row_ids" contains the row ids
+/// the values.  The second column "row_addrs" contains the row ids
 ///
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
@@ -56,31 +56,34 @@ impl FlatIndex {
 }
 
 fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Result<RecordBatch> {
-    let row_ids = batch.column(1).as_primitive::<UInt64Type>();
-    let val_idx_and_new_id = row_ids
+    let row_addrs = batch.column(1).as_primitive::<UInt64Type>();
+    let val_idx_and_new_addr = row_addrs
         .values()
         .iter()
         .enumerate()
-        .filter_map(|(idx, old_id)| {
+        .filter_map(|(idx, old_addr)| {
             mapping
-                .get(old_id)
+                .get(old_addr)
                 .copied()
-                .unwrap_or(Some(*old_id))
-                .map(|new_id| (idx, new_id))
+                .unwrap_or(Some(*old_addr))
+                .map(|new_addr| (idx, new_addr))
         })
         .collect::<Vec<_>>();
-    let new_ids = Arc::new(UInt64Array::from_iter_values(
-        val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
+    let new_addrs = Arc::new(UInt64Array::from_iter_values(
+        val_idx_and_new_addr
+            .iter()
+            .copied()
+            .map(|(_, new_addr)| new_addr),
     ));
     let new_val_indices = UInt64Array::from_iter_values(
-        val_idx_and_new_id
+        val_idx_and_new_addr
             .into_iter()
             .map(|(val_idx, _)| val_idx as u64),
     );
     let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
     Ok(RecordBatch::try_new(
         batch.schema(),
-        vec![new_vals, new_ids],
+        vec![new_vals, new_addrs],
     )?)
 }
 
@@ -127,13 +130,13 @@ impl BTreeSubIndex for FlatIndexMetadata {
     }
 
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // The data source may not call the columns "values" and "row_ids" so we need to replace
+        // The data source may not call the columns "values" and "row_addrs" so we need to replace
         // the schema
         Ok(RecordBatch::try_new(
             self.schema.clone(),
             vec![
                 batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
-                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+                batch.column_by_name(ROW_ADDR).expect_ok()?.clone(),
             ],
         )?)
     }
