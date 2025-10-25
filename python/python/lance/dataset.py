@@ -594,7 +594,8 @@ class LanceDataset(pa.dataset.Dataset):
             (branch_name, version_number) to create the branch from.
             If None, the latest version of the current branch is used.
         storage_options: Optional[Dict[str, str]]
-            Storage options for the underlying object store.
+            Storage options for the underlying object store. If not provided,
+            the storage options from the current dataset will be used.
 
         Returns
         -------
@@ -3339,7 +3340,8 @@ class LanceDataset(pa.dataset.Dataset):
             in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints).
+            endpoints). If not specified, the storage options of the source dataset
+            will be used.
 
         Returns
         -------
