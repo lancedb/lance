@@ -61,8 +61,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
-    SelectionVectorToPrefilter,
+    FilteredRowAddrsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter,
+    PreFilterSource, SelectionVectorToPrefilter,
 };
 
 pub struct AnnPartitionMetrics {
@@ -999,7 +999,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let prefilter_loader = match &prefilter_source {
             PreFilterSource::FilteredRowIds(src_node) => {
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(Box::new(FilteredRowAddrsToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
             PreFilterSource::ScalarIndexQuery(src_node) => {
                 let stream = src_node.execute(partition, context)?;
