@@ -121,6 +121,7 @@ impl ScopedFragmentRead {
             .with_row_address(self.projection.with_row_addr)
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
+            .with_row_deleted_at_version(self.projection.with_row_deleted_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
             .with_reader_priority(self.priority)
     }
@@ -373,7 +374,7 @@ impl FilteredReadStream {
                 Result::Ok(Self::load_fragment(
                     dataset.clone(),
                     frag.clone(),
-                    options.with_deleted_rows,
+                    // options.with_deleted_rows,
                 ))
             })
             .collect::<Vec<_>>();
@@ -435,14 +436,13 @@ impl FilteredReadStream {
     async fn load_fragment(
         dataset: Arc<Dataset>,
         frag: Fragment,
-        include_deleted_rows: bool,
+        // include_deleted_rows: bool,
     ) -> Result<LoadedFragment> {
         let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
-        let deletion_vector = if include_deleted_rows {
-            None
-        } else {
-            file_fragment.get_deletion_vector().await?
-        };
+        // Always load the deletion vector; when including deleted rows we will widen
+        // physical ranges later (ignore DV for pruning) but still retain DV to
+        // materialize version columns correctly.
+        let deletion_vector = file_fragment.get_deletion_vector().await?;
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
         let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
@@ -521,8 +521,12 @@ impl FilteredReadStream {
                 }
             }
 
-            let mut to_read: Vec<Range<u64>> =
-                Self::full_frag_range(*num_physical_rows, deletion_vector);
+            let mut to_read: Vec<Range<u64>> = if options.with_deleted_rows {
+                // When including deleted rows, do not prune by DV; read the full physical range.
+                vec![0..*num_physical_rows]
+            } else {
+                Self::full_frag_range(*num_physical_rows, deletion_vector)
+            };
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
@@ -1400,8 +1404,13 @@ impl FilteredReadExec {
         index_input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
         if options.with_deleted_rows {
-            // Ensure we have the row id column if with_deleted_rows is set
-            options.projection = options.projection.with_row_id();
+            // Ensure we have the row id column and deleted version column if with_deleted_rows is set
+            // Deleted rows are included by widening physical ranges, and `_row_deleted_at_version`
+            // must be materialized to support filters and counting semantics.
+            options.projection = options
+                .projection
+                .with_row_id()
+                .with_row_deleted_at_version();
         }
 
         if options.projection.is_empty() {

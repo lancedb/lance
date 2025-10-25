@@ -264,16 +264,15 @@ pub fn last_updated_at_version_meta_to_pb(
     })
 }
 
-/// Helper function to convert RowDatasetVersionMeta to protobuf format for created_at
-pub fn created_at_version_meta_to_pb(
+pub fn deleted_at_version_meta_to_pb(
     meta: &Option<RowDatasetVersionMeta>,
-) -> Option<pb::data_fragment::CreatedAtVersionSequence> {
+) -> Option<pb::data_fragment::DeletedAtVersionSequence> {
     meta.as_ref().map(|m| match m {
         RowDatasetVersionMeta::Inline(data) => {
-            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.clone())
+            pb::data_fragment::DeletedAtVersionSequence::InlineDeletedAtVersions(data.clone())
         }
         RowDatasetVersionMeta::External(file) => {
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
+            pb::data_fragment::DeletedAtVersionSequence::ExternalDeletedAtVersions(
                 pb::ExternalFile {
                     path: file.path.clone(),
                     offset: file.offset,
@@ -583,6 +582,26 @@ impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for RowDatasetVers
     }
 }
 
+/// Helper function to convert RowDatasetVersionMeta to protobuf format for created_at
+pub fn created_at_version_meta_to_pb(
+    meta: &Option<RowDatasetVersionMeta>,
+) -> Option<pb::data_fragment::CreatedAtVersionSequence> {
+    meta.as_ref().map(|m| match m {
+        RowDatasetVersionMeta::Inline(data) => {
+            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.clone())
+        }
+        RowDatasetVersionMeta::External(file) => {
+            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
+                pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                },
+            )
+        }
+    })
+}
+
 impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionMeta {
     type Error = Error;
 
@@ -602,6 +621,24 @@ impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionM
     }
 }
 
+impl TryFrom<pb::data_fragment::DeletedAtVersionSequence> for RowDatasetVersionMeta {
+    type Error = Error;
+
+    fn try_from(value: pb::data_fragment::DeletedAtVersionSequence) -> Result<Self> {
+        match value {
+            pb::data_fragment::DeletedAtVersionSequence::InlineDeletedAtVersions(data) => {
+                Ok(Self::Inline(data))
+            }
+            pb::data_fragment::DeletedAtVersionSequence::ExternalDeletedAtVersions(file) => {
+                Ok(Self::External(ExternalFile {
+                    path: file.path,
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

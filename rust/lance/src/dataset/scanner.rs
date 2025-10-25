@@ -434,6 +434,8 @@ pub struct Scanner {
     legacy_with_row_last_updated_at_version: bool,
     /// Whether the user wants the row created at version column on top of the projection
     legacy_with_row_created_at_version: bool,
+    /// Whether the user wants the row deleted at version column on top of the projection
+    legacy_with_row_deleted_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -631,6 +633,7 @@ impl Scanner {
             legacy_with_row_id: false,
             legacy_with_row_last_updated_at_version: false,
             legacy_with_row_created_at_version: false,
+            legacy_with_row_deleted_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -721,6 +724,9 @@ impl Scanner {
         }
         if self.legacy_with_row_created_at_version {
             self.projection_plan.include_row_created_at_version();
+        }
+        if self.legacy_with_row_deleted_at_version {
+            self.projection_plan.include_row_deleted_at_version();
         }
         Ok(self)
     }
@@ -1247,6 +1253,12 @@ impl Scanner {
         self
     }
 
+    pub fn with_row_deleted_at_version(&mut self) -> &mut Self {
+        self.legacy_with_row_deleted_at_version = true;
+        self.projection_plan.include_row_deleted_at_version();
+        self
+    }
+
     /// Instruct the scanner to disable automatic projection of scoring columns
     ///
     /// In the future, this will be the default behavior.  This method is useful for
@@ -1374,6 +1386,7 @@ impl Scanner {
             .with_row_addr()
             .with_row_last_updated_at_version()
             .with_row_created_at_version()
+            .with_row_deleted_at_version()
             .to_schema();
 
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
@@ -1461,6 +1474,17 @@ impl Scanner {
         {
             return Err(Error::Internal {
                 message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
+                location: location!(),
+            });
+        }
+
+        if self.legacy_with_row_deleted_at_version
+            && !output_expr
+                .iter()
+                .any(|(_, name)| name == lance_core::ROW_DELETED_AT_VERSION)
+        {
+            return Err(Error::Internal {
+                message: "user specified with_row_deleted_at_version but the column was not in the output".to_string(),
                 location: location!(),
             });
         }
@@ -2050,6 +2074,9 @@ impl Scanner {
                 self.projection_plan
                     .physical_projection
                     .with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_deleted_at_version,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -2840,6 +2867,7 @@ impl Scanner {
             false,
             false,
             false,
+            false,
             flat_fts_scan_schema,
             Arc::new(fragments),
             None,
@@ -3005,6 +3033,7 @@ impl Scanner {
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -3207,6 +3236,9 @@ impl Scanner {
                 self.projection_plan
                     .physical_projection
                     .with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_deleted_at_version,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -3249,6 +3281,7 @@ impl Scanner {
         with_row_address: bool,
         with_row_last_updated_at_version: bool,
         with_row_created_at_version: bool,
+        with_row_deleted_at_version: bool,
         with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
@@ -3269,6 +3302,7 @@ impl Scanner {
             with_row_address,
             with_row_last_updated_at_version,
             with_row_created_at_version,
+            with_row_deleted_at_version,
             with_make_deletions_null,
             projection,
             fragments,
@@ -3284,6 +3318,7 @@ impl Scanner {
         with_row_address: bool,
         with_row_last_updated_at_version: bool,
         with_row_created_at_version: bool,
+        with_row_deleted_at_version: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
@@ -3300,6 +3335,7 @@ impl Scanner {
             with_row_address,
             with_row_last_updated_at_version,
             with_row_created_at_version,
+            with_row_deleted_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
         };

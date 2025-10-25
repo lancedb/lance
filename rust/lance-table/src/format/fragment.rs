@@ -15,7 +15,8 @@ use snafu::location;
 use crate::format::pb;
 
 use crate::rowids::version::{
-    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+    created_at_version_meta_to_pb, deleted_at_version_meta_to_pb,
+    last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
 };
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
@@ -300,6 +301,9 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+    /// Deleted at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -312,6 +316,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }
     }
 
@@ -351,6 +356,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }
     }
 
@@ -480,6 +486,10 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            deleted_at_version_meta: p
+                .deleted_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -513,6 +523,7 @@ impl From<&Fragment> for pb::DataFragment {
         let last_updated_at_version_sequence =
             last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
         let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
+        let deleted_at_version_sequence = deleted_at_version_meta_to_pb(&f.deleted_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
@@ -521,6 +532,7 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            deleted_at_version_sequence,
         }
     }
 }

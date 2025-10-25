@@ -266,6 +266,27 @@ impl DatasetDelta {
 
         scanner.try_into_stream().await
     }
+
+    /// Get deleted rows between the two versions.
+    ///
+    /// Returns rows deleted in the version range where `_row_deleted_at_version` > `begin_version`
+    /// and `_row_deleted_at_version` <= `end_version`.
+    pub async fn get_deleted_rows(&self) -> Result<DatasetRecordBatchStream> {
+        let mut scanner = self.base_dataset.scan();
+
+        // Include deleted rows and necessary metadata columns
+        scanner.include_deleted_rows();
+        scanner.with_row_id();
+        scanner.with_row_deleted_at_version();
+
+        let filter = format!(
+            "_row_deleted_at_version > {} AND _row_deleted_at_version <= {}",
+            self.begin_version, self.end_version
+        );
+        scanner.filter(&filter)?;
+
+        scanner.try_into_stream().await
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +397,74 @@ mod tests {
             }
             _ => panic!("Expected VersionNotFound error."),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_deleted_rows_basic() {
+        // Create dataset with stable row IDs enabled
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("value".to_string()))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut ds = Dataset::write(data, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(ds.version().version, 1);
+
+        // Delete some rows in v2
+        ds.delete("key < 5").await.unwrap();
+        assert_eq!(ds.version().version, 2);
+
+        // Delete some other rows in v3
+        ds.delete("key >= 10 AND key < 15").await.unwrap();
+        assert_eq!(ds.version().version, 3);
+
+        // Delta for deletions in v2
+        let delta = ds
+            .delta()
+            .with_begin_version(1)
+            .with_end_version(2)
+            .build()
+            .unwrap();
+        let mut stream = delta.get_deleted_rows().await.unwrap();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            // All deleted rows in v2 should have _row_deleted_at_version = 2
+            let deleted_at = batch[lance_core::ROW_DELETED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .values();
+            for v in deleted_at.iter() {
+                assert_eq!(*v, 2);
+            }
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
+
+        // Delta for deletions in v3
+        let delta = ds
+            .delta()
+            .with_begin_version(2)
+            .with_end_version(3)
+            .build()
+            .unwrap();
+        let mut stream = delta.get_deleted_rows().await.unwrap();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let deleted_at = batch[lance_core::ROW_DELETED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .values();
+            for v in deleted_at.iter() {
+                assert_eq!(*v, 3);
+            }
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
     }
 
     #[tokio::test]

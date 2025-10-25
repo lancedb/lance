@@ -996,6 +996,7 @@ pub struct Projection {
     pub with_row_addr: bool,
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
+    pub with_row_deleted_at_version: bool,
     pub blob_handling: BlobHandling,
 }
 
@@ -1010,8 +1011,8 @@ impl Debug for Projection {
                 &self.with_row_last_updated_at_version,
             )
             .field(
-                "with_row_created_at_version",
-                &self.with_row_created_at_version,
+                "with_row_deleted_at_version",
+                &self.with_row_deleted_at_version,
             )
             .field("blob_handling", &self.blob_handling)
             .finish()
@@ -1028,6 +1029,7 @@ impl Projection {
             with_row_addr: false,
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
+            with_row_deleted_at_version: false,
             blob_handling: BlobHandling::default(),
         }
     }
@@ -1054,6 +1056,11 @@ impl Projection {
 
     pub fn with_row_created_at_version(mut self) -> Self {
         self.with_row_created_at_version = true;
+        self
+    }
+
+    pub fn with_row_deleted_at_version(mut self) -> Self {
+        self.with_row_deleted_at_version = true;
         self
     }
 
@@ -1088,6 +1095,9 @@ impl Projection {
             return Ok(self);
         } else if column == crate::ROW_CREATED_AT_VERSION {
             self.with_row_created_at_version = true;
+            return Ok(self);
+        } else if column == crate::ROW_DELETED_AT_VERSION {
+            self.with_row_deleted_at_version = true;
             return Ok(self);
         }
 
@@ -1156,6 +1166,8 @@ impl Projection {
             self.with_row_last_updated_at_version && other.with_row_last_updated_at_version;
         self.with_row_created_at_version =
             self.with_row_created_at_version && other.with_row_created_at_version;
+        self.with_row_deleted_at_version =
+            self.with_row_deleted_at_version && other.with_row_deleted_at_version;
         self
     }
 
@@ -1195,6 +1207,8 @@ impl Projection {
             self.with_row_last_updated_at_version || other.with_row_last_updated_at_version;
         self.with_row_created_at_version =
             self.with_row_created_at_version || other.with_row_created_at_version;
+        self.with_row_deleted_at_version =
+            self.with_row_deleted_at_version || other.with_row_deleted_at_version;
         self
     }
 
@@ -1218,6 +1232,10 @@ impl Projection {
             .fields()
             .iter()
             .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
+        self.with_row_deleted_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_DELETED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1245,6 +1263,10 @@ impl Projection {
             .fields()
             .iter()
             .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
+        self.with_row_deleted_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_DELETED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1286,6 +1308,8 @@ impl Projection {
                 self.with_row_last_updated_at_version = false;
             } else if field.name == crate::ROW_CREATED_AT_VERSION {
                 self.with_row_created_at_version = false;
+            } else if field.name == crate::ROW_DELETED_AT_VERSION {
+                self.with_row_deleted_at_version = false;
             } else {
                 debug_assert_eq!(field.id, -1);
             }
@@ -1300,6 +1324,7 @@ impl Projection {
             && !self.with_row_id
             && !self.with_row_last_updated_at_version
             && !self.with_row_created_at_version
+            && !self.with_row_deleted_at_version
     }
 
     /// True if the projection is only the row_id or row_addr columns
@@ -1310,7 +1335,8 @@ impl Projection {
             && (self.with_row_addr
                 || self.with_row_id
                 || self.with_row_last_updated_at_version
-                || self.with_row_created_at_version)
+                || self.with_row_created_at_version
+                || self.with_row_deleted_at_version)
     }
 
     /// True if the projection has at least one non-metadata column
@@ -1340,6 +1366,9 @@ impl Projection {
         }
         if self.with_row_created_at_version {
             extra_fields.push(crate::ROW_CREATED_AT_VERSION_FIELD.clone());
+        }
+        if self.with_row_deleted_at_version {
+            extra_fields.push(crate::ROW_DELETED_AT_VERSION_FIELD.clone());
         }
         schema.extend(&extra_fields).unwrap();
         schema
