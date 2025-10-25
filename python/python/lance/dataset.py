@@ -602,8 +602,16 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset
             A dataset instance pointing to the new branch.
         """
+        if storage_options is None:
+            storage_options = self._storage_options
         new_ds = self._ds.create_branch(branch, reference, storage_options)
-        return LanceDataset(new_ds.uri, storage_options, **kargs)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = inner
+        ds._uri = inner.uri
+        ds._storage_options = self._storage_options
+        ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params
+        return ds
 
     def checkout_branch(self, branch: str) -> "LanceDataset":
         """Check out the latest version of a branch.
@@ -3344,6 +3352,8 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
+        if storage_options is None:
+            storage_options = self._storage_options
         self._ds.shallow_clone(target_uri, version, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
