@@ -120,7 +120,8 @@ impl BlockingDataset {
             builder = builder.with_storage_options_provider(provider)
         }
         if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
-            builder = builder.with_s3_credentials_refresh_offset(std::time::Duration::from_secs(offset_seconds));
+            builder = builder
+                .with_s3_credentials_refresh_offset(std::time::Duration::from_secs(offset_seconds));
         }
 
         if let Some(serialized_manifest) = serialized_manifest {
