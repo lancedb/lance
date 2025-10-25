@@ -120,6 +120,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// Storage options for configuration
+    pub storage_options: HashMap<String, String>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -346,6 +348,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                storage_options: params.storage_options.clone().unwrap_or_default(),
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -451,6 +454,7 @@ impl ObjectStore {
                 self.block_size,
                 None,
                 self.download_retry_count,
+                Some(&self.storage_options),
             )?)),
         }
     }
@@ -469,6 +473,7 @@ impl ObjectStore {
                 path.clone(),
                 self.download_retry_count,
                 known_size,
+                Some(&self.storage_options),
             )));
         }
 
@@ -480,6 +485,7 @@ impl ObjectStore {
                 self.block_size,
                 Some(known_size),
                 self.download_retry_count,
+                Some(&self.storage_options),
             )?)),
         }
     }
@@ -738,6 +744,9 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            storage_options: storage_options
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 }
