@@ -179,7 +179,7 @@ impl FlatIndex {
         if selected.is_empty() {
             return Ok(RecordBatch::new_empty(batch.schema()));
         }
-        let indices = UInt64Array::from_iter_values(selected.into_iter());
+        let indices = UInt64Array::from_iter_values(selected);
         let filtered_columns = batch
             .columns()
             .iter()

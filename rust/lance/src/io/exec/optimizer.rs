@@ -170,15 +170,11 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 }
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
-    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = Vec::new();
-    rules.push(Arc::new(crate::io::exec::optimizer::CoalesceTake)
-        as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
-    rules.push(Arc::new(crate::io::exec::optimizer::SimplifyProjection)
-        as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
-    rules.push(Arc::new(ScanIndexRule) as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
-    rules.push(
-        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new())
-            as Arc<dyn PhysicalOptimizerRule + Send + Sync>,
-    );
+    let rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![
+        Arc::new(crate::io::exec::optimizer::CoalesceTake),
+        Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+        Arc::new(ScanIndexRule),
+        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
+    ];
     PhysicalOptimizer::with_rules(rules)
 }

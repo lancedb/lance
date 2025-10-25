@@ -1345,7 +1345,7 @@ impl ScalarIndex for BTreeIndex {
         let deletion_mask_arc = deletion_mask;
         let metrics_arc = metrics;
 
-        let page_streams = stream::iter(pages.into_iter()).then(move |page_number| {
+        let page_streams = stream::iter(pages).then(move |page_number| {
             let index = Arc::clone(&index);
             let reader = reader.clone();
             let deletion_mask = deletion_mask_arc.clone();
