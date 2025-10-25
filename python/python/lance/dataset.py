@@ -582,7 +582,6 @@ class LanceDataset(pa.dataset.Dataset):
         branch: str,
         reference: Optional[int | str | Tuple[str, int]] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        **kargs,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
 
@@ -606,8 +605,8 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options = self._storage_options
         new_ds = self._ds.create_branch(branch, reference, storage_options)
         ds = LanceDataset.__new__(LanceDataset)
-        ds._ds = inner
-        ds._uri = inner.uri
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
         ds._storage_options = self._storage_options
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
