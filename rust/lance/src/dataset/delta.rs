@@ -382,7 +382,7 @@ mod tests {
             .expect("Cleanup old versions failed");
 
         MockClock::set_system_time(std::time::Duration::from_secs(5));
-        
+
         let delta_struct = base_dataset
             .delta()
             .with_begin_version(1)
