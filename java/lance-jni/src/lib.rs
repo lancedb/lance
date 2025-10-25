@@ -51,6 +51,7 @@ mod merge_insert;
 mod optimize;
 mod schema;
 mod sql;
+mod storage_options;
 pub mod traits;
 mod transaction;
 pub mod utils;
@@ -58,6 +59,7 @@ pub mod utils;
 pub use error::Error;
 pub use error::Result;
 pub use ffi::JNIEnvExt;
+pub use storage_options::JavaStorageOptionsProvider;
 
 use env_logger::{Builder, Env};
 use std::env;

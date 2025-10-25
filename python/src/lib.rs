@@ -76,6 +76,7 @@ pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
+pub(crate) mod storage_options;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;

@@ -455,7 +455,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
     fn new(
         py: Python,
         uri: String,
@@ -470,6 +470,8 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
+        storage_options_provider: Option<PyObject>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -486,12 +488,16 @@ impl Dataset {
             let index_cache_size_bytes = index_cache_size * 20 * 1024 * 1024;
             params.index_cache_size_bytes(index_cache_size_bytes);
         }
+        // Set up store options (block size and S3 credentials refresh offset)
+        let mut store_params = params.store_options.take().unwrap_or_default();
         if let Some(block_size) = block_size {
-            params.store_options = Some(ObjectStoreParams {
-                block_size: Some(block_size),
-                ..Default::default()
-            });
-        };
+            store_params.block_size = Some(block_size);
+        }
+        if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
+            store_params.s3_credentials_refresh_offset =
+                std::time::Duration::from_secs(offset_seconds);
+        }
+        params.store_options = Some(store_params);
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
@@ -523,6 +529,7 @@ impl Dataset {
         }
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+
         if let Some(ver) = version {
             if let Ok(i) = ver.downcast_bound::<PyInt>(py) {
                 let v: u64 = i.extract()?;
@@ -554,6 +561,13 @@ impl Dataset {
 
         if let Some(session) = session {
             builder = builder.with_session(session.inner.clone());
+        }
+
+        // Add storage options provider if provided
+        if let Some(provider_obj) = storage_options_provider {
+            use crate::storage_options::py_object_to_storage_options_provider;
+            let provider = py_object_to_storage_options_provider(provider_obj)?;
+            builder = builder.with_storage_options_provider(provider);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;

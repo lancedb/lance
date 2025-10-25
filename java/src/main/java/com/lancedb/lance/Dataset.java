@@ -16,6 +16,7 @@ package com.lancedb.lance;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.io.StorageOptionsProvider;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -207,7 +208,7 @@ public class Dataset implements Closeable {
    * @param options the open options
    * @return Dataset
    */
-  private static Dataset open(
+  static Dataset open(
       BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
@@ -220,7 +221,9 @@ public class Dataset implements Closeable {
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
-            options.getSerializedManifest());
+            options.getSerializedManifest(),
+            options.getStorageOptionsProvider(),
+            options.getS3CredentialsRefreshOffsetSeconds());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -233,7 +236,31 @@ public class Dataset implements Closeable {
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
-      Optional<ByteBuffer> serializedManifest);
+      Optional<ByteBuffer> serializedManifest,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+
+  /**
+   * Creates a builder for opening a dataset from a LanceNamespace.
+   *
+   * <p>This automatically fetches the table location and storage options from the namespace via
+   * describe_table().
+   *
+   * <p>Example usage:
+   *
+   * <pre>{@code
+   * Dataset dataset = Dataset.openFromNamespace()
+   *     .namespace(myNamespace)
+   *     .tableId(Arrays.asList("my_table"))
+   *     .refreshStorageOptions(true)
+   *     .build();
+   * }</pre>
+   *
+   * @return A new NamespaceDatasetBuilder instance
+   */
+  public static OpenDatasetFromNamespaceBuilder openFromNamespace() {
+    return new OpenDatasetFromNamespaceBuilder();
+  }
 
   /**
    * Create a new version of dataset. Use {@link Transaction} instead
