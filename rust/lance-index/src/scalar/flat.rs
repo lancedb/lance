@@ -400,10 +400,14 @@ impl ScalarIndex for FlatIndex {
         &self,
         query: Option<&dyn AnyQuery>,
         batch_size: usize,
+        with_row_id: bool,
         deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {
-        let output_schema = self.schema();
+        // TODO: omit row id if not provided
+        // TODO: rename "ids" to "_rowid"
+        let mut output_schema = self.schema();
+
         let mut batch = if let Some(query) = query {
             let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
             self.filter_batch(query, metrics.as_ref())?

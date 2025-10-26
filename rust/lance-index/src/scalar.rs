@@ -792,6 +792,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         &self,
         _query: Option<&dyn AnyQuery>,
         _batch_size: usize,
+        _with_row_id: bool,
         _deletion_mask: Option<Arc<RowIdMask>>,
         _metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {

@@ -894,6 +894,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         batch_size: usize,
+        with_row_id: bool,
         deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
@@ -902,7 +903,7 @@ impl BTreeIndex {
             .await?;
         let query_ref = query.as_ref().map(|q| q as &dyn AnyQuery);
         subindex
-            .scan(query_ref, batch_size, deletion_mask, metrics)?
+            .scan(query_ref, batch_size, with_row_id, deletion_mask, metrics)?
             .ok_or_else(|| Error::Internal {
                 message: "BTree sub-indices need to implement scan".to_string(),
                 location: location!(),
@@ -1312,6 +1313,7 @@ impl ScalarIndex for BTreeIndex {
         &self,
         query: Option<&dyn AnyQuery>,
         batch_size: usize,
+        with_row_id: bool,
         deletion_mask: Option<Arc<RowIdMask>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Option<SendableRecordBatchStream>> {
@@ -1359,6 +1361,7 @@ impl ScalarIndex for BTreeIndex {
                         page_number,
                         reader,
                         batch_size,
+                        with_row_id,
                         deletion_mask,
                         metrics,
                     )

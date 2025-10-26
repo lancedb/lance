@@ -1754,53 +1754,7 @@ impl Scanner {
         }
     }
 
-    /// Create [`ExecutionPlan`] for Scan.
-    ///
-    /// An ExecutionPlan is a graph of operators that can be executed.
-    ///
-    /// The following plans are supported:
-    ///
-    ///  - **Plain scan without filter or limits.**
-    ///
-    ///  ```ignore
-    ///  Scan(projections)
-    ///  ```
-    ///
-    ///  - **Scan with filter and/or limits.**
-    ///
-    ///  ```ignore
-    ///  Scan(filtered_cols) -> Filter(expr)
-    ///     -> (*LimitExec(limit, offset))
-    ///     -> Take(remaining_cols) -> Projection()
-    ///  ```
-    ///
-    ///  - **Use KNN Index (with filter and/or limits)**
-    ///
-    /// ```ignore
-    /// KNNIndex() -> Take(vector) -> FlatRefine()
-    ///     -> Take(filtered_cols) -> Filter(expr)
-    ///     -> (*LimitExec(limit, offset))
-    ///     -> Take(remaining_cols) -> Projection()
-    /// ```
-    ///
-    /// - **Use KNN flat (brute force) with filter and/or limits**
-    ///
-    /// ```ignore
-    /// Scan(vector) -> FlatKNN()
-    ///     -> Take(filtered_cols) -> Filter(expr)
-    ///     -> (*LimitExec(limit, offset))
-    ///     -> Take(remaining_cols) -> Projection()
-    /// ```
-    ///
-    /// In general, a plan has 5 stages:
-    ///
-    /// 1. Source (from dataset Scan or from index, may include prefilter)
-    /// 2. Filter
-    /// 3. Sort
-    /// 4. Limit / Offset
-    /// 5. Take remaining columns / Projection
-    #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_unoptimized_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
@@ -1951,6 +1905,57 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
+        Ok(plan)
+    }
+
+    /// Create [`ExecutionPlan`] for Scan.
+    ///
+    /// An ExecutionPlan is a graph of operators that can be executed.
+    ///
+    /// The following plans are supported:
+    ///
+    ///  - **Plain scan without filter or limits.**
+    ///
+    ///  ```ignore
+    ///  Scan(projections)
+    ///  ```
+    ///
+    ///  - **Scan with filter and/or limits.**
+    ///
+    ///  ```ignore
+    ///  Scan(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    ///  ```
+    ///
+    ///  - **Use KNN Index (with filter and/or limits)**
+    ///
+    /// ```ignore
+    /// KNNIndex() -> Take(vector) -> FlatRefine()
+    ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    /// ```
+    ///
+    /// - **Use KNN flat (brute force) with filter and/or limits**
+    ///
+    /// ```ignore
+    /// Scan(vector) -> FlatKNN()
+    ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    /// ```
+    ///
+    /// In general, a plan has 5 stages:
+    ///
+    /// 1. Source (from dataset Scan or from index, may include prefilter)
+    /// 2. Filter
+    /// 3. Sort
+    /// 4. Limit / Offset
+    /// 5. Take remaining columns / Projection
+    #[instrument(level = "debug", skip_all)]
+    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut plan = self.create_unoptimized_plan().await?;
         let optimizer = get_physical_optimizer();
         let options = Default::default();
         for rule in optimizer.rules {
