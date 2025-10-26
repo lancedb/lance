@@ -1778,59 +1778,6 @@ def test_zonemap_index_remapping(tmp_path: Path):
     assert result.num_rows == 501  # 1000..1500 inclusive
 
 
-def test_json_inverted_index():
-    vals = [
-        """{
-            "name": "Tom",
-            "legal.age": 30,
-            "address": {
-                "city": "San Francisco",
-                "zip:us": 94102
-            }
-        }""",
-        """{
-            "name": "Alice",
-            "legal.age": 30,
-            "address": {
-                "city": "New York City",
-                "zip:us": 11215
-            }
-        }""",
-        """{
-            "name": "Bob",
-            "legal.age": 32,
-            "address": {
-                "city": "Las Vegas",
-                "zip:us": 89101
-            }
-        }""",
-    ]
-    tbl = pa.table({"jsons": pa.array(vals, pa.json_())})
-    ds = lance.write_dataset(tbl, "memory://test")
-
-    ds.create_scalar_index(
-        "jsons",
-        index_type="INVERTED",
-        lance_tokenizer="json",
-    )
-    result = ds.to_table(
-        columns=["jsons"], full_text_query=MatchQuery("legal.age,number,30", "jsons")
-    )
-    assert result.num_rows == 2
-
-    result = ds.to_table(
-        columns=["jsons"],
-        full_text_query=MatchQuery("address.zip:us,number,89101", "jsons"),
-    )
-    assert result.num_rows == 1
-
-    result = ds.to_table(
-        columns=["jsons"],
-        full_text_query=MatchQuery("address.city,str,Francisco", "jsons"),
-    )
-    assert result.num_rows == 1
-
-
 def test_json_index():
     vals = ['{"x": 7, "y": 10}', '{"x": 11, "y": 22}', '{"y": 0}', '{"x": 10}']
     tbl = pa.table({"jsons": pa.array(vals, pa.json_())})

@@ -54,7 +54,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 | Field               | Type    | Default   | Description                                                    |
 |---------------------|---------|-----------|----------------------------------------------------------------|
-| `lance_tokenizer`   | String  | "text"    | Lance tokenizer type (see Tokenizers section)                  |
+| `lance_tokenizer`   | String  | None      | Tokenizer for document type (see Tokenizers section)           |
 | `base_tokenizer`    | String  | "simple"  | Base tokenizer type (see Tokenizers section)                   |
 | `language`          | String  | "English" | Language for stemming and stop words                           |
 | `with_position`     | Boolean | false     | Store term positions for phrase queries (increases index size) |
@@ -69,22 +69,25 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 ## Tokenizers
 
-The full text search index supports multiple tokenizer types for different text processing needs.
-There are two different tokenizer configurations: `lance_tokenizer` and `base_tokenizer`.
+There are two tokenizers in InvertedIndexParams: `lance_tokenizer` and `base_tokenizer`. The `lance_tokenizer` is
+responsible for parsing different document types, such as text and json. It will be auto-inferred based on the
+document type, user shouldn't specify it manually. See [Lance Tokenizers](#lance-tokenizers).
 
-The `lance_tokenizer` is responsible for handling different document types, such as text and json,
-while the `base_tokenizer` is responsible for tokenizing documents.
+The `base_tokenizer` is responsible for tokenizing documents. It supports multiple types for different text processing
+needs, see [Base Tokenizers](#base-tokenizers).
 
 ### Lance Tokenizers
-| Tokenizer | Description                                                          | Use Case                |
-|-----------|----------------------------------------------------------------------|-------------------------|
-| **text**  | Parse TEXT document into tokens.                                     | Text document (default) |
-| **json**  | Parse JSON document into tokens in triplet format `path,type,value`. | Json document           |
+| Tokenizer | Description                                                          | Use Case        |
+|-----------|----------------------------------------------------------------------|-----------------|
+| **text**  | Parse TEXT document into tokens.                                     | Text document   |
+| **json**  | Parse JSON document into tokens in triplet format `path,type,value`. | Json document   |
 
 #### Text Tokenizer
 Text Tokenizer is responsible for handling TEXT-type data, which is Utf8, LargeUtf8 or List of them in arrow format.
-The Text Tokenizer behaves consistently in both query and document parsing scenarios, which means that if a document
-contains the word "lance," we can retrieve it using a query with "lance".
+
+Text Tokenizer applies the same rules when tokenizing query statements and documents. This rule may not necessarily
+apply to other document types. As document types become more complex, tokenizer might use different rules for query
+tokenization and document tokenization, such as the JSON Tokenizer shown below.
 
 #### Json Tokenizer
 The Json Tokenizer is responsible for handling JSON-type data, which is the JSON type in arrow format.
