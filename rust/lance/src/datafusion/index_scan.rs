@@ -15,6 +15,7 @@ use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     filter::FilterExec,
     metrics::ExecutionPlanMetricsSet,
+    projection::ProjectionExec,
     union::UnionExec,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
@@ -208,7 +209,6 @@ impl ExecutionPlan for IndexOnlyScanExec {
 
             let (deletion_mask, index) = futures::try_join!(load_deletion_mask, load_index)?;
 
-            // TODO: push down projection
             let query = query_arc.as_ref().map(|q| q.as_ref());
             index
                 .scan(query, batch_size, with_row_id, deletion_mask, collector)?
@@ -400,6 +400,22 @@ impl ScanIndexRule {
         }
 
         // TODO: handle case of with_row_addr but not with_row_id.
+        plan = {
+            let current_schema = plan.schema();
+            let output_schema = read.schema();
+            let projection = output_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let physical_expr = datafusion_physical_expr::expressions::col(
+                        field.name(),
+                        current_schema.as_ref(),
+                    )?;
+                    Ok((physical_expr, field.name().clone()))
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            Arc::new(ProjectionExec::try_new(projection, plan)?)
+        };
 
         if !unindexed_fragments.is_empty() {
             let mut options = read.options().clone();
@@ -537,7 +553,7 @@ mod tests {
         assert_batches_sorted_eq!(expected_lines, &actual);
     }
 
-    async fn test_dataset() -> Arc<Dataset> {
+    async fn test_dataset(partially_indexed: bool) -> Arc<Dataset> {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "value",
@@ -550,22 +566,22 @@ mod tests {
 
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
         dataset
-            .create_index(
-                &["value"],
-                IndexType::BTree,
-                Some("value_idx".to_string()),
-                &params,
-                true,
-            )
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .fragments(if partially_indexed {
+                vec![0]
+            } else {
+                vec![0, 1]
+            })
             .await
             .unwrap();
         dataset.delete("value % 7 = 0").await.unwrap();
         Arc::new(dataset)
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_index_scan_project_filter() {
-        let dataset = test_dataset().await;
+    async fn test_index_scan_project_filter(#[values(true, false)] partially_indexed: bool) {
+        let dataset = test_dataset(partially_indexed).await;
 
         let queries = [
             Box::new(|scanner: &mut Scanner| {
@@ -593,13 +609,13 @@ mod tests {
                     .unwrap();
             }),
             // TODO: figure out rowid filter
-            // Box::new(|scanner: &mut Scanner| {
-            //     scanner
-            //         .project(&["value"])
-            //         .unwrap()
-            //         .filter("value < 100 AND _rowid > 10")
-            //         .unwrap();
-            // }),
+            Box::new(|scanner: &mut Scanner| {
+                scanner
+                    .project(&["value"])
+                    .unwrap()
+                    .filter("value < 100 AND _rowid > 10")
+                    .unwrap();
+            }),
             Box::new(|scanner: &mut Scanner| {
                 scanner
                     .project(&["value"])
@@ -658,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_optimized() {
-        let dataset = test_dataset().await;
+        let dataset = test_dataset(false).await;
 
         let queries = [
             Box::new(|scanner: &mut Scanner| {
