@@ -190,6 +190,15 @@ pub struct RowIdAndDeletesConfig {
     pub total_num_rows: u32,
 }
 
+impl RowIdAndDeletesConfig {
+    fn has_system_cols(&self) -> bool {
+        self.with_row_id
+            || self.with_row_addr
+            || self.with_row_last_updated_at_version
+            || self.with_row_created_at_version
+    }
+}
+
 #[instrument(level = "debug", skip_all)]
 pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
@@ -205,9 +214,7 @@ pub fn apply_row_id_and_deletes(
         }
     }
     let has_deletions = deletion_vector.is_some();
-    debug_assert!(
-        batch.num_columns() > 0 || config.with_row_id || config.with_row_addr || has_deletions
-    );
+    debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
 
     // If row id sequence is None, then row id IS row address.
     let should_fetch_row_addr = config.with_row_addr

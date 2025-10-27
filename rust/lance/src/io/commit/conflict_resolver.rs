@@ -577,9 +577,25 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                Operation::DataReplacement { replacements } => {
+                    // A data replacement only conflicts if it is updating the field that
+                    // is being indexed.
+                    let newly_indexed_fields = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter())
+                        .collect::<HashSet<_>>();
+                    for replacement in replacements {
+                        for field in &replacement.1.fields {
+                            if newly_indexed_fields.contains(&field) {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
