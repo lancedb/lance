@@ -758,6 +758,7 @@ impl KMeans {
             id: usize,
             indices: Vec<usize>,
             centroid: Vec<N>,
+            finalized: bool,
         }
 
         impl<N> Eq for Cluster<N> {}
@@ -770,8 +771,15 @@ impl KMeans {
 
         impl<N> Ord for Cluster<N> {
             fn cmp(&self, other: &Self) -> Ordering {
-                // Max heap: larger clusters first
-                self.indices.len().cmp(&other.indices.len())
+                // Non-finalized clusters should always have higher priority than finalized ones
+                match (self.finalized, other.finalized) {
+                    (false, true) => Ordering::Greater,
+                    (true, false) => Ordering::Less,
+                    _ => {
+                        // Max heap: larger clusters first
+                        self.indices.len().cmp(&other.indices.len())
+                    }
+                }
             }
         }
 
@@ -838,6 +846,7 @@ impl KMeans {
                     id: next_cluster_id,
                     indices: cluster_indices,
                     centroid,
+                    finalized: false,
                 });
                 next_cluster_id += 1;
             }
@@ -846,17 +855,22 @@ impl KMeans {
         // Iteratively split largest clusters until we have target_k clusters
         while heap.len() < target_k {
             // Get the largest cluster
-            let largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
+            let mut largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
                 "No cluster can be further split".to_string(),
             ))?;
 
-            // Skip if cluster has only 1 point
-            if largest_cluster.indices.len() <= 1 {
+            // If this cluster is already finalized, no further split is possible; stop splitting
+            if largest_cluster.finalized {
+                log::warn!("Cluster {} is already finalized, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
                 heap.push(largest_cluster);
-                if heap.iter().all(|c| c.indices.len() <= 1) {
-                    break; // No more splits possible
-                }
-                continue;
+                break;
+            }
+
+            // Because the clusters are sorted by size, if the cluster has only 1 point, no further split is possible; stop splitting
+            if largest_cluster.indices.len() <= 1 {
+                log::warn!("Cluster {} has only 1 point, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                heap.push(largest_cluster);
+                break;
             }
 
             let cluster_size = largest_cluster.indices.len();
@@ -881,17 +895,17 @@ impl KMeans {
             };
 
             // Create sub-dataset for this cluster using indices
-            let cluster_fsl = Self::create_array_from_indices::<T>(
+            let sub_data = Self::create_array_from_indices::<T>(
                 &largest_cluster.indices,
                 data_values,
                 dimension,
             )?;
 
             // Run kmeans on this cluster
-            let sub_kmeans = Self::train_kmeans::<T, Algo>(&cluster_fsl, cluster_k, params)?;
+            let sub_kmeans = Self::train_kmeans::<T, Algo>(&sub_data, cluster_k, params)?;
 
             // Get membership for points in the sub-cluster
-            let sub_data = cluster_fsl.values().as_primitive::<T>().values();
+            let sub_data = sub_data.values().as_primitive::<T>().values();
             let (sub_membership, _, _) = Algo::compute_membership_and_loss(
                 sub_kmeans.centroids.as_primitive::<T>().values(),
                 sub_data,
@@ -902,10 +916,31 @@ impl KMeans {
                 None,
             );
 
+            // If all memberships are identical, the split is ineffective; finalize the original cluster
+            let mut first_sid: Option<u32> = None;
+            let mut all_same = true;
+            for cluster_id in sub_membership.iter() {
+                if let Some(cluster_id) = cluster_id {
+                    if let Some(f) = first_sid {
+                        if *cluster_id != f {
+                            all_same = false;
+                            break;
+                        }
+                    } else {
+                        first_sid = Some(*cluster_id);
+                    }
+                }
+            }
+            if all_same {
+                largest_cluster.finalized = true;
+                heap.push(largest_cluster);
+                continue;
+            }
+
             // Create new sub-clusters and add to heap
             let sub_centroids = sub_kmeans.centroids.as_primitive::<T>().values();
             for i in 0..cluster_k {
-                let mut new_cluster_indices = Vec::new();
+                let mut new_cluster_indices = Vec::with_capacity(sub_membership.len());
                 for (local_idx, &sub_cluster_id) in sub_membership.iter().enumerate() {
                     if let Some(sid) = sub_cluster_id {
                         if sid as usize == i {
@@ -924,6 +959,7 @@ impl KMeans {
                         id: next_cluster_id,
                         indices: new_cluster_indices,
                         centroid,
+                        finalized: false,
                     });
                     next_cluster_id += 1;
                 }
