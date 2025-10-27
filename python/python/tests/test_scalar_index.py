@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import os
 import random
 import re
@@ -3945,3 +3946,70 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify query still works after optimization
     results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)
     assert results.num_rows == 51  # 34 + 17 from new data
+
+
+def test_json_inverted_match_query(tmp_path):
+    # Prepare dataset with JSON data
+    json_data = [
+        {
+            "Title": "HarryPotter Chapter One",
+            "Content": "Once upon a time, there was a boy named Harry.",
+            "Author": "J.K. Rowling",
+            "Price": 99,
+            "Language": ["english", "french"],
+        },
+        {
+            "Title": "HarryPotter Chapter Two",
+            "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+            "Author": "J.K. Rowling",
+            "Price": 128,
+            "Language": ["english", "chinese"],
+        },
+        {
+            "Title": "The Hobbit",
+            "Content": "In a hole in the ground there lived a hobbit.",
+            "Author": "J.R.R. Tolkien",
+            "Price": 89,
+            "Language": ["english"],
+        },
+    ]
+
+    # Convert to JSON strings
+    json_strings = pa.array([json.dumps(doc) for doc in json_data], type=pa.json_())
+    table = pa.table({"json_col": json_strings, "id": range(len(json_data))})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Create inverted index with JSON tokenizer
+    dataset.create_scalar_index(
+        "json_col",
+        index_type="INVERTED",
+        base_tokenizer="simple",
+        max_token_length=10,
+        stem=True,
+        lower_case=True,
+        remove_stop_words=True,
+    )
+
+    # Test match query with token exceeding max_token_length
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Title,str,harrypotter", "json_col")
+    )
+    assert results.num_rows == 0
+
+    # Test stemming
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Content,str,onc", "json_col")
+    )
+    assert results.num_rows == 1
+
+    # Test language match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Language,str,english", "json_col")
+    )
+    assert results.num_rows == 3
+
+    # Test author match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Author,str,tolkien", "json_col")
+    )
+    assert results.num_rows == 1
