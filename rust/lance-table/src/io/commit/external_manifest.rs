@@ -156,6 +156,7 @@ impl ExternalManifestCommitHandler {
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
+        e_tag: Option<String>,
         store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
@@ -180,8 +181,12 @@ impl ExternalManifestCommitHandler {
         // if size < 5MB. However, we need to double check the final_manifest_path
         // exists before we change the external store, otherwise we may point to a
         // non-existing manifest.
-        let meta = store.head(&final_manifest_path).await?;
-        let e_tag = meta.e_tag;
+        let e_tag = if copied && size < 5 * 1024 * 1024 {
+            e_tag
+        } else {
+            let meta = store.head(&final_manifest_path).await?;
+            meta.e_tag
+        };
 
         let location = ManifestLocation {
             version,
@@ -249,11 +254,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     });
                 }
 
-                let size = if let Some(size) = size {
-                    size
+                let (size, e_tag) = if let Some(size) = size {
+                    (size, e_tag)
                 } else {
                     let meta = object_store.inner.head(&path).await?;
-                    meta.size
+                    (meta.size, meta.e_tag)
                 };
 
                 let final_location = self
@@ -262,6 +267,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         &path,
                         version,
                         size,
+                        e_tag.clone(),
                         &object_store.inner,
                         naming_scheme,
                     )
@@ -345,11 +351,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
         let naming_scheme =
             ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
 
-        let size = if let Some(size) = location.size {
-            size
+        let (size, e_tag) = if let Some(size) = location.size {
+            (size, location.e_tag.clone())
         } else {
             let meta = object_store.head(&location.path).await?;
-            meta.size as u64
+            (meta.size as u64, meta.e_tag)
         };
 
         self.finalize_manifest(
@@ -357,6 +363,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             &location.path,
             version,
             size,
+            e_tag,
             object_store,
             naming_scheme,
         )
@@ -410,6 +417,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &staging_path,
                 manifest.version,
                 write_res.size as u64,
+                write_res.e_tag,
                 &object_store.inner,
                 naming_scheme,
             )
