@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use super::TakeExec;
+use crate::datafusion::index_scan::ScanIndexRule;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
@@ -169,10 +170,11 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 }
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
-    PhysicalOptimizer::with_rules(vec![
+    let rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
-        // Push down limit into FilteredReadExec and other Execs via with_fetch()
+        Arc::new(ScanIndexRule),
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
-    ])
+    ];
+    PhysicalOptimizer::with_rules(rules)
 }

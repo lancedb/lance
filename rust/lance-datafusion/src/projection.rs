@@ -95,6 +95,7 @@ impl ProjectionPlan {
             }) = &expr
             {
                 if name == ROW_ID {
+                    dbg!(name);
                     needs_row_id = true;
                 } else if name == ROW_ADDR {
                     needs_row_addr = true;

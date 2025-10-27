@@ -19,7 +19,7 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Error, Result};
 use serde::Serialize;
 use snafu::location;
@@ -786,4 +786,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// If supported, scan back original data. If not, return None.
+    fn scan(
+        &self,
+        _query: Option<&dyn AnyQuery>,
+        _batch_size: usize,
+        _with_row_id: bool,
+        _deletion_mask: Option<Arc<RowIdMask>>,
+        _metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        Ok(None)
+    }
 }

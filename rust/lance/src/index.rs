@@ -336,9 +336,15 @@ pub(crate) async fn remap_index(
     }))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ScalarIndexInfo {
     indexed_columns: HashMap<String, (DataType, Box<MultiQueryParser>)>,
+}
+
+impl ScalarIndexInfo {
+    pub fn insert(&mut self, name: String, data_type: DataType, parser: Box<MultiQueryParser>) {
+        self.indexed_columns.insert(name, (data_type, parser));
+    }
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
@@ -478,6 +484,9 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
+        // TODO: Cache this metadata on the dataset itself instead. Then users
+        // can don't have to worry about evicting this data from the session cache.
+        // They can rely on calling `now_or_never()`.
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
