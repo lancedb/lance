@@ -46,7 +46,10 @@ use crate::{
             },
             general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
             packed::{
-                PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
+                PackedStructFixedWidthMiniBlockDecompressor,
+                PackedStructFixedWidthMiniBlockEncoder, PackedStructVariablePerValueDecompressor,
+                PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
+                VariablePackedStructFieldKind,
             },
             rle::{RleMiniBlockDecompressor, RleMiniBlockEncoder},
             value::{ValueDecompressor, ValueEncoder},
@@ -64,7 +67,7 @@ use arrow_array::{cast::AsArray, types::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection.
 /// RLE is chosen when the run count is less than this fraction of total values.
@@ -128,7 +131,7 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     ) -> Result<Box<dyn MiniBlockCompressor>>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DefaultCompressionStrategy {
     /// User-configured compression parameters
     params: CompressionParams,
@@ -297,6 +300,12 @@ impl DefaultCompressionStrategy {
         }
     }
 
+    /// Override the file version used to make compression decisions
+    pub fn with_version(mut self, version: LanceFileVersion) -> Self {
+        self.version = version;
+        self
+    }
+
     /// Parse compression parameters from field metadata
     fn parse_field_metadata(field: &Field) -> CompressionFieldParams {
         let mut params = CompressionFieldParams::default();
@@ -431,12 +440,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
             DataBlock::Struct(struct_data_block) => {
                 // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
                 // just being cautious here.
-                if struct_data_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                {
-                    panic!("packed struct encoding currently only supports fixed-width fields.")
+                if struct_data_block.has_variable_width_child() {
+                    return Err(Error::invalid_input(
+                        "Packed struct mini-block encoding supports only fixed-width children",
+                        location!(),
+                    ));
                 }
                 Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()))
             }
@@ -471,6 +479,32 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
             DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
+            DataBlock::Struct(struct_block) => {
+                if field.children.len() != struct_block.children.len() {
+                    return Err(Error::invalid_input(
+                        "Struct field metadata does not match data block children",
+                        location!(),
+                    ));
+                }
+                let has_variable_child = struct_block.has_variable_width_child();
+                if has_variable_child {
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::NotSupported {
+                            source: "Variable packed struct encoding requires Lance file version 2.2 or later".into(),
+                            location: location!(),
+                        });
+                    }
+                    Ok(Box::new(PackedStructVariablePerValueEncoder::new(
+                        self.clone(),
+                        field.children.clone(),
+                    )))
+                } else {
+                    Err(Error::invalid_input(
+                        "Packed struct per-value compression should not be used for fixed-width-only structs",
+                        location!(),
+                    ))
+                }
+            }
             DataBlock::VariableWidth(variable_width) => {
                 let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
                 let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
@@ -783,6 +817,52 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(CompressedBufferEncoder::from_scheme(
                     general.compression.as_ref().expect_ok()?.scheme(),
                 )?))
+            }
+            Compression::VariablePackedStruct(description) => {
+                let mut fields = Vec::with_capacity(description.fields.len());
+                for field in &description.fields {
+                    let value_encoding = field.value.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "VariablePackedStruct field is missing value encoding",
+                            location!(),
+                        )
+                    })?;
+                    let decoder = match field.layout.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "VariablePackedStruct field is missing layout details",
+                            location!(),
+                        )
+                    })? {
+                        crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerValue(
+                            bits_per_value,
+                        ) => {
+                            let decompressor =
+                                self.create_fixed_per_value_decompressor(value_encoding)?;
+                            VariablePackedStructFieldDecoder {
+                                kind: VariablePackedStructFieldKind::Fixed {
+                                    bits_per_value: *bits_per_value,
+                                    decompressor: Arc::from(decompressor),
+                                },
+                            }
+                        }
+                        crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerLength(
+                            bits_per_length,
+                        ) => {
+                            let decompressor =
+                                self.create_variable_per_value_decompressor(value_encoding)?;
+                            VariablePackedStructFieldDecoder {
+                                kind: VariablePackedStructFieldKind::Variable {
+                                    bits_per_length: *bits_per_length,
+                                    decompressor: Arc::from(decompressor),
+                                },
+                            }
+                        }
+                    };
+                    fields.push(decoder);
+                }
+                Ok(Box::new(PackedStructVariablePerValueDecompressor::new(
+                    fields,
+                )))
             }
             _ => todo!("variable-per-value decompressor for {:?}", description),
         }

@@ -2611,6 +2611,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::copy_test_data_to_tmp;
     use lance_arrow::FixedSizeListArrayExt;
+    use mock_instant::thread_local::MockClock;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -6547,8 +6548,12 @@ mod tests {
         let mut doc_array = (0..4096)
             .map(|_| {
                 let mut rng = rand::rng();
-                let mut text = String::with_capacity(4);
-                for _ in 0..rng.random_range(127..512) {
+                let mut text = String::with_capacity(512);
+                let len = rng.random_range(127..512);
+                for i in 0..len {
+                    if i > 0 {
+                        text.push(' ');
+                    }
                     text.push_str(words[rng.random_range(0..words.len())]);
                 }
                 if text.contains("lance search") {
@@ -6560,10 +6565,16 @@ mod tests {
                 text
             })
             .collect_vec();
+        // Ensure at least one doc matches each phrase deterministically
+        doc_array.push("lance search".to_owned());
+        lance_search_count += 1;
+        doc_array.push("full text".to_owned());
+        full_text_count += 1;
         doc_array.push("position for phrase query".to_owned());
 
-        let params = InvertedIndexParams::default().with_position(true);
-        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array));
+        // 1) Build index without positions and assert phrase query errors
+        let params_no_pos = InvertedIndexParams::default().with_position(false);
+        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array.clone()));
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
@@ -6578,7 +6589,29 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
         dataset
-            .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+            .create_index(&["doc"], IndexType::Inverted, None, &params_no_pos, true)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"), "{}", err);
+        assert!(err.starts_with("Invalid user input: "), "{}", err);
+
+        // 2) Recreate index with positions and assert phrase query works
+        let params_with_pos = InvertedIndexParams::default().with_position(true);
+        dataset
+            .create_index(&["doc"], IndexType::Inverted, None, &params_with_pos, true)
             .await
             .unwrap();
 
@@ -7718,9 +7751,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_skip_auto_cleanup() {
-        use lance_core::utils::testing::MockClock;
-        let clock = MockClock::new();
-
         let test_uri = TempStrDir::default();
 
         // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
@@ -7738,7 +7768,7 @@ mod tests {
         };
 
         // Start at 1 second after epoch
-        clock.set_system_time(chrono::Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let dataset = Dataset::write(data, &test_uri, Some(write_params))
             .await
@@ -7746,7 +7776,7 @@ mod tests {
         assert_eq!(dataset.version().version, 1);
 
         // Advance time by 1 second
-        clock.set_system_time(chrono::Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         // First append WITHOUT skip_auto_cleanup - should trigger cleanup
         let data1 = gen_batch()
@@ -7768,7 +7798,7 @@ mod tests {
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
         let data1_extra = gen_batch()
@@ -7795,7 +7825,7 @@ mod tests {
         );
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
         let data2 = gen_batch()
@@ -9498,5 +9528,39 @@ mod tests {
 
         // Should have both data writes (10 rows total)
         assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_auto_infer_lance_tokenizer() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col. Expect auto-infer 'json' for lance tokenizer.
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query succeed only when lance tokenizer is 'json'
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,once".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
     }
 }

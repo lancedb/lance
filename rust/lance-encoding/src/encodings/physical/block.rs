@@ -731,6 +731,7 @@ mod tests {
 
         use super::*;
 
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
         use crate::{
             constants::{
                 COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
@@ -771,6 +772,8 @@ mod tests {
                 // Some bad cardinality estimatation causes us to use dictionary encoding currently
                 // which causes the expected encoding check to fail.
                 field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+                // Also disable size-based dictionary encoding
                 field_meta.insert(
                     STRUCTURAL_ENCODING_META_KEY.to_string(),
                     STRUCTURAL_ENCODING_FULLZIP.to_string(),

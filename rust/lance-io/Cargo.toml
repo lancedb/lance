@@ -53,6 +53,7 @@ criterion.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
+mock_instant.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
