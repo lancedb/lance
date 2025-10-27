@@ -443,8 +443,8 @@ impl Dataset {
 
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        match ref_ {
+        let reference: refs::Ref = version.into();
+        match reference {
             refs::Ref::Version(branch, version_number) => {
                 self.checkout_by_ref(version_number, branch).await
             }
@@ -1945,8 +1945,7 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_ = version.into();
-        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
+        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -1957,7 +1956,9 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params.unwrap_or_default())
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);

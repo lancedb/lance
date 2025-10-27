@@ -204,18 +204,17 @@ impl Tags<'_> {
         }
 
         let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
         Ok(tag_contents)
     }
 
     pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
-        self.create_on_branch(tag, version, None).await
+        self.create_on_branch(tag, Some(version), None).await
     }
 
     pub async fn create_on_branch(
         &self,
         tag: &str,
-        version_number: u64,
+        version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<()> {
         check_valid_tag(tag)?;
@@ -231,22 +230,28 @@ impl Tags<'_> {
         }
 
         let branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
-            )
-            .await?;
+        let manifest_file = if let Some(version_number) = version_number {
+            self.refs
+                .commit_handler
+                .resolve_version_location(
+                    &branch_location.path,
+                    version_number,
+                    &self.refs.object_store.inner,
+                )
+                .await?
+        } else {
+            self.refs
+                .commit_handler
+                .resolve_latest_location(&branch_location.path, &self.refs.object_store)
+                .await?
+        };
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
                 message: format!(
                     "version {}::{} does not exist",
-                    branch.unwrap_or("Main".to_string()),
-                    version_number
+                    branch.unwrap_or("main".to_string()),
+                    manifest_file.version
                 ),
             });
         }
@@ -259,7 +264,7 @@ impl Tags<'_> {
 
         let tag_contents = TagContents {
             branch,
-            version: version_number,
+            version: manifest_file.version,
             manifest_size,
         };
 
@@ -288,14 +293,14 @@ impl Tags<'_> {
     }
 
     pub async fn update(&self, tag: &str, version: u64) -> Result<()> {
-        self.update_on_branch(tag, version, None).await
+        self.update_on_branch(tag, Some(version), None).await
     }
 
     /// Update a tag to a branch::version
     pub async fn update_on_branch(
         &self,
         tag: &str,
-        version_number: u64,
+        version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<()> {
         check_valid_tag(tag)?;
@@ -311,19 +316,25 @@ impl Tags<'_> {
         }
 
         let target_branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &target_branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
-            )
-            .await?;
+        let manifest_file = if let Some(version_number) = version_number {
+            self.refs
+                .commit_handler
+                .resolve_version_location(
+                    &target_branch_location.path,
+                    version_number,
+                    &self.refs.object_store.inner,
+                )
+                .await?
+        } else {
+            self.refs
+                .commit_handler
+                .resolve_latest_location(&target_branch_location.path, &self.refs.object_store)
+                .await?
+        };
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("version {} does not exist", version_number),
+                message: format!("version {} does not exist", manifest_file.version),
             });
         }
 
@@ -335,7 +346,7 @@ impl Tags<'_> {
 
         let tag_contents = TagContents {
             branch,
-            version: version_number,
+            version: manifest_file.version,
             manifest_size,
         };
 
