@@ -143,6 +143,16 @@ impl FileFragment {
         })
     }
 
+    #[pyo3(signature=(filter=None))]
+    fn approx_count_rows(&self, filter: Option<String>) -> PyResult<usize> {
+        rt().runtime.block_on(async {
+            self.fragment
+                .approx_count_rows(filter)
+                .await
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(signature=(columns=None, with_row_address=None))]
     fn open_session(
         self_: PyRef<'_, Self>,

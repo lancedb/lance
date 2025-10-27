@@ -4220,6 +4220,7 @@ class ScannerBuilder:
         self._strict_batch_size = False
         self._orderings = None
         self._disable_scoring_autoprojection = False
+        self._index_selection = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -4601,6 +4602,40 @@ class ScannerBuilder:
         self._disable_scoring_autoprojection = disable
         return self
 
+    def index_selection_options(
+        self, index_selection: Optional[dict] = None
+    ) -> ScannerBuilder:
+        """
+        Set index selection options for the scanner.
+
+        Parameters
+        ----------
+        index_selection : dict, optional
+            A dictionary containing index selection options:
+            - hints: list[str], query-level index type hints
+            - column_hints: dict[str, list[str]], column-level index type hints
+
+        Examples
+        --------
+        >>> import lance
+        >>> from lance.dataset import ScannerBuilder
+        >>> import pyarrow as pa
+        >>> import tempfile
+        >>> # Create a simple dataset for demonstration
+        >>> table = pa.table({"vector": [[1.0, 2.0], [3.0, 4.0]], "price": [150, 50]})
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     dataset_uri = tmpdir
+        ...     _ = lance.write_dataset(table, dataset_uri)
+        ...     dataset = lance.dataset(dataset_uri)
+        ...     scanner_builder = ScannerBuilder(dataset)
+        ...     scanner = scanner_builder.index_selection_options({
+        ...         "hints": ["btree", "bitmap"],
+        ...         "column_hints": {"price": ["btree"]}
+        ...     }).filter("price > 100").columns(["vector"]).to_scanner()
+        """
+        self._index_selection = index_selection
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -4629,6 +4664,7 @@ class ScannerBuilder:
             self._strict_batch_size,
             self._orderings,
             self._disable_scoring_autoprojection,
+            self._index_selection,
         )
         return LanceScanner(scanner, self.ds)
 

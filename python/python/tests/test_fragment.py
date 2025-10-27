@@ -514,3 +514,42 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_approx_count_rows():
+    import tempfile
+    from pathlib import Path
+
+    # Import lance after setting up the path
+    import lance
+    import pyarrow as pa
+    from lance.fragment import LanceFragment
+
+    # Create a simple dataset
+    data = pa.table({"a": range(100), "b": range(100, 200)})
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dataset_uri = Path(tmpdir) / "test_dataset"
+        dataset = lance.write_dataset(data, dataset_uri)
+
+        # Get the first fragment
+        fragment = dataset.get_fragment(0)
+        assert isinstance(fragment, LanceFragment)
+
+        # Test without filter - should return exact count
+        count = fragment.count_rows()
+        approx_count = fragment.approx_count_rows()
+        assert count == approx_count == 100, (
+            f"Expected 100, got count={count}, approx_count={approx_count}"
+        )
+
+        # Test with filter - should return exact or approximate count
+        # depending on index availability
+        filtered_count = fragment.count_rows("a > 50")
+        filtered_approx_count = fragment.approx_count_rows("a > 50")
+
+        # Both should return the same result for this simple case
+        assert filtered_count == filtered_approx_count == 49, (
+            f"Expected 49, got filtered_count={filtered_count}, "
+            f"filtered_approx_count={filtered_approx_count}"
+        )

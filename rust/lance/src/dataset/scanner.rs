@@ -57,6 +57,7 @@ use lance_datafusion::exec::{
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::scalar::expression::IndexSelectionOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
@@ -384,6 +385,9 @@ pub struct Scanner {
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
 
+    /// Optional index selection options (hints and cost-based selection)
+    index_selection_options: Option<IndexSelectionOptions>,
+
     /// Only search the data being indexed (weak consistency search).
     ///
     /// Default value is false.
@@ -617,6 +621,7 @@ impl Scanner {
             use_stats: true,
             ordered: true,
             fragments: None,
+            index_selection_options: None,
             fast_search: false,
             use_scalar_index: true,
             include_deleted_rows: false,
@@ -809,6 +814,12 @@ impl Scanner {
 
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter = Some(LanceFilter::Datafusion(filter));
+        self
+    }
+
+    /// Provide index selection options (index hints and cost-based selection)
+    pub fn index_selection_options(&mut self, opts: IndexSelectionOptions) -> &mut Self {
+        self.index_selection_options = Some(opts);
         self
     }
 
@@ -1639,7 +1650,10 @@ impl Scanner {
 
         if let Some(filter) = self.filter.as_ref() {
             let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
-            let index_info = self.dataset.scalar_index_info().await?;
+            let index_info = self
+                .dataset
+                .scalar_index_info_with_options(self.index_selection_options.clone())
+                .await?;
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
 
