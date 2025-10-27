@@ -30,7 +30,7 @@ pub struct InvertedIndexParams {
     /// lance tokenizer takes care of different data types, such as text, json, etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
-    /// - default: text
+    /// - none: auto type inference
     pub(crate) lance_tokenizer: Option<String>,
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
@@ -146,7 +146,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
-            lance_tokenizer: Some("text".to_owned()),
+            lance_tokenizer: None,
             base_tokenizer,
             language,
             with_position: false,
