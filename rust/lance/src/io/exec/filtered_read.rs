@@ -66,6 +66,16 @@ pub struct EvaluatedIndex {
 }
 
 impl EvaluatedIndex {
+    /// Get a reference to the index result
+    pub fn index_result(&self) -> &IndexExprResult {
+        &self.index_result
+    }
+
+    /// Get a reference to the applicable fragments bitmap
+    pub fn applicable_fragments(&self) -> &RoaringBitmap {
+        &self.applicable_fragments
+    }
+
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
         if batch.num_rows() != 2 {
             return Err(Error::InvalidInput {

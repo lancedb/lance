@@ -1347,7 +1347,7 @@ impl FileFragment {
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
-    pub(crate) async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
+    pub async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
         let Some(deletion_file) = self.metadata.deletion_file.as_ref() else {
             return Ok(None);
         };
