@@ -1461,16 +1461,12 @@ impl DataBlock {
         let mut nulls = extract_nulls(arrays, num_values);
 
         if let Nullability::All = nulls {
-            match data_type {
-                DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
-                    let mut builder = BooleanBufferBuilder::new(num_values as usize);
-                    builder.append_n(num_values as usize, false);
-                    nulls = Nullability::Some(NullBuffer::new(builder.finish()));
-                }
-                _ => {
-                    return Self::AllNull(AllNullDataBlock { num_values });
-                }
+            if matches!(data_type, DataType::Null) {
+                return Self::AllNull(AllNullDataBlock { num_values });
             }
+            let mut builder = BooleanBufferBuilder::new(num_values as usize);
+            builder.append_n(num_values as usize, false);
+            nulls = Nullability::Some(NullBuffer::new(builder.finish()));
         }
 
         let mut encoded = match data_type {
