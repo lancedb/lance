@@ -54,6 +54,10 @@ impl LanceField {
     pub fn metadata(&self) -> PyResult<std::collections::HashMap<String, String>> {
         Ok(self.0.metadata.clone())
     }
+
+    pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
+        PyArrowType((&self.0).into())
+    }
 }
 
 /// A Lance Schema.
@@ -149,5 +153,15 @@ impl LanceSchema {
 
     pub fn fields(&self) -> PyResult<Vec<LanceField>> {
         Ok(self.0.fields.iter().cloned().map(LanceField).collect())
+    }
+
+    /// Get a field by name or path.
+    ///
+    /// For nested fields, use dot notation (e.g., "parent.child").
+    /// Field names containing dots must be quoted with backticks (e.g., "parent.`child.with.dot`").
+    ///
+    /// Returns None if the field is not found.
+    pub fn field(&self, name: &str) -> PyResult<Option<LanceField>> {
+        Ok(self.0.field(name).map(|f| LanceField(f.clone())))
     }
 }

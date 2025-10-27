@@ -14,18 +14,16 @@
 package com.lancedb.lance;
 
 import com.google.common.base.MoreObjects;
-import com.google.common.base.Preconditions;
 
 import java.util.Optional;
 
-public class Reference {
+public class Ref {
 
   private final Optional<Long> versionNumber;
   private final Optional<String> branchName;
   private final Optional<String> tagName;
 
-  public Reference(
-      Optional<Long> versionNumber, Optional<String> branchName, Optional<String> tagName) {
+  public Ref(Optional<Long> versionNumber, Optional<String> branchName, Optional<String> tagName) {
     this.versionNumber = versionNumber;
     this.branchName = branchName;
     this.tagName = tagName;
@@ -43,8 +41,24 @@ public class Reference {
     return tagName;
   }
 
-  public static Builder builder() {
-    return new Builder();
+  public static Ref ofMain(long versionNumber) {
+    return new Ref(Optional.of(versionNumber), Optional.empty(), Optional.empty());
+  }
+
+  public static Ref ofMain() {
+    return new Ref(Optional.empty(), Optional.empty(), Optional.empty());
+  }
+
+  public static Ref ofBranch(String branchName) {
+    return new Ref(Optional.empty(), Optional.of(branchName), Optional.empty());
+  }
+
+  public static Ref ofBranch(String branchName, long versionNumber) {
+    return new Ref(Optional.of(versionNumber), Optional.of(branchName), Optional.empty());
+  }
+
+  public static Ref ofTag(String tagName) {
+    return new Ref(Optional.empty(), Optional.empty(), Optional.of(tagName));
   }
 
   @Override
@@ -54,39 +68,5 @@ public class Reference {
         .add("branchName", branchName.orElse(null))
         .add("tagName", tagName.orElse(null))
         .toString();
-  }
-
-  public static class Builder {
-    private Long versionNumber;
-    private String branchName;
-    private String tagName;
-
-    private Builder() {}
-
-    public Builder versionNumber(long versionNumber) {
-      this.versionNumber = versionNumber;
-      return this;
-    }
-
-    public Builder branchName(String branchName) {
-      this.branchName = branchName;
-      return this;
-    }
-
-    public Builder tagName(String tagName) {
-      this.tagName = tagName;
-      return this;
-    }
-
-    public Reference build() {
-      Preconditions.checkArgument(
-          (tagName == null && (versionNumber != null || branchName != null))
-              || (tagName != null && (versionNumber == null && branchName == null)),
-          "Invalid parameters: either specify tagName alone, or versionNumber/branchName together");
-      return new Reference(
-          Optional.ofNullable(versionNumber),
-          Optional.ofNullable(branchName),
-          Optional.ofNullable(tagName));
-    }
   }
 }

@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::HashMap,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+
+#[cfg(test)]
+use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
+
+#[cfg(not(test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
@@ -313,6 +314,14 @@ impl AwsCredentialAdapter {
 
 const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 
+/// Convert std::time::SystemTime from AWS SDK to our mockable SystemTime
+fn to_system_time(time: std::time::SystemTime) -> SystemTime {
+    let duration_since_epoch = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time should be after UNIX_EPOCH");
+    UNIX_EPOCH + duration_since_epoch
+}
+
 #[async_trait::async_trait]
 impl CredentialProvider for AwsCredentialAdapter {
     type Credential = ObjectStoreAwsCredential;
@@ -325,7 +334,8 @@ impl CredentialProvider for AwsCredentialAdapter {
                 .map(|cred| {
                     cred.expiry()
                         .map(|exp| {
-                            exp.checked_sub(self.credentials_refresh_offset)
+                            to_system_time(exp)
+                                .checked_sub(self.credentials_refresh_offset)
                                 .expect("this time should always be valid")
                                 < SystemTime::now()
                         })

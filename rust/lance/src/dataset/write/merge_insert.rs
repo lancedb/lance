@@ -2127,6 +2127,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use mock_instant::thread_local::MockClock;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -4070,9 +4071,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
-        use lance_core::utils::testing::MockClock;
-        let clock = MockClock::new();
-
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("{}/{}", tmpdir, "test_dataset");
 
@@ -4099,7 +4097,7 @@ mod tests {
         };
 
         // Start at 1 second after epoch
-        clock.set_system_time(chrono::Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let dataset = Dataset::write(data, &dataset_uri, Some(write_params))
             .await
@@ -4107,7 +4105,7 @@ mod tests {
         assert_eq!(dataset.version().version, 1);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         // First merge insert WITHOUT skip_auto_cleanup - should trigger cleanup
         let new_data = lance_datagen::gen_batch()
@@ -4128,7 +4126,7 @@ mod tests {
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         // Need to do another merge insert for cleanup to take effect since cleanup runs on the old dataset
         let new_data_extra = lance_datagen::gen_batch()
@@ -4164,7 +4162,7 @@ mod tests {
         );
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         // Second merge insert WITH skip_auto_cleanup - should NOT trigger cleanup
         let new_data2 = lance_datagen::gen_batch()

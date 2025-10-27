@@ -1586,3 +1586,138 @@ def test_knn_deleted_rows(tmp_path):
     )
     assert 0 not in results["id"]
     assert results.num_rows == ds.count_rows()
+
+
+def test_nested_field_vector_index(tmp_path):
+    """Test vector index creation and querying on nested fields
+
+    Note: While scalar indices work on nested fields, vector indices currently
+    have a limitation in the DataFusion integration layer that prevents them
+    from working with nested field paths. The Python validation layer now
+    correctly handles nested paths, but the Rust planner needs additional work.
+    """
+    # Create a dataset with nested vector field
+    dimensions = 128
+    num_rows = 256
+
+    # Generate random vectors
+    vectors = np.random.randn(num_rows, dimensions).astype(np.float32)
+    vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors.flatten()), dimensions
+    )
+
+    # Create nested structure with vector field
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "data",
+                pa.struct(
+                    [
+                        pa.field("embedding", pa.list_(pa.float32(), dimensions)),
+                        pa.field("label", pa.string()),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    # Create struct array
+    struct_array = pa.StructArray.from_arrays(
+        [vector_array, pa.array([f"label_{i}" for i in range(num_rows)])],
+        names=["embedding", "label"],
+    )
+
+    data = pa.table({"id": list(range(num_rows)), "data": struct_array}, schema=schema)
+
+    # Create dataset
+    uri = tmp_path / "test_nested_vector"
+    dataset = lance.write_dataset(data, uri)
+
+    # Verify the schema
+    assert "data" in dataset.schema.names
+    field = dataset.schema.field("data")
+    assert pa.types.is_struct(field.type)
+
+    # Create vector index on nested column
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+
+    # Verify index was created
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["data.embedding"]
+
+    # Test querying with the index
+    query_vec = vectors[0]
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    # Verify results
+    assert len(result) == 10
+    assert "data" in result.column_names
+    assert "_distance" in result.column_names
+
+    # The first result should be the query vector itself (or very close)
+    assert result["id"][0].as_py() == 0
+    assert result["_distance"][0].as_py() < 0.01  # Should be nearly zero
+
+    # Write additional data to the dataset
+    new_vectors = np.random.randn(50, dimensions).astype(np.float32)
+    new_vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(new_vectors.flatten()), dimensions
+    )
+
+    new_struct_array = pa.StructArray.from_arrays(
+        [new_vector_array, pa.array([f"new_label_{i}" for i in range(50)])],
+        names=["embedding", "label"],
+    )
+
+    new_data = pa.table(
+        {"id": list(range(num_rows, num_rows + 50)), "data": new_struct_array},
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(new_data, uri, mode="append")
+
+    # Verify query still works after appending data
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 15, "nprobes": 2}
+    )
+
+    assert len(result) == 15
+    assert "data" in result.column_names
+
+    # Optimize the index to include new data
+    dataset.optimize.optimize_indices()
+
+    # Verify query works after optimization
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 20, "nprobes": 2}
+    )
+
+    assert len(result) == 20
+
+    # Test with cosine metric
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="cosine",
+        replace=True,
+    )
+
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    assert len(result) == 10
+
+    # Verify total row count
+    assert dataset.count_rows() == num_rows + 50

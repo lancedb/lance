@@ -6,7 +6,6 @@
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{Duration, TimeDelta};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -18,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
@@ -203,44 +202,5 @@ impl ObjectStore for ProxyObjectStore {
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.before_method("copy_if_not_exists", from)?;
         self.target.copy_if_not_exists(from, to).await
-    }
-}
-
-// Regrettably, the system clock is a process-wide global. That means that tests running
-// in parallel can interfere with each other if they both want to adjust the system clock.
-//
-// By using MockClock below (which wraps mock_instant::MockClock), we can prevent this from
-// happening, though there is a test time cost as this will prevent some potential test
-// parallelism in a rather negative way (blocking).
-//
-// It also means that if one clock-dependent test fails then all future clock-dependent
-// tests will fail because of mutex poisoning.
-static CLOCK_MUTEX: Mutex<()> = Mutex::new(());
-pub struct MockClock<'a> {
-    _guard: MutexGuard<'a, ()>,
-}
-
-impl Default for MockClock<'_> {
-    fn default() -> Self {
-        Self {
-            _guard: CLOCK_MUTEX.lock().unwrap(),
-        }
-    }
-}
-
-impl MockClock<'_> {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn set_system_time(&self, time: Duration) {
-        mock_instant::MockClock::set_system_time(time.to_std().unwrap());
-    }
-}
-
-impl Drop for MockClock<'_> {
-    fn drop(&mut self) {
-        // Reset the clock to the epoch
-        mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());
     }
 }

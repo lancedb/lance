@@ -278,9 +278,9 @@ mod tests {
     use arrow_array::types::UInt64Type;
     use chrono::Duration;
     use futures::TryStreamExt;
-    use lance_core::utils::testing::MockClock;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{array, BatchCount, RowCount};
+    use mock_instant::thread_local::MockClock;
     use std::sync::Arc;
 
     async fn create_test_dataset() -> Dataset {
@@ -339,30 +339,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_contains_deleted_transaction() {
-        let clock = MockClock::new();
-
-        clock.set_system_time(Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let mut ds = create_test_dataset().await;
 
-        clock.set_system_time(Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         ds.delete("key = 5").await.unwrap();
         ds.delete("key = 6").await.unwrap();
         ds.delete("key = 7").await.unwrap();
 
-        clock.set_system_time(Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         let end_version = ds.version().version;
         let base_dataset = ds.clone();
 
-        clock.set_system_time(Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         ds.cleanup_old_versions(Duration::seconds(1), Some(true), None)
             .await
             .expect("Cleanup old versions failed");
 
-        clock.set_system_time(Duration::seconds(5));
+        MockClock::set_system_time(std::time::Duration::from_secs(5));
 
         let delta_struct = base_dataset
             .delta()

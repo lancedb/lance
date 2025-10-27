@@ -8,7 +8,7 @@ This crate provides concrete implementations of the Lance namespace trait:
 
 - Unified connection interface for all implementations
 - **REST Namespace** - REST API client for remote Lance namespace servers (feature: `rest`)
-- **Directory Namespace** - File system-based namespace that stores tables as Lance datasets (feature: `dir`)
+- **Directory Namespace** - File system-based namespace that stores tables as Lance datasets (always available)
 
 ## Features
 
@@ -16,15 +16,16 @@ This crate provides concrete implementations of the Lance namespace trait:
 
 The REST namespace implementation provides a client for connecting to remote Lance namespace servers via REST API.
 
-### Directory Namespace (feature: `dir`)
+### Directory Namespace (always available)
 
 The directory namespace implementation stores tables as Lance datasets in a directory structure on local or cloud storage.
 
 Supported storage backends:
-- Local filesystem
-- AWS S3
-- Google Cloud Storage (GCS)
-- Azure Blob Storage
+- Local filesystem (always available)
+- AWS S3 (feature: `dir-aws`)
+- Google Cloud Storage (feature: `dir-gcp`)
+- Azure Blob Storage (feature: `dir-azure`)
+- Alibaba Cloud OSS (feature: `dir-oss`)
 
 ## Usage
 
