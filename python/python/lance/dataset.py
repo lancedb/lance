@@ -559,6 +559,86 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return Tags(self._ds)
 
+    @property
+    def branches(self) -> "Branches":
+        """Branch management for the dataset.
+
+        Examples
+        --------
+        --------
+
+        .. code-block:: python
+
+            ds = lance.open("dataset.lance")
+            ds.create_branch("v2-prod-20250203")
+
+            branches = ds.branches.list()
+
+        """
+        return Branches(self._ds)
+
+    def create_branch(
+        self,
+        branch: str,
+        reference: Optional[int | str | Tuple[str, int]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> "LanceDataset":
+        """Create a new branch from a version or tag.
+
+        Parameters
+        ----------
+        branch: str
+            Name of the branch to create.
+        reference: Optional[int | str | Tuple[str, int]]
+            The reference which could be a version_number, a tag name or a tuple of
+            (branch_name, version_number) to create the branch from.
+            If None, the latest version of the current branch is used.
+        storage_options: Optional[Dict[str, str]]
+            Storage options for the underlying object store. If not provided,
+            the storage options from the current dataset will be used.
+
+        Returns
+        -------
+        LanceDataset
+            A dataset instance pointing to the new branch.
+        """
+        if storage_options is None:
+            storage_options = self._storage_options
+        new_ds = self._ds.create_branch(branch, reference, storage_options)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = self._storage_options
+        ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params
+        return ds
+
+    def checkout_branch(self, branch: str) -> "LanceDataset":
+        """Check out the latest version of a branch.
+
+        Parameters
+        ----------
+        branch: str
+            The branch name to checkout.
+
+        Returns
+        -------
+        LanceDataset
+            A dataset instance at the latest version of the branch.
+        """
+        inner = self._ds.checkout_branch(branch)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = inner
+        ds._uri = inner.uri
+        ds._storage_options = self._storage_options
+        ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params
+        return ds
+
+    def checkout_latest(self):
+        """Check out the latest version of the current branch."""
+        self._ds.checkout_latest()
+
     def list_indices(self) -> List[Index]:
         return self._ds.load_indices()
 
@@ -2036,7 +2116,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version: int | str) -> "LanceDataset":
+    def checkout_version(self, version: int | str | Tuple[str, int]) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -2046,9 +2126,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        version: int | str,
-            The version to check out. A version number (`int`) or a tag
-            (`str`) can be provided.
+        version: int | str | Tuple[str, int],
+            The version to check out. A version number on main (`int`), a tag
+            (`str`) or a tuple of ('branch_name', 'version_number') can be provided.
 
         Returns
         -------
@@ -3260,7 +3340,8 @@ class LanceDataset(pa.dataset.Dataset):
             in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints).
+            endpoints). If not specified, the storage options of the source dataset
+            will be used.
 
         Returns
         -------
@@ -3272,6 +3353,8 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
+        if storage_options is None:
+            storage_options = self._storage_options
         self._ds.shallow_clone(target_uri, version, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
@@ -3582,6 +3665,13 @@ class Transaction:
 
 class Tag(TypedDict):
     version: int
+    manifest_size: int
+
+
+class Branch(TypedDict):
+    parent_branch: Optional[str]
+    parent_version: int
+    create_at: int
     manifest_size: int
 
 
@@ -4856,7 +4946,7 @@ class Tags:
         """
         return self._ds.tags_ordered(order)
 
-    def create(self, tag: str, version: int) -> None:
+    def create(self, tag: str, version: int, branch: Optional[str] = None) -> None:
         """
         Create a tag for a given dataset version.
 
@@ -4867,8 +4957,10 @@ class Tags:
             names for the dataset.
         version: int,
             The dataset version to tag.
+        branch: Optional[str],
+            The specified branch to create the tag, None if the specified branch is main
         """
-        self._ds.create_tag(tag, version)
+        self._ds.create_tag(tag, version, branch)
 
     def delete(self, tag: str) -> None:
         """
@@ -4882,7 +4974,7 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
-    def update(self, tag: str, version: int) -> None:
+    def update(self, tag: str, version: int, branch: Optional[str] = None) -> None:
         """
         Update tag to a new version.
 
@@ -4892,8 +4984,42 @@ class Tags:
             The name of the tag to update.
         version: int,
             The new dataset version to tag.
+        branch: Optional[str],
+            The specified branch to create the tag, None if the specified branch is main
         """
-        self._ds.update_tag(tag, version)
+        self._ds.update_tag(tag, version, branch)
+
+
+class Branches:
+    """
+    Dataset branch manager.
+    """
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def list(self) -> dict[str, Branch]:
+        """
+        List all dataset branches.
+
+        Returns
+        -------
+        dict[str, Branch]
+            A dictionary mapping branch names to branch metadata.
+        """
+        return self._ds.branches()
+
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Branch]]:
+        """
+        List all dataset branches ordered by parent version.
+        """
+        return self._ds.branches_ordered(order)
+
+    def delete(self, branch: str) -> None:
+        """
+        Delete a branch.
+        """
+        self._ds.delete_branch(branch)
 
 
 @dataclass

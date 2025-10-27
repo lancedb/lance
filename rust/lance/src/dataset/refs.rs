@@ -208,12 +208,12 @@ impl Tags<'_> {
         Ok(tag_contents)
     }
 
-    pub async fn create(&mut self, tag: &str, version: u64) -> Result<()> {
+    pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
         self.create_on_branch(tag, version, None).await
     }
 
     pub async fn create_on_branch(
-        &mut self,
+        &self,
         tag: &str,
         version_number: u64,
         branch: Option<&str>,
@@ -272,7 +272,7 @@ impl Tags<'_> {
             .map(|_| ())
     }
 
-    pub async fn delete(&mut self, tag: &str) -> Result<()> {
+    pub async fn delete(&self, tag: &str) -> Result<()> {
         check_valid_tag(tag)?;
 
         let root_location = self.refs.root()?;
@@ -287,13 +287,13 @@ impl Tags<'_> {
         self.object_store().delete(&tag_file).await
     }
 
-    pub async fn update(&mut self, tag: &str, version: u64) -> Result<()> {
+    pub async fn update(&self, tag: &str, version: u64) -> Result<()> {
         self.update_on_branch(tag, version, None).await
     }
 
     /// Update a tag to a branch::version
     pub async fn update_on_branch(
-        &mut self,
+        &self,
         tag: &str,
         version_number: u64,
         branch: Option<&str>,
@@ -409,7 +409,7 @@ impl Branches<'_> {
     }
 
     pub async fn create(
-        &mut self,
+        &self,
         branch_name: &str,
         version_number: u64,
         source_branch: Option<&str>,
@@ -467,7 +467,7 @@ impl Branches<'_> {
     ///
     /// If the `BranchContents` does not exist, it will return an error directly unless `force` is true.
     /// If `force` is true, it will try to delete the branch directories no matter `BranchContents` exists or not.
-    pub async fn delete(&mut self, branch: &str, force: bool) -> Result<()> {
+    pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
         let root_location = self.refs.root()?;
