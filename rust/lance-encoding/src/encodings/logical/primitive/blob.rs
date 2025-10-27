@@ -14,7 +14,10 @@ use futures::{future::BoxFuture, FutureExt};
 use snafu::location;
 
 use lance_core::{
-    cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt, Error, Result,
+    cache::DeepSizeOf,
+    datatypes::{BLOB_DESC_TYPE, BLOB_DESC_V2_TYPE},
+    error::LanceOptionExt,
+    Error, Result,
 };
 
 use crate::{
@@ -303,7 +306,33 @@ impl StructuralPageScheduler for BlobPageScheduler {
 
             let descs = desc_decoder.drain(desc_decoder_task.num_rows)?;
             let descs = descs.decode()?;
-            let descs = make_array(descs.data.into_arrow(BLOB_DESC_TYPE.clone(), true)?);
+
+            let (desc_block, data_type) = match descs.data {
+                DataBlock::Struct(block) => {
+                    let data_type = match block.children.len() {
+                        2 => BLOB_DESC_TYPE.clone(),
+                        4 => BLOB_DESC_V2_TYPE.clone(),
+                        other => {
+                            return Err(Error::Internal {
+                                message: format!(
+                                    "Unexpected number of blob descriptor fields: {}",
+                                    other
+                                ),
+                                location: location!(),
+                            })
+                        }
+                    };
+                    (block, data_type)
+                }
+                _ => {
+                    return Err(Error::Internal {
+                        message: "Expected struct data block for blob descriptions".into(),
+                        location: location!(),
+                    })
+                }
+            };
+
+            let descs = make_array(DataBlock::Struct(desc_block).into_arrow(data_type, true)?);
             let descs = descs.as_struct();
             let positions = Arc::new(
                 descs

@@ -1458,10 +1458,19 @@ impl DataBlock {
         }
 
         let data_type = arrays[0].data_type();
-        let nulls = extract_nulls(arrays, num_values);
+        let mut nulls = extract_nulls(arrays, num_values);
 
         if let Nullability::All = nulls {
-            return Self::AllNull(AllNullDataBlock { num_values });
+            match data_type {
+                DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
+                    let mut builder = BooleanBufferBuilder::new(num_values as usize);
+                    builder.append_n(num_values as usize, false);
+                    nulls = Nullability::Some(NullBuffer::new(builder.finish()));
+                }
+                _ => {
+                    return Self::AllNull(AllNullDataBlock { num_values });
+                }
+            }
         }
 
         let mut encoded = match data_type {

@@ -505,6 +505,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     ))
                 }
             }
+            DataBlock::Nullable(nullable) => self.create_per_value(field, nullable.data.as_ref()),
             DataBlock::VariableWidth(variable_width) => {
                 let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
                 let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
