@@ -15,6 +15,9 @@ package com.lancedb.lance.compaction;
 
 import com.google.common.base.MoreObjects;
 
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.Optional;
 
@@ -25,14 +28,15 @@ import java.util.Optional;
  * default values.
  */
 public class CompactionOptions implements Serializable {
-  private final Optional<Long> targetRowsPerFragment;
-  private final Optional<Long> maxRowsPerGroup;
-  private final Optional<Long> maxBytesPerFile;
-  private final Optional<Boolean> materializeDeletions;
-  private final Optional<Float> materializeDeletionsThreshold;
-  private final Optional<Long> numThreads;
-  private final Optional<Long> batchSize;
-  private final Optional<Boolean> deferIndexRemap;
+  // these fields are effectively final, but not marked as final for de/ser
+  private Optional<Long> targetRowsPerFragment;
+  private Optional<Long> maxRowsPerGroup;
+  private Optional<Long> maxBytesPerFile;
+  private Optional<Boolean> materializeDeletions;
+  private Optional<Float> materializeDeletionsThreshold;
+  private Optional<Long> numThreads;
+  private Optional<Long> batchSize;
+  private Optional<Boolean> deferIndexRemap;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -101,6 +105,28 @@ public class CompactionOptions implements Serializable {
         .add("batchSize", batchSize.orElse(null))
         .add("deferIndexRemap", deferIndexRemap.orElse(null))
         .toString();
+  }
+
+  private void writeObject(ObjectOutputStream output) throws IOException {
+    output.writeObject(targetRowsPerFragment.orElse(null));
+    output.writeObject(maxRowsPerGroup.orElse(null));
+    output.writeObject(maxBytesPerFile.orElse(null));
+    output.writeObject(materializeDeletions.orElse(null));
+    output.writeObject(materializeDeletionsThreshold.orElse(null));
+    output.writeObject(numThreads.orElse(null));
+    output.writeObject(batchSize.orElse(null));
+    output.writeObject(deferIndexRemap.orElse(null));
+  }
+
+  private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
+    this.targetRowsPerFragment = Optional.ofNullable((Long) input.readObject());
+    this.maxRowsPerGroup = Optional.ofNullable((Long) input.readObject());
+    this.maxBytesPerFile = Optional.ofNullable((Long) input.readObject());
+    this.materializeDeletions = Optional.ofNullable((Boolean) input.readObject());
+    this.materializeDeletionsThreshold = Optional.ofNullable((Float) input.readObject());
+    this.numThreads = Optional.ofNullable((Long) input.readObject());
+    this.batchSize = Optional.ofNullable((Long) input.readObject());
+    this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
   }
 
   /** Builder for CompactionOptions. */

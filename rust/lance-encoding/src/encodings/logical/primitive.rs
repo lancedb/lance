@@ -572,7 +572,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let mut data = data_builder.finish();
 
-        let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
+        let unraveler =
+            RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
 
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
@@ -922,7 +923,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
-        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
+        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning, num_values);
         Ok(DecodedPage {
             data,
             repdef: unraveler,
@@ -975,6 +976,7 @@ impl DecodePageTask for SimpleAllNullDecodePageTask {
             None,
             Some(vec![1; self.num_values as usize]),
             Arc::new([DefinitionInterpretation::NullableItem]),
+            self.num_values,
         );
         Ok(DecodedPage {
             data: DataBlock::AllNull(AllNullDataBlock {
@@ -2649,7 +2651,12 @@ impl DecodePageTask for VariableFullZipDecodeTask {
         } else {
             Some(self.def.to_vec())
         };
-        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
+        let unraveler = RepDefUnraveler::new(
+            rep,
+            def,
+            self.details.def_meaning.clone(),
+            self.num_visible_items,
+        );
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -2702,7 +2709,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..task_item.rows_in_buf);
             }
 
-            let unraveler = RepDefUnraveler::new(None, None, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                None,
+                None,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
 
             Ok(DecodedPage {
                 data: data_builder.finish(),
@@ -2764,8 +2776,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            let unraveler =
-                RepDefUnraveler::new(repetition, definition, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                repetition,
+                definition,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
             let data = data_builder.finish();
 
             Ok(DecodedPage {
