@@ -918,7 +918,7 @@ impl KMeans {
 
             // Build per-cluster membership while checking whether the split is effective
             let approx_cluster_capacity = if cluster_k > 0 {
-                (largest_cluster.indices.len() + cluster_k - 1) / cluster_k
+                largest_cluster.indices.len().div_ceil(cluster_k)
             } else {
                 0
             };
