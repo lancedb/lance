@@ -4062,14 +4062,6 @@ def test_dataset_sql(tmp_path: Path):
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
 
-    explain_plan = (
-        ds.sql("SELECT * FROM test WHERE id > 1")
-        .table_name("test")
-        .build()
-        .explain_plan(True)
-    )
-    assert "projection=[id]" in explain_plan
-
 
 def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""

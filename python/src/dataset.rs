@@ -16,7 +16,6 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta};
-use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
 use log::error;
@@ -2620,22 +2619,6 @@ impl SqlQuery {
         let reader: Box<dyn RecordBatchReader + Send> =
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
-    }
-
-    #[pyo3(signature = (verbose = false))]
-    fn explain_plan(&self, verbose: bool) -> PyResult<String> {
-        let builder = self.builder.clone();
-        let plan = rt()
-            .block_on(None, async move {
-                let query = builder.build().await?;
-                query.into_dataframe().create_physical_plan().await
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))? // Handles tokio::JoinError
-            .map_err(|e| PyValueError::new_err(e.to_string()))?; // Handles datafusion::error::DataFusionError
-
-        let display = DisplayableExecutionPlan::new(plan.as_ref());
-
-        Ok(format!("{}", display.indent(verbose)))
     }
 }
 
