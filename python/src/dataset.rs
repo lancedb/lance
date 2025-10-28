@@ -2620,6 +2620,7 @@ impl SqlQuery {
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
     }
+}
 
 #[pyclass(name = "SqlQueryBuilder", module = "_lib", subclass)]
 #[derive(Clone)]
