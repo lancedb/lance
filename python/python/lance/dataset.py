@@ -3932,12 +3932,16 @@ class LanceOperation:
             the frag bitmap of the specified indices.
         """
 
-        removed_fragment_ids: List[int]
-        updated_fragments: List[FragmentMetadata]
-        new_fragments: List[FragmentMetadata]
-        fields_modified: List[int]
-        fields_for_preserving_frag_bitmap: List[int]
-        update_mode: str
+        removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
+        updated_fragments: List[FragmentMetadata] = dataclasses.field(
+            default_factory=list
+        )
+        new_fragments: List[FragmentMetadata] = dataclasses.field(default_factory=list)
+        fields_modified: List[int] = dataclasses.field(default_factory=list)
+        fields_for_preserving_frag_bitmap: List[int] = dataclasses.field(
+            default_factory=list
+        )
+        update_mode: str = ""
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
