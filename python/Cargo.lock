@@ -1124,7 +1124,7 @@ dependencies = [
  "lazy_static",
  "lazycell",
  "log",
- "prettyplease 0.2.35",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1238,7 +1238,7 @@ checksum = "40d1dad34aa19bf02295382f08d9bc40651585bd497266831d40ee6296fb49ca"
 dependencies = [
  "darling",
  "ident_case",
- "prettyplease 0.2.35",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -2783,18 +2783,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
-name = "fastbloom"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c1ddb9231d8554c2d6bdf4cfaabf0c59251658c68b6c95cd52dd0c513a912a"
-dependencies = [
- "getrandom 0.3.3",
- "libm",
- "rand 0.9.1",
- "siphasher",
-]
-
-[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4080,7 +4068,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "roaring",
  "snafu",
  "tokio",
  "tracing",
@@ -4110,7 +4097,6 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "dirs",
- "fastbloom",
  "fst",
  "futures",
  "half",
@@ -4197,21 +4183,14 @@ version = "0.38.3-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-ord",
  "arrow-schema",
- "bitvec",
  "cc",
  "deepsize",
- "futures",
  "half",
  "lance-arrow",
  "lance-core",
- "log",
  "num-traits",
  "rand 0.9.1",
- "rayon",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5595,16 +5574,6 @@ dependencies = [
 
 [[package]]
 name = "prettyplease"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c8646e95016a7a6c4adea95bafa8a16baab64b583356217f2c85db4a39d9a86"
-dependencies = [
- "proc-macro2",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "prettyplease"
 version = "0.2.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "061c1221631e079b26479d25bbf2275bfe5917ae8419cd7e34f13bfc2aa7539a"
@@ -5648,16 +5617,6 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b82eaa1d779e9a4bc1c3217db8ffbeabaae1dca241bf70183242128d48681cd"
-dependencies = [
- "bytes",
- "prost-derive 0.11.9",
-]
-
-[[package]]
-name = "prost"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
@@ -5678,28 +5637,6 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "119533552c9a7ffacc21e099c24a0ac8bb19c2a2a3f363de84cd9b844feab270"
-dependencies = [
- "bytes",
- "heck 0.4.1",
- "itertools 0.10.5",
- "lazy_static",
- "log",
- "multimap",
- "petgraph 0.6.5",
- "prettyplease 0.1.25",
- "prost 0.11.9",
- "prost-types 0.11.9",
- "regex",
- "syn 1.0.109",
- "tempfile",
- "which",
-]
-
-[[package]]
-name = "prost-build"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
@@ -5711,7 +5648,7 @@ dependencies = [
  "multimap",
  "once_cell",
  "petgraph 0.6.5",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.12.6",
  "prost-types 0.12.6",
  "regex",
@@ -5731,25 +5668,12 @@ dependencies = [
  "multimap",
  "once_cell",
  "petgraph 0.7.1",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "regex",
  "syn 2.0.106",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d2d8d10f3c6ded6da8b05b5fb3b8a5082514344d56c9f871412d29b4e075b4"
-dependencies = [
- "anyhow",
- "itertools 0.10.5",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -5776,15 +5700,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "213622a1460818959ac1181aaeb2dc9c7f63df720db7d788b3e24eacd1983e13"
-dependencies = [
- "prost 0.11.9",
 ]
 
 [[package]]
@@ -5822,7 +5737,6 @@ dependencies = [
  "arrow-array",
  "arrow-data",
  "arrow-schema",
- "arrow-select",
  "async-trait",
  "bytes",
  "chrono",
@@ -5846,9 +5760,7 @@ dependencies = [
  "libc",
  "log",
  "object_store",
- "once_cell",
  "prost 0.13.5",
- "prost-build 0.11.9",
  "prost-types 0.13.5",
  "pyo3",
  "regex",
@@ -7103,7 +7015,7 @@ dependencies = [
  "pbjson",
  "pbjson-build",
  "pbjson-types",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
