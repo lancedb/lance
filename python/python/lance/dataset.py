@@ -3575,24 +3575,6 @@ class SqlQuery:
         """
         return self._query.to_stream_reader()
 
-    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
-        """
-        Explain the query plan.
-
-        Parameters
-        ----------
-        verbose: bool, default False
-            If True, print the verbose plan.
-        analyze: bool, default False
-            If True, analyze the query and print the statistics.
-
-        Returns
-        -------
-        str
-            The query plan.
-        """
-        return self._query.explain_plan(verbose, analyze)
-
 
 class SqlQueryBuilder:
     """

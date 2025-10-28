@@ -7,6 +7,8 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use lance_datafusion::exec::{analyze_plan, LanceExecutionOptions};
 use futures::TryStreamExt;
 use std::sync::Arc;
 

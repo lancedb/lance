@@ -4043,6 +4043,11 @@ def test_dataset_sql(tmp_path: Path):
     expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
     assert pa.Table.from_batches(result) == expected
 
+    # Validate explain_plan() returns readable plan text and contains recognizable markers
+    plan_text = query.explain_plan()
+    assert isinstance(plan_text, str) and len(plan_text) > 0
+    assert any(tok in plan_text for tok in ["ProjectionExec", "LanceRead", "logical_plan", "Plan with Metrics"])
+
     stream_result = (
         ds.sql("SELECT value FROM test WHERE id = 1")
         .table_name("test")
