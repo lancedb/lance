@@ -625,7 +625,6 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
-            legacy_with_row_deleted_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
