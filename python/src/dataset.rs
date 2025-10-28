@@ -1549,22 +1549,12 @@ impl Dataset {
 
     fn create_tag(&mut self, py: Python, tag: String, reference: Option<PyObject>) -> PyResult<()> {
         let reference = self.transform_ref(py, reference)?;
-        let (version_number, branch) = match reference {
-            Ref::Version(branch, version_number) => (version_number, branch),
-            Ref::Tag(tag_name) => {
-                let tag_content = rt()
-                    .block_on(None, self.ds.tags().get(tag_name.as_str()))?
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                (Some(tag_content.version), tag_content.branch)
-            }
-        };
         rt().block_on(
             None,
-            self.ds.as_ref().tags().create_on_branch(
-                tag.as_str(),
-                version_number,
-                branch.as_deref(),
-            ),
+            self.ds
+                .as_ref()
+                .tags()
+                .create(tag.as_str(), reference),
         )?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -1599,11 +1589,10 @@ impl Dataset {
         };
         rt().block_on(
             None,
-            self.ds.as_ref().tags().update_on_branch(
-                tag.as_str(),
-                version_number,
-                branch.as_deref(),
-            ),
+            self.ds
+                .as_ref()
+                .tags()
+                .update(tag.as_str(), Ref::Version(branch, version_number)),
         )?
         .infer_error()?;
         Ok(())

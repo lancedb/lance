@@ -37,7 +37,7 @@ use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
-use lance_io::object_store::{ObjectStoreRegistry, StorageOptions};
+use lance_io::object_store::ObjectStoreRegistry;
 use std::collections::HashMap;
 use std::iter::empty;
 use std::str::FromStr;
@@ -191,20 +191,6 @@ impl BlockingDataset {
         Ok(branches)
     }
 
-    pub fn create_branch(
-        &mut self,
-        branch: &str,
-        version: u64,
-        source_branch: Option<&str>,
-    ) -> Result<Self> {
-        let reference = match source_branch {
-            Some(b) => Ref::from((b, version)),
-            None => Ref::from(version),
-        };
-        let inner = RT.block_on(self.inner.create_branch(branch, reference, None))?;
-        Ok(Self { inner })
-    }
-
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
         RT.block_on(self.inner.delete_branch(branch))?;
         Ok(())
@@ -225,17 +211,8 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn create_tag(
-        &mut self,
-        tag: &str,
-        version_number: Option<u64>,
-        branch: Option<&str>,
-    ) -> Result<()> {
-        RT.block_on(
-            self.inner
-                .tags()
-                .create_on_branch(tag, version_number, branch),
-        )?;
+    pub fn create_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
+        RT.block_on(self.inner.tags().create(tag, reference))?;
         Ok(())
     }
 
@@ -247,10 +224,14 @@ impl BlockingDataset {
     pub fn update_tag(
         &mut self,
         tag: &str,
-        version: Option<u64>,
-        branch: Option<&str>,
+        version_number: Option<u64>,
+        branch: Option<String>,
     ) -> Result<()> {
-        RT.block_on(self.inner.tags().update_on_branch(tag, version, branch))?;
+        RT.block_on(
+            self.inner
+                .tags()
+                .update(tag, Ref::Version(branch, version_number)),
+        )?;
         Ok(())
     }
 
@@ -1658,11 +1639,10 @@ fn inner_create_tag(
     jref: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
-    let version_number = env.get_optional_u64_from_method(&jref, "getVersionNumber")?;
-    let branch = env.get_optional_string_from_method(&jref, "getBranchName")?;
+    let reference = transform_jref_to_ref(jref, env)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.create_tag(tag.as_str(), version_number, branch.as_deref())?;
+    dataset_guard.create_tag(tag.as_str(), reference)?;
     Ok(())
 }
 
@@ -1706,7 +1686,7 @@ fn inner_update_tag(
     let branch = env.get_optional_string_from_method(&jref, "getBranchName")?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.update_tag(tag.as_str(), version_number, branch.as_deref())
+    dataset_guard.update_tag(tag.as_str(), version_number, branch)
 }
 
 #[no_mangle]
