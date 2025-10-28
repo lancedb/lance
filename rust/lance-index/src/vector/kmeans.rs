@@ -919,16 +919,14 @@ impl KMeans {
             // If all memberships are identical, the split is ineffective; finalize the original cluster
             let mut first_sid: Option<u32> = None;
             let mut all_same = true;
-            for cluster_id in sub_membership.iter() {
-                if let Some(cluster_id) = cluster_id {
-                    if let Some(f) = first_sid {
-                        if *cluster_id != f {
-                            all_same = false;
-                            break;
-                        }
-                    } else {
-                        first_sid = Some(*cluster_id);
+            for cluster_id in sub_membership.iter().flatten() {
+                if let Some(f) = first_sid {
+                    if *cluster_id != f {
+                        all_same = false;
+                        break;
                     }
+                } else {
+                    first_sid = Some(*cluster_id);
                 }
             }
             if all_same {
