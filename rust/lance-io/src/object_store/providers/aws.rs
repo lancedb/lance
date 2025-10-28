@@ -107,7 +107,7 @@ impl AwsStoreProvider {
         config_map.insert("bucket".to_string(), bucket);
 
         if !prefix.is_empty() {
-            config_map.insert("root".to_string(), format!("/{}", prefix));
+            config_map.insert("root".to_string(), "/".to_string());
         }
 
         let operator = Operator::from_iter::<S3>(config_map)
