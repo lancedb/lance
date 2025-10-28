@@ -197,6 +197,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
+        let version = params.data_storage_version.unwrap_or_default();
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -209,7 +210,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             &schema,
             stream,
             params.into_owned(),
-            LanceFileVersion::Stable,
+            version,
             None, // Fragment creation doesn't use target_bases
         )
         .await
@@ -533,7 +534,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_write_fragments_with_format_version(
+    async fn test_write_with_format_version(
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
@@ -556,6 +557,37 @@ mod tests {
 
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
+            let (major_version, minor_version) = file_version.to_numbers();
+            assert_eq!(f.file_major_version, major_version);
+            assert_eq!(f.file_minor_version, minor_version);
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_fragments_with_format_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable
+        )]
+        file_version: LanceFileVersion,
+    ) {
+        let data = test_data();
+        let tmp_dir = TempStrDir::default();
+        let writer_params = WriteParams {
+            data_storage_version: Some(file_version),
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write_params(&writer_params)
+            .write_fragments(data)
+            .await
+            .unwrap();
+
+        assert!(!fragment.is_empty());
+        fragment[0].files.iter().for_each(|f| {
             let (major_version, minor_version) = file_version.to_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);

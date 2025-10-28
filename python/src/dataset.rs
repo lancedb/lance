@@ -21,7 +21,7 @@ use lance_index::vector::bq::RQBuildParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
@@ -675,8 +675,11 @@ impl Dataset {
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-
-                let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+                let field_paths = idx
+                    .fields
+                    .iter()
+                    .map(|field_id| schema.field_path(*field_id).unwrap())
+                    .collect::<Vec<_>>();
 
                 let ds = self_.ds.clone();
                 let idx_type = match rt().block_on(Some(self_.py()), async {
@@ -685,7 +688,7 @@ impl Dataset {
                     } else {
                         let idx = ds
                             .open_generic_index(
-                                &idx_schema.fields[0].name,
+                                &field_paths[0],
                                 &idx.uuid.to_string(),
                                 &NoOpMetricsCollector,
                             )
@@ -701,12 +704,6 @@ impl Dataset {
                     }
                 };
 
-                let field_names = idx_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .collect::<Vec<_>>();
-
                 let fragment_set = PySet::empty(py).unwrap();
                 if let Some(bitmap) = &idx.fragment_bitmap {
                     for fragment_id in bitmap.iter() {
@@ -720,7 +717,7 @@ impl Dataset {
                 // 2. Use the new field from idx instead of hard coding it to Vector
                 dict.set_item("type", idx_type).unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                dict.set_item("fields", field_names).unwrap();
+                dict.set_item("fields", field_paths).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
                 dict.set_item("base_id", idx.base_id.map(|id| id as i64))
@@ -1430,20 +1427,45 @@ impl Dataset {
     }
 
     fn checkout_version(&self, py: Python, version: PyObject) -> PyResult<Self> {
-        if let Ok(i) = version.downcast_bound::<PyInt>(py) {
-            let ref_: u64 = i.extract()?;
-            self._checkout_version(ref_)
-        } else if let Ok(v) = version.downcast_bound::<PyString>(py) {
-            let ref_: &str = &v.to_string_lossy();
-            self._checkout_version(ref_)
-        } else {
-            Err(PyIOError::new_err(
-                "version must be an integer or a string.",
-            ))
-        }
+        let reference = self.transform_ref(py, Some(version))?;
+        self._checkout_version(reference)
     }
 
     /// Restore the current version
+    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    fn shallow_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        reference: Option<PyObject>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        // Perform a shallow clone of the dataset into the target path.
+        // `version` can be a version number or a tag name.
+        // `storage_options` will be forwarded to the object store params for the new dataset.
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options: Some(opts.clone()),
+            ..Default::default()
+        });
+
+        // Use a mutable clone of the inner dataset for operations that require &mut self
+        let mut new_self = self.ds.as_ref().clone();
+        let reference = self.transform_ref(py, reference)?;
+
+        let ds = rt()
+            .block_on(
+                Some(py),
+                new_self.shallow_clone(&target_path, reference, store_params),
+            )?
+            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?
@@ -1524,16 +1546,20 @@ impl Dataset {
         })
     }
 
-    fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
-        let new_self = self.ds.as_ref().clone();
-        rt().block_on(None, new_self.tags().create(tag.as_str(), version))?
-            .map_err(|err| match err {
-                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
-                lance::Error::VersionNotFound { .. } => PyValueError::new_err(err.to_string()),
-                _ => PyIOError::new_err(err.to_string()),
-            })?;
-        self.ds = Arc::new(new_self);
+    fn create_tag(&mut self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+        rt().block_on(
+            None,
+            self.ds
+                .as_ref()
+                .tags()
+                .create_on_branch(tag.as_str(), version, branch.as_deref()),
+        )?
+        .map_err(|err| match err {
+            Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+            Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
+            Error::VersionNotFound { .. } => PyValueError::new_err(err.to_string()),
+            _ => PyIOError::new_err(err.to_string()),
+        })?;
         Ok(())
     }
 
@@ -1545,16 +1571,139 @@ impl Dataset {
                 lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
+        Ok(())
+    }
+
+    fn update_tag(&self, tag: String, version: u64, branch: Option<String>) -> PyResult<()> {
+        rt().block_on(
+            None,
+            self.ds
+                .as_ref()
+                .tags()
+                .update_on_branch(tag.as_str(), version, branch.as_deref()),
+        )?
+        .infer_error()?;
+        Ok(())
+    }
+
+    /// Check out the latest version of the given branch
+    fn checkout_branch(&self, branch: String) -> PyResult<Self> {
+        let ds = rt()
+            .block_on(None, self.ds.checkout_branch(branch.as_str()))?
+            .map_err(|err| match err {
+                Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        let uri_str = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri: uri_str,
+        })
+    }
+
+    /// Check out the latest version of the current branch
+    fn checkout_latest(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.checkout_latest())?
+            .map_err(|err| match err {
+                Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
 
-    fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
-        let new_self = self.ds.as_ref().clone();
-        rt().block_on(None, new_self.tags().update(tag.as_str(), version))?
-            .infer_error()?;
+    /// Create a branch from a specific version reference (version number or tag)
+    #[pyo3(signature = (branch, reference=None, storage_options=None))]
+    fn create_branch(
+        &mut self,
+        py: Python,
+        branch: String,
+        reference: Option<PyObject>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let mut new_self = self.ds.as_ref().clone();
+        // Build Ref from python object
+        let reference = self.transform_ref(py, reference)?;
+        let store_params = storage_options.map(|opts| ObjectStoreParams {
+            storage_options: Some(opts),
+            ..Default::default()
+        });
+        let created = rt()
+            .block_on(
+                None,
+                new_self.create_branch(branch.as_str(), reference, store_params),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        // Update self to reflect any metadata changes; return the new branch dataset
+        self.ds = Arc::new(new_self);
+        Ok(Self {
+            uri: created.uri().to_string(),
+            ds: Arc::new(created),
+        })
+    }
+
+    /// Delete a branch
+    fn delete_branch(&mut self, branch: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.delete_branch(branch.as_str()))?
+            .map_err(|err| match err {
+                Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
         self.ds = Arc::new(new_self);
         Ok(())
+    }
+
+    /// List branches as a Python dictionary mapping name -> metadata
+    fn branches(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let branches = rt()
+            .block_on(None, self_.ds.branches().list())?
+            .infer_error()?;
+        Python::with_gil(|py| {
+            let pybranches = PyDict::new(py);
+            for (name, meta) in branches.iter() {
+                let dict = PyDict::new(py);
+                dict.set_item("parent_branch", meta.parent_branch.clone())?;
+                dict.set_item("parent_version", meta.parent_version)?;
+                dict.set_item("create_at", meta.create_at)?;
+                dict.set_item("manifest_size", meta.manifest_size)?;
+                pybranches.set_item(name, dict.into_py_any(py)?)?;
+            }
+            Ok(pybranches.into())
+        })
+    }
+
+    /// List branches ordered by parent_version
+    fn branches_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, PyObject)>> {
+        let ordering = match order {
+            Some("asc") => Some(std::cmp::Ordering::Less),
+            Some("desc") => Some(std::cmp::Ordering::Greater),
+            Some(invalid) => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid sort order '{}'. Valid values are: asc, desc",
+                    invalid
+                )));
+            }
+            None => None,
+        };
+        let ordered = rt()
+            .block_on(None, async {
+                self.ds.branches().list_ordered(ordering).await
+            })?
+            .infer_error()?;
+        Python::with_gil(|py| {
+            let mut out: Vec<(String, PyObject)> = Vec::new();
+            for (name, meta) in ordered.into_iter() {
+                let dict = PyDict::new(py);
+                dict.set_item("parent_branch", meta.parent_branch.clone())?;
+                dict.set_item("parent_version", meta.parent_version)?;
+                dict.set_item("create_at", meta.create_at)?;
+                dict.set_item("manifest_size", meta.manifest_size)?;
+                out.push((name, dict.into_py_any(py)?));
+            }
+            Ok(out)
+        })
     }
 
     #[pyo3(signature = (**kwargs))]
@@ -2526,6 +2675,48 @@ impl PyWriteDest {
 }
 
 impl Dataset {
+    fn transform_ref(&self, py: Python, reference: Option<PyObject>) -> PyResult<Ref> {
+        if let Some(reference) = reference {
+            if let Ok(i) = reference.downcast_bound::<PyInt>(py) {
+                let version_number: u64 = i.extract()?;
+                Ok(Ref::from(version_number))
+            } else if let Ok(tag_name) = reference.downcast_bound::<PyString>(py) {
+                let tag: &str = &tag_name.to_string_lossy();
+                Ok(Ref::from(tag))
+            } else if let Ok(tuple) = reference.downcast_bound::<PyTuple>(py) {
+                let len = tuple.len();
+                if len == 1 {
+                    let elem = tuple.get_item(0)?;
+                    if let Ok(version_number) = elem.extract::<u64>() {
+                        Ok(Ref::from(version_number))
+                    } else if let Ok(branch_name) = elem.extract::<String>() {
+                        Ok(Ref::Version(Some(branch_name), None))
+                    } else {
+                        Err(PyValueError::new_err(
+                            "Version tuple must contain integer or string",
+                        ))
+                    }
+                } else if len == 2 {
+                    let (branch_name, version_number) = tuple.extract::<(String, u64)>()?;
+                    Ok(Ref::Version(Some(branch_name), Some(version_number)))
+                } else {
+                    Err(PyValueError::new_err(
+                        "Version tuple must have 1 or 2 elements",
+                    ))
+                }
+            } else {
+                Err(PyValueError::new_err(
+                    "Version must be an int, a str or a (int, str) tuple.",
+                ))
+            }
+        } else {
+            Ok(Ref::Version(
+                self.ds.manifest.branch.clone(),
+                Some(self.ds.version().version),
+            ))
+        }
+    }
+
     fn _checkout_version(&self, version: impl Into<Ref> + std::marker::Send) -> PyResult<Self> {
         let ds = rt()
             .block_on(None, self.ds.checkout_version(version))?

@@ -1412,9 +1412,7 @@ public class DatasetTest {
         Schema srcSchema = src.getSchema();
 
         // shallow clone by version
-        try (Dataset clone =
-            src.shallowClone(
-                dstPathByVersion, Reference.builder().versionNumber(src.version()).build())) {
+        try (Dataset clone = src.shallowClone(dstPathByVersion, Ref.ofMain(src.version()))) {
           // Validate the version cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByVersion, clone.uri());
@@ -1432,8 +1430,7 @@ public class DatasetTest {
 
         // shallow clone by tag
         src.tags().create("tag", src.version());
-        try (Dataset clone =
-            src.shallowClone(dstPathByTag, Reference.builder().tagName("tag").build())) {
+        try (Dataset clone = src.shallowClone(dstPathByTag, Ref.ofTag("tag"))) {
           // Validate the tag cloned dataset
           assertNotNull(clone);
           assertEquals(dstPathByTag, clone.uri());
@@ -1449,6 +1446,175 @@ public class DatasetTest {
           assertEquals(srcRowCount, opened.countRows());
         }
       }
+    }
+  }
+
+  @Test
+  void testBranches(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testBranches").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      try (Dataset mainV1 = suite.createEmptyDataset()) {
+        assertEquals(1, mainV1.version());
+
+        // Step 1. write to main dataset, 5 rows -> main:2
+        try (Dataset mainV2 = suite.write(1, 5)) {
+          assertEquals(2, mainV2.version());
+          assertEquals(5, mainV2.countRows());
+
+          // Step2. create branch2 based on main:2
+          try (Dataset branch1V2 = mainV2.branches().create("branch1", 2)) {
+            assertEquals(2, branch1V2.version());
+
+            // Write batch B on branch1: 3 rows -> global@3
+            FragmentMetadata fragB = suite.createNewFragment(3);
+            Append appendB = Append.builder().fragments(Collections.singletonList(fragB)).build();
+            try (Dataset branch1V3 =
+                branch1V2.newTransactionBuilder().operation(appendB).build().commit()) {
+              assertEquals(3, branch1V3.version());
+              assertEquals(8, branch1V3.countRows()); // A(5) + B(3)
+
+              // Step 3. Create branch2 based on branch1's latest version (simulate tag 't1')
+              mainV1.tags().create("tag", 3, "branch1");
+
+              try (Dataset branch2V3 = branch1V2.branches().create("branch2", "tag")) {
+                assertEquals(3, branch2V3.version());
+                assertEquals(8, branch2V3.countRows()); // A(5) + B(3)
+
+                // Step 4. Write batch C on branch2: 2 rows -> branch2:4
+                FragmentMetadata fragC = suite.createNewFragment(2);
+                Append appendC = Append.builder().fragments(Arrays.asList(fragC)).build();
+                try (Dataset branch2V4 =
+                    branch2V3.newTransactionBuilder().operation(appendC).build().commit()) {
+                  assertEquals(4, branch2V4.version());
+                  assertEquals(10, branch2V4.countRows()); // A(5) + B(3) + C(2)
+
+                  // Step 5. Validate branch listing metadata;
+                  // delete branch1;
+                  // validate listing again
+                  List<Branch> branches = branch2V4.branches().list();
+                  Optional<Branch> b1 =
+                      branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  Optional<Branch> b2 =
+                      branches.stream().filter(b -> b.getName().equals("branch2")).findFirst();
+                  assertTrue(b1.isPresent(), "branch1 should be listed");
+                  assertTrue(b2.isPresent(), "branch2 should be listed");
+                  Branch branch1Meta = b1.get();
+                  Branch branch2Meta = b2.get();
+
+                  // Metadata fields and consistency checks
+                  assertEquals("branch1", branch1Meta.getName());
+                  assertEquals(2, branch1Meta.getParentVersion());
+                  assertFalse(branch1Meta.getParentBranch().isPresent());
+                  assertTrue(branch1Meta.getCreateAt() > 0);
+                  assertTrue(branch1Meta.getManifestSize() > 0);
+
+                  assertEquals("branch2", branch2Meta.getName());
+                  assertTrue(branch2Meta.getParentBranch().isPresent());
+                  assertEquals("branch1", branch2Meta.getParentBranch().get());
+                  assertEquals(3, branch2Meta.getParentVersion());
+                  assertTrue(branch2Meta.getCreateAt() > 0);
+                  assertTrue(branch2Meta.getManifestSize() > 0);
+
+                  // Delete branch1 and verify listing
+                  try {
+                    mainV2.branches().delete("branch1");
+                  } catch (Exception ignored) {
+                    // Some environments may report NotFound on cleanup; ignore and proceed
+                  }
+                  List<Branch> branchListAfterDelete = mainV2.branches().list();
+                  assertTrue(
+                      branchListAfterDelete.stream().noneMatch(b -> b.getName().equals("branch1")),
+                      "branch1 should be deleted");
+
+                  Optional<Branch> branch2AfterDelete =
+                      branchListAfterDelete.stream()
+                          .filter(b -> b.getName().equals("branch2"))
+                          .findFirst();
+                  assertTrue(branch2AfterDelete.isPresent(), "branch2 should remain");
+                  assertEquals(branch2Meta, branch2AfterDelete.get());
+
+                  // Step 6. use checkout_branch to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2"))) {
+                    assertEquals(4, branch2V4New.version());
+                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  }
+
+                  // Step 7. use checkout reference to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2", 3))) {
+                    assertEquals(3, branch2V4New.version());
+                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ===== Blob API tests =====
+  @Test
+  void testReadZeroLengthBlob(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadZeroLengthBlob").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(0L), "blobs");
+      assertEquals(1, blobs.size());
+      BlobFile blobFile = blobs.get(0);
+      assertEquals(0L, blobFile.size());
+      assertArrayEquals(new byte[0], blobFile.read());
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 1_000_000, "expected large blob size");
+      byte[] data1 = blobFile.readUpTo(256);
+      assertEquals(256, data1.length);
+      assertEquals(256L, blobFile.tell());
+      blobFile.seek(512);
+      byte[] range = blobFile.readUpTo(256);
+      assertEquals(256, range.length);
+      assertEquals(768L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertEquals(size, all.length);
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), data1);
+      assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadSmallBlobSequentialIntegrity(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadSmallBlobSequentialIntegrity").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 128, "expected small blob size");
+
+      blobFile.seek(0);
+      byte[] data1 = blobFile.readUpTo(64);
+      byte[] data2 = blobFile.readUpTo(64);
+      byte[] restData = blobFile.read();
+      byte[] combined = new byte[data1.length + data2.length + restData.length];
+      System.arraycopy(data1, 0, combined, 0, data1.length);
+      System.arraycopy(data2, 0, combined, data2.length, data2.length);
+      System.arraycopy(restData, 0, combined, data1.length + data2.length, restData.length);
+
+      blobFile.seek(0);
+      byte[] allData = blobFile.read();
+      assertArrayEquals(allData, combined);
+      blobFile.close();
     }
   }
 }

@@ -5,11 +5,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::dataset::branch_location::BranchLocation;
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
+use crate::{session::Session, Dataset, Error, Result};
+use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
@@ -298,8 +295,22 @@ impl DatasetBuilder {
     }
 
     #[instrument(skip_all)]
-    pub async fn load(mut self) -> Result<Dataset> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
+    pub async fn load(self) -> Result<Dataset> {
+        let uri = self.table_uri.clone();
+        let target_ref = self.version.clone();
+        match self.load_impl().boxed().await {
+            Ok(dataset) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
+                Ok(dataset)
+            }
+            Err(e) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
+                Err(e)
+            }
+        }
+    }
+
+    async fn load_impl(mut self) -> Result<Dataset> {
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(

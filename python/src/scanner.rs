@@ -43,7 +43,7 @@ impl Scanner {
         Self { scanner }
     }
 
-    pub(crate) async fn to_reader(&self) -> ::lance::error::Result<LanceReader> {
+    pub(crate) async fn to_reader(&self) -> ::lance::Result<LanceReader> {
         LanceReader::try_new(self.scanner.clone()).await
     }
 }

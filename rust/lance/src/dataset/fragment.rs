@@ -21,6 +21,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -56,7 +57,6 @@ use super::scanner::Scanner;
 use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
-use crate::arrow::*;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -647,6 +647,13 @@ impl FragReadConfig {
         self
     }
 
+    pub fn has_system_cols(&self) -> bool {
+        self.with_row_id
+            || self.with_row_address
+            || self.with_row_last_updated_at_version
+            || self.with_row_created_at_version
+    }
+
     pub fn with_scan_scheduler(mut self, value: Arc<ScanScheduler>) -> Self {
         self.scan_scheduler = Some(value);
         self
@@ -867,7 +874,7 @@ impl FileFragment {
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
 
-        if opened_files.is_empty() && !read_config.with_row_id && !read_config.with_row_address {
+        if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::io(
                 format!(
                     "Did not find any data files for schema: {}\nfragment_id={}",
@@ -2309,9 +2316,7 @@ impl FragmentReader {
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
-        let merged = if self.with_row_addr as usize + self.with_row_id as usize
-            == self.output_schema.fields.len()
-        {
+        let merged = if self.num_system_cols() == self.output_schema.fields.len() {
             let selected_rows = params.to_offsets_total(total_num_rows).len();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
@@ -2420,6 +2425,13 @@ impl FragmentReader {
         )
     }
 
+    fn num_system_cols(&self) -> usize {
+        self.with_row_id as usize
+            + self.with_row_addr as usize
+            + self.with_row_created_at_version as usize
+            + self.with_row_last_updated_at_version as usize
+    }
+
     /// Reads a range of rows from the fragment
     ///
     /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
@@ -2466,9 +2478,7 @@ impl FragmentReader {
             num_requested_rows += range.end - range.start;
         }
 
-        let merged_stream = if self.with_row_addr as usize + self.with_row_id as usize
-            == self.output_schema.fields.len()
-        {
+        let merged_stream = if self.num_system_cols() == self.output_schema.fields.len() {
             let tasks = (0..num_requested_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {

@@ -1196,4 +1196,14 @@ pub(crate) mod tests {
         )) as Arc<dyn Array>;
         check_round_trip_encoding_of_data(vec![arr_fallback], &test_cases, metadata).await;
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_mixed_page_validity() {
+        let no_nulls = Arc::new(Int32Array::from_iter_values([1, 2]));
+        let has_nulls = Arc::new(Int32Array::from_iter([Some(3), None, Some(5)]));
+
+        let test_cases = TestCases::default().with_page_sizes(vec![1]);
+        check_round_trip_encoding_of_data(vec![no_nulls, has_nulls], &test_cases, HashMap::new())
+            .await;
+    }
 }

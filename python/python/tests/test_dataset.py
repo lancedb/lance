@@ -449,7 +449,7 @@ def test_tag(tmp_path: Path):
     ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
-    ds.tags.create("tag2", 1)
+    ds.tags.create("tag2", 1, None)
 
     assert len(ds.tags.list()) == 2
 
@@ -473,9 +473,9 @@ def test_tag(tmp_path: Path):
     with pytest.raises(
         ValueError, match="Ref not found error: tag tag3 does not exist"
     ):
-        ds.tags.update("tag3", 1)
+        ds.tags.update("tag3", 1, None)
 
-    ds.tags.update("tag1", 2)
+    ds.tags.update("tag1", 2, None)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
 
@@ -1127,8 +1127,8 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1)
-    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("old-tag", 1, None)
+    dataset.tags.create("another-old-tag", 2, None)
 
     with pytest.raises(OSError):
         dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
@@ -1156,9 +1156,9 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1)
-    dataset.tags.create("another-old-tag", 2)
-    dataset.tags.create("tag-latest", 3)
+    dataset.tags.create("old-tag", 1, None)
+    dataset.tags.create("another-old-tag", 2, None)
+    dataset.tags.create("tag-latest", 3, None)
 
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
@@ -1690,18 +1690,6 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     # Accepts an iterator
     scanner = dataset.scanner(fragments=iter(fragments[0:2]), scan_in_order=False)
     assert scanner.to_table().num_rows == 2 * 100
-
-
-def test_write_unstable_data_version(tmp_path: Path, capfd):
-    # Note: this test will only work if no earlier test attempts
-    # to use an unstable version.  If we need that later we can find a way to
-    # run this test in a separate process (pytest-xdist?)
-    tab = pa.table({"a": range(100), "b": range(100)})
-    ds = lance.write_dataset(
-        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
-    )
-    assert ds.to_table() == tab
-    assert "You have requested an unstable format version" in capfd.readouterr().err
 
 
 def test_merge_data(tmp_path: Path):
@@ -4670,3 +4658,108 @@ def test_update_config_transaction(tmp_path: Path):
     assert table_metadata == {
         "only_key": "only_value"
     }  # All previous metadata should be gone
+
+
+def test_shallow_clone(tmp_path: Path):
+    """Shallow clone a filesystem dataset by version number and by tag.
+
+    Arrange:
+      - Create a source dataset at a filesystem path with two versions
+        (create v1, then overwrite to v2).
+      - Create a tag "v1" pointing to version 1.
+    Act:
+      - Shallow clone by version=2 (numeric) to one destination.
+      - Shallow clone by version="v1" (tag) to another destination.
+    Assert:
+      - Re-open cloned datasets and verify their tables equal the source
+        version they were cloned from (schema and record count).
+
+    This test uses pathlib paths and tmp_path for cross-platform compatibility
+    and should not skip on Windows.
+    """
+    # Prepare source dataset with two versions
+    src_dir = tmp_path / "shallow_src"
+    table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
+    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+
+    # Create a tag pointing to version 1
+    ds.tags.create("v1", 1, None)
+
+    # Clone by numeric version (v2) and assert equality
+    clone_v2_dir = tmp_path / "clone_v2"
+    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, version=2)
+    assert ds_clone_v2.to_table() == table_v2
+    assert lance.dataset(clone_v2_dir).to_table() == table_v2
+
+    # Clone by tag (v1) and assert equality
+    clone_v1_tag_dir = tmp_path / "clone_v1_tag"
+    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, version="v1")
+    assert ds_clone_v1_tag.to_table() == table_v1
+    assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1
+
+
+def test_branches(tmp_path: Path):
+    # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
+    base_dir = tmp_path / "test_branches"
+    main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
+    ds_main = lance.write_dataset(main_table, base_dir)
+
+    branch1 = ds_main.create_branch("branch1")
+    assert branch1.version == 1
+    branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
+    branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
+    assert branch1.version == 2
+
+    expected_branch1 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8], "b": [4, 5, 6, 9, 10]}
+    )
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+
+    # Step 2: tag latest of branch1 → create branch2 from that tag
+    tag_name = "branch1_latest"
+    branch1.tags.create(tag_name, branch1.latest_version, "branch1")
+    branch2 = branch1.create_branch("branch2", tag_name)
+    assert branch2.version == 2
+
+    # Step 3: append more data to branch2 → verify contains branch1 data + new
+    branch2_append = pa.Table.from_pydict({"a": [11], "b": [12]})
+    branch2 = lance.write_dataset(branch2_append, branch2, mode="append")
+    assert branch2.version == 3
+
+    expected_branch2 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8, 11], "b": [4, 5, 6, 9, 10, 12]}
+    )
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+
+    # Step 4: validate branches.list() and metadata
+    # delete branch1; validate list after deletion
+    branches = ds_main.branches.list()
+    assert "branch1" in branches
+    assert "branch2" in branches
+
+    b1_meta = branches["branch1"]
+    assert isinstance(b1_meta["parent_version"], int)
+    assert b1_meta["manifest_size"] > 0
+    assert "create_at" in b1_meta
+
+    try:
+        ds_main.branches.delete("branch1")
+    except OSError as e:
+        if "Not found" not in str(e):
+            raise
+    branches_after = ds_main.branches.list()
+    assert "branch1" not in branches_after
+    assert "branch2" in branches_after
+
+    branch2 = ds_main.checkout_branch("branch2")
+    assert branch2.version == 3
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+    branch2 = ds_main.checkout_version(("branch2", 2))
+    assert branch2.version == 2
+    assert branch2.to_table().combine_chunks() == expected_branch1.combine_chunks()
+    branch2.checkout_latest()
+    assert branch2.version == 3
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()

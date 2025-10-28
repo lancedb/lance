@@ -59,7 +59,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
+    fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
@@ -430,10 +430,6 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
-    /// Whether the user wants the row last updated at version column on top of the projection
-    legacy_with_row_last_updated_at_version: bool,
-    /// Whether the user wants the row created at version column on top of the projection
-    legacy_with_row_created_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -629,8 +625,6 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
-            legacy_with_row_last_updated_at_version: false,
-            legacy_with_row_created_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -715,12 +709,6 @@ impl Scanner {
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
-        }
-        if self.legacy_with_row_last_updated_at_version {
-            self.projection_plan.include_row_last_updated_at_version();
-        }
-        if self.legacy_with_row_created_at_version {
-            self.projection_plan.include_row_created_at_version();
         }
         Ok(self)
     }
@@ -1229,24 +1217,6 @@ impl Scanner {
         self
     }
 
-    /// Instruct the scanner to return row last updated at version column from the dataset.
-    ///
-    /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_last_updated_at_version = true;
-        self.projection_plan.include_row_last_updated_at_version();
-        self
-    }
-
-    /// Instruct the scanner to return row created at version column from the dataset.
-    ///
-    /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_created_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_created_at_version = true;
-        self.projection_plan.include_row_created_at_version();
-        self
-    }
-
     /// Instruct the scanner to disable automatic projection of scoring columns
     ///
     /// In the future, this will be the default behavior.  This method is useful for
@@ -1441,28 +1411,6 @@ impl Scanner {
                 let row_addr_expr = output_expr.remove(row_addr_pos);
                 output_expr.push(row_addr_expr);
             }
-        }
-
-        if self.legacy_with_row_last_updated_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
-        }
-
-        if self.legacy_with_row_created_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
         }
 
         Ok(output_expr)
@@ -1936,7 +1884,7 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 6: if requested, add the row offset column
+        // Stage 6: Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
@@ -2502,12 +2450,10 @@ impl Scanner {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
-            FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
+            FtsQuery::Phrase(query) => {
+                self.plan_phrase_query(query, params, prefilter_source)
+                    .await?
+            }
 
             FtsQuery::Boost(query) => {
                 // for boost query, we need to erase the limit so that we can find
@@ -2688,6 +2634,51 @@ impl Scanner {
         };
 
         Ok(plan)
+    }
+
+    async fn plan_phrase_query(
+        &self,
+        query: &PhraseQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query.column.clone().ok_or(Error::invalid_input(
+            "the column must be specified in the query".to_string(),
+            location!(),
+        ))?;
+
+        let index_meta = self
+            .dataset
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts(),
+            )
+            .await?
+            .ok_or(Error::invalid_input(
+                format!("No Inverted index found for column {}", column),
+                location!(),
+            ))?;
+
+        let details_any =
+            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
+        let details = details_any
+            .as_ref()
+            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
+        if !details.with_position {
+            return Err(Error::invalid_input(
+                "position is not found but required for phrase queries, try recreating the index with position"
+                    .to_string(),
+                location!(),
+            ));
+        }
+
+        Ok(Arc::new(PhraseQueryExec::new(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+        )))
     }
 
     async fn plan_match_query(
@@ -3704,6 +3695,7 @@ pub mod test_dataset {
         ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{ArrowError, DataType};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
@@ -3711,7 +3703,6 @@ pub mod test_dataset {
         IndexType,
     };
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::index::vector::VectorIndexParams;
 
@@ -3833,14 +3824,9 @@ pub mod test_dataset {
         }
 
         pub async fn make_fts_index(&mut self) -> Result<()> {
+            let params = InvertedIndexParams::default().with_position(true);
             self.dataset
-                .create_index(
-                    &["s"],
-                    IndexType::Inverted,
-                    None,
-                    &InvertedIndexParams::default(),
-                    true,
-                )
+                .create_index(&["s"], IndexType::Inverted, None, &params, true)
                 .await
         }
 
@@ -3874,10 +3860,11 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::datatypes::{Int32Type, Int64Type};
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
@@ -3892,7 +3879,10 @@ mod test {
     use half::f16;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_datagen::{
+        array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
+    };
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -3905,17 +3895,17 @@ mod test {
     use lance_io::utils::tracking_store::IOTracker;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+    use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::*;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
+        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
     };
 
     #[tokio::test]
@@ -4128,6 +4118,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_regexp_match_and_non_empty_captions() {
+        // Build a small dataset with three Utf8 columns and verify the full
+        // scan().filter(...) path handles regexp_match combined with non-null/non-empty checks.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("keywords", DataType::Utf8, true),
+            ArrowField::new("natural_caption", DataType::Utf8, true),
+            ArrowField::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("Liberty for all"),
+                    Some("peace"),
+                    Some("revolution now"),
+                    Some("Liberty"),
+                    Some("revolutionary"),
+                    Some("none"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some(""),
+                    Some("c"),
+                    Some("d"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some(""),
+                    Some("y"),
+                    Some("z"),
+                    None,
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.filter(
+            "regexp_match(keywords, 'Liberty|revolution') AND \
+             (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+              poetic_caption IS NOT NULL AND poetic_caption <> '')",
+        )
+        .unwrap();
+
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 1);
+
+        let out_keywords = out
+            .column_by_name("keywords")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        let out_nat = out
+            .column_by_name("natural_caption")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        let out_poetic = out
+            .column_by_name("poetic_caption")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+
+        assert_eq!(out_keywords, "Liberty for all");
+        assert_eq!(out_nat, "a");
+        assert_eq!(out_poetic, "x");
+    }
+
+    #[tokio::test]
     async fn test_nested_projection() {
         let point_fields: Fields = vec![
             ArrowField::new("x", DataType::Float32, true),
@@ -4204,6 +4270,61 @@ mod test {
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
         Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_limit_cancel() {
+        // If there is a filter and a limit and we can't use the index to satisfy
+        // the filter, then we have to read until we have enough matching rows and
+        // then cancel the scan.
+        //
+        // This test regresses the case where we fail to cancel the scan for whatever
+        // reason.
+
+        // Make the store slow so that if we don't cancel the scan, it will take a loooong time.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_get_per_call: Duration::from_secs(1),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled.clone()),
+                ..Default::default()
+            }),
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+
+        // Make a dataset with lots of tiny fragments, that will make it more obvious if we fail to cancel the scan.
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>().with_random_nulls(0.1))
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2000),
+                FragmentRowCount::from(1),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.filter("i IS NOT NULL").unwrap();
+        scan.limit(Some(10), None).unwrap();
+
+        let start = Instant::now();
+        scan.try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let duration = start.elapsed();
+
+        // This test is a timing test, which is unfortunate, as it may be flaky.  I'm hoping
+        // we have enough wiggle room here.  The failure case is 30s on my machine and the pass
+        // case is 2-3s.
+        assert!(duration < Duration::from_secs(10));
     }
 
     #[rstest]
@@ -4696,6 +4817,61 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn test_scan_with_wildcard() {
+        let data = gen_batch()
+            .col("x", array::step::<Float64Type>())
+            .col("y", array::step::<Float64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let check_cols = async |projection: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            scan.project(projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        check_cols(&["*"], &["x", "y"]).await;
+        check_cols(&["x", "y"], &["x", "y"]).await;
+        check_cols(&["x"], &["x"]).await;
+        check_cols(&["_rowid", "*"], &["_rowid", "x", "y"]).await;
+        check_cols(&["*", "_rowid"], &["x", "y", "_rowid"]).await;
+        check_cols(
+            &["_rowid", "*", "_rowoffset"],
+            &["_rowid", "x", "y", "_rowoffset"],
+        )
+        .await;
+
+        let check_exprs = async |exprs: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            let projection = exprs
+                .iter()
+                .map(|e| (e.to_string(), e.to_string()))
+                .collect::<Vec<_>>();
+            scan.project_with_transform(&projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        // Make sure we can reference * fields in exprs and add new columns
+        check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
+
+        let check_fails = |projection: &[&str]| {
+            let mut scan = data.scan();
+            assert!(scan.project(projection).is_err());
+        };
+
+        // Would duplicate x
+        check_fails(&["x", "*"]);
+        check_fails(&["_rowid", "_rowid"]);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_scan_order(
@@ -4933,6 +5109,8 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
+        use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -5214,6 +5392,8 @@ mod test {
             VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
+            use lance_arrow::FixedSizeListArrayExt;
+
             let test_dir = TempStrDir::default();
             let test_uri = &test_dir;
 
@@ -8133,9 +8313,10 @@ mod test {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let mut scanner = dataset.scan();
+
         scanner
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version();
+            .project(&[ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap();
 
         // Check that the schema includes version columns
         let output_schema = scanner.schema().await.unwrap();

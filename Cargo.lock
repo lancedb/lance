@@ -3275,7 +3275,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrayref",
  "paste",
@@ -4437,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4475,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4506,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4598,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "approx",
  "arrow",
@@ -4716,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4740,6 +4740,7 @@ dependencies = [
  "lance-core",
  "lance-namespace",
  "log",
+ "mock_instant",
  "mockall",
  "object_store",
  "object_store_opendal",
@@ -4761,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "approx",
  "arrow-arith",
@@ -4790,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4804,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4813,8 +4814,9 @@ dependencies = [
  "bytes",
  "lance",
  "lance-core",
+ "lance-io",
  "lance-namespace",
- "opendal",
+ "object_store",
  "reqwest",
  "serde_json",
  "snafu",
@@ -4839,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4884,7 +4886,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4893,7 +4895,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4904,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "0.38.3-beta.6"
+version = "0.38.3-beta.11"
 dependencies = [
  "clap",
  "futures",
@@ -5445,12 +5447,9 @@ dependencies = [
 
 [[package]]
 name = "mock_instant"
-version = "0.3.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
-dependencies = [
- "once_cell",
-]
+checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "mockall"
