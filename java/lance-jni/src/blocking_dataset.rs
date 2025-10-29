@@ -221,17 +221,8 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn update_tag(
-        &mut self,
-        tag: &str,
-        version_number: Option<u64>,
-        branch: Option<String>,
-    ) -> Result<()> {
-        RT.block_on(
-            self.inner
-                .tags()
-                .update(tag, Ref::Version(branch, version_number)),
-        )?;
+    pub fn update_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
+        RT.block_on(self.inner.tags().update(tag, reference))?;
         Ok(())
     }
 
@@ -1682,11 +1673,10 @@ fn inner_update_tag(
     jref: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
-    let version_number = env.get_optional_u64_from_method(&jref, "getVersionNumber")?;
-    let branch = env.get_optional_string_from_method(&jref, "getBranchName")?;
+    let reference = transform_jref_to_ref(jref, env)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.update_tag(tag.as_str(), version_number, branch)
+    dataset_guard.update_tag(tag.as_str(), reference)
 }
 
 #[no_mangle]
