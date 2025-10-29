@@ -104,7 +104,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "50.0.0", default-features = false, features = [
+datafusion = { version = "50.3.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -113,22 +113,27 @@ datafusion = { version = "50.0.0", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "50.0.0"
-datafusion-functions = { version = "50.0.0", features = ["regex_expressions"] }
-datafusion-sql = "50.0.0"
-datafusion-expr = "50.0.0"
-datafusion-ffi = "50.0.0"
-datafusion-execution = "50.0.0"
-datafusion-optimizer = "50.0.0"
-datafusion-physical-expr = "50.0.0"
-datafusion-physical-plan = "50.0.0"
-datafusion-substrait = "50.0.0"
+datafusion-common = "50.3.0"
+datafusion-functions = { version = "50.3.0", features = ["regex_expressions"] }
+datafusion-sql = "50.3.0"
+datafusion-expr = "50.3.0"
+datafusion-ffi = "50.3.0"
+datafusion-execution = "50.3.0"
+datafusion-optimizer = "50.3.0"
+datafusion-physical-expr = "50.3.0"
+datafusion-physical-plan = "50.3.0"
+datafusion-substrait = "50.3.0"
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.40.0-beta.2", path = "./rust/compression/fsst" }
 futures = "0.3"
+geoarrow-array = "0.6"
+geoarrow-schema = "0.6"
+geodatafusion = "0.1.0"
+geo-traits = "0.3.0"
+geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
@@ -178,7 +183,7 @@ tokio = { version = "1.23", features = [
     "sync",
 ] }
 tokio-stream = "0.1.14"
-tokio-util = { version = "0.7.10" }
+tokio-util = { version = "0.7.16" }
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }

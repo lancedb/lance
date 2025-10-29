@@ -725,7 +725,8 @@ fn inner_create_index(
         | IndexType::Inverted
         | IndexType::NGram
         | IndexType::ZoneMap
-        | IndexType::BloomFilter => {
+        | IndexType::BloomFilter
+        | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
