@@ -13,6 +13,8 @@ pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
 pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
 /// Metadata key for specifying RLE (Run-Length Encoding) threshold
 pub const RLE_THRESHOLD_META_KEY: &str = "lance-encoding:rle-threshold";
+/// Metadata key for specifying minichunk size
+pub const MINICHUNK_SIZE_META_KEY: &str = "lance-encoding:minichunk-size";
 
 // Dictionary encoding metadata keys
 /// Metadata key for specifying dictionary encoding threshold divisor
