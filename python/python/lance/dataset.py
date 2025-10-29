@@ -3934,6 +3934,7 @@ class LanceOperation:
             Indices that do not cover these fields may preserve the new fragment IDs
             when applicable.
         """
+
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
         updated_fragments: List[FragmentMetadata] = dataclasses.field(
             default_factory=list

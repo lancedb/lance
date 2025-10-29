@@ -2805,9 +2805,9 @@ mod tests {
                 updated_fragments: vec![Fragment::new(0)],
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
-                fields_modified: vec![],
+                bitmap_prune_field_ids: vec![],
                 mem_wal_to_merge: None,
-                fields_for_preserving_frag_bitmap: vec![],
+                bitmap_preserve_field_ids: vec![],
                 update_mode: None,
             },
         ];

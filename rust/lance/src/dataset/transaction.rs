@@ -2897,9 +2897,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                bitmap_prune_field_ids,
+                fields_modified: bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                bitmap_preserve_field_ids,
+                fields_for_preserving_frag_bitmap: bitmap_preserve_field_ids,
                 update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
@@ -3277,9 +3277,9 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::DataFragment::from)
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
-                bitmap_prune_field_ids: bitmap_prune_field_ids.clone(),
+                fields_modified: bitmap_prune_field_ids.clone(),
                 mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
-                bitmap_preserve_field_ids: bitmap_preserve_field_ids.clone(),
+                fields_for_preserving_frag_bitmap: bitmap_preserve_field_ids.clone(),
                 update_mode: update_mode
                     .as_ref()
                     .map(|mode| match mode {

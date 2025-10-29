@@ -1467,12 +1467,13 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, bitmap_prune_field_ids) = Self::update_fragments(
-                self.dataset.clone(),
-                Box::pin(stream),
-                self.dataset.manifest.version + 1,
-            )
-            .await?;
+            let (updated_fragments, new_fragments, bitmap_prune_field_ids) =
+                Self::update_fragments(
+                    self.dataset.clone(),
+                    Box::pin(stream),
+                    self.dataset.manifest.version + 1,
+                )
+                .await?;
 
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
