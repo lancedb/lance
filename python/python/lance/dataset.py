@@ -3941,9 +3941,7 @@ class LanceOperation:
         )
         new_fragments: List[FragmentMetadata] = dataclasses.field(default_factory=list)
         bitmap_prune_field_ids: List[int] = dataclasses.field(default_factory=list)
-        bitmap_preserve_exclude_field_ids: List[int] = dataclasses.field(
-            default_factory=list
-        )
+        bitmap_preserve_field_ids: List[int] = dataclasses.field(default_factory=list)
         update_mode: str = ""
 
         def __post_init__(self):

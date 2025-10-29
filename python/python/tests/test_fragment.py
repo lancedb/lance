@@ -550,7 +550,7 @@ def test_fragment_update_columns_basic(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=fields_modified,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -596,7 +596,7 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=fields_modified,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -639,7 +639,7 @@ def test_fragment_update_columns_with_nulls(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=fields_modified,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -680,7 +680,7 @@ def test_fragment_update_columns_partial_update(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=fields_modified,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -723,7 +723,7 @@ def test_fragment_update_columns_no_match(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=fields_modified,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
