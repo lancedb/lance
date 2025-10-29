@@ -542,7 +542,7 @@ def test_fragment_update_columns_basic(tmp_path):
     fragment = dataset.get_fragment(0)
     updated_fragment, bitmap_prune_field_ids = fragment.update_columns(update_data)
 
-    # Verify fields_modified is returned
+    # Verify bitmap_prune_field_ids is returned
     assert isinstance(bitmap_prune_field_ids, list)
     assert len(bitmap_prune_field_ids) > 0
 
