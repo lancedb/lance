@@ -1551,10 +1551,7 @@ impl Dataset {
         let reference = self.transform_ref(py, reference)?;
         rt().block_on(
             None,
-            self.ds
-                .as_ref()
-                .tags()
-                .create(tag.as_str(), reference),
+            self.ds.as_ref().tags().create(tag.as_str(), reference),
         )?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
