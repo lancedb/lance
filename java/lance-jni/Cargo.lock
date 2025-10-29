@@ -3479,6 +3479,7 @@ version = "0.38.3"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "async-trait",
  "chrono",
  "env_logger",
  "jni",
@@ -3490,12 +3491,14 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "log",
  "object_store",
  "prost",
  "prost-types",
  "roaring",
  "serde_json",
+ "snafu",
  "tokio",
  "uuid",
 ]
