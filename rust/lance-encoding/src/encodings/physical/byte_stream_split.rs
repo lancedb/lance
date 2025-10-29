@@ -55,15 +55,11 @@
 //! - All chunks share a single global buffer
 //! - Non-last chunks always contain power-of-2 values
 
-use std::fmt::Debug;
-
 use crate::buffer::LanceBuffer;
 use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
-};
+use crate::encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor};
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
 use crate::statistics::{GetStat, Stat};
@@ -76,18 +72,22 @@ use snafu::location;
 /// This encoding splits floating point values by byte position and stores
 /// each byte stream separately. This improves compression ratios for
 /// floating point data with similar patterns.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ByteStreamSplitEncoder {
     bits_per_value: usize,
+    inner: Box<dyn MiniBlockCompressor>,
 }
 
 impl ByteStreamSplitEncoder {
-    pub fn new(bits_per_value: usize) -> Self {
+    pub fn new(bits_per_value: usize, inner: Box<dyn MiniBlockCompressor>) -> Self {
         assert!(
             bits_per_value == 32 || bits_per_value == 64,
             "ByteStreamSplit only supports 32-bit (f32) or 64-bit (f64) values"
         );
-        Self { bits_per_value }
+        Self {
+            bits_per_value,
+            inner,
+        }
     }
 
     fn bytes_per_value(&self) -> usize {
@@ -95,14 +95,56 @@ impl ByteStreamSplitEncoder {
     }
 
     fn max_chunk_size(&self) -> usize {
-        // For ByteStreamSplit, total bytes = bytes_per_value * chunk_size
-        // MAX_MINIBLOCK_BYTES = 8186
-        // For f32 (4 bytes): 8186 / 4 = 2046, so max chunk = 1024 (power of 2)
-        // For f64 (8 bytes): 8186 / 8 = 1023, so max chunk = 512 (power of 2)
         match self.bits_per_value {
             32 => 1024,
             64 => 512,
             _ => unreachable!("ByteStreamSplit only supports 32 or 64 bit values"),
+        }
+    }
+
+    fn transform(&self, data: FixedWidthDataBlock) -> FixedWidthDataBlock {
+        if data.num_values == 0 {
+            return FixedWidthDataBlock {
+                data: LanceBuffer::empty(),
+                bits_per_value: data.bits_per_value,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            };
+        }
+
+        let num_values = data.num_values as usize;
+        let bytes_per_value = self.bytes_per_value();
+        debug_assert_eq!(
+            data.data.len(),
+            num_values * bytes_per_value,
+            "fixed-width data buffer must contain num_values * bytes_per_value bytes"
+        );
+
+        let mut buffer = vec![0u8; data.data.len()];
+        let source = data.data.as_ref();
+        let mut processed_values = 0usize;
+        let max_chunk_size = self.max_chunk_size();
+
+        while processed_values < num_values {
+            let chunk_size = (num_values - processed_values).min(max_chunk_size);
+            let chunk_offset = processed_values * bytes_per_value;
+
+            for i in 0..chunk_size {
+                let src_offset = (processed_values + i) * bytes_per_value;
+                for byte_idx in 0..bytes_per_value {
+                    let dst_offset = chunk_offset + byte_idx * chunk_size + i;
+                    buffer[dst_offset] = source[src_offset + byte_idx];
+                }
+            }
+
+            processed_values += chunk_size;
+        }
+
+        FixedWidthDataBlock {
+            data: LanceBuffer::from(buffer),
+            bits_per_value: data.bits_per_value,
+            num_values: data.num_values,
+            block_info: BlockInfo::new(),
         }
     }
 }
@@ -111,77 +153,10 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
             DataBlock::FixedWidth(data) => {
-                let num_values = data.num_values;
-                let bytes_per_value = self.bytes_per_value();
-
-                if num_values == 0 {
-                    return Ok((
-                        MiniBlockCompressed {
-                            data: vec![],
-                            chunks: vec![],
-                            num_values: 0,
-                        },
-                        ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
-                            self.bits_per_value as u64,
-                            None,
-                        )),
-                    ));
-                }
-
-                let total_size = num_values as usize * bytes_per_value;
-                let mut global_buffer = vec![0u8; total_size];
-
-                let mut chunks = Vec::new();
-                let data_slice = data.data.as_ref();
-                let mut processed_values = 0usize;
-                let max_chunk_size = self.max_chunk_size();
-
-                while processed_values < num_values as usize {
-                    let chunk_size = (num_values as usize - processed_values).min(max_chunk_size);
-                    let chunk_offset = processed_values * bytes_per_value;
-
-                    // Create chunk-local byte streams
-                    for i in 0..chunk_size {
-                        let src_offset = (processed_values + i) * bytes_per_value;
-                        for j in 0..bytes_per_value {
-                            // Store in chunk-local byte stream format
-                            let dst_offset = chunk_offset + j * chunk_size + i;
-                            global_buffer[dst_offset] = data_slice[src_offset + j];
-                        }
-                    }
-
-                    let chunk_bytes = chunk_size * bytes_per_value;
-                    let log_num_values = if processed_values + chunk_size == num_values as usize {
-                        0 // Last chunk
-                    } else {
-                        chunk_size.ilog2() as u8
-                    };
-
-                    debug_assert!(chunk_bytes > 0);
-                    chunks.push(MiniBlockChunk {
-                        buffer_sizes: vec![chunk_bytes as u16],
-                        log_num_values,
-                    });
-
-                    processed_values += chunk_size;
-                }
-
-                let data_buffers = vec![LanceBuffer::from(global_buffer)];
-
-                // TODO: Should support underlying compression
-                let encoding = ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
-                    self.bits_per_value as u64,
-                    None,
-                ));
-
-                Ok((
-                    MiniBlockCompressed {
-                        data: data_buffers,
-                        chunks,
-                        num_values,
-                    },
-                    encoding,
-                ))
+                let transformed = self.transform(data);
+                let (compressed, description) =
+                    self.inner.compress(DataBlock::FixedWidth(transformed))?;
+                Ok((compressed, ProtobufUtils21::byte_stream_split(description)))
             }
             _ => Err(lance_core::Error::InvalidInput {
                 source: "ByteStreamSplit encoding only supports FixedWidth data blocks".into(),
@@ -195,15 +170,19 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
 #[derive(Debug)]
 pub struct ByteStreamSplitDecompressor {
     bits_per_value: usize,
+    inner: Box<dyn MiniBlockDecompressor>,
 }
 
 impl ByteStreamSplitDecompressor {
-    pub fn new(bits_per_value: usize) -> Self {
+    pub fn new(bits_per_value: usize, inner: Box<dyn MiniBlockDecompressor>) -> Self {
         assert!(
             bits_per_value == 32 || bits_per_value == 64,
             "ByteStreamSplit only supports 32-bit (f32) or 64-bit (f64) values"
         );
-        Self { bits_per_value }
+        Self {
+            bits_per_value,
+            inner,
+        }
     }
 
     fn bytes_per_value(&self) -> usize {
@@ -222,41 +201,47 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
             }));
         }
 
-        let bytes_per_value = self.bytes_per_value();
-        let total_bytes = num_values as usize * bytes_per_value;
+        let split_block = self.inner.decompress(data, num_values)?;
+        let DataBlock::FixedWidth(split_data) = split_block else {
+            return Err(lance_core::Error::InvalidInput {
+                source: "ByteStreamSplit expects inner decompressor to return FixedWidth data"
+                    .into(),
+                location: location!(),
+            });
+        };
 
-        if data.len() != 1 {
+        if split_data.bits_per_value != self.bits_per_value as u64 {
             return Err(lance_core::Error::InvalidInput {
                 source: format!(
-                    "ByteStreamSplit decompression expects 1 buffer, but got {}",
-                    data.len()
+                    "ByteStreamSplit expected {} bits but inner decompressor returned {} bits",
+                    self.bits_per_value, split_data.bits_per_value
                 )
                 .into(),
                 location: location!(),
             });
         }
 
-        let input_buffer = &data[0];
+        let bytes_per_value = self.bytes_per_value();
+        let expected_len = num_values as usize * bytes_per_value;
+        let split_buffer = split_data.data.as_ref();
 
-        if input_buffer.len() != total_bytes {
+        if split_buffer.len() != expected_len {
             return Err(lance_core::Error::InvalidInput {
                 source: format!(
                     "Expected {} bytes for decompression, but got {}",
-                    total_bytes,
-                    input_buffer.len()
+                    expected_len,
+                    split_buffer.len()
                 )
                 .into(),
                 location: location!(),
             });
         }
 
-        let mut output = vec![0u8; total_bytes];
-
-        // Input buffer contains chunk-local byte streams
-        for i in 0..num_values as usize {
-            for j in 0..bytes_per_value {
-                let src_offset = j * num_values as usize + i;
-                output[i * bytes_per_value + j] = input_buffer[src_offset];
+        let mut output = vec![0u8; expected_len];
+        for value_idx in 0..num_values as usize {
+            for byte_idx in 0..bytes_per_value {
+                let src_offset = byte_idx * num_values as usize + value_idx;
+                output[value_idx * bytes_per_value + byte_idx] = split_buffer[src_offset];
             }
         }
 
@@ -322,11 +307,18 @@ fn evaluate_entropy_for_bss(data: &FixedWidthDataBlock, sensitivity: f32) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
+    use crate::format::pb21::compressive_encoding::Compression;
 
     #[test]
     fn test_round_trip_f32() {
-        let encoder = ByteStreamSplitEncoder::new(32);
-        let decompressor = ByteStreamSplitDecompressor::new(32);
+        let encoder = ByteStreamSplitEncoder::new(32, Box::new(ValueEncoder::default()));
+        let flat_encoding = ProtobufUtils21::flat(32, None);
+        let Compression::Flat(flat) = flat_encoding.compression.as_ref().unwrap() else {
+            unreachable!("flat encoding expected")
+        };
+        let decompressor =
+            ByteStreamSplitDecompressor::new(32, Box::new(ValueDecompressor::from_flat(flat)));
 
         // Test data
         let values: Vec<f32> = vec![
@@ -371,8 +363,13 @@ mod tests {
 
     #[test]
     fn test_round_trip_f64() {
-        let encoder = ByteStreamSplitEncoder::new(64);
-        let decompressor = ByteStreamSplitDecompressor::new(64);
+        let encoder = ByteStreamSplitEncoder::new(64, Box::new(ValueEncoder::default()));
+        let flat_encoding = ProtobufUtils21::flat(64, None);
+        let Compression::Flat(flat) = flat_encoding.compression.as_ref().unwrap() else {
+            unreachable!("flat encoding expected")
+        };
+        let decompressor =
+            ByteStreamSplitDecompressor::new(64, Box::new(ValueDecompressor::from_flat(flat)));
 
         // Test data
         let values: Vec<f64> = vec![
@@ -417,8 +414,13 @@ mod tests {
 
     #[test]
     fn test_empty_data() {
-        let encoder = ByteStreamSplitEncoder::new(32);
-        let decompressor = ByteStreamSplitDecompressor::new(32);
+        let encoder = ByteStreamSplitEncoder::new(32, Box::new(ValueEncoder::default()));
+        let flat_encoding = ProtobufUtils21::flat(32, None);
+        let Compression::Flat(flat) = flat_encoding.compression.as_ref().unwrap() else {
+            unreachable!("flat encoding expected")
+        };
+        let decompressor =
+            ByteStreamSplitDecompressor::new(32, Box::new(ValueDecompressor::from_flat(flat)));
 
         let data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::empty(),

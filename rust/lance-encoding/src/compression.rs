@@ -139,24 +139,28 @@ pub struct DefaultCompressionStrategy {
     version: LanceFileVersion,
 }
 
-fn try_bss_for_mini_block(
-    data: &FixedWidthDataBlock,
-    params: &CompressionFieldParams,
-) -> Option<Box<dyn MiniBlockCompressor>> {
-    // BSS requires general compression to be effective
-    // If compression is not set or explicitly disabled, skip BSS
+fn should_enable_bss(data: &FixedWidthDataBlock, params: &CompressionFieldParams) -> bool {
     if params.compression.is_none() || params.compression.as_deref() == Some("none") {
-        return None;
+        return false;
     }
 
     let mode = params.bss.unwrap_or(BssMode::Auto);
-    // should_use_bss already checks for supported bit widths (32/64)
-    if should_use_bss(data, mode) {
-        return Some(Box::new(ByteStreamSplitEncoder::new(
-            data.bits_per_value as usize,
-        )));
+    should_use_bss(data, mode)
+}
+
+fn resolve_bits_per_value(encoding: &CompressiveEncoding) -> Option<u64> {
+    use Compression::*;
+
+    let compression = encoding.compression.as_ref()?;
+    match compression {
+        Flat(flat) => Some(flat.bits_per_value),
+        InlineBitpacking(desc) => Some(desc.uncompressed_bits_per_value),
+        OutOfLineBitpacking(desc) => Some(desc.uncompressed_bits_per_value),
+        General(general) => resolve_bits_per_value(general.values.as_ref()?.as_ref()),
+        Rle(rle) => resolve_bits_per_value(rle.values.as_ref()?.as_ref()),
+        ByteStreamSplit(inner) => resolve_bits_per_value(inner.values.as_ref()?.as_ref()),
+        _ => None,
     }
-    None
 }
 
 fn try_rle_for_mini_block(
@@ -347,10 +351,30 @@ impl DefaultCompressionStrategy {
             return Ok(Box::new(ValueEncoder::default()));
         }
 
-        let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_rle_for_mini_block(data, params))
+        let enable_bss = should_enable_bss(data, params);
+        let version_supports_layers = self.version.resolve() >= LanceFileVersion::V2_2;
+
+        if enable_bss && !version_supports_layers {
+            // Older file versions only support ByteStreamSplit fused with the legacy
+            // ValueEncoder chunking logic. To preserve backward compatibility we keep
+            // emitting that layout when targeting <= 2.1.
+            let encoder = Box::new(ByteStreamSplitEncoder::new(
+                data.bits_per_value as usize,
+                Box::new(ValueEncoder::default()),
+            ));
+            return maybe_wrap_general_for_mini_block(encoder, params);
+        }
+
+        let mut base = try_rle_for_mini_block(data, params)
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
+
+        if enable_bss && version_supports_layers {
+            base = Box::new(ByteStreamSplitEncoder::new(
+                data.bits_per_value as usize,
+                base,
+            ));
+        }
 
         maybe_wrap_general_for_mini_block(base, params)
     }
@@ -734,13 +758,30 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 )))
             }
             Compression::ByteStreamSplit(bss) => {
-                let Compression::Flat(values) =
-                    bss.values.as_ref().unwrap().compression.as_ref().unwrap()
-                else {
-                    panic!("ByteStreamSplit compression only supports flat values")
-                };
+                let inner_encoding = bss
+                    .values
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "ByteStreamSplit encoding missing inner description",
+                            location!(),
+                        )
+                    })?
+                    .as_ref();
+
+                let inner_decompressor =
+                    self.create_miniblock_decompressor(inner_encoding, decompression_strategy)?;
+
+                let bits_per_value = resolve_bits_per_value(inner_encoding).ok_or_else(|| {
+                    Error::invalid_input(
+                        "ByteStreamSplit requires fixed-width inner encoding",
+                        location!(),
+                    )
+                })?;
+
                 Ok(Box::new(ByteStreamSplitDecompressor::new(
-                    values.bits_per_value as usize,
+                    bits_per_value as usize,
+                    inner_decompressor,
                 )))
             }
             Compression::General(general) => {
