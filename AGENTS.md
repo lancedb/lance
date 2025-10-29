@@ -144,5 +144,5 @@ Please consider the following when reviewing code contributions.
   code without tests.**
 
 ### Documentation
-* New features must include updates to the rust documentation comments. Like to
+* New features must include updates to the rust documentation comments. Link to
   relevant structs and methods to increase the value of documentation.
