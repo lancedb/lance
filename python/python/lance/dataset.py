@@ -3593,7 +3593,8 @@ class LanceDataset(pa.dataset.Dataset):
         Returns
         -------
         DatasetDeltaBuilder
-            A chainable builder. Call ``build()`` to get a ``DatasetDelta``, which can list transactions or stream inserted/updated rows.
+            A chainable builder. Call ``build()`` to get a ``DatasetDelta``,
+            which can list transactions or stream inserted/updated rows.
 
         Examples
         ----
@@ -3606,7 +3607,11 @@ class LanceDataset(pa.dataset.Dataset):
             ds = lance.write_dataset(pa.table({"id": [1, 2], "val": ["a", "b"]}), "memory://delta_demo")
 
             # Append some data to create v2
-            ds_append = lance.write_dataset(pa.table({"id": [3], "val": ["c"]}), "memory://delta_demo", mode="append")
+            ds_append = lance.write_dataset(
+                pa.table({"id": [3], "val": ["c"]}),
+                "memory://delta_demo",
+                mode="append"
+            )
 
             # Compute inserted rows from v1 -> v2
             delta = ds_append.delta().compared_against_version(1).build()
@@ -3784,7 +3789,8 @@ class DatasetDelta:
     """
     A view of differences between two versions.
 
-    Created by :meth:`DatasetDeltaBuilder.build`. Provides convenient methods to stream inserted/updated rows or list transactions.
+    Created by :meth:`DatasetDeltaBuilder.build`.
+    Provides convenient methods to stream inserted/updated rows or list transactions.
     """
 
     def __init__(self, delta):
@@ -3813,7 +3819,8 @@ class DatasetDeltaBuilder:
     """
     A builder for :class:`DatasetDelta`.
 
-    Supports chainable configuration: set a comparison version or an explicit version range, then call :meth:`build` to obtain the delta object.
+    Supports chainable configuration: set a comparison version or
+    an explicit version range, then call :meth:`build` to obtain the delta object.
     """
 
     def __init__(self, builder):
@@ -3828,14 +3835,16 @@ class DatasetDeltaBuilder:
 
     def with_begin_version(self, version: int) -> "DatasetDeltaBuilder":
         """
-        Set the start version (exclusive). Must be used together with :meth:`with_end_version`.
+        Set the start version (exclusive).
+        Must be used together with :meth:`with_end_version`.
         """
         self._builder = self._builder.with_begin_version(version)
         return self
 
     def with_end_version(self, version: int) -> "DatasetDeltaBuilder":
         """
-        Set the end version (inclusive). Must be used together with :meth:`with_begin_version`.
+        Set the end version (inclusive).
+        Must be used together with :meth:`with_begin_version`.
         """
         self._builder = self._builder.with_end_version(version)
         return self
