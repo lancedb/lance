@@ -3984,7 +3984,7 @@ class LanceOperation:
         0  1  a
         1  2  b
         2  3  c
-        3  4  dpython/python/lance/dataset.py
+        3  4  d
         >>> def double_a(batch: pa.RecordBatch) -> pa.RecordBatch:
         ...     doubled = pc.multiply(batch["a"], 2)
         ...     return pa.record_batch([doubled], ["a_doubled"])

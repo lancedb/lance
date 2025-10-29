@@ -37,7 +37,7 @@ pub(crate) struct FragmentMergeResult {
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
-    fields_modified: Vec<u32>,
+    bitmap_prune_field_ids: Vec<u32>,
 }
 
 //////////////////
@@ -456,13 +456,13 @@ impl IntoJava for &FragmentMergeResult {
 impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
-        let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
+        let java_bitmap_prune_field_ids = JLance(self.bitmap_prune_field_ids.clone()).into_java(env)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Object(&java_updated_fragment),
-                JValueGen::Object(&java_fields_modified),
+                JValueGen::Object(&java_bitmap_prune_field_ids),
             ],
         )?)
     }
