@@ -466,16 +466,16 @@ def test_tag(tmp_path: Path):
 
     # test tag update
     with pytest.raises(
-        ValueError, match="Version not found error: version 3 does not exist"
+        ValueError, match="Version not found error: version main:3 does not exist"
     ):
         ds.tags.update("tag1", 3)
 
     with pytest.raises(
         ValueError, match="Ref not found error: tag tag3 does not exist"
     ):
-        ds.tags.update("tag3", 1, None)
+        ds.tags.update("tag3", 1)
 
-    ds.tags.update("tag1", 2, None)
+    ds.tags.update("tag1", 2)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
 
@@ -507,12 +507,11 @@ def test_tag(tmp_path: Path):
     target_tag = ds.tags.list()["tag3"]
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
-    assert target_tag.version == 2
-    assert target_tag.branch == "branch2"
+    assert target_tag["version"] == 2
+    assert target_tag["branch"] == "branch2"
 
     ds.tags.delete("tag3")
     assert len(ds.tags.list()) == 2
-    assert ds.tags.list()["tag3"] is None
 
 
 def test_tag_order(tmp_path: Path):
