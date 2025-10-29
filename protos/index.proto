@@ -189,3 +189,5 @@ message JsonIndexDetails {
   google.protobuf.Any target_details = 2;
 }
 message BloomFilterIndexDetails {}
+
+message RTreeIndexDetails {}
