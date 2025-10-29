@@ -203,6 +203,21 @@ public class DatasetTest {
             assertEquals(3, dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
+
+            List<ManifestSummary> summaries =
+                versions.stream().map(Version::getManifestSummary).collect(Collectors.toList());
+            assertEquals(0, summaries.get(0).getTotalFragments());
+            assertEquals(0, summaries.get(0).getTotalDataFiles());
+            assertEquals(0, summaries.get(0).getTotalDataFileRows());
+            assertEquals(0, summaries.get(0).getTotalRows());
+            assertEquals(1, summaries.get(1).getTotalFragments());
+            assertEquals(1, summaries.get(1).getTotalDataFiles());
+            assertEquals(5, summaries.get(1).getTotalDataFileRows());
+            assertEquals(5, summaries.get(1).getTotalRows());
+            assertEquals(2, summaries.get(2).getTotalFragments());
+            assertEquals(2, summaries.get(2).getTotalDataFiles());
+            assertEquals(8, summaries.get(2).getTotalDataFileRows());
+            assertEquals(8, summaries.get(2).getTotalRows());
           }
         }
       }
