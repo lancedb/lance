@@ -13,7 +13,7 @@ def test_delta_get_inserted_rows():
             "val": pa.array(["a", "b", "c"], type=pa.string()),
         }
     )
-    write_dataset(table1, "memory://delta_api_test")
+    ds = write_dataset(table1, "memory://delta_api_test", enable_stable_row_ids=True)
 
     # Append more rows to create version 2
     table2 = pa.table(
@@ -22,10 +22,11 @@ def test_delta_get_inserted_rows():
             "val": pa.array(["d", "e"], type=pa.string()),
         }
     )
-    ds2 = write_dataset(table2, "memory://delta_api_test", mode="append")
+    ds.insert(table2)
 
     # Build delta compared to v1 and fetch inserted rows
-    delta = ds2.delta().compared_against_version(1).build()
+    delta = ds.delta().compared_against_version(1).build()
+    print(delta.list_transactions())
     reader = delta.get_inserted_rows()
 
     # Sum rows from all batches
