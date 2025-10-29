@@ -3398,6 +3398,209 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
+def test_distribute_btree_index_build_random_data(tmp_path):
+    """
+    Test distributed B-tree index build with 1 million random integers across 10
+    fragments. This test validates the index can handle non-sequential, random data
+    and verifies correctness through various queries.
+    """
+    import uuid
+
+    # Generate 1 million random integers
+    num_fragments = 10
+    rows_per_fragment = 100000
+    total_rows = num_fragments * rows_per_fragment
+
+    # Use a fixed seed for reproducibility
+    rng = np.random.default_rng(42)
+
+    # Generate all random integers at once to have a known set
+    all_integers = rng.integers(0, 10_000_000, size=total_rows, dtype=np.int64)
+
+    # Create first fragment
+    first_data = pa.table(
+        {
+            "id": pa.array(all_integers[:rows_per_fragment]),
+            "value": pa.array(rng.random(rows_per_fragment) * 100),
+        }
+    )
+
+    ds = lance.write_dataset(first_data, tmp_path, max_rows_per_file=rows_per_fragment)
+
+    # Add remaining fragments
+    for i in range(1, num_fragments):
+        start_idx = i * rows_per_fragment
+        end_idx = start_idx + rows_per_fragment
+        fragment_data = pa.table(
+            {
+                "id": pa.array(all_integers[start_idx:end_idx]),
+                "value": pa.array(rng.random(rows_per_fragment) * 100),
+            }
+        )
+        ds = lance.write_dataset(
+            fragment_data, tmp_path, mode="append", max_rows_per_file=rows_per_fragment
+        )
+
+    # Verify we have the expected number of fragments
+    fragments = ds.get_fragments()
+    assert len(fragments) == num_fragments, (
+        f"Expected {num_fragments} fragments, got {len(fragments)}"
+    )
+
+    # Build distributed B-tree index
+    index_id = str(uuid.uuid4())
+    index_name = "btree_random_data_idx"
+
+    fragment_ids = [fragment.fragment_id for fragment in fragments]
+
+    # Create B-tree index for each fragment
+    for fragment in fragments:
+        fragment_id = fragment.fragment_id
+
+        ds.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            name=index_name,
+            replace=False,
+            fragment_uuid=index_id,
+            fragment_ids=[fragment_id],
+        )
+
+    # Merge the B-tree index metadata
+    ds.merge_index_metadata(index_id, index_type="BTREE")
+
+    # Create an Index object
+    from lance.dataset import Index
+
+    field_id = ds.schema.get_field_index("id")
+
+    index = Index(
+        uuid=index_id,
+        name=index_name,
+        fields=[field_id],
+        dataset_version=ds.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    # Create and commit the index operation
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    ds_committed = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    # Verify the index was created
+    indices = ds_committed.list_indices()
+    assert len(indices) > 0, "No indices found after commit"
+
+    our_index = None
+    for idx in indices:
+        if idx["name"] == index_name:
+            our_index = idx
+            break
+
+    assert our_index is not None, f"Index '{index_name}' not found in indices list"
+    assert our_index["type"] == "BTree", (
+        f"Expected BTree index, got {our_index['type']}"
+    )
+
+    # Validate index correctness by comparing indexed vs non-indexed queries
+    # Helper function to compare results
+    def compare_query_results(filter_expr, test_description):
+        # Query with index
+        results_with_index = ds_committed.scanner(
+            filter=filter_expr,
+            columns=["id", "value"],
+        ).to_table()
+
+        # Query without index
+        results_without_index = ds_committed.scanner(
+            filter=filter_expr,
+            columns=["id", "value"],
+            use_scalar_index=False,
+        ).to_table()
+
+        # Sort both results by id and value for comparison
+        results_with_index_sorted = results_with_index.sort_by(
+            [("id", "ascending"), ("value", "ascending")]
+        )
+        results_without_index_sorted = results_without_index.sort_by(
+            [("id", "ascending"), ("value", "ascending")]
+        )
+
+        # Compare row counts
+        assert (
+            results_with_index_sorted.num_rows == results_without_index_sorted.num_rows
+        ), (
+            f"{test_description}: Row count mismatch. "
+            f"With index: {results_with_index_sorted.num_rows}, "
+            f"Without index: {results_without_index_sorted.num_rows}"
+        )
+
+        # Compare actual data
+        assert results_with_index_sorted.equals(results_without_index_sorted), (
+            f"{test_description}: Results differ between indexed"
+            " and non-indexed queries"
+        )
+
+    # Test 1: Query for specific values that exist
+    test_values = all_integers[::100000][:10]  # Sample 10 values from the dataset
+    for test_val in test_values:
+        compare_query_results(
+            f"id = {test_val}", f"Exact match query (id = {test_val})"
+        )
+
+    # Test 2: Range queries across multiple fragments
+    min_val = int(np.min(all_integers))
+    max_val = int(np.max(all_integers))
+
+    # Query bottom 10% of range
+    range_threshold = min_val + (max_val - min_val) // 10
+    compare_query_results(
+        f"id >= {min_val} AND id < {range_threshold}", "Range query (bottom 10%)"
+    )
+
+    # Test 3: Greater than query
+    mid_val = int(np.median(all_integers))
+    compare_query_results(f"id > {mid_val}", "Greater than query")
+
+    # Test 4: Less than or equal query
+    compare_query_results(f"id <= {mid_val}", "Less than or equal query")
+
+    # Test 5: Query for value that doesn't exist
+    non_existent_val = 15_000_000  # Outside our range
+    compare_query_results(f"id = {non_existent_val}", "Non-existent value query")
+
+    # Test 6: IN query with multiple values
+    in_values = [int(v) for v in all_integers[::200000][:5]]
+    in_filter = "id IN (" + ", ".join(str(v) for v in in_values) + ")"
+    compare_query_results(in_filter, "IN query with multiple values")
+
+    # Test 7: Complex range query
+    lower_quartile = int(np.percentile(all_integers, 25))
+    upper_quartile = int(np.percentile(all_integers, 75))
+    compare_query_results(
+        f"id >= {lower_quartile} AND id <= {upper_quartile}",
+        "Inter-quartile range query",
+    )
+
+    # Test 8: Multiple disjoint ranges
+    val1 = int(np.percentile(all_integers, 10))
+    val2 = int(np.percentile(all_integers, 20))
+    val3 = int(np.percentile(all_integers, 80))
+    val4 = int(np.percentile(all_integers, 90))
+    compare_query_results(
+        f"(id >= {val1} AND id < {val2}) OR (id >= {val3} AND id < {val4})",
+        "Disjoint ranges query",
+    )
+
+
 def test_btree_fragment_ids_parameter_validation(tmp_path):
     """
     Test validation of fragment_ids parameter for B-tree indices.
