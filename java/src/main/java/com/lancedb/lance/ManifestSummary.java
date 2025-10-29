@@ -17,9 +17,7 @@ import com.google.common.base.MoreObjects;
 
 import java.util.Map;
 
-/**
- * Manifest summary containing statistical information about the manifest (one version of Dataset).
- */
+/** Statistical summary of a dataset manifest for a specific version. */
 public class ManifestSummary {
   private static final String TOTAL_FRAGMENTS_KEY = "total_fragments";
   private static final String TOTAL_DATA_FILES_KEY = "total_data_files";
