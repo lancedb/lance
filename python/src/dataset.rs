@@ -2561,7 +2561,7 @@ impl Dataset {
 
     /// Create a delta builder to explore changes between dataset versions.
     fn delta(&self) -> PyResult<DatasetDeltaBuilder> {
-        let mut ds = self.ds.as_ref().clone();
+        let ds = self.ds.as_ref().clone();
         let builder = ds.delta();
         Ok(DatasetDeltaBuilder { builder })
     }
@@ -2669,7 +2669,6 @@ impl SqlQueryBuilder {
 // -------------------- Delta API Bindings --------------------
 
 #[pyclass(name = "DatasetDelta", module = "_lib", subclass)]
-#[derive(Clone)]
 pub struct DatasetDelta {
     inner: lance::dataset::delta::DatasetDelta,
 }
@@ -2677,7 +2676,9 @@ pub struct DatasetDelta {
 #[pymethods]
 impl DatasetDelta {
     /// List transactions between begin_version+1 and end_version.
-    fn list_transactions(&self) -> PyResult<Vec<PyLance<lance::dataset::transaction::Transaction>>> {
+    fn list_transactions(
+        &self,
+    ) -> PyResult<Vec<PyLance<lance::dataset::transaction::Transaction>>> {
         let txs = rt()
             .block_on(None, self.inner.list_transactions())?
             .infer_error()?;
