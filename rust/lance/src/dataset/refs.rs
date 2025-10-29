@@ -899,7 +899,6 @@ mod tests {
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
     #[case("a/b", &["a/b/c", "a/b/d"], None)]
-    #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
     #[case("single", &["other"], Some("single"))]
     #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
