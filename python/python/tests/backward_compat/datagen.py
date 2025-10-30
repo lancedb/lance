@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# Data generation for forward compatibility tests
+# Data generation for backward compatibility tests
 #
-# This file will be run on the up-to-date version of Lance to generate
-# test data that will be read by older versions of Lance in test_compat.py
+# This file will be run on the older versions of Lance to generate
+# test data that will be read by up-to-date version of Lance in test_compat.py
 
 import shutil
 
@@ -12,9 +12,14 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 from lance.file import LanceFileWriter
-from lance.indices.builder import IndexConfig
+from packaging.version import Version
 
-from forward_compat.util import build_basic_types, build_large, get_path
+from backward_compat.util import (
+    build_basic_types,
+    build_large,
+    get_path,
+    write_version_file,
+)
 
 
 def write_basic_types():
@@ -57,6 +62,12 @@ def write_dataset_pq_buffer():
 
 
 def write_dataset_json():
+    try:
+        from lance.indices.builder import IndexConfig
+    except ImportError:
+        # for versions <= 0.36
+        from lance.indices import IndexConfig
+
     shutil.rmtree(get_path("json"), ignore_errors=True)
 
     for frag in range(10):
@@ -102,9 +113,11 @@ def write_dataset_scalar_index():
     dataset.create_scalar_index("btree", "BTREE")
     dataset.create_scalar_index("bitmap", "BITMAP")
     dataset.create_scalar_index("label_list", "LABEL_LIST")
-    dataset.create_scalar_index("ngram", "NGRAM")
-    dataset.create_scalar_index("zonemap", "ZONEMAP")
-    dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
+
+    if Version(lance.__version__) >= Version("0.36.0"):
+        dataset.create_scalar_index("ngram", "NGRAM")
+        dataset.create_scalar_index("zonemap", "ZONEMAP")
+        dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
 
 
 def write_dataset_fts_index():
@@ -126,9 +139,16 @@ def write_dataset_fts_index():
 
 
 if __name__ == "__main__":
+    write_version_file()
     write_basic_types()
     write_large()
-    write_dataset_pq_buffer()
-    write_dataset_scalar_index()
-    write_dataset_json()
-    write_dataset_fts_index()
+
+    if Version(lance.__version__) >= Version("0.29.1.beta2"):
+        write_dataset_pq_buffer()
+
+    if Version(lance.__version__) >= Version("0.20.0"):
+        write_dataset_scalar_index()
+
+    if Version(lance.__version__) >= Version("0.36.0"):
+        write_dataset_json()
+        write_dataset_fts_index()
