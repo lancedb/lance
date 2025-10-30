@@ -46,7 +46,10 @@ def test_json_basic_write_read():
         assert len(logical_schema) == 2
         assert logical_schema.field("id").type == pa.int32()
         logical_field = logical_schema.field("data")
-        assert str(logical_field.type) == "extension<arrow.json>" or logical_field.type == pa.utf8()
+        assert (
+            str(logical_field.type) == "extension<arrow.json>"
+            or logical_field.type == pa.utf8()
+        )
 
         # Read data back
         result_table = dataset.to_table()
@@ -400,4 +403,8 @@ def test_json_filter_append_missing_json_cast(tmp_path: Path):
     )
 
     assert result.num_rows == 3
-    assert result.column("article_journal").to_pylist() == ["Cell", "PLoS One", "Nature"]
+    assert result.column("article_journal").to_pylist() == [
+        "Cell",
+        "PLoS One",
+        "Nature",
+    ]
