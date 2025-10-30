@@ -7,7 +7,6 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-import pytest
 
 
 def test_json_basic_write_read():
