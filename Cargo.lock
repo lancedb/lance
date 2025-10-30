@@ -4852,6 +4852,7 @@ dependencies = [
  "rangemap",
  "roaring",
  "rstest",
+ "semver",
  "serde",
  "serde_json",
  "snafu",

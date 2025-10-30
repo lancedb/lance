@@ -619,12 +619,24 @@ pub struct WriterVersion {
     pub version: String,
 }
 
-/// A parsed Lance library version with major, minor, and patch components.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LanceVersion {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: u32,
+/// A parsed Lance library version.
+///
+/// This is a wrapper around semver::Version that provides Lance-specific
+/// version comparison methods.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LanceVersion(semver::Version);
+
+impl LanceVersion {
+    /// Check if this version is older than the given major/minor/patch.
+    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
+        let other = semver::Version::new(major.into(), minor.into(), patch.into());
+        self.0 < other
+    }
+
+    /// Get the underlying semver::Version.
+    pub fn as_semver(&self) -> &semver::Version {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -674,42 +686,37 @@ impl WriterVersion {
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
-        // First split by '-' to separate the version from the pre-release tag
-        let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
-            (
-                &self.version[..dash_idx],
-                Some(&self.version[dash_idx + 1..]),
-            )
+        let version = semver::Version::parse(&self.version).ok()?;
+
+        // Extract the pre-release tag from the original string to maintain lifetime
+        let tag = if version.pre.is_empty() {
+            None
         } else {
-            (self.version.as_str(), None)
+            self.version.split_once('-').map(|(_, tag)| tag)
         };
 
-        let mut parts = version_part.split('.');
-        let major = parts.next().unwrap_or("0").parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().ok()?;
-        let patch = parts.next().unwrap_or("0").parse().ok()?;
-
-        Some((major, minor, patch, tag))
+        Some((
+            version.major as u32,
+            version.minor as u32,
+            version.patch as u32,
+            tag,
+        ))
     }
 
     /// Parse the version as a Lance library version.
     /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
-    pub fn lance_version(&self) -> Option<LanceVersion> {
+    pub fn lance_lib_version(&self) -> Option<LanceVersion> {
         if self.library != "lance" {
             return None;
         }
 
-        self.semver()
-            .map(|(major, minor, patch, _tag)| LanceVersion {
-                major,
-                minor,
-                patch,
-            })
+        let version = semver::Version::parse(&self.version).ok()?;
+        Some(LanceVersion(version))
     }
 
     #[deprecated(
         since = "0.38.4",
-        note = "Use `lance_version()` instead, which safely checks the library field and returns Option"
+        note = "Use `lance_lib_version()` instead, which safely checks the library field and returns Option"
     )]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
@@ -719,8 +726,8 @@ impl WriterVersion {
     /// Check if this is a Lance library version older than the given major/minor/patch.
     /// Returns None if the library is not "lance" or the version cannot be parsed.
     pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> Option<bool> {
-        let version = self.lance_version()?;
-        Some((version.major, version.minor, version.patch) < (major, minor, patch))
+        let version = self.lance_lib_version()?;
+        Some(version.older_than(major, minor, patch))
     }
 
     pub fn bump(&self, part: VersionPart, keep_tag: bool) -> Self {

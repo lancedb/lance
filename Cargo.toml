@@ -160,6 +160,7 @@ rstest = "0.23.0"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
+semver = "1.0"
 shellexpand = "3.0"
 snafu = "0.8"
 strum = "0.26"
