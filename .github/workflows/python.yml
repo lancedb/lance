@@ -165,6 +165,47 @@ jobs:
           pip install pytest pylance==${{ matrix.lance-version }}
           pytest python/tests/forward_compat --run-forward
 
+  backward-compat:
+    needs: linux
+    runs-on: ubuntu-24.04
+    name: Backward Compatibility Tests (${{ matrix.lance-version }})
+    strategy:
+      matrix:
+        lance-version: ["0.16.0", "0.30.0", "0.36.0"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/wheels
+      - name: Generate backward compatibility files (pylance ${{ matrix.lance-version }})
+        env:
+          PYTHONPATH: python/tests
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install pylance==${{ matrix.lance-version }} packaging
+          python -m backward_compat.datagen
+      - name: Install dependencies
+        run: |
+          pip uninstall pylance
+          pip install $(ls wheels/pylance-*.whl)[tests,ray]
+      - name: Run backward compatibility tests
+        run: |
+          pytest python/tests/backward_compat --run-backward
+
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
