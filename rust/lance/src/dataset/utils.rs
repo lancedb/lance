@@ -190,9 +190,6 @@ pub fn wrap_json_stream_for_writing(
 pub fn wrap_json_stream_for_reading(
     stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
-    use lance_arrow::json::ARROW_JSON_EXT_NAME;
-    use lance_arrow::ARROW_EXT_NAME_KEY;
-
     // Check if any fields need conversion
     let needs_conversion = stream.schema().fields().iter().any(|f| is_json_field(f));
 
@@ -205,19 +202,8 @@ pub fn wrap_json_stream_for_reading(
     let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
     for field in arrow_schema.fields() {
         if is_json_field(field) {
-            // Convert lance.json (LargeBinary) to arrow.json (Utf8)
-            let mut new_field = arrow_schema::Field::new(
-                field.name(),
-                arrow_schema::DataType::Utf8,
-                field.is_nullable(),
-            );
-            let mut metadata = field.metadata().clone();
-            metadata.insert(
-                ARROW_EXT_NAME_KEY.to_string(),
-                ARROW_JSON_EXT_NAME.to_string(),
-            );
-            new_field.set_metadata(metadata);
-            new_fields.push(new_field);
+            // Convert lance.json (LargeBinary) to arrow.json (Utf8) using utility
+            new_fields.push(lance_arrow::json::lance_json_to_arrow_json(field));
         } else {
             new_fields.push(field.as_ref().clone());
         }

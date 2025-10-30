@@ -357,6 +357,55 @@ pub fn arrow_json_to_lance_json(field: &ArrowField) -> ArrowField {
     }
 }
 
+/// Convert a Lance JSON field to Arrow JSON field
+///
+/// This is the inverse of `arrow_json_to_lance_json`. If the field is a Lance JSON field
+/// (LargeBinary with lance.json metadata), converts it to Arrow JSON (Utf8 with arrow.json
+/// metadata). This is useful when you want to accept Arrow JSON input data for a Lance JSON
+/// field, triggering automatic conversion during write operations.
+///
+/// # Arguments
+/// * `field` - The field to convert
+///
+/// # Returns
+/// A new field with Arrow JSON metadata if the input was Lance JSON, otherwise the field unchanged
+///
+/// # Example
+/// ```
+/// use arrow_schema::{DataType, Field as ArrowField};
+/// use lance_arrow::json::{lance_json_to_arrow_json, is_json_field, is_arrow_json_field};
+/// use lance_arrow::ARROW_EXT_NAME_KEY;
+///
+/// // Create a Lance JSON field
+/// let mut lance_json_field = ArrowField::new("data", DataType::LargeBinary, true);
+/// lance_json_field.set_metadata([(ARROW_EXT_NAME_KEY.to_string(), "lance.json".to_string())].into());
+///
+/// // Convert to Arrow JSON
+/// let arrow_json_field = lance_json_to_arrow_json(&lance_json_field);
+///
+/// assert!(is_arrow_json_field(&arrow_json_field));
+/// assert_eq!(arrow_json_field.data_type(), &DataType::Utf8);
+/// ```
+pub fn lance_json_to_arrow_json(field: &ArrowField) -> ArrowField {
+    if is_json_field(field) {
+        // Convert Lance JSON (LargeBinary) to Arrow JSON (Utf8)
+        let mut new_field = ArrowField::new(field.name(), DataType::Utf8, field.is_nullable());
+
+        // Copy all metadata from the original field
+        let mut metadata = field.metadata().clone();
+        // Add/override the extension metadata for Arrow JSON
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+
+        new_field = new_field.with_metadata(metadata);
+        new_field
+    } else {
+        field.clone()
+    }
+}
+
 /// Convert a RecordBatch with Lance JSON columns (JSONB) back to Arrow JSON format (strings)
 pub fn convert_lance_json_to_arrow(
     batch: &arrow_array::RecordBatch,
