@@ -210,8 +210,7 @@ fn logical_field(field: &ArrowField) -> ArrowField {
         if new_data_type == *field.data_type() {
             field.clone()
         } else {
-            let mut new_field =
-                ArrowField::new(field.name(), new_data_type, field.is_nullable());
+            let mut new_field = ArrowField::new(field.name(), new_data_type, field.is_nullable());
             let metadata = field.metadata().clone();
             if !metadata.is_empty() {
                 new_field.set_metadata(metadata);
