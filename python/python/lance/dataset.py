@@ -3466,7 +3466,7 @@ class LanceDataset(pa.dataset.Dataset):
             import lance
             dataset = lance.dataset("/tmp/data.lance")
             query = dataset.sql("SELECT id, name FROM dataset WHERE age > 30").build()
-            query.to_list()
+            query.to_batch_records()
 
         """
         return SqlQueryBuilder(self._ds.sql(sql))
@@ -3574,24 +3574,6 @@ class SqlQuery:
         pyarrow.RecordBatchReader
         """
         return self._query.to_stream_reader()
-
-    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
-        """
-        Explain the query plan.
-
-        Parameters
-        ----------
-        verbose: bool, default False
-            If True, print the verbose plan.
-        analyze: bool, default False
-            If True, analyze the query and print the statistics.
-
-        Returns
-        -------
-        str
-            The query plan.
-        """
-        return self._query.explain_plan(verbose, analyze)
 
 
 class SqlQueryBuilder:
