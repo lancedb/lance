@@ -213,9 +213,10 @@ pub mod utils {
     pub fn filter_false_positives(
         results: Vec<ConflictDetectionResult>,
     ) -> Vec<ConflictDetectionResult> {
+        // Only retain definite conflicts (exclude NoConflict and false positives)
         results
             .into_iter()
-            .filter(|result| !result.might_be_false_positive())
+            .filter(|result| result.has_conflict() && !result.might_be_false_positive())
             .collect()
     }
 
