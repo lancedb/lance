@@ -619,26 +619,6 @@ pub struct WriterVersion {
     pub version: String,
 }
 
-/// A parsed Lance library version.
-///
-/// This is a wrapper around semver::Version that provides Lance-specific
-/// version comparison methods.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LanceVersion(semver::Version);
-
-impl LanceVersion {
-    /// Check if this version is older than the given major/minor/patch.
-    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
-        let other = semver::Version::new(major.into(), minor.into(), patch.into());
-        self.0 < other
-    }
-
-    /// Get the underlying semver::Version.
-    pub fn as_semver(&self) -> &semver::Version {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
@@ -682,70 +662,96 @@ pub enum VersionPart {
     Patch,
 }
 
+fn bump_version(version: &mut semver::Version, part: VersionPart) {
+    match part {
+        VersionPart::Major => {
+            version.major += 1;
+            version.minor = 0;
+            version.patch = 0;
+        }
+        VersionPart::Minor => {
+            version.minor += 1;
+            version.patch = 0;
+        }
+        VersionPart::Patch => {
+            version.patch += 1;
+        }
+    }
+}
+
 impl WriterVersion {
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
+    #[deprecated(note = "Use `lance_lib_version()` instead")]
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
-        let version = semver::Version::parse(&self.version).ok()?;
-
-        // Extract the pre-release tag from the original string to maintain lifetime
-        let tag = if version.pre.is_empty() {
-            None
+        // First split by '-' to separate the version from the pre-release tag
+        let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
+            (
+                &self.version[..dash_idx],
+                Some(&self.version[dash_idx + 1..]),
+            )
         } else {
-            self.version.split_once('-').map(|(_, tag)| tag)
+            (self.version.as_str(), None)
         };
 
-        Some((
-            version.major as u32,
-            version.minor as u32,
-            version.patch as u32,
-            tag,
-        ))
+        let mut parts = version_part.split('.');
+        let major = parts.next().unwrap_or("0").parse().ok()?;
+        let minor = parts.next().unwrap_or("0").parse().ok()?;
+        let patch = parts.next().unwrap_or("0").parse().ok()?;
+
+        Some((major, minor, patch, tag))
     }
 
-    /// Parse the version as a Lance library version.
+    /// If the library is "lance", parse the version as semver and return it.
     /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
-    pub fn lance_lib_version(&self) -> Option<LanceVersion> {
+    pub fn lance_lib_version(&self) -> Option<semver::Version> {
         if self.library != "lance" {
             return None;
         }
 
         let version = semver::Version::parse(&self.version).ok()?;
-        Some(LanceVersion(version))
+        Some(version)
     }
 
     #[deprecated(
-        since = "0.38.4",
         note = "Use `lance_lib_version()` instead, which safely checks the library field and returns Option"
     )]
+    #[allow(deprecated)]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
             .unwrap_or_else(|| panic!("Invalid writer version: {}", self.version))
     }
 
     /// Check if this is a Lance library version older than the given major/minor/patch.
-    /// Returns None if the library is not "lance" or the version cannot be parsed.
-    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> Option<bool> {
-        let version = self.lance_lib_version()?;
-        Some(version.older_than(major, minor, patch))
+    ///
+    /// # Panics
+    ///
+    /// Panics if the library is not "lance" or the version cannot be parsed as semver.
+    #[deprecated(note = "Use `lance_lib_version()` and its `older_than` method instead.")]
+    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
+        let version = self
+            .lance_lib_version()
+            .expect("Not lance library or invalid version");
+        let other = semver::Version {
+            major: major.into(),
+            minor: minor.into(),
+            patch: patch.into(),
+            pre: semver::Prerelease::EMPTY,
+            build: semver::BuildMetadata::EMPTY,
+        };
+        version < other
     }
 
+    #[deprecated(note = "This is meant for testing and will be made private in future version.")]
     pub fn bump(&self, part: VersionPart, keep_tag: bool) -> Self {
-        let parts = self.semver_or_panic();
-        let tag = if keep_tag { parts.3 } else { None };
-        let new_parts = match part {
-            VersionPart::Major => (parts.0 + 1, parts.1, parts.2, tag),
-            VersionPart::Minor => (parts.0, parts.1 + 1, parts.2, tag),
-            VersionPart::Patch => (parts.0, parts.1, parts.2 + 1, tag),
-        };
-        let new_version = if let Some(tag) = tag {
-            format!("{}.{}.{}-{}", new_parts.0, new_parts.1, new_parts.2, tag)
-        } else {
-            format!("{}.{}.{}", new_parts.0, new_parts.1, new_parts.2)
-        };
+        let mut version = self.lance_lib_version().expect("Should be lance version");
+        bump_version(&mut version, part);
+        if !keep_tag {
+            version.pre = semver::Prerelease::EMPTY;
+        }
         Self {
             library: self.library.clone(),
-            version: new_version,
+            version: version.to_string(),
         }
     }
 }
@@ -761,6 +767,7 @@ impl Default for WriterVersion {
 
     // Unit tests always run as if they are in the next version.
     #[cfg(test)]
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             library: "lance".to_string(),
@@ -1024,7 +1031,7 @@ mod tests {
     fn test_writer_version() {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
-        let parts = wv.semver().unwrap();
+        let version = wv.lance_lib_version().unwrap();
 
         // Parse the actual cargo version to check if it has a pre-release tag
         let cargo_version = env!("CARGO_PKG_VERSION");
@@ -1035,29 +1042,24 @@ mod tests {
         };
 
         assert_eq!(
-            parts,
-            (
-                env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
-                env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
-                // Unit tests run against (major,minor,patch + 1)
-                env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap() + 1,
-                expected_tag
-            )
+            version.major,
+            env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap()
         );
-
-        // Verify the base version (without tag) matches CARGO_PKG_VERSION
-        let base_version = cargo_version.split('-').next().unwrap();
         assert_eq!(
-            format!("{}.{}.{}", parts.0, parts.1, parts.2 - 1),
-            base_version
+            version.minor,
+            env!("CARGO_PKG_VERSION_MINOR").parse::<u64>().unwrap()
         );
+        assert_eq!(
+            version.patch,
+            // Unit tests run against (major,minor,patch + 1)
+            env!("CARGO_PKG_VERSION_PATCH").parse::<u64>().unwrap() + 1
+        );
+        assert_eq!(version.pre.as_str(), expected_tag.unwrap_or(""));
 
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
-            let bumped = wv.bump(*part, false);
-            let bumped_parts = bumped.semver_or_panic();
-            assert!(wv
-                .older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2)
-                .expect("Valid Lance version should be comparable"));
+            let mut bumped_version = version.clone();
+            bump_version(&mut bumped_version, *part);
+            assert!(version < bumped_version);
         }
     }
 

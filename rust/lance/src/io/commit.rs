@@ -537,9 +537,26 @@ fn must_recalculate_fragment_bitmap(
     index: &IndexMetadata,
     version: Option<&WriterVersion>,
 ) -> bool {
+    if index.fragment_bitmap.is_none() {
+        return true;
+    }
     // If the fragment bitmap was written by an old version of lance then we need to recalculate
     // it because it could be corrupt due to a bug in versions < 0.8.15
-    index.fragment_bitmap.is_none() || version.and_then(|v| v.older_than(0, 8, 15)).unwrap_or(true)
+    if let Some(version) = version {
+        if version.library != "lance" {
+            // We assume a different library is not affected by the bug.
+            return false;
+        }
+
+        let cutoff = semver::Version::new(0, 8, 15);
+        version
+            .lance_lib_version()
+            .map(|lance_lib_version| lance_lib_version < cutoff)
+            .unwrap_or(true)
+    } else {
+        // Older versions of Lance library didn't record writer version at all.
+        true
+    }
 }
 
 /// Update indices with new fields.
