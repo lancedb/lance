@@ -619,6 +619,14 @@ pub struct WriterVersion {
     pub version: String,
 }
 
+/// A parsed Lance library version with major, minor, and patch components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LanceVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
@@ -684,15 +692,35 @@ impl WriterVersion {
         Some((major, minor, patch, tag))
     }
 
+    /// Parse the version as a Lance library version.
+    /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
+    pub fn lance_version(&self) -> Option<LanceVersion> {
+        if self.library != "lance" {
+            return None;
+        }
+
+        self.semver()
+            .map(|(major, minor, patch, _tag)| LanceVersion {
+                major,
+                minor,
+                patch,
+            })
+    }
+
+    #[deprecated(
+        since = "0.38.4",
+        note = "Use `lance_version()` instead, which safely checks the library field and returns Option"
+    )]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
             .unwrap_or_else(|| panic!("Invalid writer version: {}", self.version))
     }
 
-    /// Return true if self is older than the given major/minor/patch
-    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
-        let version = self.semver_or_panic();
-        (version.0, version.1, version.2) < (major, minor, patch)
+    /// Check if this is a Lance library version older than the given major/minor/patch.
+    /// Returns None if the library is not "lance" or the version cannot be parsed.
+    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> Option<bool> {
+        let version = self.lance_version()?;
+        Some((version.major, version.minor, version.patch) < (major, minor, patch))
     }
 
     pub fn bump(&self, part: VersionPart, keep_tag: bool) -> Self {
@@ -1020,7 +1048,9 @@ mod tests {
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
             let bumped = wv.bump(*part, false);
             let bumped_parts = bumped.semver_or_panic();
-            assert!(wv.older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2));
+            assert!(wv
+                .older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2)
+                .expect("Valid Lance version should be comparable"));
         }
     }
 
