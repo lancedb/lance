@@ -503,6 +503,61 @@ impl Branches<'_> {
         Ok(branches)
     }
 
+    /// Retrieves all descendant branches of a specified target branch and maps them to the target branch's parent version.
+    ///
+    /// This method traverses the parent branch hierarchy to identify all branches that are descendants of the specified target branch.
+    /// For each valid descendant, it records the `parent_version` from the target branch's metadata (the version from which the target branch was created).
+    ///
+    /// # Parameters
+    /// - `branch`: The target ancestor branch to find descendants for. If `None`, returns an empty result. Must be a valid existing branch name if provided.
+    ///
+    /// # Returns
+    /// A `Result` containing a `HashMap<String, u64>` where:
+    /// - **Key**: Name of a descendant branch (excludes the target branch itself)
+    /// - **Value**: `parent_version` of the target branch (the version from which the target branch was created)
+    ///
+    /// # Errors
+    /// Returns `RefNotFound` if the specified target branch does not exist in the repository.
+    pub async fn list_all_descendants(
+        &self,
+        branch: Option<String>,
+    ) -> Result<HashMap<String, u64>> {
+        let all_branches = self.list().await?;
+
+        if let Some(branch) = &branch {
+            if !all_branches.contains_key(branch.as_str()) {
+                return Err(Error::RefNotFound {
+                    message: format!("Branch {} does not exist", branch),
+                });
+            }
+        }
+
+        let mut descendants = HashMap::new();
+        // Check each branch to see if it's a descendant of the target branch
+        for (branch_name, contents) in &all_branches {
+            // Skip the target branch itself
+            if branch.as_ref().map(|b| b == branch_name).unwrap_or(false) {
+                continue;
+            }
+
+            let mut current_contents = contents;
+            // Traverse parent chain to find if target branch is an ancestor
+            while let Some(parent_name) = &current_contents.parent_branch {
+                if branch.as_ref() == Some(parent_name) {
+                    descendants.insert(branch_name.clone(), current_contents.parent_version);
+                    break;
+                }
+                if let Some(parent_contents) = all_branches.get(parent_name.as_str()) {
+                    current_contents = parent_contents
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(descendants)
+    }
+
     /// Clean up empty parent directories
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
@@ -670,7 +725,10 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
             return Err(Error::InvalidRef {
-                message: format!("Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.", segment),
+                message: format!(
+                    "Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.",
+                    segment
+                ),
             });
         }
     }
@@ -737,6 +795,7 @@ mod tests {
     use super::*;
     use datafusion::common::assert_contains;
 
+    use crate::Dataset;
     use rstest::rstest;
 
     #[rstest]
@@ -927,6 +986,137 @@ mod tests {
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
+    }
+
+    // Lineage overview (versions shown as @vX):
+    // main@v1 ─▶ branch1@v2 ─┬─▶ dev/branch2@v2 ─▶ feature/sub/deep@v3
+    //                         └─▶ feature/sub@v2
+    //
+    // Properties:
+    // - Descendants of branch1 include dev/branch2, feature/sub, and feature/sub/deep
+    // - Descendants of dev/branch2 include only feature/sub/deep
+    // - Mapping returns the parent_version of the target branch for each descendant
+    #[tokio::test]
+    async fn test_list_all_descendants_linear_and_branching() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = format!("{}/descendants_test", tmpdir.as_str());
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        // Create main dataset with initial version (v1)
+        let mut main = Dataset::write(
+            data_gen.batch(5),
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let v1 = main.version().version;
+        assert_eq!(v1, 1);
+
+        // Create branch1 from v1 and append to create v2
+        let mut branch1 = main.create_branch("branch1", v1, None).await.unwrap();
+        branch1
+            .append(
+                data_gen.batch(5),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        branch1.checkout_latest().await.unwrap();
+        let v2 = branch1.version().version;
+
+        // Two branches from branch1:v2
+        let _branch2 = branch1
+            .create_branch("dev/branch2", ("branch1", v2), None)
+            .await
+            .unwrap();
+        let _branch3 = branch1
+            .create_branch("feature/sub", ("branch1", v2), None)
+            .await
+            .unwrap();
+
+        // Deep descendant: feature/sub/deep from dev/branch2 after an append (v3)
+        let mut branch2 = main.checkout_branch("dev/branch2").await.unwrap();
+        branch2
+            .append(
+                data_gen.batch(5),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        branch2.checkout_latest().await.unwrap();
+        let v3 = branch2.version().version;
+        let _branch_deep = branch2
+            .create_branch("feature/sub/deep", ("dev/branch2", v3), None)
+            .await
+            .unwrap();
+
+        // Query descendants of branch1
+        let desc = main
+            .branches()
+            .list_all_descendants(Some("branch1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(desc.get("dev/branch2"), Some(&v2));
+        assert_eq!(desc.get("feature/sub"), Some(&v2));
+        assert_eq!(desc.get("feature/sub/deep"), Some(&v2));
+        assert!(!desc.contains_key("branch1")); // target branch itself excluded
+
+        // Query descendants of dev/branch2
+        let desc2 = main
+            .branches()
+            .list_all_descendants(Some("dev/branch2".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(desc2.get("feature/sub/deep"), Some(&v3));
+    }
+
+    #[tokio::test]
+    async fn test_list_all_descendants_invalid_inputs() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        // Create minimal dataset
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = format!("{}/descendants_invalid_test", tmpdir.as_str());
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let main = Dataset::write(
+            data_gen.batch(1),
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // None => empty map
+        let empty = main.branches().list_all_descendants(None).await.unwrap();
+        assert!(empty.is_empty());
+
+        // Nonexistent branch => RefNotFound
+        let err = main
+            .branches()
+            .list_all_descendants(Some("does-not-exist".to_string()))
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(err.to_string(), "Ref not found");
     }
 
     #[rstest]
