@@ -110,7 +110,7 @@ tbl = pa.Table.from_pandas(DataFrame({"a": [42]}))
 lance.write_dataset(tbl, experiment_branch, mode="append")
 ```
 
-## Cross-Branch Checkout and Tags per Branch
+## Cross-Branch Checkout and create global tags
 
 ```python
 # Checkout branch 'experiment' by using a global version tuple
