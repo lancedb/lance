@@ -2,6 +2,7 @@ name: "Close stale issues and PRs"
 on:
   schedule:
     - cron: "30 1 * * *"
+  workflow_dispatch:
 
 permissions:
   actions: write
@@ -14,5 +15,6 @@ jobs:
     steps:
       - uses: actions/stale@v10
         with:
-          close-pr-message: "Thank you for your contribution. This PR has been inactive for a while, so we’re closing it to free up bandwidth. Feel free to reopen it if you still find it useful."
+          close-pr-message: "Thank you for your contribution. This PR has been inactive for a while, so we're closing it to free up bandwidth. Feel free to reopen it if you still find it useful."
+          days-before-pr-stale: -1
           days-before-pr-close: 90
