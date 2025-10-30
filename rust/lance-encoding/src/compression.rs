@@ -952,6 +952,7 @@ mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::testing::extract_array_encoding_chain;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
@@ -1148,6 +1149,18 @@ mod tests {
         assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
     }
 
+    fn check_uncompressed_encoding(encoding: &CompressiveEncoding, variable: bool) {
+        let chain = extract_array_encoding_chain(encoding);
+        if variable {
+            assert_eq!(chain.len(), 2);
+            assert_eq!(chain.first().unwrap().as_str(), "variable");
+            assert_eq!(chain.get(1).unwrap().as_str(), "flat");
+        } else {
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain.first().unwrap().as_str(), "flat");
+        }
+    }
+
     #[test]
     fn test_none_compression() {
         let mut params = CompressionParams::new();
@@ -1170,17 +1183,21 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        assert!(format!("{:?}", compressor).contains("ValueEncoder"));
+        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        check_uncompressed_encoding(&encoding, false);
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        assert!(format!("{:?}", compressor).contains("BinaryMiniBlockEncoder"));
+        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
         let compressor = strategy.create_per_value(&field, &fixed_data).unwrap();
-        assert!(format!("{:?}", compressor).contains("ValueEncoder"));
+        let (_block, encoding) = compressor.compress(fixed_data).unwrap();
+        check_uncompressed_encoding(&encoding, false);
         let compressor = strategy.create_per_value(&field, &variable_data).unwrap();
-        assert!(format!("{:?}", compressor).contains("VariableEncoder"));
+        let (_block, encoding) = compressor.compress(variable_data).unwrap();
+        check_uncompressed_encoding(&encoding, true);
     }
 
     #[test]
@@ -1201,17 +1218,23 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        assert!(format!("{:?}", compressor).contains("ValueEncoder"));
+        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        check_uncompressed_encoding(&encoding, false);
+
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        assert!(format!("{:?}", compressor).contains("BinaryMiniBlockEncoder"));
+        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
         let compressor = strategy.create_per_value(&field, &fixed_data).unwrap();
-        assert!(format!("{:?}", compressor).contains("ValueEncoder"));
+        let (_block, encoding) = compressor.compress(fixed_data).unwrap();
+        check_uncompressed_encoding(&encoding, false);
+
         let compressor = strategy.create_per_value(&field, &variable_data).unwrap();
-        assert!(format!("{:?}", compressor).contains("VariableEncoder"));
+        let (_block, encoding) = compressor.compress(variable_data).unwrap();
+        check_uncompressed_encoding(&encoding, true);
     }
 
     #[test]
