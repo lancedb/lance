@@ -1,7 +1,10 @@
 # Manage Tags and Branches
 
-Lance, much like Git, employs the `LanceDataset.tags`
-property to label specific versions within a dataset's history.
+Lance, much like Git, employs the `LanceDataset.tags` and `LanceDataset.branches`
+property to provide tag and branch capabilities.
+
+## Tags
+Tags label specific versions within a branch's history.
 
 `Tags` are particularly useful for tracking the evolution of datasets,
 especially in machine learning workflows where datasets are frequently updated.
@@ -54,9 +57,9 @@ print(ds.tags.list_ordered())
 
 ### Branches
 
-Lance provides `LanceDataset.branches` to manage parallel lines of dataset evolution.
-Branches let you create an independent line from an existing version or tag, read/write on that branch,
-and switch between branches.
+Branches are used to manage parallel lines of dataset evolution.
+Branches let you create an independent line from an existing version or tag, read/write on them and switch between them.
+We can `create`, `delete`, `list` and `checkout` branches in a dataset. 
 
 !!! note
 
