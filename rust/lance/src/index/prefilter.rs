@@ -6,7 +6,6 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
-use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,13 +123,14 @@ impl DatasetPreFilter {
         // what the row ids were in the missing fragments.
         async fn load_row_ids_and_deletions(
             dataset: &Dataset,
-        ) -> Result<Vec<(Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
+        ) -> Result<Vec<(u32, Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
             stream::iter(dataset.get_fragments())
                 .map(|frag| async move {
+                    let frag_id = frag.id() as u32;
                     let row_ids = load_row_id_sequence(dataset, frag.metadata());
                     let deletion_vector = frag.get_deletion_vector();
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
-                    Ok::<_, crate::Error>((row_ids?, deletion_vector?))
+                    Ok::<_, crate::Error>((frag_id, row_ids?, deletion_vector?))
                 })
                 .buffer_unordered(dataset.object_store().io_parallelism())
                 .try_collect::<Vec<_>>()
@@ -148,24 +148,27 @@ impl DatasetPreFilter {
                 async move {
                     let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
-                    // The process of computing the final mask is CPU-bound, so we spawn it
-                    // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
-                        Ok(row_ids_and_deletions.into_iter().fold(
-                            RowIdTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.iter()).unwrap();
-                                    Cow::Owned(row_ids)
-                                } else {
-                                    Cow::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowIdTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
+                        let mut allow_list = RowIdTreeMap::new();
+                        for (frag_id, row_ids, deletion_vector_opt) in
+                            row_ids_and_deletions.into_iter()
+                        {
+                            let len = row_ids.len() as u32;
+                            match deletion_vector_opt {
+                                Some(dv) => {
+                                    let mut allowed = RoaringBitmap::from_iter(0..len);
+                                    let deleted = RoaringBitmap::from(dv.as_ref());
+                                    allowed -= &deleted;
+                                    allow_list.insert_bitmap(frag_id, allowed);
+                                }
+                                None => {
+                                    // No deletions in fragment: add all rows by translating rid -> addr.
+                                    let allowed = RoaringBitmap::from_iter(0..len);
+                                    allow_list.insert_bitmap(frag_id, allowed);
+                                }
+                            }
+                        }
+                        Ok::<_, crate::Error>(allow_list)
                     })
                     .await?;
 
@@ -265,15 +268,15 @@ impl PreFilter for DatasetPreFilter {
             .clone()
     }
 
-    /// Check whether a slice of row ids should be included in a query.
+    /// Check whether a slice of row addrs should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
     /// also known as a selection vector.
     ///
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.mask().selected_indices(row_ids)
+    fn filter_row_addrs<'a>(&self, row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.mask().selected_indices(row_addrs)
     }
 }
 
@@ -405,7 +408,13 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let expected = RowIdTreeMap::from_iter(0..8);
+        // In stable row-id mode, the deletion mask allow-list is expressed in ADDRESS domain.
+        // The dataset has 9 rows across 3 fragments (3 rows per fragment). After deleting x=8,
+        // the remaining addresses are: f0:{0,1,2}, f1:{0,1,2}, f2:{0,1}.
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_bitmap(0, RoaringBitmap::from_iter([0, 1, 2]));
+        expected.insert_bitmap(1, RoaringBitmap::from_iter([0, 1, 2]));
+        expected.insert_bitmap(2, RoaringBitmap::from_iter([0, 1]));
         assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list

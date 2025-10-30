@@ -244,7 +244,7 @@ impl HNSW {
         params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
         let node_ids = storage
-            .row_ids()
+            .row_addrs()
             .enumerate()
             .filter_map(|(node_id, _)| {
                 prefilter_bitset
@@ -704,7 +704,7 @@ impl IvfSubIndex for HNSW {
         let prefilter_bitset = if prefilter.is_empty() {
             None
         } else {
-            let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
+            let indices = prefilter.filter_row_addrs(Box::new(storage.row_addrs()));
             let mut bitset = prefilter_generator.generate(storage.len());
             for indices in indices {
                 bitset.insert(indices as u32);
@@ -726,16 +726,16 @@ impl IvfSubIndex for HNSW {
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
-        // need to unique by row ids in case of searching multivector
-        let (row_ids, dists): (Vec<_>, Vec<_>) = results
+        // need to unique by row addrs in case of searching multivector
+        let (row_addrs, dists): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .map(|r| (storage.row_addr(r.id), r.dist.0))
             .unique_by(|r| r.0)
             .unzip();
-        let row_ids = Arc::new(UInt64Array::from(row_ids));
+        let row_addrs = Arc::new(UInt64Array::from(row_addrs));
         let distances = Arc::new(Float32Array::from(dists));
 
-        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+        Ok(RecordBatch::try_new(schema, vec![distances, row_addrs])?)
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.

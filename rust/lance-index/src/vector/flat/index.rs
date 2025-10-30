@@ -11,7 +11,7 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ADDR_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ use std::sync::LazyLock;
 static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ])
     .into()
 });
@@ -89,7 +89,7 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
-        let row_ids = storage.row_ids();
+        let row_addrs = storage.row_addrs();
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
@@ -102,63 +102,67 @@ impl IvfSubIndex for FlatIndex {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
 
-                    for (&row_id, dist) in row_ids.zip(dists) {
+                    for (&row_addr, dist) in row_addrs.zip(dists) {
                         let dist = dist.into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 } else {
-                    for (&row_id, dist) in row_ids.zip(dists) {
+                    for (&row_addr, dist) in row_addrs.zip(dists) {
                         let dist = dist.into();
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 }
             }
             false => {
-                let row_id_mask = prefilter.mask();
+                // Use selection indices computed via PreFilter.filter_row_addrs so that stable row-id mode
+                // can translate physical addresses to stable row ids consistently.
+                let selected_indices = prefilter.filter_row_addrs(Box::new(storage.row_addrs()));
+                let selected_set: std::collections::HashSet<u64> =
+                    selected_indices.into_iter().collect();
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_id) in row_ids.enumerate() {
-                        if !row_id_mask.selected(row_id) {
+                    for (idx, &row_addr) in row_addrs.enumerate() {
+                        if !selected_set.contains(&(idx as u64)) {
                             continue;
                         }
-                        let dist = dist_calc.distance(id as u32).into();
+                        let dist = dist_calc.distance(idx as u32).into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
 
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 } else {
-                    for (id, &row_id) in row_ids.enumerate() {
-                        if !row_id_mask.selected(row_id) {
+                    for (idx, &row_addr) in row_addrs.enumerate() {
+                        if !selected_set.contains(&(idx as u64)) {
                             continue;
                         }
 
-                        let dist = dist_calc.distance(id as u32).into();
+                        let dist = dist_calc.distance(idx as u32).into();
                         if res.len() < k {
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         } else if res.peek().unwrap().dist > dist {
                             res.pop();
-                            res.push(OrderedNode::new(row_id, dist));
+                            res.push(OrderedNode::new(row_addr, dist));
                         }
                     }
                 }

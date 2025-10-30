@@ -37,6 +37,8 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
+use crate::index::DatasetIndexInternalExt;
+use lance_index::metrics::NoOpMetricsCollector;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -157,10 +159,68 @@ impl TakeStream {
 
     async fn map_batch(
         self: Arc<Self>,
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         batch_number: u32,
     ) -> DataFusionResult<RecordBatch> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
+        // input batch schema and row count
+        let has_row_addr = batch.schema().index_of(ROW_ADDR).is_ok();
+
+        // If the upstream batch contains row addresses, try to remap them using the Fragment Reuse Index.
+        if has_row_addr {
+            let fri = self
+                .dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await?;
+            if let Some(fri) = fri {
+                // Remap only the row_addr column and rebuild the batch to avoid schema constraints
+                let row_addr_idx = batch.schema().index_of(ROW_ADDR).unwrap();
+                let orig_row_addr_arr = batch.column(row_addr_idx).clone();
+                let remapped_row_addrs = fri.remap_row_addrs_array(orig_row_addr_arr);
+
+                // Rebuild columns with the remapped row_addr
+                let remapped_arc: arrow_array::ArrayRef = Arc::new(remapped_row_addrs);
+                let mut new_columns: Vec<arrow_array::ArrayRef> =
+                    Vec::with_capacity(batch.num_columns());
+                for col_idx in 0..batch.num_columns() {
+                    if col_idx == row_addr_idx {
+                        new_columns.push(remapped_arc.clone());
+                    } else {
+                        new_columns.push(batch.column(col_idx).clone());
+                    }
+                }
+                batch = RecordBatch::try_new(batch.schema(), new_columns)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            }
+        }
+
+        // Fallback validity check: filter out any rows that reference non-existent fragments
+        let mut valid_frag_ids = std::collections::HashSet::new();
+        for f in self.dataset.fragments().iter() {
+            valid_frag_ids.insert(f.id as u32);
+        }
+        if batch.schema().index_of(ROW_ADDR).is_ok() {
+            let arr = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let mut keep_indices = Vec::new();
+            let mut invalid = std::collections::HashSet::new();
+            for i in 0..arr.len() {
+                let ra = RowAddress::new_from_u64(arr.value(i));
+                let fid = ra.fragment_id();
+                if valid_frag_ids.contains(&fid) {
+                    keep_indices.push(i as u32);
+                } else {
+                    invalid.insert(fid);
+                }
+            }
+            if !invalid.is_empty() {
+                let indices = UInt32Array::from(keep_indices);
+                batch = arrow_select::take::take_record_batch(&batch, &indices).unwrap();
+            }
+        }
+
         let row_addrs_arr = self.get_row_addrs(&batch).await?;
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 

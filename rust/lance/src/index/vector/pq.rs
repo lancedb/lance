@@ -21,7 +21,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -62,8 +62,8 @@ pub struct PQIndex {
     /// call `Self::get_pq_codes` to get the PQ code for a specific vector.
     pub code: Option<Arc<UInt8Array>>,
 
-    /// ROW Id used to refer to the actual row in dataset.
-    pub row_ids: Option<Arc<UInt64Array>>,
+    /// ROW addr used to refer to the actual row in dataset.
+    pub row_addrs: Option<Arc<UInt64Array>>,
 
     /// Metric type.
     metric_type: MetricType,
@@ -80,7 +80,7 @@ impl DeepSizeOf for PQIndex {
                 .map(|code| code.get_array_memory_size())
                 .unwrap_or(0)
             + self
-                .row_ids
+                .row_addrs
                 .as_ref()
                 .map(|row_ids| row_ids.get_array_memory_size())
                 .unwrap_or(0)
@@ -108,7 +108,7 @@ impl PQIndex {
     ) -> Self {
         Self {
             code: None,
-            row_ids: None,
+            row_addrs: None,
             pq,
             metric_type,
             frag_reuse_index,
@@ -127,7 +127,7 @@ impl PQIndex {
             warn!("Filtering on empty PQ code array");
             return Ok((code, row_ids));
         }
-        let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
+        let indices_to_keep = pre_filter.filter_row_addrs(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
@@ -193,7 +193,7 @@ impl Index for PQIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        if let Some(row_ids) = &self.row_ids {
+        if let Some(row_ids) = &self.row_addrs {
             let mut frag_ids = row_ids
                 .values()
                 .iter()
@@ -222,7 +222,7 @@ impl VectorIndex for PQIndex {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if self.code.is_none() || self.row_ids.is_none() {
+        if self.code.is_none() || self.row_addrs.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
                 location: location!(),
@@ -231,7 +231,7 @@ impl VectorIndex for PQIndex {
         pre_filter.wait_for_ready().await?;
 
         let code = self.code.as_ref().unwrap().clone();
-        let row_ids = self.row_ids.as_ref().unwrap().clone();
+        let row_ids = self.row_addrs.as_ref().unwrap().clone();
 
         metrics.record_comparisons(row_ids.len());
 
@@ -356,9 +356,9 @@ impl VectorIndex for PQIndex {
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
                 let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
                     .enumerate()
-                    .filter_map(|(vec_idx, old_row_id)| {
-                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
-                        new_row_id.map(|new_row_id| {
+                    .filter_map(|(vec_idx, old_row_addr)| {
+                        let new_row_addr = frag_reuse_index_ref.remap_row_addr(*old_row_addr);
+                        new_row_addr.map(|new_row_id| {
                             (
                                 new_row_id,
                                 Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
@@ -381,7 +381,7 @@ impl VectorIndex for PQIndex {
 
         Ok(Box::new(Self {
             code: Some(transposed_pq_codes),
-            row_ids: Some(primitive_row_ids),
+            row_addrs: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
             frag_reuse_index: self.frag_reuse_index.clone(),
@@ -389,13 +389,13 @@ impl VectorIndex for PQIndex {
     }
 
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
-        let row_ids = self.row_ids.clone().ok_or(Error::Index {
+        let row_ids = self.row_addrs.clone().ok_or(Error::Index {
             message: "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
             location: location!(),
         })?;
 
         let num_rows = row_ids.len();
-        let mut fields = vec![ROW_ID_FIELD.clone()];
+        let mut fields = vec![ROW_ADDR_FIELD.clone()];
         let mut columns: Vec<ArrayRef> = vec![row_ids];
         if with_vector {
             let transposed_codes = self.code.clone().ok_or(Error::Index {
@@ -426,18 +426,18 @@ impl VectorIndex for PQIndex {
     }
 
     fn num_rows(&self) -> u64 {
-        self.row_ids
+        self.row_addrs
             .as_ref()
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let num_vectors = self.row_ids.as_ref().unwrap().len();
-        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let num_vectors = self.row_addrs.as_ref().unwrap().len();
+        let row_ids = self.row_addrs.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
             .enumerate()
@@ -454,7 +454,7 @@ impl VectorIndex for PQIndex {
             })
             .collect::<Vec<_>>();
 
-        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+        self.row_addrs = Some(Arc::new(UInt64Array::from_iter_values(
             remapped.iter().map(|(row_id, _)| *row_id),
         )));
 
@@ -462,7 +462,7 @@ impl VectorIndex for PQIndex {
             UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
         let transposed_codes = transpose(
             &pq_codes,
-            self.row_ids.as_ref().unwrap().len(),
+            self.row_addrs.as_ref().unwrap().len(),
             self.pq.num_sub_vectors,
         );
         self.code = Some(Arc::new(transposed_codes));
@@ -601,7 +601,7 @@ pub(crate) fn build_pq_storage(
     std::mem::drop(code_array);
 
     let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-        (ROW_ID, row_ids, true),
+        (ROW_ADDR, row_ids, true),
         (pq.column(), pq_column, false),
     ])?;
     let pq_store = ProductQuantizationStorage::new(
@@ -757,12 +757,12 @@ mod tests {
     }
 
     struct TestPreFilter {
-        row_ids: Vec<u64>,
+        row_addrs: Vec<u64>,
     }
 
     impl TestPreFilter {
-        fn new(row_ids: Vec<u64>) -> Self {
-            Self { row_ids }
+        fn new(row_addrs: Vec<u64>) -> Self {
+            Self { row_addrs }
         }
     }
 
@@ -773,16 +773,19 @@ mod tests {
         }
 
         fn is_empty(&self) -> bool {
-            self.row_ids.is_empty()
+            self.row_addrs.is_empty()
         }
 
         fn mask(&self) -> Arc<RowIdMask> {
             RowIdMask::all_rows().into()
         }
 
-        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-            row_ids
-                .filter(|&row_id| self.row_ids.contains(row_id))
+        fn filter_row_addrs<'a>(
+            &self,
+            row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>,
+        ) -> Vec<u64> {
+            row_addrs
+                .filter(|&row_addr| self.row_addrs.contains(row_addr))
                 .cloned()
                 .collect()
         }

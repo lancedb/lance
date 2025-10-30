@@ -10,7 +10,7 @@ use arrow::{array::AsArray, buffer::NullBuffer};
 use arrow_array::{make_array, Array, ArrayRef, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_linalg::distance::{multivec_distance, DistanceType};
 use snafu::location;
 use tracing::instrument;
@@ -105,14 +105,14 @@ pub async fn compute_distance(
 
     let vectors = get_column_from_batch(&batch, column)?;
 
-    let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
+    let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ADDR) {
         NullBuffer::union(rowids.nulls(), vectors.nulls())
     } else {
         vectors.nulls().cloned()
     };
 
     tokio::task::spawn_blocking(move || {
-        // A selection vector may have been applied to _rowid column, so we need to
+        // A selection vector may have been applied to _rowaddr column, so we need to
         // push that onto vectors if possible.
 
         let vectors = vectors

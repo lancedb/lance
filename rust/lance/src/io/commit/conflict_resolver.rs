@@ -1365,7 +1365,7 @@ impl<'a> TransactionRebase<'a> {
                 let conflicting_rows = existing_deletions.clone() & affected_rows.clone();
                 if conflicting_rows.len().map(|v| v > 0).unwrap_or(true) {
                     let sample_addressed = conflicting_rows
-                        .row_ids()
+                        .row_addrs()
                         .unwrap()
                         .take(5)
                         .collect::<Vec<_>>();
