@@ -1226,6 +1226,24 @@ mod tests {
     }
 
     #[test]
+    fn test_writer_version_non_semver() {
+        // Test that Lance library can have non-semver version strings
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "custom-build-v1".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // lance_lib_version should return None for non-semver
+        assert!(v.lance_lib_version().is_none());
+
+        // But the WriterVersion itself should still be valid and usable
+        assert_eq!(v.library, "lance");
+        assert_eq!(v.version, "custom-build-v1");
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn test_older_than_with_prerelease() {
         // Test that older_than correctly handles prerelease
