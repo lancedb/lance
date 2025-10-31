@@ -332,12 +332,26 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
         let mut field_metadata = Vec::with_capacity(self.fields.len());
 
         for (field, child_block) in self.fields.iter().zip(struct_block.children.into_iter()) {
-            let compressor = crate::compression::CompressionStrategy::create_per_value(
-                &self.strategy,
-                field,
-                &child_block,
-            )?;
-            let (compressed, encoding) = compressor.compress(child_block)?;
+            let (child_data, compressor) = match child_block {
+                DataBlock::Nullable(nullable) => {
+                    let compressor = crate::compression::CompressionStrategy::create_per_value(
+                        &self.strategy,
+                        field,
+                        nullable.data.as_ref(),
+                    )?;
+                    let inner = *nullable.data;
+                    (inner, compressor)
+                }
+                other => {
+                    let compressor = crate::compression::CompressionStrategy::create_per_value(
+                        &self.strategy,
+                        field,
+                        &other,
+                    )?;
+                    (other, compressor)
+                }
+            };
+            let (compressed, encoding) = compressor.compress(child_data)?;
             match compressed {
                 PerValueDataBlock::Fixed(block) => {
                     field_metadata.push(ProtobufUtils21::packed_struct_field_fixed(

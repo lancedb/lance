@@ -4067,6 +4067,15 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_lists: u64,
     ) -> Result<EncodedPage> {
+        let total_values = data.num_values();
+        if let DataBlock::AllNull(_) = &data {
+            if repdefs.iter().all(|rd| rd.is_simple_validity()) {
+                return Self::encode_simple_all_null(column_idx, total_values, row_number);
+            } else {
+                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_lists);
+            }
+        }
+
         let repdef = RepDefBuilder::serialize(repdefs);
         let max_rep = repdef
             .repetition_levels
@@ -4084,10 +4093,10 @@ impl PrimitiveStructuralEncoder {
             if let Some(rep_levels) = repdef.repetition_levels.as_ref() {
                 // If there are rep levels there may be "invisible" items and we need to encode
                 // rep_levels.len() things which might be larger than data.num_values()
-                (rep_levels.len() as u64, data.num_values())
+                (rep_levels.len() as u64, total_values)
             } else {
                 // If there are no rep levels then we encode data.num_values() things
-                (data.num_values(), data.num_values())
+                (total_values, total_values)
             };
 
         let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);

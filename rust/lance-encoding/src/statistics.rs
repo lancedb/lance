@@ -309,6 +309,7 @@ impl GetStat for AllNullDataBlock {
                 Some(Arc::new(UInt64Array::from(vec![null_count])))
             }
             Stat::DataSize => Some(Arc::new(UInt64Array::from(vec![0]))),
+            Stat::MaxLength => Some(Arc::new(UInt64Array::from(vec![0]))),
             _ => None,
         }
     }

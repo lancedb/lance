@@ -383,6 +383,7 @@ impl StructuralEncodingStrategy {
                         column_index.next_column_index(field.id as u32),
                         options,
                         self.compression_strategy.clone(),
+                        self.version,
                     )?));
                 }
                 _ => {

@@ -3,11 +3,17 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray, UInt64Array};
+use arrow_array::{
+    builder::StringBuilder, cast::AsArray, Array, ArrayRef, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_buffer::Buffer;
-use arrow_schema::{DataType, Field as ArrowField, Fields};
+use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, FutureExt};
-use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
+use lance_core::{
+    datatypes::{Field, BLOB_DESC_FIELDS, BLOB_DESC_V2_FIELDS},
+    error::LanceOptionExt,
+    Error, Result,
+};
 use snafu::location;
 
 use crate::{
@@ -18,6 +24,7 @@ use crate::{
     encodings::logical::primitive::PrimitiveStructuralEncoder,
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
+    version::LanceFileVersion,
 };
 
 /// Blob structural encoder - stores large binary data in external buffers
@@ -30,6 +37,7 @@ pub struct BlobStructuralEncoder {
     descriptor_encoder: Box<dyn FieldEncoder>,
     // Set when we first see data
     def_meaning: Option<Arc<[DefinitionInterpretation]>>,
+    use_v2_descriptor: bool,
 }
 
 impl BlobStructuralEncoder {
@@ -38,16 +46,21 @@ impl BlobStructuralEncoder {
         column_index: u32,
         options: &crate::encoder::EncodingOptions,
         compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        version: LanceFileVersion,
     ) -> Result<Self> {
         // Create descriptor field: struct<position: u64, size: u64>
         // Preserve the original field's metadata for packed struct
         let mut descriptor_metadata = HashMap::with_capacity(1);
         descriptor_metadata.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
 
-        let descriptor_data_type = DataType::Struct(Fields::from(vec![
-            ArrowField::new("position", DataType::UInt64, false),
-            ArrowField::new("size", DataType::UInt64, false),
-        ]));
+        let (descriptor_fields, use_v2_descriptor) = if version.resolve() >= LanceFileVersion::V2_2
+        {
+            (BLOB_DESC_V2_FIELDS.clone(), true)
+        } else {
+            (BLOB_DESC_FIELDS.clone(), false)
+        };
+
+        let descriptor_data_type = DataType::Struct(descriptor_fields);
 
         // Use the original field's name for the descriptor
         let descriptor_field = Field::try_from(
@@ -67,6 +80,7 @@ impl BlobStructuralEncoder {
         Ok(Self {
             descriptor_encoder,
             def_meaning: None,
+            use_v2_descriptor,
         })
     }
 
@@ -142,6 +156,12 @@ impl FieldEncoder for BlobStructuralEncoder {
         // Collect positions and sizes
         let mut positions = Vec::with_capacity(binary_array.len());
         let mut sizes = Vec::with_capacity(binary_array.len());
+        let mut blob_ids = self
+            .use_v2_descriptor
+            .then(|| Vec::with_capacity(binary_array.len()));
+        let mut uri_builder = self
+            .use_v2_descriptor
+            .then(|| StringBuilder::with_capacity(binary_array.len(), 0));
 
         for i in 0..binary_array.len() {
             if binary_array.is_null(i) {
@@ -156,18 +176,36 @@ impl FieldEncoder for BlobStructuralEncoder {
                 debug_assert_ne!(repdef, 0);
                 positions.push(repdef);
                 sizes.push(0);
+                if let Some(ids) = blob_ids.as_mut() {
+                    ids.push(0);
+                }
+                if let Some(builder) = uri_builder.as_mut() {
+                    builder.append_null();
+                }
             } else {
                 let value = binary_array.value(i);
                 if value.is_empty() {
                     // Empty values
                     positions.push(0);
                     sizes.push(0);
+                    if let Some(ids) = blob_ids.as_mut() {
+                        ids.push(0);
+                    }
+                    if let Some(builder) = uri_builder.as_mut() {
+                        builder.append_value("");
+                    }
                 } else {
                     // Add data to external buffers
                     let position =
                         external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
                     positions.push(position);
                     sizes.push(value.len() as u64);
+                    if let Some(ids) = blob_ids.as_mut() {
+                        ids.push(0);
+                    }
+                    if let Some(builder) = uri_builder.as_mut() {
+                        builder.append_value("");
+                    }
                 }
             }
         }
@@ -175,12 +213,21 @@ impl FieldEncoder for BlobStructuralEncoder {
         // Create descriptor array
         let position_array = Arc::new(UInt64Array::from(positions));
         let size_array = Arc::new(UInt64Array::from(sizes));
+        let mut children: Vec<ArrayRef> = vec![position_array as ArrayRef, size_array as ArrayRef];
+        if let (Some(ids), Some(mut builder)) = (blob_ids, uri_builder) {
+            let blob_id_array = Arc::new(UInt32Array::from(ids));
+            let blob_uri_array = Arc::new(builder.finish());
+            children.push(blob_id_array as ArrayRef);
+            children.push(blob_uri_array as ArrayRef);
+        }
+        let descriptor_fields = if self.use_v2_descriptor {
+            BLOB_DESC_V2_FIELDS.clone()
+        } else {
+            BLOB_DESC_FIELDS.clone()
+        };
         let descriptor_array = Arc::new(StructArray::new(
-            Fields::from(vec![
-                ArrowField::new("position", DataType::UInt64, false),
-                ArrowField::new("size", DataType::UInt64, false),
-            ]),
-            vec![position_array as ArrayRef, size_array as ArrayRef],
+            descriptor_fields,
+            children,
             None, // Descriptors are never null
         ));
 
@@ -228,6 +275,7 @@ mod tests {
         compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{check_round_trip_encoding_of_data, TestCases},
+        version::LanceFileVersion,
     };
     use arrow_array::LargeBinaryArray;
 
@@ -240,7 +288,13 @@ mod tests {
         let options = EncodingOptions::default();
         let compression = Arc::new(DefaultCompressionStrategy::new());
 
-        let encoder = BlobStructuralEncoder::new(&field, column_idx, &options, compression);
+        let encoder = BlobStructuralEncoder::new(
+            &field,
+            column_idx,
+            &options,
+            compression,
+            LanceFileVersion::V2_2,
+        );
 
         assert!(encoder.is_ok());
     }
@@ -258,8 +312,14 @@ mod tests {
         let options = EncodingOptions::default();
         let compression = Arc::new(DefaultCompressionStrategy::new());
 
-        let mut encoder =
-            BlobStructuralEncoder::new(&field, column_idx, &options, compression).unwrap();
+        let mut encoder = BlobStructuralEncoder::new(
+            &field,
+            column_idx,
+            &options,
+            compression,
+            LanceFileVersion::V2_2,
+        )
+        .unwrap();
 
         // Create test data with larger blobs
         let large_data = vec![0u8; 1024 * 100]; // 100KB blob

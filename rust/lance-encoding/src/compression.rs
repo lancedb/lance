@@ -505,6 +505,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     ))
                 }
             }
+            DataBlock::Nullable(nullable) => self.create_per_value(field, nullable.data.as_ref()),
             DataBlock::VariableWidth(variable_width) => {
                 // Check for explicit "none" compression
                 if field_params.compression.as_deref() == Some("none") {
