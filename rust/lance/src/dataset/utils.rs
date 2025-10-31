@@ -3,7 +3,7 @@
 
 use crate::Result;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -138,111 +138,121 @@ impl Default for CapturedRowIds {
     }
 }
 
-/// Wrap a stream to convert arrow.json to lance.json for writing
-///
-// FIXME: this is bad, really bad, we need to find a way to remove this.
-pub fn wrap_json_stream_for_writing(
-    stream: SendableRecordBatchStream,
-) -> SendableRecordBatchStream {
-    // Check if any fields need conversion
-    let needs_conversion = stream
-        .schema()
-        .fields()
-        .iter()
-        .any(|f| is_arrow_json_field(f));
-
-    if !needs_conversion {
-        return stream;
-    }
-
-    // Convert the schema
-    let arrow_schema = stream.schema();
-    let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
-    for field in arrow_schema.fields() {
-        if is_arrow_json_field(field) {
-            new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
-        } else {
-            new_fields.push(Arc::clone(field));
-        }
-    }
-    let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
-        new_fields,
-        arrow_schema.metadata().clone(),
-    ));
-
-    // Convert the stream
-    let converted_stream = stream.map(move |batch_result| {
-        batch_result.and_then(|batch| {
-            convert_json_columns(&batch)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
-        })
-    });
-
-    Box::pin(RecordBatchStreamAdapter::new(
-        converted_schema,
-        converted_stream,
-    ))
+/// Adapter around the existing JSON conversion utilities.
+#[derive(Debug, Clone)]
+pub struct SchemaAdapter {
+    logical_schema: ArrowSchemaRef,
 }
 
-/// Wrap a stream to convert lance.json (JSONB) back to arrow.json (strings) for reading
-///
-// FIXME: this is bad, really bad, we need to find a way to remove this.
-pub fn wrap_json_stream_for_reading(
-    stream: SendableRecordBatchStream,
-) -> SendableRecordBatchStream {
-    use lance_arrow::json::ARROW_JSON_EXT_NAME;
-    use lance_arrow::ARROW_EXT_NAME_KEY;
-
-    // Check if any fields need conversion
-    let needs_conversion = stream.schema().fields().iter().any(|f| is_json_field(f));
-
-    if !needs_conversion {
-        return stream;
+impl SchemaAdapter {
+    /// Create a new adapter given the logical Arrow schema.
+    pub fn new(logical_schema: ArrowSchemaRef) -> Self {
+        Self { logical_schema }
     }
 
-    // Convert the schema
-    let arrow_schema = stream.schema();
-    let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
-    for field in arrow_schema.fields() {
-        if is_json_field(field) {
-            // Convert lance.json (LargeBinary) to arrow.json (Utf8)
-            let mut new_field = arrow_schema::Field::new(
-                field.name(),
-                arrow_schema::DataType::Utf8,
-                field.is_nullable(),
-            );
-            let mut metadata = field.metadata().clone();
-            metadata.insert(
-                ARROW_EXT_NAME_KEY.to_string(),
-                ARROW_JSON_EXT_NAME.to_string(),
-            );
-            new_field.set_metadata(metadata);
-            new_fields.push(new_field);
-        } else {
-            new_fields.push(field.as_ref().clone());
+    /// Determine if the logical schema includes Arrow JSON fields that require conversion.
+    pub fn requires_physical_conversion(&self) -> bool {
+        self.logical_schema
+            .fields()
+            .iter()
+            .any(|field| is_arrow_json_field(field))
+    }
+
+    /// Determine if the physical schema includes Lance JSON fields that must be converted back.
+    pub fn requires_logical_conversion(schema: &ArrowSchemaRef) -> bool {
+        schema.fields().iter().any(|field| is_json_field(field))
+    }
+
+    /// Convert a logical stream into a physical stream.
+    pub fn to_physical_stream(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        // Check if any fields need conversion
+        if !self.requires_physical_conversion() {
+            return stream;
         }
-    }
-    let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
-        new_fields,
-        arrow_schema.metadata().clone(),
-    ));
 
-    // Convert the stream
-    let converted_stream = stream.map(move |batch_result| {
-        batch_result.and_then(|batch| {
-            convert_lance_json_to_arrow(&batch).map_err(|e| {
-                datafusion::error::DataFusionError::ArrowError(
-                    Box::new(arrow_schema::ArrowError::InvalidArgumentError(
-                        e.to_string(),
-                    )),
-                    None,
-                )
+        let arrow_schema = stream.schema();
+        let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
+        for field in arrow_schema.fields() {
+            if is_arrow_json_field(field) {
+                new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
+            } else {
+                new_fields.push(Arc::clone(field));
+            }
+        }
+        let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+            new_fields,
+            arrow_schema.metadata().clone(),
+        ));
+
+        let converted_stream = stream.map(move |batch_result| {
+            batch_result.and_then(|batch| {
+                convert_json_columns(&batch)
+                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
             })
-        })
-    });
+        });
 
-    Box::pin(RecordBatchStreamAdapter::new(
-        converted_schema,
-        converted_stream,
-    ))
+        Box::pin(RecordBatchStreamAdapter::new(
+            converted_schema,
+            converted_stream,
+        ))
+    }
+
+    /// Convert a physical stream into a logical stream.
+    pub fn to_logical_stream(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+
+        if !Self::requires_logical_conversion(&stream.schema()) {
+            return stream;
+        }
+
+        let arrow_schema = stream.schema();
+        let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
+        for field in arrow_schema.fields() {
+            if is_json_field(field) {
+                let mut new_field = arrow_schema::Field::new(
+                    field.name(),
+                    arrow_schema::DataType::Utf8,
+                    field.is_nullable(),
+                );
+                let mut metadata = field.metadata().clone();
+                metadata.insert(
+                    ARROW_EXT_NAME_KEY.to_string(),
+                    ARROW_JSON_EXT_NAME.to_string(),
+                );
+                new_field.set_metadata(metadata);
+                new_fields.push(new_field);
+            } else {
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+        let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+            new_fields,
+            arrow_schema.metadata().clone(),
+        ));
+
+        let converted_stream = stream.map(move |batch_result| {
+            batch_result.and_then(|batch| {
+                convert_lance_json_to_arrow(&batch).map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(
+                        Box::new(arrow_schema::ArrowError::InvalidArgumentError(
+                            e.to_string(),
+                        )),
+                        None,
+                    )
+                })
+            })
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            converted_schema,
+            converted_stream,
+        ))
+    }
 }

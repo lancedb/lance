@@ -75,7 +75,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::utils::wrap_json_stream_for_reading;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -3647,10 +3647,13 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        // Convert lance.json (JSONB) back to arrow.json (strings) for reading
-        //
-        // This is so bad, we need to find a way to remove this.
-        let exec_node = wrap_json_stream_for_reading(exec_node);
+        let schema = exec_node.schema();
+        let adapter = SchemaAdapter::new(schema.clone());
+        let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
+            adapter.to_logical_stream(exec_node)
+        } else {
+            exec_node
+        };
 
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
