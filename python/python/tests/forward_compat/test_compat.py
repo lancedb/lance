@@ -160,7 +160,7 @@ def test_write_fts(tmp_path: str):
     ds = lance.dataset(tmp_path)
     data = pa.table(
         {
-            "id": pa.array([1000]),
+            "idx": pa.array([1000]),
             "text": pa.array(["new document to index"]),
         }
     )
