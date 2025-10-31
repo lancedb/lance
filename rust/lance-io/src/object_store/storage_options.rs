@@ -42,8 +42,8 @@ pub const EXPIRES_AT_MILLIS_KEY: &str = "expires_at_millis";
 ///   A/B testing, or gradual migration scenarios
 /// - **Just-in-time Permission Elevation**: Request elevated permissions only when needed
 ///   for sensitive operations, then immediately revoke them
-/// - **Secret Manager Integration**: Fetch credentials from HashiCorp Vault, AWS Secrets
-///   Manager, Azure Key Vault, or Google Secret Manager with automatic rotation
+/// - **Secret Manager Integration**: Fetch encryption keys from AWS Secrets Manager,
+///   Azure Key Vault, or Google Secret Manager with automatic rotation
 /// - **OIDC/SAML Federation**: Integrate with identity providers to obtain storage
 ///   credentials based on user identity and group membership
 ///
