@@ -35,6 +35,7 @@ use snafu::location;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone, Debug)]
 pub struct DatasetDeltaBuilder {
     dataset: Dataset,
     compared_against_version: Option<u64>,
