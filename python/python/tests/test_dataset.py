@@ -2394,6 +2394,72 @@ def test_merge_insert_use_index():
     assert updated_count == 3
 
 
+def test_merge_insert_with_json_column(tmp_path: Path):
+    """Test merge_insert with JSON columns using plain JSON strings.
+
+    The dataset is created with pa.json() type (has metadata), but the
+    input data provides plain JSON strings without metadata. The conversion
+    should happen automatically based on the dataset schema.
+    """
+    import json
+
+    # Create dataset with JSON column using arrow.json extension metadata
+    json_field = pa.field("data", pa.utf8()).with_metadata(
+        {"ARROW:extension:name": "arrow.json"}
+    )
+    schema = pa.schema([pa.field("id", pa.int64()), json_field])
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "data": [
+                json.dumps({"x": 1, "y": "a"}),
+                json.dumps({"x": 2, "y": "b"}),
+                json.dumps({"x": 3, "y": "c"}),
+            ],
+        },
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(data, tmp_path / "test_json", mode="create")
+
+    # Merge insert with plain JSON strings (no pa.json() metadata)
+    # This should work because the dataset schema has the JSON metadata
+    new_data = pa.table(
+        {
+            "id": [2, 3, 4],
+            "data": [
+                json.dumps({"x": 22, "y": "bb"}),  # Update id=2
+                json.dumps({"x": 33, "y": "cc"}),  # Update id=3
+                json.dumps({"x": 4, "y": "d"}),  # Insert id=4
+            ],
+        }
+    )  # Note: no schema parameter, so no pa.json() metadata
+
+    dataset.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(new_data)
+
+    # Verify results
+    result = dataset.to_table().to_pydict()
+    assert len(result["id"]) == 4
+    assert set(result["id"]) == {1, 2, 3, 4}
+
+    # Verify the updated/inserted data
+    result_df = dataset.to_table().to_pandas()
+    row_2 = result_df[result_df["id"] == 2].iloc[0]
+    assert json.loads(row_2["data"]) == {"x": 22, "y": "bb"}
+
+    row_3 = result_df[result_df["id"] == 3].iloc[0]
+    assert json.loads(row_3["data"]) == {"x": 33, "y": "cc"}
+
+    row_4 = result_df[result_df["id"] == 4].iloc[0]
+    assert json.loads(row_4["data"]) == {"x": 4, "y": "d"}
+
+    # Row 1 should be unchanged
+    row_1 = result_df[result_df["id"] == 1].iloc[0]
+    assert json.loads(row_1["data"]) == {"x": 1, "y": "a"}
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)

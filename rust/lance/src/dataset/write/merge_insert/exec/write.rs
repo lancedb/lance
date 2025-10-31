@@ -367,16 +367,43 @@ impl FullSchemaMergeInsertExec {
             ));
         }
 
-        // Create output schema with only data columns
+        // Create output schema with only data columns, using dataset schema metadata
+        // to preserve JSON type information and other metadata
         let output_fields: Vec<_> = data_column_indices
             .iter()
             .map(|&idx| {
-                let field = input_schema.field(idx);
-                Arc::new(arrow_schema::Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ))
+                let input_field = input_schema.field(idx);
+                let field_name = input_field.name();
+
+                // Try to find corresponding field in dataset schema to preserve JSON metadata
+                if let Some(dataset_field) = self.dataset.schema().field(field_name) {
+                    let dataset_arrow_field = arrow_schema::Field::from(dataset_field);
+
+                    // Special handling for JSON fields: if the dataset has a Lance JSON field
+                    // (LargeBinary with lance.json metadata), we need to create an Arrow JSON field
+                    // (Utf8 with arrow.json metadata) to trigger the conversion in write_fragments_internal
+                    if lance_arrow::json::is_json_field(&dataset_arrow_field) {
+                        // Use utility to convert Lance JSON → Arrow JSON
+                        Arc::new(lance_arrow::json::lance_json_to_arrow_json(
+                            &dataset_arrow_field,
+                        ))
+                    } else {
+                        // For non-JSON fields, use the input field (preserving input type but we could
+                        // enhance this in the future to use dataset field properties)
+                        Arc::new(arrow_schema::Field::new(
+                            field_name,
+                            input_field.data_type().clone(),
+                            input_field.is_nullable(),
+                        ))
+                    }
+                } else {
+                    // Fallback: field not in dataset schema (shouldn't happen in normal merge)
+                    Arc::new(arrow_schema::Field::new(
+                        field_name,
+                        input_field.data_type().clone(),
+                        input_field.is_nullable(),
+                    ))
+                }
             })
             .collect();
         let output_schema = Arc::new(Schema::new(output_fields));

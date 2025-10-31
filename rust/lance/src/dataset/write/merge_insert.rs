@@ -529,7 +529,10 @@ impl MergeInsertJob {
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
-        let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
+        // Special handling for JSON fields: if the dataset has JSON fields and the input
+        // has plain string fields, we should add the arrow.json metadata to trigger conversion
+        let schema_with_json = self.add_json_metadata_if_needed(schema)?;
+        let lance_schema: lance_core::datatypes::Schema = (&schema_with_json).try_into()?;
         let is_compatible = lance_schema.check_compatible(
             self.dataset.schema(),
             &SchemaCompareOptions {
@@ -555,13 +558,58 @@ impl MergeInsertJob {
         if let Err(e) = is_compatible {
             // It might be a subschema
             let dataset_arrow_schema = Schema::from(self.dataset.schema());
-            if is_subschema(&dataset_arrow_schema, schema) {
+            if is_subschema(&dataset_arrow_schema, &schema_with_json) {
                 Ok(SchemaComparison::Subschema)
             } else {
                 Err(e)
             }
         } else {
             Ok(SchemaComparison::FullCompatible)
+        }
+    }
+
+    /// Add arrow.json metadata to string fields if the dataset has corresponding JSON fields
+    fn add_json_metadata_if_needed(&self, schema: &Schema) -> Result<Schema> {
+        let mut modified = false;
+        let new_fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                // Check if the dataset has a JSON field with the same name
+                if let Some(dataset_field) = self.dataset.schema().field(field.name()) {
+                    let dataset_arrow_field = arrow_schema::Field::from(dataset_field);
+                    // If dataset field is JSON and input field is plain string, add JSON metadata
+                    if lance_arrow::json::is_json_field(&dataset_arrow_field)
+                        && (field.data_type() == &arrow_schema::DataType::Utf8
+                            || field.data_type() == &arrow_schema::DataType::LargeUtf8)
+                        && !lance_arrow::json::is_arrow_json_field(field)
+                    {
+                        modified = true;
+                        let mut new_field = arrow_schema::Field::new(
+                            field.name(),
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        );
+                        let mut metadata = field.metadata().clone();
+                        metadata.insert(
+                            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                            lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+                        );
+                        new_field = new_field.with_metadata(metadata);
+                        Arc::new(new_field)
+                    } else {
+                        field.clone()
+                    }
+                } else {
+                    field.clone()
+                }
+            })
+            .collect();
+
+        if modified {
+            Ok(Schema::new(new_fields))
+        } else {
+            Ok(schema.clone())
         }
     }
 
@@ -2119,7 +2167,8 @@ mod tests {
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
-    use lance_arrow::FixedSizeListArrayExt;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::{FixedSizeListArrayExt, ARROW_EXT_NAME_KEY};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
@@ -4931,5 +4980,84 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_json() {
+        // JSON columns are special in that they rely on the preservation of the
+        // field metadata. This test ensures that when the dataset schema has JSON
+        // metadata, merge_insert properly converts Arrow JSON (Utf8) to Lance JSON (LargeBinary)
+        // based on the dataset schema, even when the input doesn't have the metadata.
+
+        // Create initial dataset with Arrow JSON field (Utf8 with arrow.json metadata)
+        // This will be converted to Lance JSON (LargeBinary with lance.json metadata) on write
+        let arrow_json_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Utf8, true),
+            Field::new("meta", DataType::Utf8, true).with_metadata(
+                [(
+                    ARROW_EXT_NAME_KEY.to_string(),
+                    ARROW_JSON_EXT_NAME.to_string(),
+                )]
+                .into(),
+            ),
+        ]));
+
+        let initial_data = RecordBatch::try_new(
+            arrow_json_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"key1": "value1"}"#,
+                    r#"{"key2": 2}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new("memory://")
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // After writing, the dataset schema should have LargeBinary with lance.json metadata
+        // Now merge_insert with plain JSON strings (no metadata)
+        // The key test: input has NO JSON metadata, just plain Utf8
+        let input_schema_without_metadata = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Utf8, true),
+            Field::new("meta", DataType::Utf8, true), // No metadata!
+        ]));
+        let new_data = RecordBatch::try_new(
+            input_schema_without_metadata,
+            vec![
+                Arc::new(Int32Array::from(vec![2, 3])),
+                Arc::new(StringArray::from(vec!["b_updated", "c"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"key2": "updated"}"#,
+                    r#"{"key3": 3}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let _ds = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(Box::pin(RecordBatchStreamAdapter::new(
+                new_data.schema(),
+                futures::stream::once(async { Ok(new_data) }).boxed(),
+            )))
+            .await
+            .unwrap()
+            .0;
+
+        // The test passes if we reach here without panicking
+        // This demonstrates that the dataset schema metadata is being used,
+        // not the input schema metadata
     }
 }
