@@ -40,16 +40,15 @@ def test_json_basic_write_read():
         # Read back the dataset
         dataset = lance.dataset(dataset_path)
 
-        # Verify storage schema
-        assert len(dataset.schema) == 2
-        assert dataset.schema.field("id").type == pa.int32()
-
-        # Check that JSON field is stored as JSONB internally
-        storage_field = dataset.schema.field("data")
-        assert storage_field.type == pa.large_binary()
-        assert storage_field.metadata is not None
-        assert b"ARROW:extension:name" in storage_field.metadata
-        assert storage_field.metadata[b"ARROW:extension:name"] == b"lance.json"
+        # Verify logical schema exposed to users
+        logical_schema = dataset.schema
+        assert len(logical_schema) == 2
+        assert logical_schema.field("id").type == pa.int32()
+        logical_field = logical_schema.field("data")
+        assert (
+            str(logical_field.type) == "extension<arrow.json>"
+            or logical_field.type == pa.utf8()
+        )
 
         # Read data back
         result_table = dataset.to_table()
@@ -355,3 +354,56 @@ def test_json_array_operations():
         result = dataset.to_table(filter="json_array_length(data, '$.items') = 0")
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 3
+
+
+def test_json_filter_append_missing_json_cast(tmp_path: Path):
+    """Ensure appending via dataset.schema keeps JSON columns valid."""
+
+    dataset_path = tmp_path / "json_append_issue.lance"
+
+    initial_table = pa.table(
+        {
+            "article_metadata": pa.array(
+                [json.dumps({"article_journal": "Cell"})], type=pa.json_()
+            ),
+            "article_journal": pa.array(["Cell"], type=pa.string()),
+        }
+    )
+
+    lance.write_dataset(initial_table, dataset_path)
+    dataset = lance.dataset(dataset_path)
+    schema = dataset.schema
+    field = schema.field("article_metadata")
+    assert str(field.type) == "extension<arrow.json>" or field.type == pa.utf8()
+
+    append_table = pa.table(
+        {
+            "article_metadata": pa.array(
+                [
+                    json.dumps({"article_journal": "PLoS One"}),
+                    json.dumps({"article_journal": "Nature"}),
+                ],
+                type=pa.json_(),
+            ),
+            "article_journal": pa.array(["PLoS One", "Nature"], type=pa.string()),
+        }
+    )
+
+    append_cast = append_table.cast(schema)
+    first_value = append_cast.column("article_metadata").to_pylist()[0]
+    assert isinstance(first_value, str)
+
+    lance.write_dataset(append_cast, dataset_path, mode="append")
+    dataset = lance.dataset(dataset_path)
+    assert dataset.count_rows() == 3
+
+    result = dataset.to_table(
+        filter="json_get(article_metadata, 'article_journal') IS NOT NULL"
+    )
+
+    assert result.num_rows == 3
+    assert result.column("article_journal").to_pylist() == [
+        "Cell",
+        "PLoS One",
+        "Nature",
+    ]

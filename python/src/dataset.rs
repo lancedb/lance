@@ -89,7 +89,7 @@ use crate::fragment::FileFragment;
 use crate::indices::PyIndexConfig;
 use crate::rt;
 use crate::scanner::ScanStatistics;
-use crate::schema::LanceSchema;
+use crate::schema::{logical_schema_from_lance, LanceSchema};
 use crate::session::Session;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
@@ -592,8 +592,8 @@ impl Dataset {
 
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let arrow_schema = ArrowSchema::from(self_.ds.schema());
-        arrow_schema.to_pyarrow(self_.py())
+        let logical_schema = logical_schema_from_lance(self_.ds.schema());
+        logical_schema.to_pyarrow(self_.py())
     }
 
     #[getter(lance_schema)]
