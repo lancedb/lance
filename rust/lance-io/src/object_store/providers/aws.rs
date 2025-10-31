@@ -231,6 +231,15 @@ async fn resolve_s3_region(
 ///    `aws_secret_access_key`, `aws_session_token`)
 /// 4. The default credential provider chain from AWS SDK.
 ///
+/// # Initial Credentials with Storage Options Provider
+///
+/// When `storage_options_provider` is provided along with `storage_options` and
+/// `expires_at_millis`, these serve as **initial values** to avoid redundant calls to
+/// fetch new storage options. The provider will use these initial credentials until they
+/// expire (based on `expires_at_millis`), then automatically fetch fresh credentials from
+/// the provider. Once the initial credentials expire, the passed-in values are no longer
+/// used - all future credentials come from the provider's `fetch_storage_options()` method.
+///
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
 pub async fn build_aws_credential(
     credentials_refresh_offset: Duration,
@@ -491,6 +500,14 @@ impl ObjectStoreParams {
 /// This adapter converts our generic StorageOptionsProvider trait into
 /// AWS-specific credentials that can be used with S3. It caches credentials
 /// and automatically refreshes them before they expire.
+///
+/// # Future Work
+///
+/// TODO: Support AWS/GCP/Azure together in a unified credential provider.
+/// Currently this is AWS-specific. Needs investigation of how GCP and Azure credential
+/// refresh mechanisms work and whether they can be unified with AWS's approach.
+///
+/// See: <https://github.com/lancedb/lance/pull/4905#discussion_r2474605265>
 pub struct DynamicStorageOptionsCredentialProvider {
     provider: Arc<dyn StorageOptionsProvider>,
     cache: Arc<RwLock<Option<CachedCredential>>>,

@@ -25,6 +25,28 @@ pub const EXPIRES_AT_MILLIS_KEY: &str = "expires_at_millis";
 /// Implementations can fetch storage options from various sources (namespace servers,
 /// secret managers, etc.) and are usable from Python/Java.
 ///
+/// # Current Use Cases
+///
+/// - **Temporary Credentials**: Fetch short-lived AWS temporary credentials that expire
+///   after a set time period, with automatic refresh before expiration
+///
+/// # Future Possible Use Cases
+///
+/// - **Dynamic Storage Location Resolution**: Resolve logical names to actual storage
+///   locations (bucket aliases, S3 Access Points, region-specific endpoints) that may
+///   change based on region, tier, data migration, or failover scenarios
+/// - **Runtime S3 Tags Assignment**: Inject cost allocation tags, security labels, or
+///   compliance metadata into S3 requests based on the current execution context (user,
+///   application, workspace, etc.)
+/// - **Dynamic Endpoint Configuration**: Update storage endpoints for disaster recovery,
+///   A/B testing, or gradual migration scenarios
+/// - **Just-in-time Permission Elevation**: Request elevated permissions only when needed
+///   for sensitive operations, then immediately revoke them
+/// - **Secret Manager Integration**: Fetch credentials from HashiCorp Vault, AWS Secrets
+///   Manager, Azure Key Vault, or Google Secret Manager with automatic rotation
+/// - **OIDC/SAML Federation**: Integrate with identity providers to obtain storage
+///   credentials based on user identity and group membership
+///
 /// # Equality and Hashing
 ///
 /// Implementations must provide `provider_id()` which returns a unique identifier for
