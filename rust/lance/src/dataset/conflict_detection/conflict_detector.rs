@@ -277,7 +277,7 @@ mod tests {
 
         // Create concurrent transactions
         let mut filter1 = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
-        filter1.insert(shared_key.clone()).unwrap();
+        filter1.insert(shared_key).unwrap();
 
         let mut filter2 = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
         filter2

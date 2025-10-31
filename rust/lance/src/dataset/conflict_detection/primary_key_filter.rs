@@ -265,7 +265,7 @@ mod tests {
             PrimaryKeyValue::Int64(67890),
         ];
 
-        for (_idx, key) in test_keys.iter().enumerate() {
+        for key in test_keys.iter() {
             original_filter.insert(key.clone()).unwrap();
         }
 
@@ -293,34 +293,34 @@ mod tests {
         let mut filter1 = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
         let mut filter2 = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
 
-        let keys1 = vec![
+        let keys1 = [
             PrimaryKeyValue::String("alice".to_string()),
             PrimaryKeyValue::String("bob".to_string()),
             PrimaryKeyValue::String("charlie".to_string()),
         ];
 
-        for (_idx, key) in keys1.iter().enumerate() {
+        for key in keys1.iter() {
             filter1.insert(key.clone()).unwrap();
         }
 
-        let keys2 = vec![
+        let keys2 = [
             PrimaryKeyValue::String("charlie".to_string()), // duplicated!
             PrimaryKeyValue::String("david".to_string()),
             PrimaryKeyValue::String("eve".to_string()),
         ];
 
-        for (_idx, key) in keys2.iter().enumerate() {
+        for key in keys2.iter() {
             filter2.insert(key.clone()).unwrap();
         }
 
         let conflict_result = detector
-            .check_filter_conflict(&filter1, &filter2, &"test_transaction_uuid".to_string(), 2)
+            .check_filter_conflict(&filter1, &filter2, "test_transaction_uuid", 2)
             .unwrap();
 
         assert!(conflict_result.has_conflict(), "should detect conflict");
         assert_eq!(
             conflict_result.conflicting_uuid(),
-            Some(&"test_transaction_uuid".to_string()).map(|x| x.as_str())
+            Some("test_transaction_uuid")
         );
     }
 
@@ -331,28 +331,28 @@ mod tests {
         let mut filter1 = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
         let mut filter2 = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
 
-        let keys1 = vec![
+        let keys1 = [
             PrimaryKeyValue::String("alice".to_string()),
             PrimaryKeyValue::String("bob".to_string()),
             PrimaryKeyValue::String("charlie".to_string()),
         ];
 
-        for (_idx, key) in keys1.iter().enumerate() {
+        for key in keys1.iter() {
             filter1.insert(key.clone()).unwrap();
         }
 
-        let keys2 = vec![
+        let keys2 = [
             PrimaryKeyValue::String("david".to_string()),
             PrimaryKeyValue::String("eve".to_string()),
             PrimaryKeyValue::String("frank".to_string()),
         ];
 
-        for (_idx, key) in keys2.iter().enumerate() {
+        for key in keys2.iter() {
             filter2.insert(key.clone()).unwrap();
         }
 
         let conflict_result = detector
-            .check_filter_conflict(&filter1, &filter2, &"test_transaction_uuid".to_string(), 2)
+            .check_filter_conflict(&filter1, &filter2, "test_transaction_uuid", 2)
             .unwrap();
 
         assert!(
@@ -365,12 +365,12 @@ mod tests {
     fn test_transaction_with_bloom_filter() {
         let mut bloom_filter = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
 
-        let keys = vec![
+        let keys = [
             PrimaryKeyValue::String("transaction_user_1".to_string()),
             PrimaryKeyValue::String("transaction_user_2".to_string()),
         ];
 
-        for (_idx, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             bloom_filter.insert(key.clone()).unwrap();
         }
 
@@ -473,7 +473,7 @@ mod tests {
 
         // Step 1: Create the Bloom Filter for the first transaction.
         let mut transaction1_filter = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
-        let transaction1_keys = vec![
+        let transaction1_keys = [
             PrimaryKeyValue::String("workflow_user_1".to_string()),
             PrimaryKeyValue::String("workflow_user_2".to_string()),
             PrimaryKeyValue::String("workflow_user_3".to_string()),
@@ -498,7 +498,7 @@ mod tests {
 
         // Step 3: Create the Bloom Filter for the second transaction (with a conflict).
         let mut transaction2_filter = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
-        let transaction2_keys = vec![
+        let transaction2_keys = [
             PrimaryKeyValue::String("workflow_user_3".to_string()), // Conflict!
             PrimaryKeyValue::String("workflow_user_4".to_string()),
             PrimaryKeyValue::String("workflow_user_5".to_string()),
@@ -551,7 +551,7 @@ mod tests {
 
         // Step 7: Test the no-conflict case.
         let mut transaction3_filter = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
-        let transaction3_keys = vec![
+        let transaction3_keys = [
             PrimaryKeyValue::String("workflow_user_6".to_string()),
             PrimaryKeyValue::String("workflow_user_7".to_string()),
             PrimaryKeyValue::String("workflow_user_8".to_string()),
@@ -617,7 +617,7 @@ mod tests {
 
         // Check for conflicts.
         let conflict_result = detector
-            .check_filter_conflict(&filter1, &filter2, &"false_positive_test".to_string(), 2)
+            .check_filter_conflict(&filter1, &filter2, "false_positive_test", 2)
             .unwrap();
 
         // With the current exact map implementation, no conflict should be found.
