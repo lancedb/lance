@@ -1772,7 +1772,6 @@ def test_zonemap_index_remapping(tmp_path: Path):
     # Test with a different query to ensure index works properly
     scanner = dataset.scanner(filter="values BETWEEN 1000 AND 1500", prefilter=True)
     plan = scanner.explain_plan()
-    print(f"Query plan after optimization: {plan}")
     assert "ScalarIndexQuery" in plan
 
     result = scanner.to_table()
@@ -3076,16 +3075,13 @@ def test_distribute_fts_index_build(tmp_path):
     import uuid
 
     index_id = str(uuid.uuid4())
-    print(f"Using index ID: {index_id}")
     index_name = "multiple_fragment_idx"
 
     fragments = ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
 
     for fragment in ds.get_fragments():
         fragment_id = fragment.fragment_id
-        print(f"Creating index for fragment {fragment_id}")
 
         # Use the new fragment_ids and fragment_uuid parameters
         ds.create_scalar_index(
@@ -3134,8 +3130,6 @@ def test_distribute_fts_index_build(tmp_path):
         read_version=ds.version,
     )
 
-    print("Successfully committed multiple fragment index")
-
     # Verify the index was created and is functional
     indices = ds_committed.list_indices()
     assert len(indices) > 0, "No indices found after commit"
@@ -3163,7 +3157,6 @@ def test_distribute_fts_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    print(f"Search for '{search_word}' returned {results.num_rows} results")
     # We should get at least one result since we searched for a word from the dataset
     assert results.num_rows > 0, f"No results found for search term '{search_word}'"
 

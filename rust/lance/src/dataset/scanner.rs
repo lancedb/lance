@@ -3884,6 +3884,7 @@ mod test {
         array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
     };
     use lance_file::version::LanceFileVersion;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -5874,7 +5875,10 @@ mod test {
 
             // UPDATE
 
-            dataset.optimize_indices(&Default::default()).await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1))
+                .await
+                .unwrap();
             let updated_version = dataset.version().version;
 
             // APPEND -> DELETE
