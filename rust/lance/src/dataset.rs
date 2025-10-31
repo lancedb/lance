@@ -2630,9 +2630,10 @@ mod tests {
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
+        SchemaRef,
     };
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+    use lance_arrow::{SchemaExt, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
@@ -2641,6 +2642,7 @@ mod tests {
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
+        SCORE_FIELD,
     };
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
@@ -2653,12 +2655,16 @@ mod tests {
 
     use crate::datafusion::LanceTableProvider;
     use crate::dataset::refs::branch_contents_path;
+    use crate::dataset::scanner::QueryFilter;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
     use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::Query;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -8650,6 +8656,405 @@ mod tests {
         .unwrap();
         let plan = format!("{:?}", results);
         assert_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    async fn prepare_query_filter_dataset() -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ArrowField::new("text", DataType::Utf8, false),
+            ArrowField::new("category", DataType::Utf8, false),
+        ]));
+
+        // Prepare dataset
+        let mut vectors = vec![];
+        for i in 1..=300 {
+            vectors.extend(vec![i as f32; 4]);
+        }
+
+        // id 256..298 has noop, others has text
+        let mut text = vec![];
+        for i in 1..=255 {
+            text.push(format!("text {}", i));
+        }
+        for i in 256..=298 {
+            text.push(format!("noop {}", i));
+        }
+        text.extend(vec!["text 299".to_string(), "text 300".to_string()]);
+
+        let mut category = vec![];
+        for i in 1..=300 {
+            if i % 3 == 1 {
+                category.push("literature".to_string());
+            } else if i % 3 == 2 {
+                category.push("science".to_string());
+            } else {
+                category.push("geography".to_string());
+            }
+        }
+
+        let vectors = Float32Array::from(vectors);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(1..=300)),
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, 4).unwrap()),
+                Arc::new(StringArray::from(text)),
+                Arc::new(StringArray::from(category)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create index
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().with_position(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        dataset
+    }
+
+    async fn check_results(
+        stream: DatasetRecordBatchStream,
+        expected_schema: SchemaRef,
+        expected_ids: &[i32],
+    ) {
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&results[0].schema(), &results).unwrap();
+        assert_eq!(batch.schema(), expected_schema);
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), expected_ids);
+    }
+
+    #[tokio::test]
+    async fn test_fts_filter_vector_search() {
+        let dataset = prepare_query_filter_dataset().await;
+        let schema: ArrowSchema = dataset.schema().into();
+
+        // Case 1: search with prefilter=true, query_filter=match("text")
+        let query_vector = Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]);
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(true)
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new(
+                "text".to_string(),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[300, 299, 255, 254, 253],
+        )
+        .await;
+
+        // Case 2: search with prefilter=true, query_filter=match("text"), filter="category='geography'"
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(true)
+            .filter("category='geography'")
+            .unwrap()
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new(
+                "text".to_string(),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[300, 255, 252, 249, 246],
+        )
+        .await;
+
+        // Case 3: search with prefilter=false, query_filter=match("text")
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new(
+                "text".to_string(),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[300, 299],
+        )
+        .await;
+
+        // Case 4: search with prefilter=false, query_filter=match("text"), filter="category='geography'"
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .filter("category='geography'")
+            .unwrap()
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new(
+                "text".to_string(),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[300],
+        )
+        .await;
+
+        // Case 5: search with prefilter=false, query_filter=phrase("text")
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new_query(
+                FtsQuery::Phrase(
+                    PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+                ),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[299, 300],
+        )
+        .await;
+
+        // Case 6: search with prefilter=false, query_filter=phrase("text")
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .filter("category='geography'")
+            .unwrap()
+            .query_filter(QueryFilter::Fts(FullTextSearchQuery::new_query(
+                FtsQuery::Phrase(
+                    PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+                ),
+            )))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+                .unwrap()
+                .into(),
+            &[300],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_vector_filter_fts_search() {
+        let dataset = prepare_query_filter_dataset().await;
+        let schema: ArrowSchema = dataset.schema().into();
+
+        let query_vector = Arc::new(Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]));
+        let vector_query = Query {
+            column: "vector".to_string(),
+            key: query_vector,
+            k: 5,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 20,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: MetricType::L2,
+            use_index: true,
+            dist_q_c: 0.0,
+        };
+
+        // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new("text".to_string()))
+            .unwrap()
+            .prefilter(true)
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[300, 299],
+        )
+        .await;
+
+        // Case 2: search with prefilter=true, query_filter=vector([300,300,300,300]), filter="category='geography'"
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new("text".to_string()))
+            .unwrap()
+            .prefilter(true)
+            .filter("category='geography'")
+            .unwrap()
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[300],
+        )
+        .await;
+
+        // Case 3: search with prefilter=true, phrase query, query_filter=vector([300,300,300,300])
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .prefilter(true)
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[299, 300],
+        )
+        .await;
+
+        // Case 4: search with prefilter=true, phrase query, query_filter=vector([300,300,300,300]), filter="category='geography'"
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .prefilter(true)
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .filter("category='geography'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[300],
+        )
+        .await;
+
+        // Case 5: search with prefilter=false, phrase query, query_filter=vector([300,300,300,300])
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .prefilter(false)
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[300, 299, 255, 254, 253],
+        )
+        .await;
+
+        // Case 6: search with prefilter=false, phrase query, query_filter=vector([300,300,300,300]), filter="category='geography'"
+        let mut scanner = dataset.scan();
+        let stream = scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .prefilter(false)
+            .filter("category='geography'")
+            .unwrap()
+            .query_filter(QueryFilter::Vector(vector_query.clone()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        check_results(
+            stream,
+            schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+            &[300, 255],
+        )
+        .await;
     }
 
     async fn execute_sql(
