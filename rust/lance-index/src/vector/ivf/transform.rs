@@ -21,7 +21,7 @@ use lance_linalg::distance::DistanceType;
 use crate::vector::kmeans::compute_partitions_arrow_array;
 use crate::vector::transform::Transformer;
 use crate::vector::utils::SimpleIndex;
-use crate::vector::{CENTROID_DIST_FIELD, LOSS_METADATA_KEY, PART_ID_FIELD};
+use crate::vector::{CENTROID_DIST_COLUMN, CENTROID_DIST_FIELD, LOSS_METADATA_KEY, PART_ID_FIELD};
 
 use super::PART_ID_COLUMN;
 
@@ -75,10 +75,17 @@ impl PartitionTransformer {
 impl Transformer for PartitionTransformer {
     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.column_by_name(&self.output_column).is_some() {
-            // If the partition ID column is already present, we don't need to compute it again.
+        if !(batch.column_by_name(&self.output_column).is_none()
+            || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
+        {
+            // If the output columns are already present, we don't need to compute it again.
             return Ok(batch.clone());
         }
+
+        // clear the columns if any of them is present
+        let batch = batch
+            .drop_column(PART_ID_COLUMN)?
+            .drop_column(CENTROID_DIST_COLUMN)?;
 
         let arr =
             batch

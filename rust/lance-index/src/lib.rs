@@ -43,6 +43,15 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 // Currently all vector indexes are version 1
 pub const VECTOR_INDEX_VERSION: u32 = 1;
 
+/// The factor of threshold to trigger split / join for vector index.
+///
+/// If the number of rows in the single partition is greater than `MAX_PARTITION_SIZE_FACTOR * target_partition_size`,
+/// the partition will be split.
+/// If the number of rows in the single partition is less than `MIN_PARTITION_SIZE_PERCENT *target_partition_size / 100`,
+/// the partition will be joined.
+pub const MAX_PARTITION_SIZE_FACTOR: usize = 4;
+pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
+
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
