@@ -252,7 +252,6 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
-              .refreshStorageOptions(true) // Refresh enabled
               .readOptions(readOptions)
               .build()) {
         // With the fix, describeTable should only be called once during open
@@ -357,7 +356,6 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
-              .refreshStorageOptions(true) // Enable automatic refresh
               .readOptions(readOptions)
               .build()) {
         // With the fix, describeTable should only be called once during open

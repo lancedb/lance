@@ -260,7 +260,6 @@ public class Dataset implements Closeable {
    * Dataset dataset = Dataset.open()
    *     .namespace(myNamespace)
    *     .tableId(Arrays.asList("my_table"))
-   *     .refreshStorageOptions(true)
    *     .build();
    * }</pre>
    *

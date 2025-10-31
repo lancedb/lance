@@ -91,7 +91,7 @@ def dataset(
     session: Optional[Session] = None,
     namespace: Optional[any] = None,
     table_id: Optional[list] = None,
-    refresh_storage_options: bool = False,
+    ignore_namespace_table_storage_options: bool = False,
     s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """
@@ -162,15 +162,12 @@ def dataset(
     table_id : optional, list of str
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
-    refresh_storage_options : bool, default False
+    ignore_namespace_table_storage_options : bool, default False
         Only applicable when using `namespace` and `table_id`. If True, storage
-        options will be automatically refreshed from the namespace before they
-        expire. This is currently only used for refreshing AWS temporary access
-        credentials. When enabled, the namespace will be queried periodically to
-        fetch new temporary credentials before the current ones expire. The new
-        storage options will contain updated AWS access credentials with a new
-        expiration time. If False (default), only the initial storage options
-        from describe_table() will be used.
+        options returned from the namespace's describe_table() will be ignored
+        (treated as None). If False (default), storage options from describe_table()
+        will be used and a dynamic storage options provider will be created to
+        automatically refresh credentials before they expire.
     s3_credentials_refresh_offset_seconds : optional, int
         The number of seconds before credential expiration to trigger a refresh.
         Default is 60 seconds. Only applicable when using AWS S3 with temporary
@@ -183,8 +180,8 @@ def dataset(
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
-    - A `LanceNamespaceStorageOptionsProvider` will be created automatically only
-      if `refresh_storage_options=True`
+    - Storage options from describe_table() will be used unless
+      `ignore_namespace_table_storage_options=True`
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
@@ -215,30 +212,18 @@ def dataset(
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
 
-        # Extract storage options from namespace
-        namespace_storage_options = table_info.get("storage_options", {})
+        if ignore_namespace_table_storage_options:
+            namespace_storage_options = None
+        else:
+            namespace_storage_options = table_info.get("storage_options")
 
-        # Create storage options provider if refresh is enabled
-        if refresh_storage_options:
+        if namespace_storage_options:
             storage_options_provider = LanceNamespaceStorageOptionsProvider(
                 namespace=namespace, table_id=table_id
             )
-            # Merge storage options (namespace takes precedence)
-            # Pass initial credentials to Rust so it can cache them and avoid
-            # immediately calling fetch_storage_options() during object store creation
             if storage_options is None:
                 storage_options = namespace_storage_options
             else:
-                # Merge: user options first, then override with namespace options
-                merged_options = dict(storage_options)
-                merged_options.update(namespace_storage_options)
-                storage_options = merged_options
-        else:
-            # Without refresh, merge storage options (namespace takes precedence)
-            if storage_options is None:
-                storage_options = namespace_storage_options
-            else:
-                # Merge: user options first, then override with namespace options
                 merged_options = dict(storage_options)
                 merged_options.update(namespace_storage_options)
                 storage_options = merged_options

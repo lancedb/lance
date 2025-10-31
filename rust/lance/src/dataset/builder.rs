@@ -95,12 +95,8 @@ impl DatasetBuilder {
     /// # Arguments
     /// * `namespace` - The namespace implementation to fetch table info from
     /// * `table_id` - The table identifier (e.g., vec!["my_table"])
-    /// * `refresh_storage_options` - If true, storage options will be automatically refreshed
-    ///   from the namespace before they expire. This is currently only used for refreshing AWS
-    ///   temporary access credentials. When enabled, the namespace will be queried periodically
-    ///   to fetch new temporary credentials before the current ones expire. The new storage
-    ///   options will contain updated AWS access credentials with a new expiration time.
-    ///   Defaults to false.
+    /// * `ignore_namespace_table_storage_options` - If true, storage options returned from
+    ///   the namespace's `describe_table()` will be ignored (treated as None). Defaults to false.
     ///
     /// # Example
     /// ```ignore
@@ -113,7 +109,7 @@ impl DatasetBuilder {
     ///     .connect()
     ///     .await?;
     ///
-    /// // Load a dataset from the namespace without storage options refresh
+    /// // Load a dataset using storage options from namespace
     /// let dataset = DatasetBuilder::from_namespace(
     ///     namespace.clone(),
     ///     vec!["my_table".to_string()],
@@ -123,7 +119,7 @@ impl DatasetBuilder {
     /// .load()
     /// .await?;
     ///
-    /// // Load a dataset with automatic storage options refresh
+    /// // Load a dataset ignoring namespace storage options
     /// let dataset = DatasetBuilder::from_namespace(
     ///     namespace,
     ///     vec!["my_table".to_string()],
@@ -136,7 +132,7 @@ impl DatasetBuilder {
     pub async fn from_namespace(
         namespace: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
-        refresh_storage_options: bool,
+        ignore_namespace_table_storage_options: bool,
     ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
@@ -160,11 +156,15 @@ impl DatasetBuilder {
 
         let mut builder = Self::from_uri(table_uri);
 
-        // Store namespace storage options as override - these will be applied last
-        builder.storage_options_override = response.storage_options;
+        let namespace_storage_options = if ignore_namespace_table_storage_options {
+            None
+        } else {
+            response.storage_options
+        };
 
-        // Set storage options provider if refresh is enabled
-        if refresh_storage_options {
+        builder.storage_options_override = namespace_storage_options.clone();
+
+        if namespace_storage_options.is_some() {
             builder.options.storage_options_provider = Some(Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
             ));

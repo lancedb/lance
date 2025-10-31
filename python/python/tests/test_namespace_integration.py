@@ -199,14 +199,14 @@ def test_namespace_open_dataset(s3_bucket: str):
     )
     namespace.register_table([table_name], table_uri)
 
-    # Open dataset through namespace (without refresh)
+    # Open dataset through namespace (ignoring storage options from namespace)
     # This should call describe_table once
     assert namespace.get_call_count() == 0
 
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=[table_name],
-        refresh_storage_options=False,
+        ignore_namespace_table_storage_options=True,
     )
 
     # Verify describe_table was called once during open
@@ -241,13 +241,12 @@ def test_namespace_with_refresh(s3_bucket: str):
 
     assert namespace.get_call_count() == 0
 
-    # Open dataset with refresh enabled and short refresh offset
-    # Set refresh offset to 1 second (shorter than 2s credential lifetime)
+    # Open dataset with short refresh offset
+    # Storage options from namespace are used by default
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=[table_name],
-        refresh_storage_options=True,  # Enable automatic refresh
-        s3_credentials_refresh_offset_seconds=1,  # Refresh 1s before expiration
+        s3_credentials_refresh_offset_seconds=1,
     )
 
     initial_call_count = namespace.get_call_count()
@@ -305,7 +304,7 @@ def test_namespace_append_through_namespace(s3_bucket: str):
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=[table_name],
-        refresh_storage_options=False,
+        ignore_namespace_table_storage_options=True,
     )
 
     assert ds_from_namespace.count_rows() == 1
@@ -324,7 +323,7 @@ def test_namespace_append_through_namespace(s3_bucket: str):
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=[table_name],
-        refresh_storage_options=False,
+        ignore_namespace_table_storage_options=True,
     )
 
     assert ds_from_namespace.count_rows() == 2

@@ -48,7 +48,6 @@ import java.util.Map;
  * Dataset dataset = Dataset.open()
  *     .namespace(myNamespace)
  *     .tableId(Arrays.asList("my_table"))
- *     .refreshStorageOptions(true)
  *     .build();
  * }</pre>
  */
@@ -59,7 +58,7 @@ public class OpenDatasetBuilder {
   private LanceNamespace namespace;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
-  private boolean refreshStorageOptions = false;
+  private boolean ignoreNamespaceTableStorageOptions = false;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
   OpenDatasetBuilder() {}
@@ -130,18 +129,15 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets whether storage options should be automatically refreshed before they expire.
+   * Sets whether to ignore storage options from the namespace's describe_table().
    *
-   * <p>This is only applicable when using namespace-based opening. It is currently only used for
-   * refreshing AWS temporary access credentials. When enabled, the namespace will be queried
-   * periodically to fetch new temporary credentials before the current ones expire. The new storage
-   * options will contain updated AWS access credentials with a new expiration time.
-   *
-   * @param refreshStorageOptions If true, storage options will be automatically refreshed
+   * @param ignoreNamespaceTableStorageOptions If true, storage options returned from
+   *     describe_table() will be ignored (treated as null)
    * @return this builder instance
    */
-  public OpenDatasetBuilder refreshStorageOptions(boolean refreshStorageOptions) {
-    this.refreshStorageOptions = refreshStorageOptions;
+  public OpenDatasetBuilder ignoreNamespaceTableStorageOptions(
+      boolean ignoreNamespaceTableStorageOptions) {
+    this.ignoreNamespaceTableStorageOptions = ignoreNamespaceTableStorageOptions;
     return this;
   }
 
@@ -203,26 +199,25 @@ public class OpenDatasetBuilder {
 
     DescribeTableResponse response = namespace.describeTable(request);
 
-    // Extract location
     String location = response.getLocation();
     if (location == null || location.isEmpty()) {
       throw new IllegalArgumentException("Namespace did not return a table location");
     }
 
-    // Build new ReadOptions with initial storage options
+    Map<String, String> namespaceStorageOptions =
+        ignoreNamespaceTableStorageOptions ? null : response.getStorageOptions();
+
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
             .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
 
-    // Only set storage options provider if refresh is enabled
-    if (refreshStorageOptions) {
+    if (namespaceStorageOptions != null && !namespaceStorageOptions.isEmpty()) {
       LanceNamespaceStorageOptionsProvider storageOptionsProvider =
           new LanceNamespaceStorageOptionsProvider(namespace, tableId);
       optionsBuilder.setStorageOptionsProvider(storageOptionsProvider);
     }
 
-    // Set optional fields only if present
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
@@ -230,10 +225,9 @@ public class OpenDatasetBuilder {
         .getS3CredentialsRefreshOffsetSeconds()
         .ifPresent(optionsBuilder::setS3CredentialsRefreshOffsetSeconds);
 
-    // Add initial storage options from describe_table response if present
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
-    if (response.getStorageOptions() != null) {
-      storageOptions.putAll(response.getStorageOptions());
+    if (namespaceStorageOptions != null) {
+      storageOptions.putAll(namespaceStorageOptions);
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
