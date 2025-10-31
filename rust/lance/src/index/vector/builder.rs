@@ -99,6 +99,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+
+    // fields for distributed indexing
+    fragment_filter: Option<Vec<u32>>,
 }
 
 type BuildStream<S, Q> =
@@ -137,6 +140,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
+            fragment_filter: None,
         })
     }
 
@@ -196,6 +200,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
+            fragment_filter: None,
         })
     }
 
@@ -276,6 +281,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     pub fn with_existing_indices(&mut self, indices: Vec<Arc<dyn VectorIndex>>) -> &mut Self {
         self.existing_indices = indices;
+        self
+    }
+
+    /// Set fragment filter for distributed indexing
+    pub fn with_fragment_filter(&mut self, fragment_ids: Vec<u32>) -> &mut Self {
+        self.fragment_filter = Some(fragment_ids);
         self
     }
 
@@ -434,6 +445,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .batch_readahead(get_num_compute_intensive_cpus())
                     .project(&[self.column.as_str()])?
                     .with_row_id();
+
+                // Apply fragment filter for distributed indexing
+                if let Some(fragment_ids) = &self.fragment_filter {
+                    log::info!(
+                        "applying fragment filter for distributed indexing: {:?}",
+                        fragment_ids
+                    );
+                    // Filter fragments by converting fragment_ids to Fragment objects
+                    let all_fragments = dataset.fragments();
+                    let filtered_fragments: Vec<_> = all_fragments
+                        .iter()
+                        .filter(|fragment| fragment_ids.contains(&(fragment.id as u32)))
+                        .cloned()
+                        .collect();
+                    builder.with_fragments(filtered_fragments);
+                }
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
                 let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
