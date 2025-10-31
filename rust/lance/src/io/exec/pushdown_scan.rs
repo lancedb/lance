@@ -491,8 +491,11 @@ impl FragmentScanner {
                 let remainder_batch = if !remaining_fields.is_empty() {
                     let remaining_projection =
                         self.projection.project_by_ids(&remaining_fields, true);
+                    let mut remainder_reader = self.reader.clone();
+                    remainder_reader.with_row_address();
+                    remainder_reader.with_make_deletions_null();
                     Some(
-                        self.reader
+                        remainder_reader
                             .legacy_read_batch_projected(
                                 batch_id,
                                 selection.clone(),
