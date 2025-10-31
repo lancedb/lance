@@ -71,6 +71,7 @@ mod external_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
+#[allow(dead_code)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -84,7 +85,7 @@ pub(crate) async fn read_transaction_file(
 }
 
 /// Write a transaction to a file and return the relative path.
-async fn write_transaction_file(
+pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
@@ -111,7 +112,11 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, base_path, transaction).await?
+    } else {
+        String::new()
+    };
 
     let (mut manifest, indices) = if let Operation::Clone {
         ref_name,
@@ -190,6 +195,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
+        Some(transaction),
     )
     .await;
 
@@ -641,7 +647,11 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, &dataset.base, transaction).await?
+    } else {
+        String::new()
+    };
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
@@ -693,6 +703,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
+            Some(transaction),
         )
         .await;
 
@@ -866,8 +877,11 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
-        let transaction_file =
-            write_transaction_file(object_store, &dataset.base, &transaction).await?;
+        let transaction_file = if !write_config.disable_transaction_file() {
+            write_transaction_file(object_store, &dataset.base, &transaction).await?
+        } else {
+            String::new()
+        };
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
@@ -925,6 +939,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
+            Some(&transaction),
         )
         .await;
 
