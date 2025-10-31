@@ -9,6 +9,7 @@ use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Document type for full text search.
+#[derive(Debug, Clone)]
 pub enum DocType {
     Text,
     Json,
@@ -49,6 +50,25 @@ impl TryFrom<&Field> for DocType {
     }
 }
 
+impl DocType {
+    /// Get the length of the prefix before value.
+    ///  - JSON Token: path,type,value
+    ///  - Text Token: value
+    pub fn prefix_len(&self, token: &str) -> usize {
+        match self {
+            Self::Json => {
+                if let Some(pos) = token.find(',') {
+                    if let Some(second_pos) = token[pos + 1..].find(',') {
+                        return pos + second_pos + 2;
+                    }
+                }
+                panic!("json token must be in format of <path>,<type>,<value>")
+            }
+            Self::Text => 0,
+        }
+    }
+}
+
 /// Lance full text search tokenizer.
 ///
 /// `LanceTokenizer` defines 2 methods for tokenization, normally they are the same, but sometimes
@@ -63,6 +83,8 @@ pub trait LanceTokenizer: Send + Sync {
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a>;
     /// Clone the tokenizer.
     fn box_clone(&self) -> Box<dyn LanceTokenizer>;
+    /// Get document type.
+    fn doc_type(&self) -> DocType;
 }
 
 impl Clone for Box<dyn LanceTokenizer> {
@@ -93,6 +115,10 @@ impl LanceTokenizer for TextTokenizer {
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
         Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Text
     }
 }
 
@@ -128,6 +154,10 @@ impl LanceTokenizer for JsonTokenizer {
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
         Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Json
     }
 }
 

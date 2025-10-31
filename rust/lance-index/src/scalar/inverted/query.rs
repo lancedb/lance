@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
@@ -650,11 +651,70 @@ impl FtsQueryNode for BooleanQuery {
     }
 }
 
+#[derive(Clone)]
+pub struct Tokens {
+    tokens: Vec<String>,
+    tokens_set: HashSet<String>,
+    token_type: DocType,
+}
+
+impl Tokens {
+    pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
+        let mut tokens_vec = vec![];
+        let mut tokens_set = HashSet::new();
+        for token in tokens.into_iter() {
+            tokens_vec.push(token.clone());
+            tokens_set.insert(token);
+        }
+
+        Self {
+            tokens: tokens_vec,
+            tokens_set,
+            token_type,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    pub fn token_type(&self) -> &DocType {
+        &self.token_type
+    }
+
+    pub fn contains(&self, token: &str) -> bool {
+        self.tokens_set.contains(token)
+    }
+}
+
+impl IntoIterator for Tokens {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Tokens {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens.iter()
+    }
+}
+
 pub fn collect_query_tokens(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     inclusive: Option<&HashSet<String>>,
-) -> Vec<String> {
+) -> Tokens {
+    let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
@@ -665,14 +725,15 @@ pub fn collect_query_tokens(
         }
         tokens.push(token.text.to_owned());
     }
-    tokens
+    Tokens::new(tokens, token_type)
 }
 
 pub fn collect_doc_tokens(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&HashSet<String>>,
-) -> Vec<String> {
+    inclusive: Option<&Tokens>,
+) -> Tokens {
+    let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
@@ -683,7 +744,7 @@ pub fn collect_doc_tokens(
         }
         tokens.push(token.text.to_owned());
     }
-    tokens
+    Tokens::new(tokens, token_type)
 }
 
 pub fn fill_fts_query_column(
