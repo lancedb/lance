@@ -95,7 +95,7 @@ use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, read_transaction_file,
+    detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -952,8 +952,9 @@ impl Dataset {
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
         }
+
         // Prefer inline transaction from manifest when available
-        if let Some(pos) = self.manifest.transaction_section {
+        let transaction = if let Some(pos) = self.manifest.transaction_section {
             let reader = if let Some(size) = self.manifest_location.size {
                 self.object_store
                     .open_with_size(&self.manifest_location.path, size as usize)
@@ -963,19 +964,23 @@ impl Dataset {
             };
 
             let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
-            return Transaction::try_from(tx).map(Some);
-            // If any of the checks above fail, we will fall through to external file
-        }
-
-        // Fallback: read external transaction file if present
-        if let Some(path) = &self.manifest.transaction_file {
+            Transaction::try_from(tx).map(Some)?
+        } else if let Some(path) = &self.manifest.transaction_file {
+            // Fallback: read external transaction file if present
             let path = self.base.child("_transactions").child(path.as_str());
             let data = self.object_store.inner.get(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
-            return Transaction::try_from(transaction).map(Some);
-        }
+            Transaction::try_from(transaction).map(Some)?
+        } else {
+            None
+        };
 
-        Ok(None)
+        if let Some(tx) = transaction.as_ref() {
+            self.metadata_cache
+                .insert_with_key(&transaction_key, Arc::new(tx.clone()))
+                .await;
+        }
+        Ok(transaction)
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -2143,20 +2148,16 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
                     )?;
-                    let object_store = dataset_version.object_store();
-                    let path = dataset_version
-                        .manifest
-                        .transaction_file
-                        .as_ref()
-                        .ok_or_else(|| Error::Internal {
-                            message: format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ),
-                            location: location!(),
-                        })?;
                     let loaded =
-                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                            Error::Internal {
+                                message: format!(
+                                    "Dataset version {} does not have a transaction file",
+                                    manifest_copy.version
+                                ),
+                                location: location!(),
+                            }
+                        })?);
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())

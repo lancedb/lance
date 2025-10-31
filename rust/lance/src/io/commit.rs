@@ -71,6 +71,7 @@ mod external_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
+#[allow(dead_code)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
