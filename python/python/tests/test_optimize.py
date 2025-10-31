@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright The Lance Authors
+# SPDX-FileCopyrightTexPiot: Copyright The Lance Authors
 import pickle
 import random
 import re

@@ -117,6 +117,8 @@ pub enum IndexType {
 
     BloomFilter = 9, // Bloom filter
 
+    BkdTree = 10, // BKD Tree
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -139,6 +141,7 @@ impl std::fmt::Display for IndexType {
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
             Self::MemWal => write!(f, "MemWal"),
+            Self::BkdTree => write!(f, "BkdTree"),
             Self::ZoneMap => write!(f, "ZoneMap"),
             Self::BloomFilter => write!(f, "BloomFilter"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
@@ -165,6 +168,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
             v if v == Self::FragmentReuse as i32 => Ok(Self::FragmentReuse),
             v if v == Self::MemWal as i32 => Ok(Self::MemWal),
+            v if v == Self::BkdTree as i32 => Ok(Self::BkdTree),
             v if v == Self::ZoneMap as i32 => Ok(Self::ZoneMap),
             v if v == Self::BloomFilter as i32 => Ok(Self::BloomFilter),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
@@ -223,6 +227,7 @@ impl IndexType {
                 | Self::NGram
                 | Self::ZoneMap
                 | Self::BloomFilter
+                | Self::BkdTree
         )
     }
 
@@ -261,7 +266,7 @@ impl IndexType {
             Self::MemWal => 0,
             Self::ZoneMap => 0,
             Self::BloomFilter => 0,
-
+            Self::BkdTree => 0,
             // for now all vector indices are built by the same builder,
             // so they share the same version.
             Self::Vector

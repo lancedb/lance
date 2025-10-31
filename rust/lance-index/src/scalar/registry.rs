@@ -15,9 +15,9 @@ use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
-        CreatedIndex, IndexStore, ScalarIndex,
+        expression::ScalarQueryParser, geo::BkdTreePlugin, inverted::InvertedIndexPlugin,
+        json::JsonIndexPlugin, label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin,
+        zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore, ScalarIndex,
     },
 };
 
@@ -201,6 +201,7 @@ impl ScalarIndexPluginRegistry {
         registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
         registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
         registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pb::BkdTreeIndexDetails, BkdTreePlugin>();
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
