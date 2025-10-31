@@ -70,7 +70,7 @@ We can `create`, `delete`, `list` and `checkout` branches in a dataset.
     the version number of different branches could overlap. We need to use (branch, version_number) as a global 
     version identifier for cases like checkout, tags.create.
 
-    "main" is a reversed name of branch. Lance use "main" to identify the main branch.
+    "main" is a reserved branch name. Lance uses "main" to identify the default branch.
 
 #### Create and check out branches
 ```python
