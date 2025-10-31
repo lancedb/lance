@@ -731,6 +731,7 @@ pub async fn commit_handler_from_url(
             let options = options.clone().unwrap_or_default();
             let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
             let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
+            let expires_at_millis = storage_options.expires_at_millis();
             let storage_options = storage_options.as_s3_options();
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
@@ -740,6 +741,8 @@ pub async fn commit_handler_from_url(
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
+                options.storage_options_provider.clone(),
+                expires_at_millis,
             )
             .await?;
 

@@ -262,6 +262,18 @@ pub struct DirectoryNamespace {
     base_path: Path,
 }
 
+impl std::fmt::Debug for DirectoryNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
+impl std::fmt::Display for DirectoryNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
 impl DirectoryNamespace {
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
@@ -715,6 +727,10 @@ impl LanceNamespace for DirectoryNamespace {
             properties: None,
             storage_options: self.storage_options.clone(),
         })
+    }
+
+    fn namespace_id(&self) -> String {
+        format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
 }
 

@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.io.StorageOptionsProvider;
+
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
@@ -29,6 +31,8 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
+  private final Optional<StorageOptionsProvider> storageOptionsProvider;
+  private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
@@ -37,6 +41,8 @@ public class ReadOptions {
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
     this.serializedManifest = builder.serializedManifest;
+    this.storageOptionsProvider = builder.storageOptionsProvider;
+    this.s3CredentialsRefreshOffsetSeconds = builder.s3CredentialsRefreshOffsetSeconds;
   }
 
   public Optional<Integer> getVersion() {
@@ -63,6 +69,14 @@ public class ReadOptions {
     return serializedManifest;
   }
 
+  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
+    return storageOptionsProvider;
+  }
+
+  public Optional<Long> getS3CredentialsRefreshOffsetSeconds() {
+    return s3CredentialsRefreshOffsetSeconds;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -85,6 +99,8 @@ public class ReadOptions {
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
+    private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
+    private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -187,6 +203,37 @@ public class ReadOptions {
      */
     public Builder setSerializedManifest(ByteBuffer serializedManifest) {
       this.serializedManifest = Optional.of(serializedManifest);
+      return this;
+    }
+
+    /**
+     * Set a custom storage options provider for automatic storage options refresh.
+     *
+     * <p>The storage options provider will be called automatically before storage options expire,
+     * enabling long-running operations on cloud storage without interruption. This is currently
+     * only used for refreshing AWS temporary access credentials.
+     *
+     * @param storageOptionsProvider the storage options provider implementation
+     * @return this builder
+     */
+    public Builder setStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
+      this.storageOptionsProvider = Optional.of(storageOptionsProvider);
+      return this;
+    }
+
+    /**
+     * Set the number of seconds before credential expiration to trigger a refresh.
+     *
+     * <p>Default is 60 seconds. Only applicable when using AWS S3 with temporary credentials. For
+     * example, if set to 60, credentials will be refreshed when they have less than 60 seconds
+     * remaining before expiration. This should be set shorter than the credential lifetime to avoid
+     * using expired credentials.
+     *
+     * @param s3CredentialsRefreshOffsetSeconds the refresh offset in seconds
+     * @return this builder
+     */
+    public Builder setS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
+      this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
       return this;
     }
 
