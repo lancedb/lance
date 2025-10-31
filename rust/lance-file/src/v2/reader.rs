@@ -27,7 +27,7 @@ use lance_encoding::{
 };
 use log::debug;
 use object_store::path::Path;
-use prost::{Message, Name};
+use prost::Message;
 use snafu::location;
 
 use lance_core::{
@@ -36,12 +36,15 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
+
 use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
     scheduler::FileScheduler,
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     ReadBatchParams,
 };
+use pbenc::column_encoding::ColumnEncoding as ColumnEncodingKind;
+use pbenc::ColumnEncoding as ColumnEncodingMsg;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
@@ -538,6 +541,41 @@ impl FileReader {
         }
     }
 
+    // Reads exactly the requested range [start..end] using tail-back buffering.
+    // If part of the requested range overlaps with the already-read tail, we avoid issuing extra I/O.
+    async fn optimistic_tail_read_range(
+        tail_bytes: &Bytes,
+        scheduler: &FileScheduler,
+        file_len: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes> {
+        assert!(end >= start);
+        assert!(end <= file_len);
+        let tail_begin = file_len - tail_bytes.len() as u64;
+        if start >= tail_begin {
+            // Entirely within tail
+            let offset_start = (start - tail_begin) as usize;
+            let offset_end = (end - tail_begin) as usize;
+            Ok(tail_bytes.slice(offset_start..offset_end))
+        } else {
+            // Need to read missing prefix
+            let missing_end = end.min(tail_begin);
+            let missing_bytes = scheduler.submit_single(start..missing_end, 0).await?;
+            if end > tail_begin {
+                // Append overlap from tail
+                let tail_overlap_len = (end - tail_begin) as usize;
+                let tail_slice = tail_bytes.slice(0..tail_overlap_len);
+                let mut combined = BytesMut::with_capacity(missing_bytes.len() + tail_overlap_len);
+                combined.extend(missing_bytes);
+                combined.extend(tail_slice);
+                Ok(combined.freeze())
+            } else {
+                Ok(missing_bytes)
+            }
+        }
+    }
+
     fn do_decode_gbo_table(
         gbo_bytes: &Bytes,
         footer: &Footer,
@@ -665,7 +703,243 @@ impl FileReader {
         })
     }
 
-    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> M {
+    /// Reads only the ColumnMetadata needed for the provided projection, with coalesced I/O.
+    /// Falls back to reading all metadata if selective read is not possible (e.g., indirect encodings).
+    async fn read_metadata_for_projection(
+        scheduler: &FileScheduler,
+        projection: &ReaderProjection,
+    ) -> Result<CachedFileMetadata> {
+        // 1. Read tail and decode footer
+        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let footer = Self::decode_footer(&tail_bytes)?;
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        // 2. Decode global buffers (schema pointer), then read schema
+        let gbo_table =
+            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
+        if gbo_table.is_empty() {
+            return Err(Error::Internal {
+                message: "File did not contain any global buffers, schema expected".to_string(),
+                location: location!(),
+            });
+        }
+        let schema_start = gbo_table[0].position;
+        let schema_size = gbo_table[0].size;
+        let num_footer_bytes = file_len - schema_start;
+        // Read only the schema bytes [schema_start .. schema_start + schema_size]
+        let schema_bytes = Self::optimistic_tail_read_range(
+            &tail_bytes,
+            scheduler,
+            file_len,
+            schema_start,
+            schema_start + schema_size,
+        )
+        .await?;
+        let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
+
+        // 3. Read CMO (Column Metadata Offsets) table only
+        let cmo_bytes = Self::optimistic_tail_read_range(
+            &tail_bytes,
+            scheduler,
+            file_len,
+            footer.column_meta_offsets_start,
+            footer.global_buff_offsets_start,
+        )
+        .await?;
+        let num_columns = footer.num_columns as usize;
+        let cmo_table_size = 16 * num_columns;
+        if cmo_bytes.len() != cmo_table_size {
+            return Err(Error::io(
+                format!(
+                    "Unexpected CMO size: got {} bytes, expected {}",
+                    cmo_bytes.len(),
+                    cmo_table_size
+                ),
+                location!(),
+            ));
+        }
+        // Selective column metadata will be fetched via coalesced scheduler requests; no full buffer here
+
+        // 4. Build position/length pairs from CMO table
+        let mut positions_and_lengths = Vec::with_capacity(num_columns);
+        for col_idx in 0..footer.num_columns {
+            let offset = (col_idx * 16) as usize;
+            let position = LittleEndian::read_u64(&cmo_bytes[offset..offset + 8]);
+            let length = LittleEndian::read_u64(&cmo_bytes[offset + 8..offset + 16]);
+            positions_and_lengths.push((position, length));
+        }
+
+        // Always include column 0 to correctly determine encoding style for scheduler
+        let mut needed: BTreeSet<u32> = projection.column_indices.iter().copied().collect();
+        needed.insert(0);
+
+        // 5. Decode selected ColumnMetadata from a single tail-backed buffer
+        let mut needed_indices_sorted = needed.iter().copied().collect::<Vec<_>>();
+        needed_indices_sorted.sort_unstable();
+        let col_meta_start = footer.column_meta_start;
+        let cmo_start = footer.column_meta_offsets_start;
+
+        // 5. Build selective metadata ranges for requested columns
+        let mut ranges: Vec<Range<u64>> = Vec::new();
+        let mut idx_order: Vec<u32> = Vec::new();
+        for &idx in &needed_indices_sorted {
+            let (pos, len) = positions_and_lengths[idx as usize];
+            // Column metadata lies in [col_meta_start, cmo_start)
+            let start = pos.max(col_meta_start);
+            let end = (pos + len).min(cmo_start);
+            if end < start {
+                return Err(Error::io(
+                    format!(
+                        "Invalid column metadata range for column {}: pos={}, len={} out of bounds [{}, {})",
+                        idx, pos, len, col_meta_start, cmo_start
+                    ),
+                    location!(),
+                ));
+            }
+            ranges.push(start..end);
+            idx_order.push(idx);
+        }
+        let planned_total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        if planned_total > (footer.global_buff_offsets_start - footer.column_meta_start) {
+            // Defensive fallback: if selective read would exceed full metadata region, read all metadata
+            return Self::read_all_metadata(scheduler).await;
+        }
+
+        // 6. Materialize selected ColumnMetadata by issuing coalesced I/O for just the needed ranges
+        let bytes_vec = scheduler.submit_request(ranges, 0).await?;
+        let mut column_metadatas_opt: Vec<Option<pbfile::ColumnMetadata>> = vec![None; num_columns];
+        for (i, meta_bytes) in bytes_vec.into_iter().enumerate() {
+            let idx = idx_order[i] as usize;
+            let meta = pbfile::ColumnMetadata::decode(meta_bytes)?;
+            if let Some(enc) = &meta.encoding {
+                if matches!(enc.location, Some(pbfile::encoding::Location::Indirect(_))) {
+                    // Fallback to full metadata read if indirect encoding is present
+                    return Self::read_all_metadata(scheduler).await;
+                }
+            }
+            column_metadatas_opt[idx] = Some(meta);
+        }
+
+        // 7. Create ColumnInfos vector sized to num_columns, with placeholders for non-needed columns
+        let mut column_infos: Vec<Arc<ColumnInfo>> = Vec::with_capacity(num_columns);
+        for (col_idx, meta_opt) in column_metadatas_opt.iter().enumerate() {
+            if let Some(meta) = meta_opt {
+                column_infos.push(Self::col_meta_to_col_info(
+                    col_idx as u32,
+                    meta,
+                    file_version,
+                ));
+            } else {
+                // Placeholder ColumnInfo for non-requested columns
+                column_infos.push(Arc::new(ColumnInfo {
+                    index: col_idx as u32,
+                    page_infos: Arc::from([]),
+                    buffer_offsets_and_sizes: Arc::from([]),
+                    encoding: ColumnEncodingMsg {
+                        column_encoding: Some(ColumnEncodingKind::Values(())),
+                    },
+                }));
+            }
+        }
+
+        // 8. Construct a full-length column_metadatas vector with empty placeholders for non-loaded columns
+        let mut column_metadatas: Vec<pbfile::ColumnMetadata> = Vec::with_capacity(num_columns);
+        for meta_opt in column_metadatas_opt.into_iter() {
+            if let Some(meta) = meta_opt {
+                column_metadatas.push(meta);
+            } else {
+                column_metadatas.push(pbfile::ColumnMetadata {
+                    pages: Vec::new(),
+                    buffer_offsets: Vec::new(),
+                    buffer_sizes: Vec::new(),
+                    encoding: None,
+                });
+            }
+        }
+
+        // 9. Compute size summaries
+        let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
+        let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
+        let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
+
+        Ok(CachedFileMetadata {
+            file_schema: Arc::new(schema),
+            column_metadatas,
+            column_infos,
+            num_rows,
+            num_data_bytes,
+            num_column_metadata_bytes,
+            num_global_buffer_bytes,
+            num_footer_bytes,
+            file_buffers: gbo_table,
+            major_version: footer.major_version,
+            minor_version: footer.minor_version,
+        })
+    }
+
+    /// Converts a single ColumnMetadata entry to ColumnInfo
+    fn col_meta_to_col_info(
+        col_idx: u32,
+        col_meta: &pbfile::ColumnMetadata,
+        file_version: LanceFileVersion,
+    ) -> Arc<ColumnInfo> {
+        let page_infos = col_meta
+            .pages
+            .iter()
+            .map(|page| {
+                let num_rows = page.length;
+                let encoding = match file_version {
+                    LanceFileVersion::V2_0 => {
+                        PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                            page.encoding.as_ref().unwrap(),
+                        ))
+                    }
+                    _ => PageEncoding::Structural(Self::fetch_encoding::<pbenc21::PageLayout>(
+                        page.encoding.as_ref().unwrap(),
+                    )),
+                };
+                let buffer_offsets_and_sizes = Arc::from(
+                    page.buffer_offsets
+                        .iter()
+                        .zip(page.buffer_sizes.iter())
+                        .map(|(offset, size)| {
+                            // Starting with version 2.1 we can assert that page buffers are aligned
+                            assert!(
+                                file_version < LanceFileVersion::V2_1
+                                    || offset % PAGE_BUFFER_ALIGNMENT as u64 == 0
+                            );
+                            (*offset, *size)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                PageInfo {
+                    buffer_offsets_and_sizes,
+                    encoding,
+                    num_rows,
+                    priority: page.priority,
+                }
+            })
+            .collect::<Vec<_>>();
+        let buffer_offsets_and_sizes = Arc::from(
+            col_meta
+                .buffer_offsets
+                .iter()
+                .zip(col_meta.buffer_sizes.iter())
+                .map(|(offset, size)| (*offset, *size))
+                .collect::<Vec<_>>(),
+        );
+        Arc::new(ColumnInfo {
+            index: col_idx,
+            page_infos: Arc::from(page_infos),
+            buffer_offsets_and_sizes,
+            encoding: Self::fetch_encoding(col_meta.encoding.as_ref().unwrap()),
+        })
+    }
+
+    fn fetch_encoding<M: Default + prost::Name + Sized>(encoding: &pbfile::Encoding) -> M {
         match &encoding.location {
             Some(pbfile::encoding::Location::Indirect(_)) => todo!(),
             Some(pbfile::encoding::Location::Direct(encoding)) => {
@@ -785,7 +1059,21 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
+        // Prefer selective metadata read when a base projection is provided
+        let file_metadata = if let Some(projection) = base_projection.as_ref() {
+            match Self::read_metadata_for_projection(&scheduler, projection).await {
+                Ok(meta) => Arc::new(meta),
+                Err(e) => {
+                    debug!(
+                        "Selective metadata read failed, falling back to full metadata: {}",
+                        e
+                    );
+                    Arc::new(Self::read_all_metadata(&scheduler).await?)
+                }
+            }
+        } else {
+            Arc::new(Self::read_all_metadata(&scheduler).await?)
+        };
         let path = scheduler.reader().path().clone();
 
         // Create LanceEncodingsIo with read chunk size from options
@@ -1555,8 +1843,6 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
-
     use arrow_array::{
         types::{Float64Type, Int32Type},
         RecordBatch, UInt32Array,
@@ -1575,12 +1861,14 @@ pub mod tests {
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use rstest::rstest;
+    use std::collections::BTreeSet;
+    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
     use tokio::sync::mpsc;
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection},
         testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
-        writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
+        writer::{EncodedBatchWriteExt, FileWriterOptions},
     };
     use lance_encoding::decoder::DecoderConfig;
 
@@ -2227,16 +2515,114 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_selective_metadata_coalesced_io() {
+        use lance_io::scheduler::bytes_read_counter;
+        use lance_io::utils::CachedFileSize;
+
+        let fs = FsFixture::default();
+        // Use 2.1 to exercise structural path
+        let written_file = create_some_file(&fs, LanceFileVersion::V2_1).await;
+        let total_rows = written_file
+            .data
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        // Build a projection for a single logical column
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["score"],
+        )
+        .unwrap();
+
+        let start_bytes = bytes_read_counter();
+        let _reader = FileReader::try_open(
+            file_scheduler.clone(),
+            Some(projection),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let selective_bytes = bytes_read_counter() - start_bytes;
+
+        let start_bytes_full = bytes_read_counter();
+        let _reader_full = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let full_bytes = bytes_read_counter() - start_bytes_full;
+
+        // Opening with selective projection should read fewer bytes of metadata than opening full schema
+        assert!(
+            selective_bytes <= full_bytes,
+            "selective metadata read ({} bytes) should be less than or equal to full metadata read ({} bytes)",
+            selective_bytes,
+            full_bytes
+        );
+
+        // Smoke check that reading data still works with selective metadata
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            Some(
+                ReaderProjection::from_column_names(
+                    LanceFileVersion::V2_1,
+                    &written_file.schema,
+                    &["score"],
+                )
+                .unwrap(),
+            ),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                total_rows as u32,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), total_rows);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
     async fn test_global_buffers() {
+        use crate::v2::testing::{test_cache, FsFixture};
+        use crate::v2::writer::{FileWriter, FileWriterOptions};
         let fs = FsFixture::default();
 
-        let lance_schema =
-            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
-                "foo",
-                DataType::Int32,
-                true,
-            )]))
-            .unwrap();
+        let lance_schema = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+            arrow_schema::Field::new("foo", arrow_schema::DataType::Int32, true),
+        ]))
+        .unwrap();
 
         let mut file_writer = FileWriter::try_new(
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
@@ -2256,6 +2642,7 @@ pub mod tests {
 
         file_writer.finish().await.unwrap();
 
+        use lance_io::utils::CachedFileSize;
         let file_scheduler = fs
             .scheduler
             .open_file(&fs.tmp_path, &CachedFileSize::unknown())
@@ -2273,5 +2660,56 @@ pub mod tests {
 
         let buf = file_reader.read_global_buffer(1).await.unwrap();
         assert_eq!(buf, test_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_open_with_projection_keeps_unrequested_columns_placeholder() {
+        use crate::v2::testing::{test_cache, FsFixture};
+        use lance_io::utils::CachedFileSize;
+
+        let fs = FsFixture::default();
+        // Use v2.1 to exercise structural metadata path
+        let written_file = create_some_file(&fs, LanceFileVersion::V2_1).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["score"],
+        )
+        .unwrap();
+
+        let reader = FileReader::try_open(
+            file_scheduler,
+            Some(projection.clone()),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Ensure non-requested columns have placeholder metadata entries
+        let requested: BTreeSet<u32> = projection.column_indices.iter().copied().collect();
+        for (idx, ci) in reader.metadata.column_infos.iter().enumerate() {
+            let idx = idx as u32;
+            if !requested.contains(&idx) {
+                assert!(
+                    ci.page_infos.is_empty(),
+                    "non-requested column {} should have empty page_infos",
+                    idx
+                );
+                assert!(
+                    ci.buffer_offsets_and_sizes.is_empty(),
+                    "non-requested column {} should have empty buffers",
+                    idx
+                );
+            }
+        }
     }
 }
