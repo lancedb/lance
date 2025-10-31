@@ -86,6 +86,11 @@ if TYPE_CHECKING:
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
+# Unified index type constants
+INDEX_TYPE_VECTOR = "VECTOR"
+INDEX_TYPE_BTREE = "BTREE"
+INDEX_TYPE_INVERTED = "INVERTED"
+
 
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
@@ -2539,6 +2544,9 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         train: bool = True,
+        # distributed indexing parameters
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
         **kwargs,
@@ -2610,6 +2618,16 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method creates temporary index metadata but does not commit the index
+            to the dataset. The index can be committed later using
+            merge_index_metadata(index_uuid, "VECTOR", column=..., index_name=...).
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing. Multiple
+            fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated.
         target_partition_size: int, optional
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
@@ -2887,12 +2905,12 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
             if (ivf_centroids is None) and (pq_codebook is not None):
-                raise ValueError(
-                    "ivf_centroids must be specified when pq_codebook is provided"
+                warnings.warn(
+                    "pq_codebook is ignored; global codebook will be trained",
+                    UserWarning,
                 )
 
             if ivf_centroids is not None:
-                # User provided IVF centroids
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
@@ -2906,17 +2924,15 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
-                            "IVF centroids must be floating number"
-                            + f"got {ivf_centroids.dtype}"
+                            f"IVF centroids must be floating number, "
+                            f"got {ivf_centroids.dtype}"
                         )
                     dim = ivf_centroids.shape[1]
                     values = pa.array(ivf_centroids.reshape(-1))
                     ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
-                # Convert it to RecordBatch because Rust side only accepts RecordBatch.
-                ivf_centroids_batch = pa.RecordBatch.from_arrays(
+                kwargs["ivf_centroids"] = pa.RecordBatch.from_arrays(
                     [ivf_centroids], ["_ivf_centroids"]
                 )
-                kwargs["ivf_centroids"] = ivf_centroids_batch
 
         if "PQ" in index_type:
             if num_sub_vectors is None:
@@ -2957,6 +2973,13 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+        # Add fragment_ids and fragment_uuid to kwargs if provided for
+        # distributed indexing
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
 
         timers["final_create_index:start"] = time.time()
         self._ds.create_index(
@@ -3007,34 +3030,120 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         index_uuid: str,
         index_type: str,
+        index_name: Optional[str] = None,
+        column: Optional[str] = None,
         batch_readhead: Optional[int] = None,
     ):
         """
-        Merge an index which is not commit at present.
+        Unified entry to merge and commit index metadata for VECTOR/BTREE/INVERTED.
+
+        This API first merges temporary index files (e.g., per-fragment partials),
+        and then commits the index manifest so that list_indices() can discover
+        the newly created index.
 
         Parameters
         ----------
-        index_uuid: str
-            The uuid of the index which want to merge.
-        index_type: str
-            The type of the index.
-            Only "BTREE" and "INVERTED" are supported now.
-        batch_readhead: int, optional
-            The number of prefetch batches of sub-page files for merging.
-            Default 1.
+        index_uuid : str
+            The shared UUID used when building fragment-level indices.
+        index_type : str
+            One of "VECTOR", "BTREE", or "INVERTED" (case-insensitive).
+        index_name : str, optional
+            The logical name of the index. Defaults to "<column>_idx" if not provided.
+        column : str, optional
+            The column to attach the index to. Strongly recommended.
+            If omitted, the system will pick a reasonable column candidate based on
+            index_type:
+            - VECTOR: first vector column (FixedSizeList or 1D FixedShapeTensor)
+            - BTREE: first scalar column (int/float/bool/string/fixed-size-binary/
+              temporal)
+            - INVERTED: first string column or list-of-strings
+        batch_readhead : int, optional
+            Prefetch concurrency used by BTREE merge reader. Default: 1.
         """
-        index_type = index_type.upper()
-        if index_type not in [
-            "BTREE",
-            "INVERTED",
-        ]:
+        # Normalize type
+        t = index_type.upper()
+        valid = {INDEX_TYPE_VECTOR, INDEX_TYPE_BTREE, INDEX_TYPE_INVERTED}
+        if t not in valid:
             raise NotImplementedError(
-                (
-                    'Only "BTREE" or "INVERTED" are supported for '
-                    f"merge index metadata.  Received {index_type}",
-                )
+                f'Only "VECTOR", "BTREE" or "INVERTED" are supported, '
+                f"received {index_type}"
             )
-        return self._ds.merge_index_metadata(index_uuid, index_type, batch_readhead)
+
+        # Merge physical index files at the index directory
+        self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
+
+        # Resolve target column (if not provided) based on type heuristics
+        if column is None:
+            # Inspect schema to pick the first suitable column
+            for field in self.schema:
+                ft = field.type
+                if hasattr(ft, "storage_type"):
+                    ft = ft.storage_type
+                if t == INDEX_TYPE_VECTOR:
+                    if (
+                        pa.types.is_fixed_size_list(ft)
+                        or (
+                            pa.types.is_list(ft)
+                            and pa.types.is_fixed_size_list(ft.value_type)
+                        )
+                        or isinstance(ft, pa.FixedShapeTensorType)
+                    ):
+                        column = field.name
+                        break
+                elif t == INDEX_TYPE_BTREE:
+                    if (
+                        pa.types.is_integer(ft)
+                        or pa.types.is_floating(ft)
+                        or pa.types.is_boolean(ft)
+                        or pa.types.is_string(ft)
+                        or pa.types.is_temporal(ft)
+                        or pa.types.is_fixed_size_binary(ft)
+                    ) and not pa.types.is_list(ft):
+                        column = field.name
+                        break
+                elif t == INDEX_TYPE_INVERTED:
+                    value_type = ft
+                    if pa.types.is_list(ft) or pa.types.is_large_list(ft):
+                        value_type = ft.value_type
+                    if pa.types.is_string(value_type) or pa.types.is_large_string(
+                        value_type
+                    ):
+                        column = field.name
+                        break
+            if column is None:
+                raise ValueError(
+                    "Unable to infer a suitable column for the given index type; "
+                    "please provide 'column'."
+                )
+
+        # Default index_name
+        if index_name is None:
+            index_name = f"{column}_idx"
+
+        # Resolve field id from Lance schema
+        field_id = None
+        for f in self.lance_schema.fields():
+            if f.name() == column:
+                field_id = f.id()
+                break
+        if field_id is None:
+            raise ValueError(f"Column '{column}' not found in Lance schema.")
+
+        # Build Index record and commit manifest
+        frag_ids = set([frag.fragment_id for frag in self.get_fragments()])
+        index = Index(
+            uuid=index_uuid,
+            name=index_name,
+            fields=[field_id],
+            dataset_version=self.version,
+            fragment_ids=frag_ids,
+            index_version=0,
+        )
+        create_index_op = LanceOperation.CreateIndex(
+            new_indices=[index], removed_indices=[]
+        )
+        LanceDataset.commit(self.uri, create_index_op, read_version=self.version)
+        return None
 
     def session(self) -> Session:
         """

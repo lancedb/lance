@@ -17,7 +17,8 @@ use crate::{
     index::{
         scalar::build_scalar_index,
         vector::{
-            build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+            build_distributed_vector_index, build_empty_vector_index, build_vector_index,
+            VectorIndexParams, LANCE_VECTOR_INDEX,
         },
         vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
     },
@@ -241,16 +242,32 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
 
                 if train {
-                    // this is a large future so move it to heap
-                    Box::pin(build_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        &index_id.to_string(),
-                        vec_params,
-                        fri,
-                    ))
-                    .await?;
+                    // Check if this is distributed indexing (fragment-level)
+                    if self.fragments.is_some() {
+                        // For distributed indexing, build only on specified fragments
+                        // This creates temporary index metadata without committing
+                        Box::pin(build_distributed_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                            self.fragments.as_ref().unwrap(),
+                        ))
+                        .await?;
+                    } else {
+                        // Standard full dataset indexing
+                        Box::pin(build_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                        ))
+                        .await?;
+                    }
                 } else {
                     // Create empty vector index
                     build_empty_vector_index(

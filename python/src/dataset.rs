@@ -1989,8 +1989,19 @@ impl Dataset {
                     )
                     .await
                 }
-                _ => Err(Error::InvalidInput {
-                    source: format!("Index type {} is not supported.", index_type).into(),
+                "VECTOR" => {
+                    // Merge distributed vector index partials into unified auxiliary.idx
+                    lance_index::vector::distributed::index_merger::merge_vector_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                    )
+                    .await
+                }
+                _ => Err(lance::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Unsupported index type: {}", index_type),
+                    )),
                     location: location!(),
                 }),
             }
@@ -3106,15 +3117,17 @@ fn prepare_vector_index_params(
             pq_params.num_sub_vectors = n.extract()?
         };
 
-        if let Some(c) = kwargs.get_item("pq_codebook")? {
-            let batch = RecordBatch::from_pyarrow_bound(&c)?;
-            if "_pq_codebook" != batch.schema().field(0).name() {
-                return Err(PyValueError::new_err(
-                    "Expected '_pq_codebook' as the first column name.",
-                ));
-            }
-            let codebook = as_fixed_size_list_array(batch.column(0));
-            pq_params.codebook = Some(codebook.values().clone())
+        if let Some(_c) = kwargs.get_item("pq_codebook")? {
+            log::warn!("pq_codebook is ignored; global codebook will be trained by default in distributed IVF-PQ");
+            // For backward compatibility, accept the parameter but do not set pq_params.codebook
+            // let batch = RecordBatch::from_pyarrow_bound(&c)?;
+            // if "_pq_codebook" != batch.schema().field(0).name() {
+            //     return Err(PyValueError::new_err(
+            //         "Expected '_pq_codebook' as the first column name.",
+            //     ));
+            // }
+            // let codebook = as_fixed_size_list_array(batch.column(0));
+            // pq_params.codebook = Some(codebook.values().clone())
         };
 
         if let Some(version) = kwargs.get_item("index_file_version")? {

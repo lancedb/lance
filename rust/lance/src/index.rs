@@ -592,18 +592,44 @@ impl DatasetIndexExt for Dataset {
         // TODO: At some point we should just fail if the index details are missing and ask the user to
         // retrain the index.
         indices.sort_by_key(|idx| idx.fields[0]);
-        let indice_by_field = indices.into_iter().chunk_by(|idx| idx.fields[0]);
-        for (field_id, indices) in &indice_by_field {
-            let indices = indices.collect::<Vec<_>>();
+        // Group indices by field id without holding non-Send iterators across await
+        let mut grouped: Vec<(i32, Vec<&IndexMetadata>)> = Vec::new();
+        {
+            let by_field = indices.into_iter().chunk_by(|idx| idx.fields[0]);
+            for (field_id, group) in &by_field {
+                let group_vec = group.collect::<Vec<_>>();
+                grouped.push((field_id, group_vec));
+            }
+        }
+        for (field_id, indices) in grouped {
             let has_multiple = indices.len() > 1;
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
-                    if index_matches_criteria(idx, &criteria, field, has_multiple, self.schema())? {
-                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
-                        });
-                        let is_fts_index = if let Some(details) = &idx.index_details {
+                    // Backward-compatible: if multiple indices exist on the same field and
+                    // this index is missing details (older manifest format), try to infer
+                    // details from the on-disk index files so we can safely select it.
+                    let idx_checked = if has_multiple && idx.index_details.is_none() {
+                        let field_path = self.schema().field_path(field_id)?;
+                        let details = fetch_index_details(self, &field_path, idx).await?;
+                        let mut idx_clone = idx.clone();
+                        idx_clone.index_details = Some(details);
+                        idx_clone
+                    } else {
+                        idx.clone()
+                    };
+                    if index_matches_criteria(
+                        &idx_checked,
+                        &criteria,
+                        field,
+                        has_multiple,
+                        self.schema(),
+                    )? {
+                        let non_empty =
+                            idx_checked.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                                bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                            });
+                        let is_fts_index = if let Some(details) = &idx_checked.index_details {
                             IndexDetails(details.clone()).supports_fts()
                         } else {
                             false
@@ -613,7 +639,7 @@ impl DatasetIndexExt for Dataset {
                         // bitmap appropriately and fall back to scanning unindexed data.
                         // Other index types can be skipped if empty since they're optional optimizations.
                         if non_empty || is_fts_index {
-                            return Ok(Some(idx.clone()));
+                            return Ok(Some(idx_checked));
                         }
                     }
                 }
