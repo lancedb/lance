@@ -95,9 +95,7 @@ assert isinstance(dataset, pa.dataset.Dataset)
 
 **Tags and branches**
 
-Use branches to manage parallel dataset evolution. You can write to branches, create tags on the latest version of the branch, and check out the branch by tag or a version tuple.
-
-
+Use branches to manage parallel dataset evolution. You can write to branches, create global tags on versions of branches, and check out the branch you want by a tag or a version tuple.
 
 **Pandas**
 ```python
