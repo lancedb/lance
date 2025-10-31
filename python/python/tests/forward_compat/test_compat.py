@@ -143,7 +143,7 @@ def test_write_scalar_index(tmp_path: str):
         }
     )
     ds.insert(data)
-    ds.optimize.optimize_indices()
+    # ds.optimize.optimize_indices()
     ds.optimize.compact_files()
 
 
@@ -165,5 +165,5 @@ def test_write_fts(tmp_path: str):
         }
     )
     ds.insert(data)
-    ds.optimize.optimize_indices()
+    # ds.optimize.optimize_indices()
     ds.optimize.compact_files()

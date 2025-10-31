@@ -759,9 +759,11 @@ impl WriterVersion {
 impl Default for WriterVersion {
     #[cfg(not(test))]
     fn default() -> Self {
+        let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        version.pre = semver::Prerelease::EMPTY;
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: version.to_string(),
         }
     }
 

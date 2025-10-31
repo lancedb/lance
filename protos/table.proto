@@ -58,6 +58,13 @@ message Manifest {
     // that the library is semantically versioned, this is a string. However, if it
     // is semantically versioned, it should be a valid semver string without any 'v'
     // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    //
+    // Compatibility note: The Lance Rust library prior to version X.Y.Z would 
+    // panic if it encountered a non-semver version string here or a version string
+    // with anything more than major, minor, patch version. For example, a "1.2.3-beta"
+    // version string would cause a panic. For compatibility with older datasets, the 
+    // Lance Rust library always writes version as "X.Y.Z" without any pre-release or build
+    // metadata.
     string version = 2;
   }
 
