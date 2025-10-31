@@ -617,6 +617,8 @@ impl DeepSizeOf for BasePath {
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
+    pub prerelease: Option<String>,
+    pub build_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -680,6 +682,36 @@ fn bump_version(version: &mut semver::Version, part: VersionPart) {
 }
 
 impl WriterVersion {
+    /// Split a version string into clean version (major.minor.patch), prerelease, and build metadata.
+    ///
+    /// Returns None if the input is not a valid semver string.
+    ///
+    /// For example:
+    /// - "2.0.0-rc.1" -> Some(("2.0.0", Some("rc.1"), None))
+    /// - "2.0.0-rc.1+build.123" -> Some(("2.0.0", Some("rc.1"), Some("build.123")))
+    /// - "2.0.0+build.123" -> Some(("2.0.0", None, Some("build.123")))
+    /// - "not-a-version" -> None
+    fn split_version(full_version: &str) -> Option<(String, Option<String>, Option<String>)> {
+        let mut parsed = semver::Version::parse(full_version).ok()?;
+
+        let prerelease = if parsed.pre.is_empty() {
+            None
+        } else {
+            Some(parsed.pre.to_string())
+        };
+
+        let build_metadata = if parsed.build.is_empty() {
+            None
+        } else {
+            Some(parsed.build.to_string())
+        };
+
+        // Remove prerelease and build metadata to get clean version
+        parsed.pre = semver::Prerelease::EMPTY;
+        parsed.build = semver::BuildMetadata::EMPTY;
+        Some((parsed.to_string(), prerelease, build_metadata))
+    }
+
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
     #[deprecated(note = "Use `lance_lib_version()` instead")]
@@ -704,12 +736,26 @@ impl WriterVersion {
 
     /// If the library is "lance", parse the version as semver and return it.
     /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
+    ///
+    /// This method reconstructs the full semantic version by combining the version field
+    /// with the prerelease and build_metadata fields (if present). For example:
+    /// - version="2.0.0" + prerelease=Some("rc.1") -> "2.0.0-rc.1"
+    /// - version="2.0.0" + prerelease=Some("rc.1") + build_metadata=Some("build.123") -> "2.0.0-rc.1+build.123"
     pub fn lance_lib_version(&self) -> Option<semver::Version> {
         if self.library != "lance" {
             return None;
         }
 
-        let version = semver::Version::parse(&self.version).ok()?;
+        let mut version = semver::Version::parse(&self.version).ok()?;
+
+        if let Some(ref prerelease) = self.prerelease {
+            version.pre = semver::Prerelease::new(prerelease).ok()?;
+        }
+
+        if let Some(ref build_metadata) = self.build_metadata {
+            version.build = semver::BuildMetadata::new(build_metadata).ok()?;
+        }
+
         Some(version)
     }
 
@@ -749,9 +795,13 @@ impl WriterVersion {
         if !keep_tag {
             version.pre = semver::Prerelease::EMPTY;
         }
+        let (clean_version, prerelease, build_metadata) = Self::split_version(&version.to_string())
+            .expect("Bumped version should be valid semver");
         Self {
             library: self.library.clone(),
-            version: version.to_string(),
+            version: clean_version,
+            prerelease,
+            build_metadata,
         }
     }
 }
@@ -759,9 +809,14 @@ impl WriterVersion {
 impl Default for WriterVersion {
     #[cfg(not(test))]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
     }
 
@@ -769,9 +824,14 @@ impl Default for WriterVersion {
     #[cfg(test)]
     #[allow(deprecated)]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
         .bump(VersionPart::Patch, true)
     }
@@ -809,9 +869,17 @@ impl TryFrom<pb::Manifest> for Manifest {
         });
         // We only use the writer version if it is fully set.
         let writer_version = match p.writer_version {
-            Some(pb::manifest::WriterVersion { library, version }) => {
-                Some(WriterVersion { library, version })
-            }
+            Some(pb::manifest::WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }) => Some(WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }),
             _ => None,
         };
         let fragments = Arc::new(
@@ -922,6 +990,8 @@ impl From<&Manifest> for pb::Manifest {
                 .map(|wv| pb::manifest::WriterVersion {
                     library: wv.library.clone(),
                     version: wv.version.clone(),
+                    prerelease: wv.prerelease.clone(),
+                    build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             table_metadata: m.table_metadata.clone(),
@@ -1031,7 +1101,6 @@ mod tests {
     fn test_writer_version() {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
-        let version = wv.lance_lib_version().unwrap();
 
         // Parse the actual cargo version to check if it has a pre-release tag
         let cargo_version = env!("CARGO_PKG_VERSION");
@@ -1041,6 +1110,25 @@ mod tests {
             None
         };
 
+        // Verify the version field contains only major.minor.patch
+        let version_parts: Vec<&str> = wv.version.split('.').collect();
+        assert_eq!(
+            version_parts.len(),
+            3,
+            "Version should be major.minor.patch"
+        );
+        assert!(
+            !wv.version.contains('-'),
+            "Version field should not contain prerelease"
+        );
+
+        // Verify the prerelease field matches the expected tag
+        assert_eq!(wv.prerelease.as_deref(), expected_tag);
+        // Build metadata should be None for default version
+        assert_eq!(wv.build_metadata, None);
+
+        // Verify lance_lib_version() reconstructs the full semver correctly
+        let version = wv.lance_lib_version().unwrap();
         assert_eq!(
             version.major,
             env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap()
@@ -1061,6 +1149,114 @@ mod tests {
             bump_version(&mut bumped_version, *part);
             assert!(version < bumped_version);
         }
+    }
+
+    #[test]
+    fn test_writer_version_split() {
+        // Test splitting version with prerelease
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version without prerelease
+        let (version, prerelease, build_metadata) = WriterVersion::split_version("2.0.0").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version with prerelease and build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test splitting version with only build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test with invalid version returns None
+        assert!(WriterVersion::split_version("not-a-version").is_none());
+    }
+
+    #[test]
+    fn test_writer_version_comparison_with_prerelease() {
+        let v1 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        let v2 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        let semver1 = v1.lance_lib_version().unwrap();
+        let semver2 = v2.lance_lib_version().unwrap();
+
+        // rc.1 should be less than the release version
+        assert!(semver1 < semver2);
+    }
+
+    #[test]
+    fn test_writer_version_with_build_metadata() {
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: Some("build.123".to_string()),
+        };
+
+        let semver = v.lance_lib_version().unwrap();
+        assert_eq!(semver.to_string(), "2.0.0-rc.1+build.123");
+        assert_eq!(semver.major, 2);
+        assert_eq!(semver.minor, 0);
+        assert_eq!(semver.patch, 0);
+        assert_eq!(semver.pre.as_str(), "rc.1");
+        assert_eq!(semver.build.as_str(), "build.123");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_older_than_with_prerelease() {
+        // Test that older_than correctly handles prerelease
+        let v_rc = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        // 2.0.0-rc.1 should be older than 2.0.0
+        assert!(v_rc.older_than(2, 0, 0));
+
+        // 2.0.0-rc.1 should be older than 2.0.1
+        assert!(v_rc.older_than(2, 0, 1));
+
+        // 2.0.0-rc.1 should not be older than 1.9.9
+        assert!(!v_rc.older_than(1, 9, 9));
+
+        let v_release = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // 2.0.0 should not be older than 2.0.0
+        assert!(!v_release.older_than(2, 0, 0));
+
+        // 2.0.0 should be older than 2.0.1
+        assert!(v_release.older_than(2, 0, 1));
     }
 
     #[test]
