@@ -2829,9 +2829,9 @@ mod tests {
             removed_fragment_ids: vec![],
             updated_fragments: vec![updated_fragment1],
             new_fragments: vec![],
-            fields_modified: fields_modified1,
+            bitmap_prune_field_ids: fields_modified1,
             mem_wal_to_merge: None,
-            fields_for_preserving_frag_bitmap: vec![],
+            bitmap_preserve_field_ids: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
         };
         let mut dataset1 = Dataset::commit(
@@ -2901,9 +2901,9 @@ mod tests {
             removed_fragment_ids: vec![],
             updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
-            fields_modified: fields_modified2,
+            bitmap_prune_field_ids: fields_modified2,
             mem_wal_to_merge: None,
-            fields_for_preserving_frag_bitmap: vec![],
+            bitmap_preserve_field_ids: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
         };
         let dataset2 = Dataset::commit(

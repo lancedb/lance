@@ -211,10 +211,10 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
 
-                let fields_modified = ob.getattr("fields_modified")?.extract()?;
+                let bitmap_prune_field_ids = ob.getattr("bitmap_prune_field_ids")?.extract()?;
 
-                let fields_for_preserving_frag_bitmap = ob
-                    .getattr("fields_for_preserving_frag_bitmap")?
+                let bitmap_preserve_field_ids = ob
+                    .getattr("bitmap_preserve_field_ids")?
                     .extract()
                     .unwrap_or_default();
 
@@ -228,9 +228,9 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
-                    fields_modified,
+                    bitmap_prune_field_ids,
                     mem_wal_to_merge: None,
-                    fields_for_preserving_frag_bitmap,
+                    bitmap_preserve_field_ids,
                     update_mode,
                 };
                 Ok(Self(op))
@@ -367,17 +367,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified,
-                fields_for_preserving_frag_bitmap,
+                bitmap_prune_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
-                let fields_modified = fields_modified.into_pyobject(py)?;
-                let fields_for_preserving_frag_bitmap =
-                    fields_for_preserving_frag_bitmap.into_pyobject(py)?;
+                let bitmap_prune_field_ids = bitmap_prune_field_ids.into_pyobject(py)?;
+                let bitmap_preserve_field_ids = bitmap_preserve_field_ids.into_pyobject(py)?;
                 let update_mode = match update_mode {
                     Some(mode) => match mode {
                         lance::dataset::transaction::UpdateMode::RewriteRows => "rewrite_rows",
@@ -394,8 +393,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
-                    fields_modified,
-                    fields_for_preserving_frag_bitmap,
+                    bitmap_prune_field_ids,
+                    bitmap_preserve_field_ids,
                     update_mode,
                 ))
             }
