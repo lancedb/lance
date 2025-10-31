@@ -128,7 +128,7 @@ def test_list_indices_ignores_new_fts_index_version():
 def test_write_scalar_index(tmp_path: str):
     path = get_path("scalar_index")
     # copy to tmp path to avoid modifying original
-    shutil.copytree(path, tmp_path)
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
 
     ds = lance.dataset(tmp_path)
     data = pa.table(
@@ -155,7 +155,7 @@ def test_write_scalar_index(tmp_path: str):
 def test_write_fts(tmp_path: str):
     path = get_path("fts_index")
     # copy to tmp path to avoid modifying original
-    shutil.copytree(path, tmp_path)
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
 
     ds = lance.dataset(tmp_path)
     data = pa.table(
