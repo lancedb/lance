@@ -6,6 +6,7 @@ use object_store::path::Path;
 use snafu::location;
 
 pub const BRANCH_DIR: &str = "tree";
+pub const MAIN_BRANCH: &str = "main";
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BranchLocation {
@@ -76,6 +77,9 @@ impl BranchLocation {
 
         let root_location = self.find_main()?;
         if let Some(target_branch) = branch_name.as_ref() {
+            if target_branch == MAIN_BRANCH {
+                return Ok(root_location);
+            }
             let (new_path, new_uri) = {
                 // Handle empty segment
                 if target_branch.is_empty() {

@@ -957,6 +957,44 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Create a branch at a specified version. The returned Dataset points to the created branch's
+   * initial version.
+   *
+   * @param branch the branch name to create
+   * @param ref the reference to create branch from
+   * @return a new Dataset of the branch
+   */
+  public Dataset createBranch(String branch, Ref ref) {
+    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
+    return innerCreateBranch(branch, ref, Optional.empty());
+  }
+
+  /**
+   * Create a branch at a specified version. The returned Dataset points to the created branch's
+   * initial version.
+   *
+   * @param branch the branch name to create
+   * @param ref the reference to create branch from
+   * @param storageOptions the storage options to create branch with
+   * @return a new Dataset of the branch
+   */
+  public Dataset createBranch(String branch, Ref ref, Map<String, String> storageOptions) {
+    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
+    Preconditions.checkArgument(
+        storageOptions != null && !storageOptions.isEmpty(), "storageOptions cannot be null");
+    return innerCreateBranch(branch, ref, Optional.of(storageOptions));
+  }
+
+  private Dataset innerCreateBranch(
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions) {
+    Preconditions.checkArgument(branch != null, "Branch cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCreateBranch(branch, ref, storageOptions);
+    }
+  }
+
+  /**
    * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
    * specified (branch_name, version_number).
    *
@@ -989,29 +1027,29 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch.
+     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * #create(String, Ref)} instead.
      *
      * @param tag the tag name
      * @param versionNumber the version number to tag
      */
     public void create(String tag, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTag(tag, versionNumber);
-      }
+      Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
+      create(tag, Ref.ofMain(versionNumber));
     }
 
     /**
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param versionNumber the version number to tag
+     * @param ref the referenced version to tag
      */
-    public void create(String tag, long versionNumber, String targetBranch) {
-      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    public void create(String tag, Ref ref) {
+      Preconditions.checkArgument(tag != null, "Tag name cannot be null");
+      Preconditions.checkArgument(ref != null, "ref cannot be null");
+      try (LockManager.WriteLock readLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTagOnBranch(tag, versionNumber, targetBranch);
+        nativeCreateTag(tag, ref);
       }
     }
 
@@ -1028,29 +1066,29 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version on main branch.
+     * Update a tag to a new version_number on main. This is left for compatibility. We should use
+     * {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the version number to tag
+     * @param versionNumber the versionNumber on main.
      */
-    public void update(String tag, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTag(tag, versionNumber);
-      }
+    public void update(String tag, int versionNumber) {
+      Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
+      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
     }
 
     /**
-     * Update a tag to a new version on a specified branch.
+     * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param version the version to tag
+     * @param ref the referenced version to tag
      */
-    public void update(String tag, long version, String targetBranch) {
-      Preconditions.checkArgument(targetBranch != null, "Branch cannot be null");
+    public void update(String tag, Ref ref) {
+      Preconditions.checkArgument(tag != null, "tag cannot be null");
+      Preconditions.checkArgument(ref != null, "ref cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTagOnBranch(tag, version, targetBranch);
+        nativeUpdateTag(tag, ref);
       }
     }
 
@@ -1082,51 +1120,6 @@ public class Dataset implements Closeable {
 
   /** Branch operations of the dataset. */
   public class Branches {
-    /**
-     * Create a branch at a specified version. The returned Dataset points to the created branch's
-     * initial version.
-     *
-     * @param branch the branch name to create
-     * @param versionNumber the version number to create branch from
-     * @return a new Dataset of the branch
-     */
-    public Dataset create(String branch, long versionNumber) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        return nativeCreateBranch(branch, versionNumber, Optional.empty());
-      }
-    }
-
-    /**
-     * Create a branch from a specific source branch and version.
-     *
-     * @param branchName the branch name to create
-     * @param versionNumber the version number to create branch from
-     * @param sourceBranch the source branch name
-     * @return a new Dataset of the created branch
-     */
-    public Dataset create(String branchName, long versionNumber, String sourceBranch) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        Preconditions.checkNotNull(sourceBranch);
-        return nativeCreateBranch(branchName, versionNumber, Optional.of(sourceBranch));
-      }
-    }
-
-    /**
-     * Create a branch from a tag reference.
-     *
-     * @param branchName the branch name to create
-     * @param sourceTag the tag name to create branch from
-     * @return a new Dataset of the created branch
-     */
-    public Dataset create(String branchName, String sourceTag) {
-      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        Preconditions.checkNotNull(sourceTag);
-        return nativeCreateBranchOnTag(branchName, sourceTag);
-      }
-    }
 
     /**
      * Delete a branch and its metadata.
@@ -1180,7 +1173,7 @@ public class Dataset implements Closeable {
    * @return MergeInsertResult containing the new merged Dataset.
    */
   public MergeInsertResult mergeInsert(MergeInsertParams mergeInsert, ArrowArrayStream source) {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
 
       Dataset newDataset = result.dataset();
@@ -1197,15 +1190,11 @@ public class Dataset implements Closeable {
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
-  private native void nativeCreateTag(String tag, long versionNumber);
-
-  private native void nativeCreateTagOnBranch(String tag, long versionNumber, String branch);
+  private native void nativeCreateTag(String tag, Ref ref);
 
   private native void nativeDeleteTag(String tag);
 
-  private native void nativeUpdateTag(String tag, long versionNumber);
-
-  private native void nativeUpdateTagOnBranch(String tag, long versionNumber, String branch);
+  private native void nativeUpdateTag(String tag, Ref ref);
 
   private native List<Tag> nativeListTags();
 
@@ -1215,9 +1204,7 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckout(Ref ref);
 
   private native Dataset nativeCreateBranch(
-      String branch, long versionNumber, Optional<String> sourceBranch);
-
-  private native Dataset nativeCreateBranchOnTag(String branch, String tagName);
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions);
 
   private native void nativeDeleteBranch(String branch);
 
