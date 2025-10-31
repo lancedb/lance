@@ -120,6 +120,11 @@ def test_list_indices_ignores_new_fts_index_version():
     assert len(indices) == 0
 
 
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.20.0"),
+    reason="Version is too old to read index files stored with Lance 2.0 file format",
+)
 def test_write_scalar_index(tmp_path: str):
     path = get_path("scalar_index")
     # copy to tmp path to avoid modifying original
@@ -142,6 +147,11 @@ def test_write_scalar_index(tmp_path: str):
     ds.optimize.compact_files()
 
 
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.36.0"),
+    reason="FTS token set format was introduced in 0.36.0",
+)
 def test_write_fts(tmp_path: str):
     path = get_path("fts_index")
     # copy to tmp path to avoid modifying original
