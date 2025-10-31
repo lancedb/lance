@@ -63,7 +63,7 @@ We can `create`, `delete`, `list` and `checkout` branches in a dataset.
 
 !!! note
 
-    Creating or deleting branches does not generate new dataset versions as well.
+    Creating or deleting branches does not generate new dataset versions.
     New versions are created by writes (append/overwrite/index operations).
 
     Each branch has a linear history of versions and the version number is strictly increased, which means 
