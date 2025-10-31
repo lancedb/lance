@@ -19,7 +19,11 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
-/** Write Params for Write Operations of Lance. */
+/**
+ * Write Params for Write Operations of Lance. Please check the <a
+ * href="https://docs.rs/lance/latest/src/lance/dataset/write.rs.html#152">rust code</a> for all
+ * default values.
+ */
 public class WriteParams {
 
   /** Write Mode. */
