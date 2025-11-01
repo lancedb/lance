@@ -93,6 +93,10 @@ dataset = lance.dataset("/tmp/test.lance")
 assert isinstance(dataset, pa.dataset.Dataset)
 ```
 
+**Tags and branches**
+
+Use branches to manage parallel dataset evolution. You can write to branches, create global tags on versions of branches, and check out the branch you want by a tag or a version tuple.
+
 **Pandas**
 ```python
 df = dataset.to_table().to_pandas()
@@ -182,7 +186,7 @@ Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Appl
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
 
-**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation.
+**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation. We can also create branches or tags on versions and manage them in Lance.
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
