@@ -65,9 +65,7 @@ use crate::{
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::constants::DICT_SIZE_RATIO_META_KEY;
-use crate::encodings::logical::primitive::dict::{
-    DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-};
+use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
@@ -1232,14 +1230,19 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 4,
                     num_dictionary_items,
                 }),
-                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
-                    dictionary_decompressor: decompressors
-                        .create_block_decompressor(dictionary_encoding)?
-                        .into(),
-                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                    dictionary_data_alignment: 16,
-                    num_dictionary_items,
-                }),
+                Compression::Flat(flat) => {
+                    let bits_per_value = flat.bits_per_value;
+                    let alignment = bits_per_value / 8;
+
+                    Some(MiniBlockSchedulerDictionary {
+                        dictionary_decompressor: decompressors
+                            .create_block_decompressor(dictionary_encoding)?
+                            .into(),
+                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                        dictionary_data_alignment: alignment,
+                        num_dictionary_items,
+                    })
+                }
                 Compression::General(_) => Some(MiniBlockSchedulerDictionary {
                     dictionary_decompressor: decompressors
                         .create_block_decompressor(dictionary_encoding)?
@@ -4168,9 +4171,9 @@ impl PrimitiveStructuralEncoder {
         let num_values = data_block.num_values();
 
         match data_block {
-            DataBlock::FixedWidth(_) => {
+            DataBlock::FixedWidth(fix_width) => {
                 // Dictionary: cardinality unique values at 128 bits each
-                let dict_size = cardinality * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+                let dict_size = cardinality * (fix_width.bits_per_value / 8);
                 // Indices: num_values indices at 32 bits each
                 let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
                 Some(dict_size + indices_size)
@@ -5565,7 +5568,7 @@ mod tests {
             .insert(Stat::Cardinality, cardinality_array);
 
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 32,
+            bits_per_value: 128,
             data: crate::buffer::LanceBuffer::from(vec![0u8; (num_values * 4) as usize]),
             num_values,
             block_info,
@@ -5602,16 +5605,14 @@ mod tests {
 
     #[test]
     fn test_estimate_dict_size_fixed_width() {
-        use crate::encodings::logical::primitive::dict::{
-            DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-        };
+        use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
 
         let block = create_test_fixed_data_block(1000, 400);
         let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
 
         // Dictionary: 400 * 16 bytes (128-bit values)
         // Indices: 1000 * 4 bytes (32-bit i32)
-        let expected_dict_size = 400 * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+        let expected_dict_size = 400 * (128 / 8);
         let expected_indices_size = 1000 * (DICT_INDICES_BITS_PER_VALUE / 8);
         let expected_total = expected_dict_size + expected_indices_size;
 
