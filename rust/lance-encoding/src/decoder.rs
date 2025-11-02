@@ -789,7 +789,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
         } else if data_type.is_binary_like() {
-            let column_info = column_infos.next().unwrap().clone();
+            let column_info = column_infos.expect_next()?;
             // Column is blob and user is asking for binary data
             if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
                 let desc_scheduler =
@@ -813,18 +813,30 @@ impl CoreFieldDecoderStrategy {
                             false,
                         )))
                     };
-                    let list_field = Field::try_from(ArrowField::new(
+                    let list_field_result = Field::try_from(ArrowField::new(
                         field.name.clone(),
                         list_type,
                         field.nullable,
-                    ))
-                    .unwrap();
-                    let list_scheduler = self.create_list_scheduler(
+                    ));
+
+                    if list_field_result.is_err() {
+                        return Err(list_field_result.err().unwrap());
+                    }
+
+                    let list_field = list_field_result?;
+                    let list_scheduler_result = self.create_list_scheduler(
                         &list_field,
                         column_infos,
                         buffers,
                         &column_info,
-                    )?;
+                    );
+
+                    if list_scheduler_result.is_err() {
+                        return Err(list_scheduler_result.err().unwrap());
+                    }
+
+                    let list_scheduler = list_scheduler_result?;
+
                     let binary_scheduler = Box::new(BinaryFieldScheduler::new(
                         list_scheduler.into(),
                         field.data_type(),
@@ -837,7 +849,7 @@ impl CoreFieldDecoderStrategy {
                 }
             } else {
                 return self.create_primitive_scheduler(field, &column_info, buffers);
-            }
+            };
         }
         match &data_type {
             DataType::FixedSizeList(inner, _dimension) => {
