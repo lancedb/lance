@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
@@ -195,9 +196,6 @@ struct IoQueueState {
     pending_requests: BinaryHeap<IoTask>,
     // Priorities of in-flight requests
     priorities_in_flight: PrioritiesInFlight,
-    // Set when the scheduler is finished to notify the I/O loop to shut down
-    // once all outstanding requests have been completed.
-    done_scheduling: bool,
     // Time when the scheduler started
     start: Instant,
     // Last time we warned about backpressure
@@ -211,14 +209,9 @@ impl IoQueueState {
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
             priorities_in_flight: PrioritiesInFlight::new(io_capacity),
-            done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
         }
-    }
-
-    fn finished(&self) -> bool {
-        self.done_scheduling && self.pending_requests.is_empty()
     }
 
     fn warn_if_needed(&self) {
@@ -303,7 +296,7 @@ impl IoQueue {
         self.notify.notify_one();
     }
 
-    async fn pop(&self) -> Option<IoTask> {
+    async fn pop(&self) -> IoTask {
         loop {
             {
                 // First, grab a reservation on the global IOPS quota
@@ -317,11 +310,7 @@ impl IoQueue {
                     // Reservation successfully acquired, we will release the global
                     // global reservation after task has run.
                     iop_res.forget();
-                    return Some(task);
-                }
-
-                if state.finished() {
-                    return None;
+                    return task;
                 }
             }
 
@@ -343,14 +332,6 @@ impl IoQueue {
         for _ in 0..num_reqs {
             state.priorities_in_flight.remove(priority);
         }
-        drop(state);
-
-        self.notify.notify_one();
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.done_scheduling = true;
         drop(state);
 
         self.notify.notify_one();
@@ -506,19 +487,9 @@ impl IoTask {
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(tasks: Arc<IoQueue>) {
-    // Pop the first finished task off the queue and submit another until
-    // we are done
     loop {
         let next_task = tasks.pop().await;
-        match next_task {
-            Some(task) => {
-                tokio::spawn(task.run());
-            }
-            None => {
-                // The sender has been dropped, we are done
-                return;
-            }
-        }
+        tokio::spawn(next_task.run());
     }
 }
 
@@ -584,6 +555,7 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: Arc<IoQueue>,
     stats: Arc<StatsCollector>,
+    io_loop_handle: JoinHandle<()>,
 }
 
 impl Debug for ScanScheduler {
@@ -639,13 +611,12 @@ impl ScanScheduler {
             io_capacity as u32,
             config.io_buffer_size_bytes,
         ));
-        let scheduler = Self {
+        Arc::new(Self {
             object_store,
             io_queue: io_queue.clone(),
             stats: Arc::new(StatsCollector::new()),
-        };
-        tokio::task::spawn(async move { run_io_loop(io_queue).await });
-        Arc::new(scheduler)
+            io_loop_handle: tokio::task::spawn(async move { run_io_loop(io_queue).await }),
+        })
     }
 
     /// Open a file for reading
@@ -769,7 +740,7 @@ impl ScanScheduler {
 
 impl Drop for ScanScheduler {
     fn drop(&mut self) {
-        self.io_queue.close();
+        self.io_loop_handle.abort();
     }
 }
 

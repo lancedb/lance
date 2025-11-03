@@ -2056,6 +2056,10 @@ impl Scanner {
             read_options = read_options.with_deleted_rows()?;
         }
 
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
         let index_input = filter_plan.index_query.clone().map(|index_query| {
             Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
                 as Arc<dyn ExecutionPlan>
@@ -8375,5 +8379,54 @@ mod test {
                 "All rows created at version 1"
             );
         }
+    }
+
+    #[test_log::test(test)]
+    fn test_scan_finishes_all_tasks() {
+        // Need to use multi-threaded runtime otherwise tasks don't run unless someone is polling somewhere
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let ds = lance_datagen::gen_batch()
+                .col("id", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1000), FragmentRowCount::from(10))
+                .await
+                .unwrap();
+
+            // This scan with has a small I/O buffer size and batch size to mimic a real-world situation
+            // that required a lot of data.  Many fragments will be scheduled at low priority and the data
+            // buffer will fill up with data reads.  When the scan is abandoned, the tasks to read the fragment
+            // metadata were left behind and would never finish because the data was never decoded to drain the
+            // backpressure queue.
+            //
+            // The fix (that this test verifies) is to ensure we close the I/O scheduler when the scan is abandoned.
+            let mut stream = ds
+                .scan()
+                .fragment_readahead(1000)
+                .batch_size(1)
+                .io_buffer_size(1)
+                .batch_readahead(1)
+                .try_into_stream()
+                .await
+                .unwrap();
+            stream.next().await.unwrap().unwrap();
+        });
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if runtime.handle().metrics().num_alive_tasks() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            runtime.handle().metrics().num_alive_tasks() == 0,
+            "Tasks should have finished within 10 seconds but there are still {} tasks running",
+            runtime.handle().metrics().num_alive_tasks()
+        );
     }
 }
