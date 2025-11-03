@@ -167,3 +167,70 @@ Output:
 4     dave   66         4
 5      eve   77         3
 ``` 
+
+## Update Columns
+
+Currently, Lance supports the fragment level update columns ability to update existing columns in a distributed manner.
+
+This operation performs a left-outer-hash-join with the right table (new data)
+on the column specified by `left_on` and `right_on`. For every row in the current
+fragment, the updated column value is:
+1. If no matched row on the right side, the column value of the left side row.
+2. If there is exactly one corresponding row on the right side, the column value
+   of the matching row.
+3. If there are multiple corresponding rows, the column value of a random row.
+
+```python
+import lance
+import pyarrow as pa
+
+# Create initial dataset
+data = pa.table(
+    {
+        "id": [1, 2, 3, 4],
+        "name": ["Alice", "Bob", "Charlie", "David"],
+        "score": [85, 90, 75, 80],
+    }
+)
+dataset_uri = "test_dataset_update_columns_custom_join_key"
+dataset = lance.write_dataset(data, dataset_uri)
+
+# Prepare update data using 'id' as join key
+# Note: We only update 'score', not 'id' itself
+update_data = pa.table(
+    {
+        "id": [1, 3],
+        "name": ["Alan", "Chase"],
+        "score": [95, 85],
+    }
+)
+
+# Get the fragment and update columns
+fragment = dataset.get_fragment(0)
+updated_fragment, fields_modified = fragment.update_columns(
+    update_data, left_on="id", right_on="id"
+)
+
+# Commit the changes
+
+op = lance.LanceOperation.Update(
+    updated_fragments=[updated_fragment],
+    fields_modified=fields_modified,
+)
+updated_dataset = lance.LanceDataset.commit(
+    str(dataset_uri), op, read_version=dataset.version
+)
+
+# Verify the update
+result = updated_dataset.to_table().to_pydict()
+print(result)
+```
+
+Output:
+```
+   id   name  score
+0   1   Alan     95
+1   2    Bob     90
+2   3  Chase     85
+3   4  David     80
+```
