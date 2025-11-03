@@ -156,7 +156,10 @@ def test_write_fts(tmp_path: str):
     # copy to tmp path to avoid modifying original
     shutil.copytree(path, tmp_path, dirs_exist_ok=True)
 
-    ds = lance.dataset(tmp_path)
+    # Dataset::load_manifest does not do retain_supported_indices
+    # so this can only work with no cache
+    session = lance.Session(index_cache_size_bytes=0, metadata_cache_size_bytes=0)
+    ds = lance.dataset(tmp_path, session=session)
     data = pa.table(
         {
             "idx": pa.array([1000]),
@@ -164,5 +167,7 @@ def test_write_fts(tmp_path: str):
         }
     )
     ds.insert(data)
+    num_frags = len(ds.get_fragments())
     # ds.optimize.optimize_indices()
     ds.optimize.compact_files()
+    assert len(ds.get_fragments()) < num_frags
