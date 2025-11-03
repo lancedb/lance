@@ -90,6 +90,7 @@ use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::utils::make_rowid_capture_stream;
+use super::write::InputData;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
@@ -732,7 +733,7 @@ async fn rewrite_files(
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema().clone(),
-        reader,
+        InputData::Stream(reader),
         params,
         None, // Compaction doesn't use target_bases
     )

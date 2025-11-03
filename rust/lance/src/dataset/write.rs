@@ -2,19 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{Stream, StreamExt, TryStreamExt};
+use datafusion_physical_plan::RecordBatchStream;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
-use lance_core::error::LanceOptionExt;
-use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -28,6 +27,7 @@ use object_store::path::Path;
 use snafu::location;
 use std::collections::HashMap;
 use std::num::NonZero;
+use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -54,6 +54,82 @@ pub mod update;
 pub use commit::CommitBuilder;
 pub use delete::DeleteBuilder;
 pub use insert::InsertBuilder;
+
+/// Input data for write operations.
+///
+/// This enum distinguishes between streaming and materialized (in-memory) inputs.
+/// Materialized inputs can be optimized to avoid unnecessary spilling and enable
+/// better query planning in operations like merge_insert.
+pub enum InputData {
+    /// A stream of record batches that may be larger than memory
+    Stream(SendableRecordBatchStream),
+    /// Fully materialized data that is already in memory
+    Materialized {
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+    },
+}
+
+impl InputData {
+    /// Convert the input data into a stream
+    pub fn into_stream(self) -> SendableRecordBatchStream {
+        match self {
+            InputData::Stream(stream) => stream,
+            InputData::Materialized { batches, schema } => {
+                let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+            }
+        }
+    }
+
+    /// Check if the input data is materialized
+    pub fn is_materialized(&self) -> bool {
+        matches!(self, InputData::Materialized { .. })
+    }
+
+    /// Get the schema of the input data
+    pub fn schema(&self) -> SchemaRef {
+        match self {
+            InputData::Stream(stream) => stream.schema(),
+            InputData::Materialized { schema, .. } => schema.clone(),
+        }
+    }
+}
+
+impl<T: RecordBatchStream + Send + 'static> From<Pin<Box<T>>> for InputData {
+    fn from(stream: Pin<Box<T>>) -> Self {
+        InputData::Stream(stream as SendableRecordBatchStream)
+    }
+}
+
+impl From<SendableRecordBatchStream> for InputData {
+    fn from(stream: SendableRecordBatchStream) -> Self {
+        InputData::Stream(stream)
+    }
+}
+
+impl From<RecordBatch> for InputData {
+    fn from(batch: RecordBatch) -> Self {
+        let schema = batch.schema();
+        InputData::Materialized {
+            batches: vec![batch],
+            schema,
+        }
+    }
+}
+
+impl From<Vec<RecordBatch>> for InputData {
+    fn from(batches: Vec<RecordBatch>) -> Self {
+        if batches.is_empty() {
+            // Create empty schema
+            let schema = Arc::new(arrow_schema::Schema::empty());
+            InputData::Materialized { batches, schema }
+        } else {
+            let schema = batches[0].schema();
+            InputData::Materialized { batches, schema }
+        }
+    }
+}
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]
@@ -572,7 +648,7 @@ pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: Schema,
-    data: SendableRecordBatchStream,
+    data: InputData,
     mut params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<WrittenFragments> {
@@ -585,15 +661,18 @@ pub async fn write_fragments_internal(
         .iter()
         .any(|f| is_arrow_json_field(f));
 
+    // Convert InputData to stream for JSON conversion and blob extraction
     let (data, converted_schema) = if needs_conversion {
-        let data = wrap_json_stream_for_writing(data);
+        let stream = data.into_stream();
+        let data = wrap_json_stream_for_writing(stream);
         // Update the schema to match the converted data
         let arrow_schema = data.schema();
         let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
         (data, converted_schema)
     } else {
         // No conversion needed, use original schema to preserve dictionary info
-        (data, schema)
+        let stream = data.into_stream();
+        (stream, schema)
     };
 
     // Make sure the max rows per group is not larger than the max rows per file
@@ -974,112 +1053,6 @@ async fn resolve_commit_handler(
     }
 }
 
-/// Create an iterator of record batch streams from the given source.
-///
-/// If `enable_retries` is true, then the source will be saved either in memory
-/// or spilled to disk to allow replaying the source in case of a failure. The
-/// source will be kept in memory if either (1) the size hint shows that
-/// there is only one batch or (2) the stream contains less than 100MB of
-/// data. Otherwise, the source will be spilled to a temporary file on disk.
-///
-/// This is used to support retries on write operations.
-async fn new_source_iter(
-    source: SendableRecordBatchStream,
-    enable_retries: bool,
-) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
-    if enable_retries {
-        let schema = source.schema();
-
-        // If size hint shows there is only one batch, spilling has no benefit, just keep that
-        // in memory. (This is a pretty common case.)
-        let size_hint = source.size_hint();
-        if size_hint.0 == 1 && size_hint.1 == Some(1) {
-            let batches: Vec<RecordBatch> = source.try_collect().await?;
-            Ok(Box::new(std::iter::repeat_with(move || {
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema.clone(),
-                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
-                )) as SendableRecordBatchStream
-            })))
-        } else {
-            // Allow buffering up to 100MB in memory before spilling to disk.
-            Ok(Box::new(
-                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
-            ))
-        }
-    } else {
-        Ok(Box::new(std::iter::once(source)))
-    }
-}
-
-struct SpillStreamIter {
-    receiver: SpillReceiver,
-    #[allow(dead_code)] // Exists to keep the SpillSender alive
-    sender_handle: tokio::task::JoinHandle<SpillSender>,
-    // This temp dir is used to store the spilled data. It is kept alive by
-    // this struct. When this struct is dropped, the Drop implementation of
-    // tempfile::TempDir will delete the temp dir.
-    #[allow(dead_code)] // Exists to keep the temp dir alive
-    tmp_dir: TempDir,
-}
-
-impl SpillStreamIter {
-    pub async fn try_new(
-        mut source: SendableRecordBatchStream,
-        memory_limit: usize,
-    ) -> Result<Self> {
-        let tmp_dir = tokio::task::spawn_blocking(|| {
-            TempDir::try_new().map_err(|e| Error::InvalidInput {
-                source: format!("Failed to create temp dir: {}", e).into(),
-                location: location!(),
-            })
-        })
-        .await
-        .ok()
-        .expect_ok()??;
-
-        let tmp_path = tmp_dir.std_path().join("spill.arrows");
-        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
-
-        let sender_handle = tokio::task::spawn(async move {
-            while let Some(res) = source.next().await {
-                match res {
-                    Ok(batch) => match sender.write(batch).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            sender.send_error(e);
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        sender.send_error(e);
-                        break;
-                    }
-                }
-            }
-
-            if let Err(err) = sender.finish().await {
-                sender.send_error(err);
-            }
-            sender
-        });
-
-        Ok(Self {
-            receiver,
-            tmp_dir,
-            sender_handle,
-        })
-    }
-}
-
-impl Iterator for SpillStreamIter {
-    type Item = SendableRecordBatchStream;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.receiver.read())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,7 +1174,7 @@ mod tests {
                     object_store,
                     &Path::from("test"),
                     schema,
-                    data_stream,
+                    InputData::Stream(data_stream),
                     write_params,
                     None,
                 )
@@ -1273,7 +1246,7 @@ mod tests {
                 object_store,
                 &Path::from("test"),
                 schema,
-                data_stream,
+                InputData::Stream(data_stream),
                 write_params,
                 None,
             )
@@ -1351,7 +1324,7 @@ mod tests {
             object_store.clone(),
             &base_path,
             schema.clone(),
-            data_stream,
+            InputData::Stream(data_stream),
             write_params,
             None,
         )

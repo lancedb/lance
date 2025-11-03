@@ -22,7 +22,7 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 use assign_action::merge_insert_action;
 
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::{write_fragments_internal, CommitBuilder, InputData, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -47,6 +47,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::NullEquality;
 use datafusion::error::DataFusionError;
 use datafusion::{
+    datasource::MemTable,
     execution::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
@@ -584,7 +585,7 @@ impl MergeInsertJob {
 
     async fn create_indexed_scan_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source: InputData,
         index: IndexMetadata,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
@@ -595,8 +596,9 @@ impl MergeInsertJob {
             SchemaComparison::Subschema => true,
         };
 
-        // 1 - Input from user
-        let input = Arc::new(OneShotExec::new(source));
+        // 1 - Input from user - convert to stream for OneShotExec
+        let stream = source.into_stream();
+        let input = Arc::new(OneShotExec::new(stream));
 
         // 2 - Fork/Replay the input
         // Regrettably, this needs to have unbounded capacity, and so we need to fully read
@@ -752,12 +754,21 @@ impl MergeInsertJob {
     // If the join keys are not indexed then we need to do a full scan of the table
     async fn create_full_table_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source: InputData,
     ) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
-        let new_data = session_ctx.read_one_shot(source)?;
+
+        // For materialized inputs, use MemTable which enables DataFusion to compute statistics
+        // for better join optimization. For streaming inputs, use read_one_shot.
+        let new_data = match source {
+            InputData::Materialized { batches, schema } => {
+                let mem_table = MemTable::try_new(schema, vec![batches])?;
+                session_ctx.read_table(Arc::new(mem_table))?
+            }
+            InputData::Stream(stream) => session_ctx.read_one_shot(stream)?,
+        };
         let join_cols = self
             .params
             .on // columns to join on
@@ -824,13 +835,16 @@ impl MergeInsertJob {
         if can_use_scalar_index {
             // keeping unmatched rows, no deletion
             if let Some(index) = self.join_key_as_scalar_index().await? {
-                self.create_indexed_scan_joined_stream(source, index).await
+                self.create_indexed_scan_joined_stream(InputData::Stream(source), index)
+                    .await
             } else {
-                self.create_full_table_joined_stream(source).await
+                self.create_full_table_joined_stream(InputData::Stream(source))
+                    .await
             }
         } else {
             info!("The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan");
-            self.create_full_table_joined_stream(source).await
+            self.create_full_table_joined_stream(InputData::Stream(source))
+                .await
         }
     }
 
@@ -1102,7 +1116,7 @@ impl MergeInsertJob {
                     dataset.object_store.clone(),
                     &dataset.base,
                     write_schema,
-                    stream,
+                    InputData::Stream(stream),
                     Default::default(), // TODO: support write params.
                     None,               // Merge insert doesn't use target_bases
                 )
@@ -1227,20 +1241,25 @@ impl MergeInsertJob {
     ///
     /// This will take in the source, merge it with the existing target data, and insert new
     /// rows, update existing rows, and delete existing rows
-    pub async fn execute(
-        self,
-        source: SendableRecordBatchStream,
-    ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let source_iter = super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+    pub async fn execute(self, source: impl Into<InputData>) -> Result<(Arc<Dataset>, MergeStats)> {
+        let source = source.into();
         let dataset = self.dataset.clone();
+
+        // Disable retries for streaming inputs, only enable for materialized data
+        let max_retries = if source.is_materialized() {
+            self.params.conflict_retries
+        } else {
+            0
+        };
+
         let config = RetryConfig {
-            max_retries: self.params.conflict_retries,
+            max_retries,
             retry_timeout: self.params.retry_timeout,
         };
 
-        let wrapper = MergeInsertJobWithIterator {
+        let wrapper = MergeInsertJobWithData {
             job: self,
-            source_iter: Arc::new(Mutex::new(source_iter)),
+            source: Arc::new(Mutex::new(Some(source))),
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -1255,13 +1274,11 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(stream).await
+        self.execute_uncommitted_impl(InputData::Stream(stream))
+            .await
     }
 
-    async fn create_plan(
-        self,
-        source: SendableRecordBatchStream,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan(self, source: InputData) -> Result<Arc<dyn ExecutionPlan>> {
         // Goal: we shouldn't manually have to specify which columns to scan.
         //       DataFusion's optimizer should be able to automatically perform
         //       projection pushdown for us.
@@ -1276,7 +1293,15 @@ impl MergeInsertJob {
             .iter()
             .map(|name| name.as_str())
             .collect::<Vec<_>>();
-        let source_df = session_ctx.read_one_shot(source)?;
+
+        // Use MemTable for materialized inputs to enable statistics for join optimization
+        let source_df = match source {
+            InputData::Materialized { batches, schema } => {
+                let mem_table = MemTable::try_new(schema, vec![batches])?;
+                session_ctx.read_table(Arc::new(mem_table))?
+            }
+            InputData::Stream(stream) => session_ctx.read_one_shot(stream)?,
+        };
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
         let join_type = if self.params.insert_not_matched {
@@ -1317,7 +1342,7 @@ impl MergeInsertJob {
 
     async fn execute_uncommitted_v2(
         self,
-        source: SendableRecordBatchStream,
+        source: InputData,
     ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
         let plan = self.create_plan(source).await?;
 
@@ -1414,10 +1439,7 @@ impl MergeInsertJob {
             ))
     }
 
-    async fn execute_uncommitted_impl(
-        self,
-        source: SendableRecordBatchStream,
-    ) -> Result<UncommittedMergeInsert> {
+    async fn execute_uncommitted_impl(self, source: InputData) -> Result<UncommittedMergeInsert> {
         // Check if we can use the fast path
         let can_use_fast_path = self.can_use_create_plan(source.schema().as_ref()).await?;
 
@@ -1440,7 +1462,7 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
-        let joined = self.create_joined_stream(source).await?;
+        let joined = self.create_joined_stream(source.into_stream()).await?;
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -1492,7 +1514,7 @@ impl MergeInsertJob {
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema().clone(),
-                Box::pin(stream),
+                InputData::Stream(Box::pin(stream)),
                 WriteParams::default(),
                 None, // Merge insert doesn't use target_bases
             )
@@ -1670,7 +1692,9 @@ impl MergeInsertJob {
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(Box::pin(stream)).await?;
+        let plan = cloned_job
+            .create_plan(InputData::Stream(Box::pin(stream)))
+            .await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))
@@ -1695,7 +1719,8 @@ impl MergeInsertJob {
     ///
     /// Returns Error::NotSupported if the merge insert configuration doesn't support
     /// the fast path required for plan generation.
-    pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
+    pub async fn analyze_plan(&self, source: impl Into<InputData>) -> Result<String> {
+        let source = source.into();
         // Check if we can use create_plan
         if !self.can_use_create_plan(source.schema().as_ref()).await? {
             return Err(Error::NotSupported {
@@ -1753,15 +1778,17 @@ pub struct UncommittedMergeInsert {
     pub stats: MergeStats,
 }
 
-/// Wrapper struct that combines MergeInsertJob with the source iterator for retry functionality
+/// Wrapper struct that combines MergeInsertJob with the source data for retry functionality.
+/// Holds InputData directly instead of an iterator. For materialized data, the batches are
+/// cloned on retry. For streaming data, retries are disabled.
 #[derive(Clone)]
-struct MergeInsertJobWithIterator {
+struct MergeInsertJobWithData {
     job: MergeInsertJob,
-    source_iter: Arc<Mutex<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>>>,
+    source: Arc<Mutex<Option<InputData>>>,
     attempt_count: Arc<AtomicU32>,
 }
 
-impl RetryExecutor for MergeInsertJobWithIterator {
+impl RetryExecutor for MergeInsertJobWithData {
     type Data = UncommittedMergeInsert;
     type Result = (Arc<Dataset>, MergeStats);
 
@@ -1769,10 +1796,36 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         // Increment attempt counter
         self.attempt_count.fetch_add(1, Ordering::SeqCst);
 
-        // We need to get a fresh stream for each retry attempt
-        // The source_iter provides unlimited streams from the same source data
-        let stream = self.source_iter.lock().unwrap().next().unwrap();
-        self.job.clone().execute_uncommitted_impl(stream).await
+        // Take the source data from the mutex
+        let source = self
+            .source
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Error::Internal {
+                message: "Source data already consumed".into(),
+                location: location!(),
+            })?;
+
+        // For materialized data, we can clone the batches back for potential retry
+        // For streaming data, this will consume the stream (but retries are disabled for streams anyway)
+        let source_for_retry = match &source {
+            InputData::Materialized { batches, schema } => Some(InputData::Materialized {
+                batches: batches.clone(),
+                schema: schema.clone(),
+            }),
+            InputData::Stream(_) => None,
+        };
+
+        // Execute the operation
+        let result = self.job.clone().execute_uncommitted_impl(source).await;
+
+        // If we have data for retry (materialized case), put it back
+        if let Some(retry_data) = source_for_retry {
+            *self.source.lock().unwrap() = Some(retry_data);
+        }
+
+        result
     }
 
     async fn commit(&self, dataset: Arc<Dataset>, mut data: Self::Data) -> Result<Self::Result> {
@@ -2115,6 +2168,7 @@ mod tests {
         FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
         RecordBatchReader, StringArray, UInt32Array,
     };
+    use arrow_schema::ArrowError;
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -3948,9 +4002,15 @@ mod tests {
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
         let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
-        let new_data_stream = reader_to_stream(Box::new(new_data));
+        // let new_data_stream = reader_to_stream(Box::new(new_data));
+        let new_data = new_data
+            .collect::<std::result::Result<Vec<RecordBatch>, ArrowError>>()
+            .unwrap();
 
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        println!("{}", merge_insert_job.analyze_plan(new_data).await.unwrap());
+        assert!(false);
+
+        // let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
         // Assert the plan structure using portable plan matching
         // The optimized plan should have:
@@ -3959,20 +4019,20 @@ mod tests {
         // 3. ProjectionExec that creates the common expression for key validation
         // 4. HashJoin with projection optimization
         // 5. LanceScan that only reads the key column (projection pushdown working!)
-        assert_plan_node_equals(
-            plan,
-            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
-  CoalescePartitionsExec
-    ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@2 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@2 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
-        CoalesceBatchesExec...
-          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-            CooperativeExec
-              LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-              row_id=true, row_addr=true, full_filter=--, refine_filter=--
-            RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
-              StreamingTableExec: partition_sizes=1, projection=[value, key]"
-        ).await.unwrap();
+        //         assert_plan_node_equals(
+        //             plan,
+        //             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+        //   CoalescePartitionsExec
+        //     ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@2 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@2 IS NOT NULL THEN 1 ELSE 0 END as __action]
+        //       ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
+        //         CoalesceBatchesExec...
+        //           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+        //             CooperativeExec
+        //               LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+        //               row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        //             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+        //               StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        //         ).await.unwrap();
     }
 
     #[tokio::test]
@@ -4004,7 +4064,10 @@ mod tests {
         let new_data_stream = reader_to_stream(Box::new(new_data));
 
         // This should use the fast path (execute_uncommitted_v2)
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(InputData::Stream(new_data_stream))
+            .await
+            .unwrap();
 
         // The optimized plan should use Inner join instead of Right join
         // since we're not inserting unmatched rows
@@ -4052,7 +4115,10 @@ mod tests {
         let new_data_reader = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
         let new_data_stream = reader_to_stream(Box::new(new_data_reader));
 
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(InputData::Stream(new_data_stream))
+            .await
+            .unwrap();
 
         // The optimized plan should use Inner join and include the UpdateIf condition
         assert_plan_node_equals(
@@ -4708,7 +4774,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
                 .try_build()
                 .unwrap()
-                .execute(Box::pin(upsert_stream))
+                .execute(InputData::Stream(Box::pin(upsert_stream)))
                 .await
                 .unwrap();
 
@@ -4825,7 +4891,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
                 .try_build()
                 .unwrap()
-                .execute(Box::pin(upsert_stream))
+                .execute(InputData::Stream(Box::pin(upsert_stream)))
                 .await
                 .unwrap();
 
