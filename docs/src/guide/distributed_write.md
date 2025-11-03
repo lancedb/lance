@@ -184,20 +184,30 @@ fragment, the updated column value is:
 import lance
 import pyarrow as pa
 
-# Create initial dataset
-data = pa.table(
+# Create initial dataset with two fragments
+# First fragment
+data1 = pa.table(
     {
         "id": [1, 2, 3, 4],
         "name": ["Alice", "Bob", "Charlie", "David"],
         "score": [85, 90, 75, 80],
     }
 )
-dataset_uri = "test_dataset_update_columns_custom_join_key"
-dataset = lance.write_dataset(data, dataset_uri)
+dataset_uri = "./my_dataset.lance"
+dataset = lance.write_dataset(data1, dataset_uri)
 
-# Prepare update data using 'id' as join key
-# Note: We only update 'score', not 'id' itself
-update_data = pa.table(
+# Second fragment
+data2 = pa.table(
+    {
+        "id": [5, 6, 7, 8],
+        "name": ["Eve", "Frank", "Grace", "Henry"],
+        "score": [88, 92, 78, 82],
+    }
+)
+dataset = lance.write_dataset(data2, dataset_uri, mode="append")
+
+# Prepare update data for fragment 0 using 'id' as join key
+update_data1 = pa.table(
     {
         "id": [1, 3],
         "name": ["Alan", "Chase"],
@@ -205,16 +215,30 @@ update_data = pa.table(
     }
 )
 
-# Get the fragment and update columns
-fragment = dataset.get_fragment(0)
-updated_fragment, fields_modified = fragment.update_columns(
-    update_data, left_on="id", right_on="id"
+# Prepare update data for fragment 1
+update_data2 = pa.table(
+    {
+        "id": [5, 7],
+        "name": ["Eva", "Gracie"],
+        "score": [98, 88],
+    }
 )
 
-# Commit the changes
+# Update fragment 0
+fragment0 = dataset.get_fragment(0)
+updated_fragment0, fields_modified = fragment0.update_columns(
+    update_data1, left_on="id", right_on="id"
+)
 
+# Update fragment 1
+fragment1 = dataset.get_fragment(1)
+updated_fragment1, _ = fragment1.update_columns(
+    update_data2, left_on="id", right_on="id"
+)
+
+# Commit the changes for both fragments
 op = lance.LanceOperation.Update(
-    updated_fragments=[updated_fragment],
+    updated_fragments=[updated_fragment0, updated_fragment1],
     fields_modified=fields_modified,
 )
 updated_dataset = lance.LanceDataset.commit(
@@ -222,15 +246,19 @@ updated_dataset = lance.LanceDataset.commit(
 )
 
 # Verify the update
-result = updated_dataset.to_table().to_pydict()
-print(result)
+dataset = lance.dataset(dataset_uri)
+print(dataset.to_table().to_pandas())
 ```
 
 Output:
 ```
-   id   name  score
-0   1   Alan     95
-1   2    Bob     90
-2   3  Chase     85
-3   4  David     80
+   id    name  score
+0   1    Alan     95
+1   2     Bob     90
+2   3   Chase     85
+3   4   David     80
+4   5     Eva     98
+5   6   Frank     92
+6   7  Gracie     88
+7   8   Henry     82
 ```
