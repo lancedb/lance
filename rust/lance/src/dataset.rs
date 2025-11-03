@@ -9838,4 +9838,221 @@ mod tests {
             .unwrap();
         assert_eq!(1, batch.num_rows());
     }
+
+    #[tokio::test]
+    async fn test_add_sub_column_to_packed_struct_col_v2_2() {
+        test_add_sub_column_to_packed_struct_col(LanceFileVersion::V2_2).await;
+    }
+
+    async fn test_add_sub_column_to_packed_struct_col(version: LanceFileVersion) {
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:packed".to_string(), "true".to_string());
+        let mut dataset = prepare_initial_dataset_with_struct_col(version, metadata).await;
+
+        // add 2 sub-columns of animal
+        let batch = prepare_sub_column_batch().await;
+        let new_schema = batch.schema();
+
+        let error = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(batch)],
+                    new_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Column animal is packed struct and already exists in the dataset"));
+    }
+
+    #[tokio::test]
+    async fn test_add_sub_column_to_struct_col_v2_0() {
+        let mut dataset =
+            prepare_initial_dataset_with_struct_col(LanceFileVersion::V2_0, HashMap::new()).await;
+
+        // add 2 sub-column of animal
+        let batch = prepare_sub_column_batch().await;
+        let new_schema = batch.schema();
+
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(batch)],
+                    new_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(
+            "Column animal is a struct col, add sub column is not supported in Lance file version"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_add_sub_column_to_struct_col_v2_1() {
+        test_add_sub_column_to_struct_col(LanceFileVersion::V2_1).await;
+    }
+
+    #[tokio::test]
+    async fn test_add_sub_column_to_struct_col_v2_2() {
+        test_add_sub_column_to_struct_col(LanceFileVersion::V2_2).await;
+    }
+
+    async fn test_add_sub_column_to_struct_col(version: LanceFileVersion) {
+        let mut dataset = prepare_initial_dataset_with_struct_col(version, HashMap::new()).await;
+
+        // add 2 sub-columns of animal
+        let batch = prepare_sub_column_batch().await;
+        let new_schema = batch.schema();
+
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(batch)],
+                    new_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // verify the schema was updated
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert_eq!(dataset.schema().fields[0].name, "animal");
+        assert_eq!(dataset.schema().fields[0].children.len(), 3);
+        assert_eq!(
+            dataset.schema().fields[0].children[0].name,
+            "name".to_string()
+        );
+        assert_eq!(
+            dataset.schema().fields[0].children[1].name,
+            "food".to_string()
+        );
+        assert_eq!(
+            dataset.schema().fields[0].children[2].name,
+            "life".to_string()
+        );
+
+        // verify data is updated
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let name_col = col
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let food_col = col
+            .column_by_name("food")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let life_col = col
+            .column_by_name("life")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "bear");
+        assert_eq!(food_col.value(0), "omnivore");
+        assert_eq!(life_col.value(0), "20y~40y");
+    }
+
+    async fn prepare_sub_column_batch() -> RecordBatch {
+        // add 2 sub-columns of animal
+        let new_added_struct_field = ArrowField::new(
+            "animal",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("food", DataType::Utf8, false),
+                ArrowField::new("life", DataType::Utf8, false),
+            ])),
+            false,
+        );
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_added_struct_field]));
+
+        let food_array = StringArray::from(vec!["omnivore"]);
+        let life_array = StringArray::from(vec!["20y~40y"]);
+        let struct_array = StructArray::new(
+            ArrowFields::from(vec![
+                ArrowField::new("food", DataType::Utf8, false),
+                ArrowField::new("life", DataType::Utf8, false),
+            ]),
+            vec![
+                Arc::new(food_array) as ArrayRef,
+                Arc::new(life_array) as ArrayRef,
+            ],
+            None,
+        );
+        RecordBatch::try_new(new_schema.clone(), vec![Arc::new(struct_array)]).unwrap()
+    }
+
+    async fn prepare_initial_dataset_with_struct_col(
+        version: LanceFileVersion,
+        metadata: HashMap<String, String>,
+    ) -> Dataset {
+        // create schema with struct column
+        let mut animal_struct_field = ArrowField::new(
+            "animal",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "name",
+                DataType::Utf8,
+                false,
+            )])),
+            false,
+        );
+        animal_struct_field.set_metadata(metadata);
+        let schema = Arc::new(ArrowSchema::new(vec![animal_struct_field]));
+
+        // create data with one record
+        let name_array = StringArray::from(vec!["bear"]);
+        let struct_array = StructArray::new(
+            ArrowFields::from(vec![ArrowField::new("name", DataType::Utf8, false)]),
+            vec![Arc::new(name_array) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://test", Some(write_params))
+            .await
+            .unwrap();
+
+        // verify initial schema
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert_eq!(dataset.schema().fields[0].name, "animal");
+
+        // add conflict sub-column
+        let res = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(batch)],
+                    schema,
+                ))),
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_err());
+
+        dataset
+    }
 }
