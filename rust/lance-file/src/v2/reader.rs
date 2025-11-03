@@ -1843,6 +1843,8 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 pub mod tests {
+    use std::{collections::BTreeMap, collections::BTreeSet, pin::Pin, sync::Arc};
+
     use arrow_array::{
         types::{Float64Type, Int32Type},
         RecordBatch, UInt32Array,
@@ -1861,14 +1863,12 @@ pub mod tests {
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use rstest::rstest;
-    use std::collections::BTreeSet;
-    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
     use tokio::sync::mpsc;
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection},
         testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
-        writer::{EncodedBatchWriteExt, FileWriterOptions},
+        writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
     use lance_encoding::decoder::DecoderConfig;
 
@@ -2515,6 +2515,55 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_buffers() {
+        let fs = FsFixture::default();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
+                "foo",
+                DataType::Int32,
+                true,
+            )]))
+            .unwrap();
+
+        let mut file_writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let test_bytes = Bytes::from_static(b"hello");
+
+        let buf_index = file_writer
+            .add_global_buffer(test_bytes.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(buf_index, 1);
+
+        file_writer.finish().await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let buf = file_reader.read_global_buffer(1).await.unwrap();
+        assert_eq!(buf, test_bytes);
+    }
+
+    #[tokio::test]
     async fn test_selective_metadata_coalesced_io() {
         use lance_io::scheduler::bytes_read_counter;
         use lance_io::utils::CachedFileSize;
@@ -2611,55 +2660,6 @@ pub mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), total_rows);
         assert_eq!(batches[0].num_columns(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_global_buffers() {
-        use crate::v2::testing::{test_cache, FsFixture};
-        use crate::v2::writer::{FileWriter, FileWriterOptions};
-        let fs = FsFixture::default();
-
-        let lance_schema = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
-            arrow_schema::Field::new("foo", arrow_schema::DataType::Int32, true),
-        ]))
-        .unwrap();
-
-        let mut file_writer = FileWriter::try_new(
-            fs.object_store.create(&fs.tmp_path).await.unwrap(),
-            lance_schema.clone(),
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-
-        let test_bytes = Bytes::from_static(b"hello");
-
-        let buf_index = file_writer
-            .add_global_buffer(test_bytes.clone())
-            .await
-            .unwrap();
-
-        assert_eq!(buf_index, 1);
-
-        file_writer.finish().await.unwrap();
-
-        use lance_io::utils::CachedFileSize;
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_reader = FileReader::try_open(
-            file_scheduler.clone(),
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        let buf = file_reader.read_global_buffer(1).await.unwrap();
-        assert_eq!(buf, test_bytes);
     }
 
     #[tokio::test]
