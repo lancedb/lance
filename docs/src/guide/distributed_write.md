@@ -226,20 +226,21 @@ update_data2 = pa.table(
 
 # Update fragment 0
 fragment0 = dataset.get_fragment(0)
-updated_fragment0, fields_modified = fragment0.update_columns(
+updated_fragment0, fields_modified0 = fragment0.update_columns(
     update_data1, left_on="id", right_on="id"
 )
 
 # Update fragment 1
 fragment1 = dataset.get_fragment(1)
-updated_fragment1, _ = fragment1.update_columns(
+updated_fragment1, fields_modified1 = fragment1.update_columns(
     update_data2, left_on="id", right_on="id"
 )
 
+union_fields_modified = list(set(fields_modified0 + fields_modified1))
 # Commit the changes for both fragments
 op = lance.LanceOperation.Update(
     updated_fragments=[updated_fragment0, updated_fragment1],
-    fields_modified=fields_modified,
+    fields_modified=union_fields_modified,
 )
 updated_dataset = lance.LanceDataset.commit(
     str(dataset_uri), op, read_version=dataset.version
