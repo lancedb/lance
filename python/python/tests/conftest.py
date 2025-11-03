@@ -42,24 +42,12 @@ def pytest_addoption(parser):
         default=False,
         help="Run forward compatibility tests (requires files to be generated already)",
     )
-    parser.addoption(
-        "--run-backward",
-        action="store_true",
-        default=False,
-        help=(
-            "Run backward compatibility tests (requires files to be generated already)"
-        ),
-    )
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "forward: mark tests that require forward compatibility datagen files",
-    )
-    config.addinivalue_line(
-        "markers",
-        "backward: mark tests that require backward compatibility datagen files",
     )
     config.addinivalue_line(
         "markers", "integration: mark test that requires object storage integration"
@@ -76,8 +64,6 @@ def pytest_collection_modifyitems(config, items):
         disable_items_with_mark(items, "slow", "--run-slow not specified")
     if not config.getoption("--run-forward"):
         disable_items_with_mark(items, "forward", "--run-forward not specified")
-    if not config.getoption("--run-backward"):
-        disable_items_with_mark(items, "backward", "--run-backward not specified")
     try:
         import torch
 

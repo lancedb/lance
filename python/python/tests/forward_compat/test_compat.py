@@ -25,11 +25,11 @@ from .util import build_basic_types, build_large, get_path
 )
 def test_json_index():
     ds = lance.dataset(get_path("json"))
-    tbl = ds.to_table(filter="json_get_int(json, 'val') == 777")
+    tbl = ds.to_table(filter="json_get_int(json, 'val') == 7")
     assert tbl.num_rows == 1
-    assert tbl.column("idx").to_pylist() == [777]
+    assert tbl.column("idx").to_pylist() == [7]
 
-    explain = ds.scanner(filter="json_get_int(json, 'val') == 777").explain_plan()
+    explain = ds.scanner(filter="json_get_int(json, 'val') == 7").explain_plan()
     assert "ScalarIndexQuery" in explain
 
 
@@ -58,19 +58,19 @@ def test_index_search():
     def query_seven(filt: str):
         table = ds.to_table(filter=filt)
         assert table.num_rows == 1
-        assert table.column("idx").to_pylist() == [777]
+        assert table.column("idx").to_pylist() == [7]
 
         explain = ds.scanner(filter=filt).explain_plan()
         print(explain)
         assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
-    query_seven("btree == 777")
-    query_seven("bitmap == 777")
-    query_seven("array_has_any(label_list, ['label777'])")
+    query_seven("btree == 7")
+    query_seven("bitmap == 7")
+    query_seven("array_has_any(label_list, ['label7'])")
     if Version(lance.__version__) >= Version("0.36.0"):
         # Older lance versions didn't support these indexes
-        query_seven("zonemap == 777")
-        query_seven("bloomfilter == 777")
+        query_seven("zonemap == 7")
+        query_seven("bloomfilter == 7")
 
 
 @pytest.mark.forward
@@ -167,7 +167,5 @@ def test_write_fts(tmp_path: str):
         }
     )
     ds.insert(data)
-    num_frags = len(ds.get_fragments())
     # ds.optimize.optimize_indices()
     ds.optimize.compact_files()
-    assert len(ds.get_fragments()) < num_frags

@@ -59,18 +59,14 @@ def write_dataset_pq_buffer():
 def write_dataset_json():
     shutil.rmtree(get_path("json"), ignore_errors=True)
 
-    for frag in range(10):
-        r = range(frag * 100, (frag + 1) * 100)
-        data = pa.table(
-            {
-                "idx": pa.array(r),
-                "json": pa.array([f'{{"val": {i}}}' for i in r], pa.json_()),
-            }
-        )
-        dataset = lance.write_dataset(
-            data, get_path("json"), mode="create" if frag == 0 else "append"
-        )
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
+        }
+    )
 
+    dataset = lance.write_dataset(data, get_path("json"), max_rows_per_file=100)
     dataset.create_scalar_index(
         "json",
         IndexConfig(
@@ -82,23 +78,19 @@ def write_dataset_json():
 def write_dataset_scalar_index():
     shutil.rmtree(get_path("scalar_index"), ignore_errors=True)
 
-    for frag in range(10):
-        r = range(frag * 100, (frag + 1) * 100)
-        data = pa.table(
-            {
-                "idx": pa.array(r),
-                "btree": pa.array(r),
-                "bitmap": pa.array(r),
-                "label_list": pa.array([[f"label{i}"] for i in r]),
-                "ngram": pa.array([f"word{i}" for i in r]),
-                "zonemap": pa.array(r),
-                "bloomfilter": pa.array(r),
-            }
-        )
-        dataset = lance.write_dataset(
-            data, get_path("scalar_index"), mode="create" if frag == 0 else "append"
-        )
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "btree": pa.array(range(1000)),
+            "bitmap": pa.array(range(1000)),
+            "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
+            "ngram": pa.array([f"word{i}" for i in range(1000)]),
+            "zonemap": pa.array(range(1000)),
+            "bloomfilter": pa.array(range(1000)),
+        }
+    )
 
+    dataset = lance.write_dataset(data, get_path("scalar_index"), max_rows_per_file=100)
     dataset.create_scalar_index("btree", "BTREE")
     dataset.create_scalar_index("bitmap", "BITMAP")
     dataset.create_scalar_index("label_list", "LABEL_LIST")
@@ -110,18 +102,16 @@ def write_dataset_scalar_index():
 def write_dataset_fts_index():
     shutil.rmtree(get_path("fts_index"), ignore_errors=True)
 
-    for frag in range(10):
-        r = range(frag * 100, (frag + 1) * 100)
-        data = pa.table(
-            {
-                "idx": pa.array(r),
-                "text": pa.array([f"document with words {i} and more text" for i in r]),
-            }
-        )
-        dataset = lance.write_dataset(
-            data, get_path("fts_index"), mode="create" if frag == 0 else "append"
-        )
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "text": pa.array(
+                [f"document with words {i} and more text" for i in range(1000)]
+            ),
+        }
+    )
 
+    dataset = lance.write_dataset(data, get_path("fts_index"), max_rows_per_file=100)
     dataset.create_scalar_index("text", "INVERTED")
 
 
