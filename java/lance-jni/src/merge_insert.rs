@@ -9,7 +9,7 @@ use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use jni::JNIEnv;
-use lance::dataset::scanner::LanceFilter;
+use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
@@ -158,7 +158,7 @@ fn extract_when_not_matched_by_source_str<'local>(
 fn extract_when_not_matched_by_source_delete_expr<'local>(
     env: &mut JNIEnv<'local>,
     jparam: &JObject,
-) -> Result<Option<LanceFilter>> {
+) -> Result<Option<ExprFilter>> {
     let when_not_matched_by_source_delete_expr = env
         .call_method(
             jparam,
@@ -169,7 +169,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
         .l()?;
 
     if let Some(expr) = env.get_string_opt(&when_not_matched_by_source_delete_expr)? {
-        return Ok(Some(LanceFilter::Sql(expr)));
+        return Ok(Some(ExprFilter::Sql(expr)));
     }
 
     let when_not_matched_by_source_delete_substrait_expr = env
@@ -182,7 +182,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
         .l()?;
 
     match env.get_bytes_opt(&when_not_matched_by_source_delete_substrait_expr)? {
-        Some(expr) => Ok(Some(LanceFilter::Substrait(expr.to_vec()))),
+        Some(expr) => Ok(Some(ExprFilter::Substrait(expr.to_vec()))),
         None => Ok(None),
     }
 }
@@ -190,7 +190,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
 fn extract_when_not_matched_by_source(
     schema: &Schema,
     when_not_matched_by_source: &str,
-    when_not_matched_by_source_delete_expr: Option<LanceFilter>,
+    when_not_matched_by_source_delete_expr: Option<ExprFilter>,
 ) -> Result<WhenNotMatchedBySource> {
     match when_not_matched_by_source {
         "Keep" => Ok(WhenNotMatchedBySource::Keep),

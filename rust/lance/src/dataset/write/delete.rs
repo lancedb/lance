@@ -167,7 +167,7 @@ impl RetryExecutor for DeleteJob {
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows) = if let Some(filter_expr) =
-            scanner.get_filter()?
+            scanner.get_expr_filter()?
         {
             if matches!(
                 filter_expr,
