@@ -39,12 +39,22 @@ def test_json_index():
     reason="version is too old to support NGRAM index",
 )
 def test_ngram_index():
-    ds = lance.dataset(get_path("scalar_index"))
+    ds = lance.dataset(get_path("ngram_zonemap_bloomfilter_index"))
     tbl = ds.to_table(filter="contains(ngram, 'word7')")
     assert tbl.num_rows == 111
 
     explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
     assert "ScalarIndexQuery" in explain
+
+
+def query_seven(ds, filt: str):
+    table = ds.to_table(filter=filt)
+    assert table.num_rows == 1
+    assert table.column("idx").to_pylist() == [7]
+
+    explain = ds.scanner(filter=filt).explain_plan()
+    print(explain)
+    assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
 
 @pytest.mark.forward
@@ -53,24 +63,24 @@ def test_ngram_index():
     reason="Version is too old to read index files stored with Lance 2.0 file format",
 )
 def test_index_search():
-    ds = lance.dataset(get_path("scalar_index"))
+    ds = lance.dataset(get_path("btree_index"))
+    query_seven(ds, "btree == 7")
 
-    def query_seven(filt: str):
-        table = ds.to_table(filter=filt)
-        assert table.num_rows == 1
-        assert table.column("idx").to_pylist() == [7]
+    ds = lance.dataset(get_path("bitmap_labellist_index"))
 
-        explain = ds.scanner(filter=filt).explain_plan()
-        print(explain)
-        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+    query_seven(ds, "bitmap == 7")
+    query_seven(ds, "array_has_any(label_list, ['label7'])")
 
-    query_seven("btree == 7")
-    query_seven("bitmap == 7")
-    query_seven("array_has_any(label_list, ['label7'])")
-    if Version(lance.__version__) >= Version("0.36.0"):
-        # Older lance versions didn't support these indexes
-        query_seven("zonemap == 7")
-        query_seven("bloomfilter == 7")
+
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.36.0"),
+    reason="ZONEMAP and BLOOMFILTER indices were introduced in 0.36.0",
+)
+def test_zonemap_bloomfilter_index_search():
+    ds = lance.dataset(get_path("ngram_zonemap_bloomfilter_index"))
+    query_seven(ds, "zonemap == 7")
+    query_seven(ds, "bloomfilter == 7")
 
 
 @pytest.mark.forward
@@ -121,11 +131,11 @@ def test_list_indices_ignores_new_fts_index_version():
 
 @pytest.mark.forward
 @pytest.mark.skipif(
-    Version(lance.__version__) < Version("0.20.0"),
-    reason="Version is too old to read index files stored with Lance 2.0 file format",
+    Version(lance.__version__) < Version("0.35.0"),
+    reason="0.35.0 changes BTREE index schema",
 )
-def test_write_scalar_index(tmp_path: str):
-    path = get_path("scalar_index")
+def test_write_btree_index(tmp_path: str):
+    path = get_path("btree_index")
     # copy to tmp path to avoid modifying original
     shutil.copytree(path, tmp_path, dirs_exist_ok=True)
 
@@ -134,15 +144,78 @@ def test_write_scalar_index(tmp_path: str):
         {
             "idx": pa.array([1000]),
             "btree": pa.array([1000]),
+        }
+    )
+    ds.insert(data)
+    ds.optimize.optimize_indices()
+    ds.optimize.compact_files()
+
+
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.20.0"),
+    reason="Version is too old to read index files stored with Lance 2.0 file format",
+)
+def test_write_bitmap_labellist_index(tmp_path: str):
+    path = get_path("bitmap_labellist_index")
+    # copy to tmp path to avoid modifying original
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+
+    ds = lance.dataset(tmp_path)
+    data = pa.table(
+        {
+            "idx": pa.array([1000]),
             "bitmap": pa.array([1000]),
             "label_list": pa.array([["label1000"]]),
+        }
+    )
+    ds.insert(data)
+    ds.optimize.optimize_indices()
+    ds.optimize.compact_files()
+
+
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.36.0"),
+    reason="NGRAM index was introduced in 0.36.0",
+)
+def test_write_ngram_index(tmp_path: str):
+    path = get_path("ngram_zonemap_bloomfilter_index")
+    # copy to tmp path to avoid modifying original
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+
+    ds = lance.dataset(tmp_path)
+    data = pa.table(
+        {
+            "idx": pa.array([1000]),
             "ngram": pa.array(["word1000"]),
+        }
+    )
+    ds.insert(data)
+    ds.optimize.optimize_indices()
+    ds.optimize.compact_files()
+
+
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.36.0"),
+    reason="ZONEMAP and BLOOMFILTER index was introduced in 0.36.0",
+)
+def test_write_zonemap_bloomfilter_index(tmp_path: str):
+    path = get_path("ngram_zonemap_bloomfilter_index")
+    # copy to tmp path to avoid modifying original
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+
+    ds = lance.dataset(tmp_path)
+    data = pa.table(
+        {
+            "idx": pa.array([1000]),
             "zonemap": pa.array([1000]),
             "bloomfilter": pa.array([1000]),
         }
     )
     ds.insert(data)
-    # ds.optimize.optimize_indices()
+    ds.optimize.optimize_indices()
     ds.optimize.compact_files()
 
 
