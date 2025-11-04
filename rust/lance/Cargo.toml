@@ -134,6 +134,8 @@ gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 huggingface = ["lance-io/huggingface"]
+# Enable slow integration tests (disabled by default in CI)
+slow_tests = []
 
 [[bin]]
 name = "lq"
