@@ -3,5 +3,6 @@
 
 // NOTE: we only create one integration test binary, to keep compilation overhead down.
 
+#[cfg(feature = "slow_tests")]
 mod query;
 mod utils;
