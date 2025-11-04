@@ -2101,7 +2101,7 @@ mod tests {
         // Cluster 1: 3000 rows
         // Cluster 2: 3000 rows
         let nlist = 3;
-        let cluster_sizes = vec![100, 3000, 3000];
+        let cluster_sizes = [100, 3000, 3000];
         let total_rows: usize = cluster_sizes.iter().sum();
 
         // Generate 3 well-separated centroids in DIM-dimensional space
@@ -2200,7 +2200,7 @@ mod tests {
         let partitions = stats["indices"][0]["partitions"].as_array().unwrap();
         let partition_0_size = partitions[0]["size"].as_u64().unwrap();
         assert!(
-            partition_0_size >= 50 && partition_0_size <= 150,
+            (50..=150).contains(&partition_0_size),
             "Partition 0 should have ~100 rows, got {}",
             partition_0_size
         );
