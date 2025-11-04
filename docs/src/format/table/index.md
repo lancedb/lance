@@ -188,8 +188,8 @@ The commit process is as follows:
    If there are any, begin the rebase process: read their transaction structures and check for conflicts.
    If there are any conflicts and the conflicts are not retriable, abort the commit.
    If the conflicts are retriable, writer should go back to step 2 and rebuild the transaction based on the newest version to resolve the conflicts.
-4. Create a transaction file in the _transactions directory which describes the operations that were performed for purposes including detecting conflicts and CDC.
-   In the latest spec, transactions are included in manifest files to reduce IO requests, which means this step is merged into step 5.
+4. Create a transaction file in the _transactions directory which describes the operations that were performed for two purposes: 
+   (1) to detect conflicts, and (2) to re-build the manifest during retries.
 5. Build a manifest and attempt to commit it to the next version.
    If the commit fails because another writer has already committed, go back to step 3.
 
