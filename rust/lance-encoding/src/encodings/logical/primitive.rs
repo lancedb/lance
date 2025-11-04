@@ -4179,14 +4179,12 @@ impl PrimitiveStructuralEncoder {
     /// 1. Dictionary: stores unique values
     /// 2. Indices: maps each value to a dictionary entry
     ///
+    /// Indices: num_values × 4 bytes (32-bit i32)
     /// For FixedWidth (e.g., 128-bit Decimal):
-    /// - Dictionary: cardinality × 16 bytes (128 bits per value)
-    /// - Indices: num_values × 4 bytes (32-bit i32)
+    /// - Dictionary values: cardinality × 16 bytes (128 bits per value)
     ///
     /// For VariableWidth (strings/binary):
     /// - Dictionary values: cardinality × avg_value_size (actual data)
-    /// - Dictionary offsets: cardinality × offset_size (32 or 64 bits)
-    /// - Indices: num_values × offset_size (same as dictionary offsets)
     fn estimate_dict_size(data_block: &DataBlock) -> Option<u64> {
         let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
             cardinality_array.as_primitive::<UInt64Type>().value(0)
@@ -4195,36 +4193,15 @@ impl PrimitiveStructuralEncoder {
         };
 
         let num_values = data_block.num_values();
+        let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
 
-        match data_block {
-            DataBlock::FixedWidth(_) => {
-                // Dictionary: cardinality unique values at 128 bits each
-                let dict_size = cardinality * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
-                // Indices: num_values indices at 32 bits each
-                let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
-                Some(dict_size + indices_size)
-            }
-            DataBlock::VariableWidth(var) => {
-                // Only 32-bit and 64-bit offsets are supported
-                if var.bits_per_offset != 32 && var.bits_per_offset != 64 {
-                    return None;
-                }
-                let bits_per_offset = var.bits_per_offset as u64;
+        let avg_value_size = match data_block {
+            DataBlock::FixedWidth(_) => DICT_FIXED_WIDTH_BITS_PER_VALUE / 8,
+            DataBlock::VariableWidth(_) => data_block.data_size() / num_values,
+            _ => unreachable!("Variable width offsets can only be 32 or 64 bits"),
+        };
 
-                let data_size = data_block.data_size();
-                let avg_value_size = data_size / num_values;
-
-                // Dictionary values: actual bytes of unique strings/binary
-                let dict_values_size = cardinality * avg_value_size;
-                // Dictionary offsets: pointers into dictionary values
-                let dict_offsets_size = cardinality * (bits_per_offset / 8);
-                // Indices: map each row to dictionary entry
-                let indices_size = num_values * (bits_per_offset / 8);
-
-                Some(dict_values_size + dict_offsets_size + indices_size)
-            }
-            _ => None,
-        }
+        Some(avg_value_size * cardinality + indices_size)
     }
 
     fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
@@ -4235,6 +4212,13 @@ impl PrimitiveStructuralEncoder {
             DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_)
         ) {
             return false;
+        }
+
+        // Currently VariableWidth only supports 32 and 64 bits
+        if let DataBlock::VariableWidth(var) = data_block {
+            if var.bits_per_offset != 32 && var.bits_per_offset != 64 {
+                return false;
+            }
         }
 
         // Don't dictionary encode tiny arrays
@@ -4386,57 +4370,64 @@ impl PrimitiveStructuralEncoder {
                     Some(dictionary_data_block),
                     num_rows
                 )
-            } else if Self::should_dictionary_encode(&data_block, &field) {
-                log::debug!(
-                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                    column_idx,
-                    num_values
-                );
-                let (indices_data_block, dictionary_data_block) =
-                    dict::dictionary_encode(data_block);
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    indices_data_block,
-                    repdefs,
-                    row_number,
-                    Some(dictionary_data_block),
-                    num_rows,
-                )
-            } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
-                log::debug!(
-                    "Encoding column {} with {} items using mini-block layout",
-                    column_idx,
-                    num_values
-                );
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdefs,
-                    row_number,
-                    None,
-                    num_rows,
-                )
-            } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip layout",
-                    column_idx,
-                    num_values
-                );
-                Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdefs,
-                    row_number,
-                    num_rows,
-                )
             } else {
-                Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                // Try dictionary encoding first if applicable
+                let dict_result = if Self::should_dictionary_encode(&data_block, &field) {
+                    log::debug!(
+                        "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                        column_idx,
+                        num_values
+                    );
+                    dict::dictionary_encode(data_block.clone())
+                } else {
+                    None
+                };
+
+                if let Some((indices_data_block, dictionary_data_block)) = dict_result {
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        indices_data_block,
+                        repdefs,
+                        row_number,
+                        Some(dictionary_data_block),
+                        num_rows,
+                    )
+                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+                    log::debug!(
+                        "Encoding column {} with {} items using mini-block layout",
+                        column_idx,
+                        num_values
+                    );
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdefs,
+                        row_number,
+                        None,
+                        num_rows,
+                    )
+                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                    log::debug!(
+                        "Encoding column {} with {} items using full-zip layout",
+                        column_idx,
+                        num_values
+                    );
+                    Self::encode_full_zip(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdefs,
+                        row_number,
+                        num_rows,
+                    )
+                } else {
+                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                }
             }
         })
         .boxed();
@@ -5656,7 +5647,7 @@ mod tests {
         let data_size = block.data_size();
         let avg_value_size = data_size / 1000;
 
-        let expected = 400 * avg_value_size + 400 * 4 + 1000 * 4;
+        let expected = 400 * avg_value_size + 1000 * 4;
 
         assert_eq!(estimated_size, expected);
     }
