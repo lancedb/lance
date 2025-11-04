@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
-use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
@@ -179,8 +178,6 @@ impl PrioritiesInFlight {
     fn remove(&mut self, prio: u128) {
         if let Ok(pos) = self.in_flight.binary_search(&prio) {
             self.in_flight.remove(pos);
-        } else {
-            unreachable!();
         }
     }
 }
@@ -196,6 +193,9 @@ struct IoQueueState {
     pending_requests: BinaryHeap<IoTask>,
     // Priorities of in-flight requests
     priorities_in_flight: PrioritiesInFlight,
+    // Set when the scheduler is finished to notify the I/O loop to shut down
+    // once all outstanding requests have been completed.
+    done_scheduling: bool,
     // Time when the scheduler started
     start: Instant,
     // Last time we warned about backpressure
@@ -209,6 +209,7 @@ impl IoQueueState {
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
             priorities_in_flight: PrioritiesInFlight::new(io_capacity),
+            done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
         }
@@ -296,7 +297,7 @@ impl IoQueue {
         self.notify.notify_one();
     }
 
-    async fn pop(&self) -> IoTask {
+    async fn pop(&self) -> Option<IoTask> {
         loop {
             {
                 // First, grab a reservation on the global IOPS quota
@@ -310,7 +311,11 @@ impl IoQueue {
                     // Reservation successfully acquired, we will release the global
                     // global reservation after task has run.
                     iop_res.forget();
-                    return task;
+                    return Some(task);
+                }
+
+                if state.done_scheduling {
+                    return None;
                 }
             }
 
@@ -333,6 +338,18 @@ impl IoQueue {
             state.priorities_in_flight.remove(priority);
         }
         drop(state);
+
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.done_scheduling = true;
+        let pending_requests = std::mem::take(&mut state.pending_requests);
+        drop(state);
+        for request in pending_requests {
+            request.cancel();
+        }
 
         self.notify.notify_one();
     }
@@ -451,6 +468,12 @@ impl IoTask {
     fn num_bytes(&self) -> u64 {
         self.to_read.end - self.to_read.start
     }
+    fn cancel(self) {
+        (self.when_done)(Err(Error::Internal {
+            message: "Scheduler closed before I/O was completed".to_string(),
+            location: location!(),
+        }));
+    }
 
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
@@ -487,9 +510,19 @@ impl IoTask {
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(tasks: Arc<IoQueue>) {
+    // Pop the first finished task off the queue and submit another until
+    // we are done
     loop {
         let next_task = tasks.pop().await;
-        tokio::spawn(next_task.run());
+        match next_task {
+            Some(task) => {
+                tokio::spawn(task.run());
+            }
+            None => {
+                // The sender has been dropped, we are done
+                return;
+            }
+        }
     }
 }
 
@@ -550,12 +583,15 @@ impl ScanStats {
 /// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
-/// TODO: This will also add coalescing
+/// The ScanScheduler will cancel any outstanding I/O requests when it is dropped.
+/// For this reason it should be kept alive until all I/O has finished.
+///
+/// Note: The 2.X file readers already do this so this is only a concern if you are
+/// using the ScanScheduler directly.
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: Arc<IoQueue>,
     stats: Arc<StatsCollector>,
-    io_loop_handle: JoinHandle<()>,
 }
 
 impl Debug for ScanScheduler {
@@ -611,12 +647,16 @@ impl ScanScheduler {
             io_capacity as u32,
             config.io_buffer_size_bytes,
         ));
-        Arc::new(Self {
+        let slf = Arc::new(Self {
             object_store,
             io_queue: io_queue.clone(),
             stats: Arc::new(StatsCollector::new()),
-            io_loop_handle: tokio::task::spawn(async move { run_io_loop(io_queue).await }),
-        })
+        });
+        // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
+        // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
+        // to wait for it to finish but that doesn't seem helpful.
+        tokio::task::spawn(async move { run_io_loop(io_queue).await });
+        slf
     }
 
     /// Open a file for reading
@@ -740,7 +780,18 @@ impl ScanScheduler {
 
 impl Drop for ScanScheduler {
     fn drop(&mut self) {
-        self.io_loop_handle.abort();
+        // If the user is dropping the ScanScheduler then they _should_ be done with I/O.  This can happen
+        // even when I/O is in progress if, for example, the user is dropping a scan mid-read because they found
+        // the data they wanted (limit after filter or some other example).
+        //
+        // Closing the I/O queue will cancel any requests that have not yet been sent to the I/O loop.  However,
+        // it will not terminate the I/O loop itself.  This is to help prevent deadlock and ensure that all I/O
+        // requests that are submitted will terminate.
+        //
+        // In theory, this isn't strictly necessary, as callers should drop any task expecting I/O before they
+        // drop the scheduler.  In practice, this can be difficult to do, and it is better to spend a little bit
+        // of time letting the I/O loop drain so that we can avoid any potential deadlocks.
+        self.io_queue.close();
     }
 }
 
