@@ -30,7 +30,7 @@ use lance_namespace_reqwest_client::models::{
 /// must provide. Each method corresponds to a specific operation on namespaces
 /// or tables.
 #[async_trait]
-pub trait LanceNamespace: Send + Sync {
+pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// List namespaces.
     async fn list_namespaces(
         &self,
@@ -276,4 +276,19 @@ pub trait LanceNamespace: Send + Sync {
             location: Location::new(file!(), line!(), column!()),
         })
     }
+
+    /// Return a human-readable unique identifier for this namespace instance.
+    ///
+    /// This is used for equality comparison and hashing when the namespace is
+    /// used as part of a storage options provider. Two namespace instances with
+    /// the same ID are considered equal and will share cached resources.
+    ///
+    /// The ID should be human-readable for debugging and logging purposes.
+    /// For example:
+    /// - REST namespace: `"rest(endpoint=https://api.example.com)"`
+    /// - Directory namespace: `"dir(root=/path/to/data)"`
+    ///
+    /// Implementations should include all configuration that uniquely identifies
+    /// the namespace to provide semantic equality.
+    fn namespace_id(&self) -> String;
 }
