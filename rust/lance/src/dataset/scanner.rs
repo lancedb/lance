@@ -2827,7 +2827,23 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+
+        // TODO: refactor the code
+        // Only return index and deltas if there is an index on the column and at least one of the target fragments are index
+        let index_and_deltas =
+            if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                let deltas = self.dataset.load_indices_by_name(&index.name).await?;
+                let index_frags = self.get_indexed_frags(&deltas);
+                if !index_frags.is_empty() {
+                    Some((index, deltas))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some((index, deltas)) = index_and_deltas {
             log::trace!("index found for vector search");
             // There is an index built for the column.
             // We will use the index.
@@ -2838,14 +2854,11 @@ impl Scanner {
                 ));
             }
 
-            // Find all deltas with the same index name.
-            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
                 DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
-
             let mut knn_node = if q.refine_factor.is_some() {
                 let vector_projection = self
                     .dataset
@@ -2894,7 +2907,7 @@ impl Scanner {
                     filter_plan,
                     vector_scan_projection,
                     /*include_deleted_rows=*/ true,
-                    None,
+                    self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
                 )
@@ -2916,7 +2929,15 @@ impl Scanner {
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index was built.
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+
+        // Only keep unindexed fragments from required fragments if present
+        if let Some(scanner_fragments) = &self.fragments {
+            let scanner_ids: std::collections::HashSet<_> =
+                scanner_fragments.iter().map(|f| f.id).collect();
+            unindexed_fragments.retain(|f| scanner_ids.contains(&f.id));
+        }
+
         if !unindexed_fragments.is_empty() {
             // need to set the metric type to be the same as the index
             // to make sure the distance is comparable.
@@ -8380,6 +8401,143 @@ mod test {
                 created_at_array.value(i),
                 1,
                 "All rows created at version 1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_respects_fragment_list() {
+        // Create a dataset with 5 fragments
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        // Create vector index on initial data (fragments 0-4)
+        test_ds.make_vector_index().await.unwrap();
+
+        // Reload dataset to see the index
+        let dataset = Dataset::open(&test_ds.tmp_dir).await.unwrap();
+        let num_indexed_fragments = dataset.fragments().len();
+
+        // Append new data to create unindexed fragments
+        test_ds.append_new_data().await.unwrap();
+
+        // Reload to see new data
+        let dataset = Dataset::open(&test_ds.tmp_dir).await.unwrap();
+        let total_fragments = dataset.fragments().len();
+
+        // Verify we have at least one unindexed fragment
+        assert!(
+            total_fragments > num_indexed_fragments,
+            "Should have unindexed fragments after append"
+        );
+
+        // Get fragment metadata for testing
+        let all_fragments: Vec<_> = dataset.fragments().iter().cloned().collect();
+
+        // Get the actual indexed fragments from the index metadata
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|i| i.name == "idx").unwrap();
+        let indexed_fragment_ids: std::collections::HashSet<u32> =
+            index.fragment_bitmap.as_ref().unwrap().iter().collect();
+
+        let mut indexed_fragments = Vec::new();
+        let mut unindexed_fragments = Vec::new();
+        for frag in all_fragments {
+            if indexed_fragment_ids.contains(&(frag.id as u32)) {
+                indexed_fragments.push(frag);
+            } else {
+                unindexed_fragments.push(frag);
+            }
+        }
+
+        // Test 1: Scan only indexed fragments
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(indexed_fragments.clone());
+        scanner.with_row_id();
+        scanner.prefilter(true);
+        scanner.nearest("vec", &key, 10).unwrap();
+
+        let plan = scanner.explain_plan(true).await.unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        // All results should be from indexed fragments only
+        let row_ids = results.column_by_name(ROW_ID).unwrap();
+        let row_id_array = row_ids.as_primitive::<arrow::datatypes::UInt64Type>();
+
+        for i in 0..row_id_array.len() {
+            let row_id = row_id_array.value(i);
+            let fragment_id = (row_id >> 32) as u32;
+            assert!(
+                fragment_id < num_indexed_fragments as u32,
+                "Row from fragment {} found, but only indexed fragments 0-{} should be scanned. Plan:\n{}",
+                fragment_id,
+                num_indexed_fragments - 1,
+                plan
+            );
+        }
+
+        // Test 2: Scan only unindexed fragments (flat search)
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(unindexed_fragments.clone());
+        scanner.with_row_id();
+        scanner.prefilter(true);
+        scanner.nearest("vec", &key, 10).unwrap();
+
+        let plan = scanner.explain_plan(true).await.unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        // All results should be from unindexed fragments only
+        let row_ids = results.column_by_name(ROW_ID).unwrap();
+        let row_id_array = row_ids.as_primitive::<arrow::datatypes::UInt64Type>();
+
+        for i in 0..row_id_array.len() {
+            let row_id = row_id_array.value(i);
+            let fragment_id = (row_id >> 32) as u32;
+            assert!(
+                fragment_id >= num_indexed_fragments as u32,
+                "Row from fragment {} found, but only unindexed fragments {}-{} should be scanned. Plan:\n{}",
+                fragment_id,
+                num_indexed_fragments,
+                total_fragments - 1,
+                plan
+            );
+        }
+
+        // Test 3: Scan mix of indexed and unindexed fragments
+        let mixed_fragments = vec![
+            indexed_fragments[0].clone(),   // indexed
+            indexed_fragments[1].clone(),   // indexed
+            unindexed_fragments[0].clone(), // unindexed
+        ];
+
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(mixed_fragments.clone());
+        scanner.with_row_id();
+        scanner.prefilter(true);
+        scanner.nearest("vec", &key, 10).unwrap();
+
+        let plan = scanner.explain_plan(true).await.unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        // Collect allowed fragment IDs
+        let allowed_fragment_ids: std::collections::HashSet<u32> =
+            mixed_fragments.iter().map(|f| f.id as u32).collect();
+
+        // All results should be from the specified fragments only
+        let row_ids = results.column_by_name(ROW_ID).unwrap();
+        let row_id_array = row_ids.as_primitive::<arrow::datatypes::UInt64Type>();
+
+        for i in 0..row_id_array.len() {
+            let row_id = row_id_array.value(i);
+            let fragment_id = (row_id >> 32) as u32;
+            assert!(
+                allowed_fragment_ids.contains(&fragment_id),
+                "Row from fragment {} found, but only fragments {:?} should be scanned. Plan:\n{}",
+                fragment_id,
+                allowed_fragment_ids,
+                plan
             );
         }
     }
