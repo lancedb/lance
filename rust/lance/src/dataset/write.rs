@@ -6,7 +6,9 @@ use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions};
+use lance_core::datatypes::{
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
@@ -594,26 +596,11 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
-                let dataset_schema = dataset.schema();
-                let mut write_fields = Vec::with_capacity(converted_schema.fields.len());
-                for field in converted_schema.fields.iter() {
-                    let dataset_field =
-                        dataset_schema
-                            .field(&field.name)
-                            .ok_or_else(|| Error::SchemaMismatch {
-                                difference: format!(
-                                    "Column '{}' not found in target schema",
-                                    field.name
-                                ),
-                                location: location!(),
-                            })?;
-                    write_fields.push(dataset_field.clone());
-                }
-
-                let write_schema = Schema {
-                    fields: write_fields,
-                    metadata: dataset_schema.metadata.clone(),
-                };
+                let write_schema = dataset.schema().project_by_schema(
+                    &converted_schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 // Use the storage version from the dataset, ignoring any version from the user.
                 let data_storage_version = dataset
                     .manifest()
