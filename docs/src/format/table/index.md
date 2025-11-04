@@ -183,18 +183,20 @@ See the `transaction.proto` file for its definition.
 The commit process is as follows:
 
 1. The writer finishes writing all data files.
-2. The writer creates a transaction file in the `_transactions` directory.
-   This file describes the operations that were performed, which is used for two purposes:
-   (1) to detect conflicts, and (2) to re-build the manifest during retries.
+2. Build a transaction struct based on the current version to tell how the manifest changes. Different operations have different structures for metadata changing.
 3. Look for any new commits since the writer started writing.
-   If there are any, read their transaction files and check for conflicts.
-   If there are any conflicts, abort the commit. Otherwise, continue.
-4. Build a manifest and attempt to commit it to the next version.
+   If there are any, begin the rebase process: read their transaction structures and check for conflicts.
+   If there are any conflicts and the conflicts are not retriable, abort the commit.
+   If the conflicts are retriable, writer should go back to step 2 and rebuild the transaction based on the newest version to resolve the conflicts.
+   Continue the steps until there are no conflicts to resolve.
+4. Create a transaction file in the _transactions directory which describes the operations that were performed for purposes including detecting conflicts and CDC.
+   In the latest spec, transactions are included in manifest files to reduce IO requests, which means this step is merged into step 5.
+5. Build a manifest and attempt to commit it to the next version.
    If the commit fails because another writer has already committed, go back to step 3.
 
 When checking whether two transactions conflict, be conservative.
-If the transaction file is missing, assume it conflicts.
-If the transaction file has an unknown operation, assume it conflicts.
+If the transaction structure is missing, assume it conflicts.
+If the transaction structure has an unknown operation, assume it conflicts.
 
 ### External Manifest Store
 
