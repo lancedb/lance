@@ -11,7 +11,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::location;
@@ -160,10 +160,16 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner
-            .with_row_id()
-            .project(&[ROW_ID])?
-            .filter(&self.predicate)?;
+        scanner.with_row_id();
+        if !self.dataset.manifest.uses_stable_row_ids() {
+            // Output column name `_rowid`, expression `_rowaddr`.
+            scanner.project_with_transform(&[(ROW_ID, ROW_ADDR)])?;
+        } else {
+            // Stable row ids: request `_rowid` directly.
+            scanner.project(&[ROW_ID])?;
+        }
+
+        scanner.filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows) = if let Some(filter_expr) =

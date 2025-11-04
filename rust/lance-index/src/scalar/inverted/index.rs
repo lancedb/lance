@@ -40,8 +40,10 @@ use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
-use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{
+    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
+    ROW_ADDR, ROW_ADDR_FIELD,
+};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
@@ -106,10 +108,14 @@ pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
-pub static FTS_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
-static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+pub static FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        ROW_ADDR_FIELD.clone(),
+        SCORE_FIELD.clone(),
+    ]))
+});
+static ROW_ADDR_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum TokenSetFormat {
@@ -267,7 +273,7 @@ impl InvertedIndex {
         let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         while let Some(res) = parts.try_next().await? {
             for DocCandidate {
-                row_id,
+                row_addr,
                 freqs,
                 doc_length,
             } in res?
@@ -277,10 +283,10 @@ impl InvertedIndex {
                     score += scorer.score(token.as_str(), freq, doc_length);
                 }
                 if candidates.len() < limit {
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                    candidates.push(Reverse(ScoredDoc::new(row_addr, score)));
                 } else if candidates.peek().unwrap().0.score.0 < score {
                     candidates.pop();
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                    candidates.push(Reverse(ScoredDoc::new(row_addr, score)));
                 }
             }
         }
@@ -288,7 +294,7 @@ impl InvertedIndex {
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .map(|Reverse(doc)| (doc.row_addr, doc.score.0))
             .unzip())
     }
 
@@ -507,7 +513,7 @@ impl InvertedIndex {
             .await?;
 
         Ok(RecordBatch::try_new(
-            ROW_ID_SCHEMA.clone(),
+            ROW_ADDR_SCHEMA.clone(),
             vec![Arc::new(UInt64Array::from(doc_ids))],
         )?)
     }
@@ -587,7 +593,7 @@ impl ScalarIndex for InvertedIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_addr();
         if self.is_legacy() {
             UpdateCriteria::requires_old_data(criteria)
         } else {
@@ -1284,7 +1290,7 @@ impl PostingListReader {
         token_id: u32,
         with_position: bool,
     ) -> Result<RecordBatch> {
-        let mut columns = vec![ROW_ID, FREQUENCY_COL];
+        let mut columns = vec![ROW_ADDR, FREQUENCY_COL];
         if with_position {
             columns.push(POSITION_COL);
         }
@@ -1435,7 +1441,7 @@ impl PostingListReader {
 
     fn posting_columns(&self, with_position: bool) -> Vec<&'static str> {
         let mut base_columns = match self.offsets {
-            Some(_) => vec![ROW_ID, FREQUENCY_COL],
+            Some(_) => vec![ROW_ADDR, FREQUENCY_COL],
             None => vec![POSTING_COL],
         };
         if with_position {
@@ -1564,10 +1570,10 @@ impl PostingList {
                     positions: PositionRecorder,
                 }
                 let doc_ids = docs
-                    .row_ids
+                    .row_addrs
                     .iter()
                     .enumerate()
-                    .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+                    .map(|(doc_id, row_addr)| (*row_addr, doc_id as u32))
                     .collect::<HashMap<_, _>>();
                 let mut items = Vec::with_capacity(posting.len());
                 for (row_id, freq, positions) in posting.iter() {
@@ -1640,7 +1646,10 @@ impl PlainPostingList {
     }
 
     pub fn from_batch(batch: &RecordBatch, max_score: Option<f32>) -> Self {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
+        let row_addrs = batch[ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .clone();
         let frequencies = batch[FREQUENCY_COL]
             .as_primitive::<Float32Type>()
             .values()
@@ -1649,7 +1658,7 @@ impl PlainPostingList {
             .column_by_name(POSITION_COL)
             .map(|col| col.as_list::<i32>().clone());
 
-        Self::new(row_ids, frequencies, max_score, positions)
+        Self::new(row_addrs, frequencies, max_score, positions)
     }
 
     pub fn len(&self) -> usize {
@@ -2071,9 +2080,9 @@ impl Ord for RawDocInfo {
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
-    row_ids: Vec<u64>,
+    row_addrs: Vec<u64>,
     num_tokens: Vec<u32>,
-    // (row_id, doc_id) pairs sorted by row_id
+    // (row_addr, doc_id) pairs sorted by row_addr
     inv: Vec<(u64, u32)>,
 
     total_tokens: u64,
@@ -2082,7 +2091,7 @@ pub struct DocSet {
 impl DocSet {
     #[inline]
     pub fn len(&self) -> usize {
-        self.row_ids.len()
+        self.row_addrs.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2090,22 +2099,22 @@ impl DocSet {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &u32)> {
-        self.row_ids.iter().zip(self.num_tokens.iter())
+        self.row_addrs.iter().zip(self.num_tokens.iter())
     }
 
-    pub fn row_id(&self, doc_id: u32) -> u64 {
-        self.row_ids[doc_id as usize]
+    pub fn row_addr(&self, doc_id: u32) -> u64 {
+        self.row_addrs[doc_id as usize]
     }
 
-    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+    pub fn doc_id(&self, row_addr: u64) -> Option<u64> {
         if self.inv.is_empty() {
-            // in legacy format, the row id is doc id
-            match self.row_ids.binary_search(&row_id) {
-                Ok(_) => Some(row_id),
+            // in legacy format, the row addr is doc id
+            match self.row_addrs.binary_search(&row_addr) {
+                Ok(_) => Some(row_addr),
                 Err(_) => None,
             }
         } else {
-            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
+            match self.inv.binary_search_by_key(&row_addr, |x| x.0) {
                 Ok(idx) => Some(self.inv[idx].1 as u64),
                 Err(_) => None,
             }
@@ -2150,18 +2159,18 @@ impl DocSet {
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
-        let row_id_col = UInt64Array::from_iter_values(self.row_ids.iter().cloned());
+        let row_addr_col = UInt64Array::from_iter_values(self.row_addrs.iter().cloned());
         let num_tokens_col = UInt32Array::from_iter_values(self.num_tokens.iter().cloned());
 
         let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
             arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
         ]);
 
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
-                Arc::new(row_id_col) as ArrayRef,
+                Arc::new(row_addr_col) as ArrayRef,
                 Arc::new(num_tokens_col) as ArrayRef,
             ],
         )?;
@@ -2174,19 +2183,19 @@ impl DocSet {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let row_addr_col = batch[ROW_ADDR].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        // for legacy format, the row id is doc id; sorting keeps binary search viable
+        // for legacy format, the row addr is doc id; sorting keeps binary search viable
         if is_legacy {
-            let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
+            let (row_addrs, num_tokens): (Vec<_>, Vec<_>) = row_addr_col
                 .values()
                 .iter()
-                .filter_map(|id| {
+                .filter_map(|addr| {
                     if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
+                        frag_reuse_index_ref.remap_row_addr(*addr)
                     } else {
-                        Some(*id)
+                        Some(*addr)
                     }
                 })
                 .zip(num_tokens_col.values().iter())
@@ -2195,54 +2204,54 @@ impl DocSet {
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
-                row_ids,
+                row_addrs,
                 num_tokens,
                 inv: Vec::new(),
                 total_tokens,
             });
         }
 
-        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
+        // if frag reuse happened, we'll need to remap the row_addrs. And after row_addrs been
         // remapped, we'll need resort to make sure binary_search works.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            let mut row_ids = Vec::with_capacity(row_id_col.len());
+            let mut row_addrs = Vec::with_capacity(row_addr_col.len());
             let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
-            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    row_ids.push(new_row_id);
+            for (row_addr, num_token) in row_addr_col.values().iter().zip(num_tokens_col.values()) {
+                if let Some(new_row_addr) = frag_reuse_index_ref.remap_row_addr(*row_addr) {
+                    row_addrs.push(new_row_addr);
                     num_tokens.push(*num_token);
                 }
             }
 
-            let mut inv: Vec<(u64, u32)> = row_ids
+            let mut inv: Vec<(u64, u32)> = row_addrs
                 .iter()
                 .enumerate()
-                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+                .map(|(doc_id, row_addr)| (*row_addr, doc_id as u32))
                 .collect();
             inv.sort_unstable_by_key(|entry| entry.0);
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
-                row_ids,
+                row_addrs,
                 num_tokens,
                 inv,
                 total_tokens,
             });
         }
 
-        let row_ids = row_id_col.values().to_vec();
+        let row_addrs = row_addr_col.values().to_vec();
         let num_tokens = num_tokens_col.values().to_vec();
-        let mut inv: Vec<(u64, u32)> = row_ids
+        let mut inv: Vec<(u64, u32)> = row_addrs
             .iter()
             .enumerate()
-            .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+            .map(|(doc_id, row_addr)| (*row_addr, doc_id as u32))
             .collect();
-        if !row_ids.is_sorted() {
+        if !row_addrs.is_sorted() {
             inv.sort_unstable_by_key(|entry| entry.0);
         }
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
-            row_ids,
+            row_addrs,
             num_tokens,
             inv,
             total_tokens,
@@ -2254,19 +2263,19 @@ impl DocSet {
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Vec<u32> {
         let mut removed = Vec::new();
         let len = self.len();
-        let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
+        let row_addrs = std::mem::replace(&mut self.row_addrs, Vec::with_capacity(len));
         let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
-        for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
-            match mapping.get(&row_id) {
-                Some(Some(new_row_id)) => {
-                    self.row_ids.push(*new_row_id);
+        for (doc_id, (row_addr, num_token)) in std::iter::zip(row_addrs, num_tokens).enumerate() {
+            match mapping.get(&row_addr) {
+                Some(Some(new_row_addr)) => {
+                    self.row_addrs.push(*new_row_addr);
                     self.num_tokens.push(num_token);
                 }
                 Some(None) => {
                     removed.push(doc_id as u32);
                 }
                 None => {
-                    self.row_ids.push(row_id);
+                    self.row_addrs.push(row_addr);
                     self.num_tokens.push(num_token);
                 }
             }
@@ -2280,22 +2289,22 @@ impl DocSet {
     }
 
     // this can be used only if it's a legacy format,
-    // which store the sorted row ids so that we can use binary search
+    // which store the sorted row addrs so that we can use binary search
     #[inline]
-    pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
-        self.row_ids
-            .binary_search(&row_id)
+    pub fn num_tokens_by_row_addr(&self, row_addr: u64) -> u32 {
+        self.row_addrs
+            .binary_search(&row_addr)
             .map(|idx| self.num_tokens[idx])
             .unwrap_or(0)
     }
 
     // append a document to the doc set
     // returns the doc_id (the number of documents before appending)
-    pub fn append(&mut self, row_id: u64, num_tokens: u32) -> u32 {
-        self.row_ids.push(row_id);
+    pub fn append(&mut self, row_addr: u64, num_tokens: u32) -> u32 {
+        self.row_addrs.push(row_addr);
         self.num_tokens.push(num_tokens);
         self.total_tokens += num_tokens as u64;
-        self.row_ids.len() as u32 - 1
+        self.row_addrs.len() as u32 - 1
     }
 }
 
@@ -2338,13 +2347,13 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let query_tokens = collect_query_tokens(query, &mut tokenizer, None);
 
     for batch in batches {
-        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let row_addr_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
-        for i in 0..row_id_array.len() {
+        for i in 0..row_addr_array.len() {
             let doc = doc_array.value(i);
             let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, Some(&query_tokens));
             if !doc_tokens.is_empty() {
-                results.push(row_id_array.value(i));
+                results.push(row_addr_array.value(i));
                 assert!(doc.contains(query));
             }
         }
@@ -2453,7 +2462,7 @@ pub fn flat_bm25_search_stream(
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
+        debug_assert!(batch[ROW_ADDR].null_count() == 0, "flat FTS produces nulls");
         Ok(batch)
     });
 
@@ -2565,8 +2574,8 @@ mod tests {
         assert_eq!(builder.posting_lists.len(), 1);
         assert_eq!(builder.posting_lists[0].len(), 2);
         assert_eq!(builder.docs.len(), 2);
-        assert_eq!(builder.docs.row_id(0), 1);
-        assert_eq!(builder.docs.row_id(1), 3);
+        assert_eq!(builder.docs.row_addr(0), 1);
+        assert_eq!(builder.docs.row_addr(1), 3);
 
         builder.write(store.as_ref()).await.unwrap();
 
@@ -2595,7 +2604,7 @@ mod tests {
         builder1.tokens.add("test".to_owned());
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
-        builder1.docs.append(100, 1); // row_id=100, num_tokens=1
+        builder1.docs.append(100, 1); // row_addr=100, num_tokens=1
         builder1.write(store.as_ref()).await.unwrap();
 
         // Create second partition with one token and posting list length 4
@@ -2606,10 +2615,10 @@ mod tests {
         builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
         builder2.posting_lists[0].add(2, PositionRecorder::Count(3));
         builder2.posting_lists[0].add(3, PositionRecorder::Count(1));
-        builder2.docs.append(200, 2); // row_id=200, num_tokens=2
-        builder2.docs.append(201, 1); // row_id=201, num_tokens=1
-        builder2.docs.append(202, 3); // row_id=202, num_tokens=3
-        builder2.docs.append(203, 1); // row_id=203, num_tokens=1
+        builder2.docs.append(200, 2); // row_addr=200, num_tokens=2
+        builder2.docs.append(201, 1); // row_addr=201, num_tokens=1
+        builder2.docs.append(202, 3); // row_addr=202, num_tokens=3
+        builder2.docs.append(203, 1); // row_addr=203, num_tokens=1
         builder2.write(store.as_ref()).await.unwrap();
 
         // Create metadata file with both partitions
@@ -2670,16 +2679,16 @@ mod tests {
         let prefilter = Arc::new(NoFilter);
         let metrics = Arc::new(NoOpMetricsCollector);
 
-        let (row_ids, scores) = index
+        let (row_addrs, scores) = index
             .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
             .await
             .unwrap();
 
         // Verify that we got search results
         // Expected to find 5 documents: 1 from first partition, 4 from second partition
-        assert_eq!(row_ids.len(), 5, "row_ids: {:?}", row_ids);
-        assert!(!row_ids.is_empty(), "Should find at least some documents");
-        assert_eq!(row_ids.len(), scores.len());
+        assert_eq!(row_addrs.len(), 5, "row_addrs: {:?}", row_addrs);
+        assert!(!row_addrs.is_empty(), "Should find at least some documents");
+        assert_eq!(row_addrs.len(), scores.len());
 
         // All scores should be positive since all documents contain the search token
         for &score in &scores {
@@ -2688,12 +2697,12 @@ mod tests {
 
         // Check that we got results from both partitions
         assert!(
-            row_ids.contains(&100),
-            "Should contain row_id from partition 0"
+            row_addrs.contains(&100),
+            "Should contain row_addr from partition 0"
         );
         assert!(
-            row_ids.iter().any(|&id| id >= 200),
-            "Should contain row_id from partition 1"
+            row_addrs.iter().any(|&id| id >= 200),
+            "Should contain row_addr from partition 1"
         );
     }
 }

@@ -277,15 +277,37 @@ pub fn apply_row_id_and_deletes(
     });
 
     let batch = if config.with_row_id {
-        let row_id_arr = row_ids.unwrap();
-        batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
+        if config.row_id_sequence.is_some() {
+            // Stable row id is requested and available: expose as _rowid
+            let row_id_arr = row_ids.unwrap();
+            batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
+        } else {
+            // No stable row id sequence: row id equals physical row address.
+            // Always expose _rowid for downstream consumers; values equal _rowaddr.
+            let row_addr_arr = row_addrs
+                .clone()
+                .expect("row_addrs should be available when with_row_id and no sequence");
+            let batch = batch.try_with_column(ROW_ID_FIELD.clone(), row_addr_arr.clone())?;
+            // Additionally expose _rowaddr to preserve legacy behavior and test expectations.
+            if batch.schema().field_with_name(ROW_ADDR).is_ok() {
+                batch
+            } else {
+                batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
+            }
+        }
     } else {
         batch
     };
 
     let batch = if config.with_row_addr {
-        let row_addr_arr = row_addrs.unwrap();
-        batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
+        if config.with_row_id && config.row_id_sequence.is_none() {
+            // Already exposed _rowaddr above to represent row ids when no stable sequence exists.
+            // Avoid appending the same column twice.
+            batch
+        } else {
+            let row_addr_arr = row_addrs.unwrap();
+            batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
+        }
     } else {
         batch
     };
@@ -403,7 +425,7 @@ mod tests {
     use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
     use lance_core::{
         utils::{address::RowAddress, deletion::DeletionVector},
-        ROW_ID,
+        ROW_ADDR,
     };
     use lance_datagen::{BatchCount, RowCount};
     use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
@@ -490,15 +512,17 @@ mod tests {
                 let mut offset = 0;
                 let expected = expected.clone();
                 for batch in batches {
-                    let actual_row_ids =
-                        batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-                    let expected_row_ids = expected[offset..offset + 10]
+                    let actual_row_addrs = batch[ROW_ADDR]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec();
+                    let expected_row_addrs = expected[offset..offset + 10]
                         .iter()
                         .map(|row_offset| {
                             RowAddress::new_from_parts(fragment_id, *row_offset).into()
                         })
                         .collect::<Vec<u64>>();
-                    assert_eq!(actual_row_ids, expected_row_ids);
+                    assert_eq!(actual_row_addrs, expected_row_addrs);
                     offset += batch.num_rows();
                 }
             }
@@ -609,7 +633,7 @@ mod tests {
                             let total_num_nulls = if make_deletions_null {
                                 batches
                                     .iter()
-                                    .map(|b| b[ROW_ID].null_count())
+                                    .map(|b| b[ROW_ADDR].null_count())
                                     .sum::<usize>()
                             } else {
                                 0
@@ -630,20 +654,20 @@ mod tests {
                                     // If we make deletions null we get 3 batches of all-null and then
                                     // a batch of half-null
                                     assert_eq!(
-                                        batches[3][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[3][ROW_ADDR].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 30))
                                     );
-                                    assert_eq!(batches[3][ROW_ID].null_count(), 5);
+                                    assert_eq!(batches[3][ROW_ADDR].null_count(), 5);
                                 } else {
                                     // If we materialize deletions the first row will be 35
                                     assert_eq!(
-                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[0][ROW_ADDR].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 35))
                                     );
                                 }
                             }
                             if !with_row_id {
-                                assert!(batches[0].column_by_name(ROW_ID).is_none());
+                                assert!(batches[0].column_by_name(ROW_ADDR).is_none());
                             }
                         }
                     }

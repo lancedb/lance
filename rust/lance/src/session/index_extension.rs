@@ -179,7 +179,7 @@ mod test {
             unimplemented!()
         }
 
-        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+        fn row_addrs(&self) -> Box<dyn Iterator<Item = &u64>> {
             unimplemented!()
         }
 

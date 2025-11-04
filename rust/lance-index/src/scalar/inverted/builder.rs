@@ -23,9 +23,9 @@ use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
+use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu, ROW_ADDR, ROW_ADDR_FIELD};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
@@ -571,13 +571,13 @@ impl IndexWorker {
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
         let doc_iter = iter_str_array(doc_col);
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let row_addr_col = batch[ROW_ADDR].as_primitive::<datatypes::UInt64Type>();
         let docs = doc_iter
-            .zip(row_id_col.values().iter())
-            .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+            .zip(row_addr_col.values().iter())
+            .filter_map(|(doc, row_addr)| doc.map(|doc| (doc, *row_addr)));
 
         let with_position = self.has_position();
-        for (doc, row_id) in docs {
+        for (doc, row_addr) in docs {
             let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
@@ -598,7 +598,7 @@ impl IndexWorker {
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::new(with_position)
                 });
-            let doc_id = self.builder.docs.append(row_id, token_num);
+            let doc_id = self.builder.docs.append(row_addr, token_num);
             self.total_doc_length += doc.len();
 
             token_occurrences
@@ -700,14 +700,14 @@ impl PositionRecorder {
 
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
 pub struct ScoredDoc {
-    pub row_id: u64,
+    pub row_addr: u64,
     pub score: OrderedFloat,
 }
 
 impl ScoredDoc {
-    pub fn new(row_id: u64, score: f32) -> Self {
+    pub fn new(row_addr: u64, score: f32) -> Self {
         Self {
-            row_id,
+            row_addr,
             score: OrderedFloat(score),
         }
     }
@@ -727,7 +727,7 @@ impl Ord for ScoredDoc {
 
 pub fn legacy_inverted_list_schema(with_position: bool) -> SchemaRef {
     let mut fields = vec![
-        arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+        arrow_schema::Field::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
         arrow_schema::Field::new(FREQUENCY_COL, arrow_schema::DataType::Float32, false),
     ];
     if with_position {
@@ -858,7 +858,7 @@ impl RecordBatchStream for FlattenStream {
                 self.data_type.clone(),
                 true,
             ),
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
         ]);
 
         Arc::new(schema)
@@ -870,15 +870,17 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     doc_col: &Arc<dyn Array>,
 ) -> Result<RecordBatch> {
     let docs = doc_col.as_list::<Offset>();
-    let row_ids = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+    let row_addrs = batch[ROW_ADDR].as_primitive::<datatypes::UInt64Type>();
 
-    let row_ids = row_ids
+    let row_addrs = row_addrs
         .values()
         .iter()
         .zip(docs.iter())
-        .flat_map(|(row_id, doc)| std::iter::repeat_n(*row_id, doc.map(|d| d.len()).unwrap_or(0)));
+        .flat_map(|(row_addr, doc)| {
+            std::iter::repeat_n(*row_addr, doc.map(|d| d.len()).unwrap_or(0))
+        });
 
-    let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
+    let row_addrs = Arc::new(UInt64Array::from_iter_values(row_addrs));
     let docs = match docs.value_type() {
         datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
         _ => {
@@ -898,9 +900,9 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
             docs.data_type().clone(),
             true,
         ),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_addrs])?;
     Ok(batch)
 }
 
