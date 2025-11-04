@@ -39,10 +39,8 @@ use super::blob::BlobStreamExt;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
-use super::utils::wrap_json_stream_for_writing;
+use super::utils::SchemaAdapter;
 use super::DATA_DIR;
-
-use lance_arrow::json::is_arrow_json_field;
 
 mod commit;
 pub mod delete;
@@ -378,10 +376,8 @@ pub async fn do_write_fragments(
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
-    // Convert arrow.json to lance.json (JSONB) for storage if needed
-    //
-    // FIXME: this is bad, really bad, we need to find a way to remove this.
-    let data = wrap_json_stream_for_writing(data);
+    let adapter = SchemaAdapter::new(data.schema());
+    let data = adapter.to_physical_stream(data);
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // In v1 we split the stream into row group sized batches
@@ -576,17 +572,10 @@ pub async fn write_fragments_internal(
     mut params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<WrittenFragments> {
-    // Convert Arrow JSON columns to Lance JSON (JSONB) format
-    //
-    // FIXME: this is bad, really bad, we need to find a way to remove this.
-    let needs_conversion = data
-        .schema()
-        .fields()
-        .iter()
-        .any(|f| is_arrow_json_field(f));
+    let adapter = SchemaAdapter::new(data.schema());
 
-    let (data, converted_schema) = if needs_conversion {
-        let data = wrap_json_stream_for_writing(data);
+    let (data, converted_schema) = if adapter.requires_physical_conversion() {
+        let data = adapter.to_physical_stream(data);
         // Update the schema to match the converted data
         let arrow_schema = data.schema();
         let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
