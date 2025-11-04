@@ -4,9 +4,8 @@
 use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::utils::SchemaAdapter;
 use lance::datatypes::{Field, Schema};
-use lance_arrow::json::convert_lance_json_to_arrow;
+use lance_arrow::json::{convert_lance_json_to_arrow, has_json_fields};
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
@@ -172,11 +171,11 @@ impl LanceSchema {
 pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {
     use std::sync::Arc;
 
-    let schema_ref = Arc::new(schema.clone());
-    if !SchemaAdapter::requires_logical_conversion(&schema_ref) {
+    if !schema.fields().iter().any(|f| has_json_fields(f.as_ref())) {
         return schema.clone();
     }
 
+    let schema_ref = Arc::new(schema.clone());
     let empty_batch = RecordBatch::new_empty(schema_ref.clone());
     match convert_lance_json_to_arrow(&empty_batch) {
         Ok(converted) => converted.schema().as_ref().clone(),
