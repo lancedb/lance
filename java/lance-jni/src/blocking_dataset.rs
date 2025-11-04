@@ -19,11 +19,13 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
+use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -44,6 +46,7 @@ use std::collections::HashMap;
 use std::iter::empty;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -318,6 +321,10 @@ impl BlockingDataset {
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
         RT.block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
+    }
+
+    pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
+        Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
     }
 
     pub fn close(&self) {}
@@ -2222,4 +2229,64 @@ fn convert_java_compaction_options_to_rust(
         &batch_size,
         &defer_index_remap,
     )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCleanupWithPolicy<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_cleanup_with_policy(&mut env, jdataset, jpolicy))
+}
+
+fn inner_cleanup_with_policy<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> Result<JObject<'local>> {
+    let before_ts_millis =
+        env.get_optional_u64_from_method(&jpolicy, "getBeforeTimestampMillis")?;
+    let before_timestamp = before_ts_millis.map(|millis| {
+        let st = UNIX_EPOCH + Duration::from_millis(millis);
+        DateTime::<Utc>::from(st)
+    });
+
+    let before_version = env.get_optional_u64_from_method(&jpolicy, "getBeforeVersion")?;
+
+    let delete_unverified = env
+        .get_optional_from_method(&jpolicy, "getDeleteUnverified", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
+    let error_if_tagged_old_versions = env
+        .get_optional_from_method(&jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(true);
+
+    let policy = CleanupPolicy {
+        before_timestamp,
+        before_version,
+        delete_unverified,
+        error_if_tagged_old_versions,
+    };
+
+    let stats = {
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.cleanup_with_policy(policy)
+    }?;
+
+    let jstats = env.new_object(
+        "com/lancedb/lance/cleanup/RemovalStats",
+        "(JJ)V",
+        &[
+            JValue::Long(stats.bytes_removed as i64),
+            JValue::Long(stats.old_versions as i64),
+        ],
+    )?;
+
+    Ok(jstats)
 }

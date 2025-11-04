@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.cleanup.CleanupPolicy;
+import com.lancedb.lance.cleanup.RemovalStats;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
@@ -1290,4 +1292,19 @@ public class Dataset implements Closeable {
 
   private native Dataset nativeShallowClone(
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
+
+  /**
+   * Cleanup dataset based on a specified policy.
+   *
+   * @param policy cleanup policy
+   * @return removal stats
+   */
+  public RemovalStats cleanupWithPolicy(CleanupPolicy policy) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCleanupWithPolicy(policy);
+    }
+  }
+
+  private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
 }
