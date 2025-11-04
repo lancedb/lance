@@ -36,9 +36,6 @@ pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
 
-    /// Local schema, only containing fields that are not marked as blobs
-    pub local_schema: Schema,
-
     /// Dataset version
     pub version: u64,
 
@@ -174,11 +171,9 @@ impl Manifest {
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_non_blob_fields();
 
         Self {
             schema,
-            local_schema,
             version: 1,
             branch: None,
             writer_version: Some(WriterVersion::default()),
@@ -206,11 +201,9 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_non_blob_fields();
 
         Self {
             schema,
-            local_schema,
             version: previous.version + 1,
             branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
@@ -267,7 +260,6 @@ impl Manifest {
 
         Self {
             schema: self.schema.clone(),
-            local_schema: self.local_schema.clone(),
             version: self.version,
             branch: branch_name,
             writer_version: self.writer_version.clone(),
@@ -911,11 +903,9 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
-        let local_schema = schema.retain_non_blob_fields();
 
         Ok(Self {
             schema,
-            local_schema,
             version: p.version,
             branch: p.branch,
             writer_version,

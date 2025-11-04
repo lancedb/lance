@@ -995,8 +995,6 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
-    use std::collections::HashMap;
-
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [

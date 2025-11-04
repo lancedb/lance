@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::DataTypeExt;
@@ -12,6 +10,7 @@ use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_binary_array, read_fixed_stride_array};
 use snafu::location;
+use std::collections::HashMap;
 
 use crate::format::pb;
 
@@ -264,9 +263,9 @@ mod tests {
     use arrow_schema::Fields as ArrowFields;
     use arrow_schema::Schema as ArrowSchema;
     use lance_core::datatypes::Schema;
+    use std::collections::HashMap;
 
-    use super::{Field, Fields, FieldsWithMeta};
-    use crate::format::pb;
+    use super::{Fields, FieldsWithMeta};
 
     #[test]
     fn test_schema_set_ids() {

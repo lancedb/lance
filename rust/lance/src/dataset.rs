@@ -1554,10 +1554,6 @@ impl Dataset {
     }
 
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
-    pub fn local_schema(&self) -> &Schema {
-        &self.manifest.local_schema
-    }
-
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())

@@ -146,56 +146,6 @@ impl Schema {
         }
     }
 
-    pub fn retain_blob_fields(&self) -> Self {
-        self.retain_by(|f| f.is_blob())
-    }
-
-    pub fn retain_non_blob_fields(&self) -> Self {
-        self.retain_by(|f| !f.is_blob())
-    }
-
-    fn retain_by<F: Fn(&Field) -> bool>(&self, predicate: F) -> Self {
-        let fields = self
-            .fields
-            .iter()
-            .filter(|f| predicate(f))
-            .cloned()
-            .collect();
-        Self {
-            fields,
-            metadata: self.metadata.clone(),
-        }
-    }
-
-    /// Splits the schema into two schemas, one with non-blob fields and the other with blob fields.
-    /// If there are no blob fields, the second schema will be `None`.
-    /// The order of fields is preserved.
-    pub fn partition_by_blob_columns(&self) -> (Self, Option<Self>) {
-        let mut non_blob_fields = Vec::with_capacity(self.fields.len());
-        let mut blob_fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields.iter() {
-            if field.is_blob() {
-                blob_fields.push(field.clone());
-            } else {
-                non_blob_fields.push(field.clone());
-            }
-        }
-        (
-            Self {
-                fields: non_blob_fields,
-                metadata: self.metadata.clone(),
-            },
-            if blob_fields.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    fields: blob_fields,
-                    metadata: self.metadata.clone(),
-                })
-            },
-        )
-    }
-
     pub fn has_dictionary_types(&self) -> bool {
         self.fields.iter().any(|f| f.has_dictionary_types())
     }

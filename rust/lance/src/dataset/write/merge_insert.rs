@@ -877,7 +877,7 @@ impl MergeInsertJob {
                     .as_ref()
                     .without_column(ROW_ADDR)
                     .without_column(ROW_ID);
-                let write_schema = dataset.local_schema().project_by_schema(
+                let write_schema = dataset.schema().project_by_schema(
                     &write_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
@@ -1392,7 +1392,7 @@ impl MergeInsertJob {
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
-        let full_schema = self.dataset.local_schema();
+        let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -1432,7 +1432,7 @@ impl MergeInsertJob {
 
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
-        let full_schema = self.dataset.local_schema();
+        let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
