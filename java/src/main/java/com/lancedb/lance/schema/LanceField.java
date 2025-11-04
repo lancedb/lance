@@ -30,7 +30,6 @@ public class LanceField {
   private final String name;
   private final boolean nullable;
   private final ArrowType type;
-  private final StorageType storageType;
   private final DictionaryEncoding dictionaryEncoding;
   private final Map<String, String> metadata;
   private final List<LanceField> children;
@@ -42,7 +41,6 @@ public class LanceField {
       String name,
       boolean nullable,
       ArrowType type,
-      StorageType storageType,
       DictionaryEncoding dictionaryEncoding,
       Map<String, String> metadata,
       List<LanceField> children,
@@ -52,7 +50,6 @@ public class LanceField {
     this.name = name;
     this.nullable = nullable;
     this.type = type;
-    this.storageType = storageType;
     this.dictionaryEncoding = dictionaryEncoding;
     this.metadata = metadata;
     this.children = children;
@@ -77,10 +74,6 @@ public class LanceField {
 
   public ArrowType getType() {
     return type;
-  }
-
-  public StorageType getStorageType() {
-    return storageType;
   }
 
   public Optional<DictionaryEncoding> getDictionaryEncoding() {
@@ -114,7 +107,6 @@ public class LanceField {
         .add("name", name)
         .add("nullable", nullable)
         .add("type", type)
-        .add("storageType", storageType)
         .add("dictionaryEncoding", dictionaryEncoding)
         .add("children", children)
         .add("isUnenforcedPrimaryKey", isUnenforcedPrimaryKey)

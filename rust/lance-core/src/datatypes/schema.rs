@@ -15,7 +15,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
@@ -146,11 +146,19 @@ impl Schema {
         }
     }
 
-    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
+    pub fn retain_blob_fields(&self) -> Self {
+        self.retain_by(|f| f.is_blob())
+    }
+
+    pub fn retain_non_blob_fields(&self) -> Self {
+        self.retain_by(|f| !f.is_blob())
+    }
+
+    fn retain_by<F: Fn(&Field) -> bool>(&self, predicate: F) -> Self {
         let fields = self
             .fields
             .iter()
-            .filter(|f| f.storage_class() == storage_class)
+            .filter(|f| predicate(f))
             .cloned()
             .collect();
         Self {
@@ -159,28 +167,29 @@ impl Schema {
         }
     }
 
-    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
-    /// If there are no blob storage class fields, the second schema will be `None`.
+    /// Splits the schema into two schemas, one with non-blob fields and the other with blob fields.
+    /// If there are no blob fields, the second schema will be `None`.
     /// The order of fields is preserved.
-    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
-        let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut sibling_fields = Vec::with_capacity(self.fields.len());
+    pub fn partition_by_blob_columns(&self) -> (Self, Option<Self>) {
+        let mut non_blob_fields = Vec::with_capacity(self.fields.len());
+        let mut blob_fields = Vec::with_capacity(self.fields.len());
         for field in self.fields.iter() {
-            match field.storage_class() {
-                StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => sibling_fields.push(field.clone()),
+            if field.is_blob() {
+                blob_fields.push(field.clone());
+            } else {
+                non_blob_fields.push(field.clone());
             }
         }
         (
             Self {
-                fields: local_fields,
+                fields: non_blob_fields,
                 metadata: self.metadata.clone(),
             },
-            if sibling_fields.is_empty() {
+            if blob_fields.is_empty() {
                 None
             } else {
                 Some(Self {
-                    fields: sibling_fields,
+                    fields: blob_fields,
                     metadata: self.metadata.clone(),
                 })
             },

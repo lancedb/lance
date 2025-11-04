@@ -1097,7 +1097,7 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let fragments = write_fragments_internal(
+                let (fragments, _) = write_fragments_internal(
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -1108,7 +1108,7 @@ impl MergeInsertJob {
                 )
                 .await?;
 
-                new_fragments.lock().unwrap().extend(fragments.default.0);
+                new_fragments.lock().unwrap().extend(fragments);
                 Ok(reservation_size)
             }
             // We shouldn't need much more memory beyond what is already in the batches.
@@ -1487,7 +1487,7 @@ impl MergeInsertJob {
             // we can't use affected rows here.
             (operation, None)
         } else {
-            let written = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
@@ -1497,9 +1497,6 @@ impl MergeInsertJob {
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
-
-            assert!(written.blob.is_none());
-            let mut new_fragments = written.default.0;
 
             if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
                 let fragment_sizes = new_fragments
@@ -1570,12 +1567,7 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(
-            self.dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
 
         Ok(UncommittedMergeInsert {
             transaction,

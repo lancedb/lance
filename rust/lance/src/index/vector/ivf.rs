@@ -2377,7 +2377,6 @@ mod tests {
                 removed_indices: vec![],
             },
             None,
-            None,
         );
 
         // Apply the transaction to register the index
@@ -2479,7 +2478,6 @@ mod tests {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
             },
-            None,
             None,
         );
 

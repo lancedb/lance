@@ -19,7 +19,7 @@ use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Schema, StorageClass};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
@@ -36,7 +36,7 @@ pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
 
-    /// Local schema, only containing fields with the default storage class (not blobs)
+    /// Local schema, only containing fields that are not marked as blobs
     pub local_schema: Schema,
 
     /// Dataset version
@@ -98,9 +98,6 @@ pub struct Manifest {
     /// associated with the table. This is different than configuration, which
     /// is used to tell libraries how to read, write, or manage the table.
     pub table_metadata: HashMap<String, String>,
-
-    /// Blob dataset version
-    pub blob_dataset_version: Option<u64>,
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
@@ -174,11 +171,10 @@ impl Manifest {
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
-        blob_dataset_version: Option<u64>,
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
+        let local_schema = schema.retain_non_blob_fields();
 
         Self {
             schema,
@@ -200,7 +196,6 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             table_metadata: HashMap::new(),
-            blob_dataset_version,
             base_paths,
         }
     }
@@ -209,12 +204,9 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
-        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
-
-        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
+        let local_schema = schema.retain_non_blob_fields();
 
         Self {
             schema,
@@ -236,7 +228,6 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
-            blob_dataset_version,
             base_paths: previous.base_paths.clone(),
         }
     }
@@ -293,7 +284,6 @@ impl Manifest {
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
-            blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
                 let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
@@ -921,7 +911,7 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
+        let local_schema = schema.retain_non_blob_fields();
 
         Ok(Self {
             schema,
@@ -947,11 +937,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
-            blob_dataset_version: if p.blob_dataset_version == 0 {
-                None
-            } else {
-                Some(p.blob_dataset_version)
-            },
             base_paths: p
                 .base_paths
                 .iter()
@@ -1009,7 +994,6 @@ impl From<&Manifest> for pb::Manifest {
                 version: m.data_storage_format.version.clone(),
             }),
             config: m.config.clone(),
-            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
             base_paths: m
                 .base_paths
                 .values()
@@ -1294,7 +1278,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1370,7 +1353,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1394,7 +1376,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1423,7 +1404,6 @@ mod tests {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1446,7 +1426,6 @@ mod tests {
             schema.clone(),
             Arc::new(empty_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1470,7 +1449,6 @@ mod tests {
             schema.clone(),
             Arc::new(real_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1506,7 +1484,6 @@ mod tests {
             schema,
             Arc::new(vec![fragment_with_deletion]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 

@@ -2211,7 +2211,7 @@ mod tests {
         ];
         let other_transactions = other_operations
             .iter()
-            .map(|op| Transaction::new(0, op.clone(), None, None))
+            .map(|op| Transaction::new(0, op.clone(), None))
             .collect::<Vec<_>>();
 
         // Transactions and whether they are expected to conflict with each
@@ -2569,7 +2569,7 @@ mod tests {
         ];
 
         for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None, None);
+            let transaction = Transaction::new(0, operation.clone(), None);
             let mut rebase = TransactionRebase {
                 transaction,
                 initial_fragments: HashMap::new(),

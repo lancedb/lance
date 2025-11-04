@@ -6,8 +6,7 @@
 use std::{
     cmp::{max, Ordering},
     collections::{HashMap, VecDeque},
-    fmt::{self, Display},
-    str::FromStr,
+    fmt,
     sync::Arc,
 };
 
@@ -32,7 +31,7 @@ use super::{
 };
 use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
 
-pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
+const LEGACY_STORAGE_CLASS_METADATA_KEY: &str = "lance-schema:storage-class";
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
 /// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
@@ -85,40 +84,6 @@ pub enum Encoding {
     RLE,
 }
 
-/// Describes the rate at which a column should be compacted
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
-pub enum StorageClass {
-    /// Default storage class (stored in primary dataset)
-    #[default]
-    Default,
-    /// Blob storage class (stored in blob dataset)
-    Blob,
-}
-
-impl Display for StorageClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => write!(f, "default"),
-            Self::Blob => write!(f, "blob"),
-        }
-    }
-}
-
-impl FromStr for StorageClass {
-    type Err = Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "default" | "" => Ok(Self::Default),
-            "blob" => Ok(Self::Blob),
-            _ => Err(Error::Schema {
-                message: format!("Unknown storage class: {}", s),
-                location: location!(),
-            }),
-        }
-    }
-}
-
 /// What to do on a merge operation if the types of the fields don't match
 #[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
 pub enum OnTypeMismatch {
@@ -143,7 +108,6 @@ pub struct Field {
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
-    pub storage_class: StorageClass,
     pub unenforced_primary_key: bool,
 }
 
@@ -171,14 +135,6 @@ impl Field {
     pub fn has_dictionary_types(&self) -> bool {
         matches!(self.data_type(), DataType::Dictionary(_, _))
             || self.children.iter().any(Self::has_dictionary_types)
-    }
-
-    pub fn is_default_storage(&self) -> bool {
-        self.storage_class == StorageClass::Default
-    }
-
-    pub fn storage_class(&self) -> StorageClass {
-        self.storage_class
     }
 
     /// Merge a field with another field using a reference field to ensure
@@ -526,7 +482,6 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
-            storage_class: self.storage_class,
             unenforced_primary_key: self.unenforced_primary_key,
         };
         if path_components.is_empty() {
@@ -744,7 +699,6 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
                 unenforced_primary_key: self.unenforced_primary_key,
             };
             return Ok(f);
@@ -808,7 +762,6 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
                 unenforced_primary_key: self.unenforced_primary_key,
             })
         }
@@ -978,17 +931,23 @@ impl TryFrom<&ArrowField> for Field {
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
-        let storage_class = field
-            .metadata()
-            .get(LANCE_STORAGE_CLASS_SCHEMA_META_KEY)
-            .map(|s| StorageClass::from_str(s))
-            .unwrap_or(Ok(StorageClass::Default))?;
-
-        let unenforced_primary_key = field
-            .metadata()
+        let mut metadata = field.metadata().clone();
+        let unenforced_primary_key = metadata
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
+
+        if let Some(value) = metadata
+            .get(LEGACY_STORAGE_CLASS_METADATA_KEY)
+            .map(|v| v.to_ascii_lowercase())
+        {
+            if value == "blob" {
+                metadata
+                    .entry(lance_arrow::BLOB_META_KEY.to_string())
+                    .or_insert_with(|| "true".to_string());
+            }
+            metadata.remove(LEGACY_STORAGE_CLASS_METADATA_KEY);
+        }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
@@ -1010,11 +969,10 @@ impl TryFrom<&ArrowField> for Field {
                 DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
-            metadata: field.metadata().clone(),
+            metadata,
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            storage_class,
             unenforced_primary_key,
         })
     }
@@ -1032,6 +990,7 @@ impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
+        metadata.remove(LEGACY_STORAGE_CLASS_METADATA_KEY);
 
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
@@ -1041,15 +1000,6 @@ impl From<&Field> for ArrowField {
             );
         }
 
-        match field.storage_class {
-            StorageClass::Default => {}
-            StorageClass::Blob => {
-                metadata.insert(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                );
-            }
-        }
         out.with_metadata(metadata)
     }
 }
@@ -1060,6 +1010,7 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
+    use std::collections::HashMap;
 
     #[test]
     fn arrow_field_to_field() {
@@ -1169,6 +1120,22 @@ mod tests {
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::from(&field), arrow_field);
+    }
+
+    #[test]
+    fn legacy_storage_class_metadata_sets_blob() {
+        let metadata = HashMap::from([(
+            super::LEGACY_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "blob".to_string(),
+        )]);
+        let arrow_field =
+            ArrowField::new("blob", DataType::LargeBinary, false).with_metadata(metadata);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert!(field.is_blob());
+        assert_eq!(
+            field.metadata.get(lance_arrow::BLOB_META_KEY),
+            Some(&"true".to_string())
+        );
     }
 
     #[test]

@@ -355,7 +355,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
-            /*blobs_op= */ None,
             None,
         );
 

@@ -527,10 +527,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
-        let blobs_op = ob
-            .getattr("blobs_op")?
-            .extract::<Option<PyLance<Operation>>>()?
-            .map(|op| op.0);
         let transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
@@ -540,7 +536,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             read_version,
             uuid,
             operation,
-            blobs_op,
             tag: None,
             transaction_properties,
         }))
@@ -560,18 +555,12 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let read_version = self.0.read_version;
         let uuid = &self.0.uuid;
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
-        let blobs_op = self
-            .0
-            .blobs_op
-            .as_ref()
-            .map(|op| PyLance(op).into_pyobject(py))
-            .transpose()?;
 
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
 
-        let py_transaction = cls.call1((read_version, operation, uuid, blobs_op))?;
+        let py_transaction = cls.call1((read_version, operation, uuid))?;
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;

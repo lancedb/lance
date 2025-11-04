@@ -4,21 +4,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_array::RecordBatchIterator;
+use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::NullabilityComparison;
-use lance_core::datatypes::Schema;
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::ROW_ADDR;
-use lance_core::ROW_ID;
-use lance_core::ROW_OFFSET;
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
+use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::location;
@@ -36,8 +32,6 @@ use super::resolve_commit_handler;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
-use super::WrittenFragments;
-
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -199,7 +193,7 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
-        let written_frags = write_fragments_internal(
+        let (written_fragments, _) = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -210,14 +204,14 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(schema, written_frags, &context)?;
+        let transaction = Self::build_transaction(schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
 
     fn build_transaction(
         schema: Schema,
-        written_frags: WrittenFragments,
+        fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
@@ -255,7 +249,7 @@ impl<'a> InsertBuilder<'a> {
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
-                    fragments: written_frags.default.0,
+                    fragments,
                     config_upsert_values,
                     initial_bases: context.params.initial_bases.clone(),
                 }
@@ -264,25 +258,13 @@ impl<'a> InsertBuilder<'a> {
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
-                    fragments: written_frags.default.0,
+                    fragments,
                     config_upsert_values: None,
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
-            WriteMode::Append => Operation::Append {
-                fragments: written_frags.default.0,
-            },
+            WriteMode::Append => Operation::Append { fragments },
         };
-
-        let blobs_op = written_frags.blob.map(|blob| match context.params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
-                schema: blob.1,
-                fragments: blob.0,
-                config_upsert_values: None,
-                initial_bases: context.params.initial_bases.clone(),
-            },
-            WriteMode::Append => Operation::Append { fragments: blob.0 },
-        });
 
         let transaction = TransactionBuilder::new(
             context
@@ -292,7 +274,6 @@ impl<'a> InsertBuilder<'a> {
                 .unwrap_or(0),
             operation,
         )
-        .blobs_op(blobs_op)
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
 
@@ -328,26 +309,16 @@ impl<'a> InsertBuilder<'a> {
                     );
                     context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
                 }
-                let m = dataset.manifest.as_ref();
-                let mut schema_cmp_opts = SchemaCompareOptions {
-                    // In the legacy format we stored the dictionary in the manifest and
-                    // all files must have identical dictionaries.
-                    //
-                    // In 2.0+ the dictionary is stored in the files and dictionaries may
-                    // fluctuate between files.
-                    compare_dictionary: m.should_use_legacy_format(),
-                    // array nullability is checked later, using actual data instead
-                    // of the schema
+
+                let schema_cmp_opts = SchemaCompareOptions {
+                    compare_dictionary: dataset.manifest.should_use_legacy_format(),
                     compare_nullability: NullabilityComparison::Ignore,
+                    allow_missing_if_nullable: true,
+                    ignore_field_order: true,
                     ..Default::default()
                 };
-                if m.blob_dataset_version.is_none() {
-                    // Balanced datasets don't yet support schema evolution
-                    schema_cmp_opts.ignore_field_order = true;
-                    schema_cmp_opts.allow_missing_if_nullable = true;
-                }
 
-                data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+                data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
             }
         }
 
@@ -363,15 +334,6 @@ impl<'a> InsertBuilder<'a> {
                     location: location!(),
                 });
             }
-        }
-
-        // If we are writing a dataset with non-default storage, we need to enable stable row ids
-        if context.dest.dataset().is_none()
-            && !context.params.enable_stable_row_ids
-            && data_schema.fields.iter().any(|f| !f.is_default_storage())
-        {
-            log::info!("Enabling stable row ids because non-default storage is used");
-            context.params.enable_stable_row_ids = true;
         }
 
         // Feature flags

@@ -18,10 +18,7 @@ mod field;
 mod schema;
 
 use crate::{Error, Result};
-pub use field::{
-    Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
-    LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
-};
+pub use field::{Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions};
 pub use schema::{
     escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
     Projectable, Projection, Schema,
