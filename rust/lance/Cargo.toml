@@ -129,6 +129,8 @@ aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
+# Enable slow integration tests (disabled by default in CI)
+slow_tests = []
 
 [[bin]]
 name = "lq"
