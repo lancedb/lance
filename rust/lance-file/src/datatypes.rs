@@ -15,12 +15,10 @@ use snafu::location;
 
 use crate::format::pb;
 
-const LEGACY_STORAGE_CLASS_METADATA_KEY: &str = "lance-schema:storage-class";
-
 #[allow(clippy::fallible_impl_from)]
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
-        let mut lance_metadata: HashMap<String, String> = field
+        let lance_metadata: HashMap<String, String> = field
             .metadata
             .iter()
             .map(|(key, value)| {
@@ -28,21 +26,9 @@ impl From<&pb::Field> for Field {
                 (key.clone(), string_value)
             })
             .collect();
+        let mut lance_metadata = lance_metadata;
         if !field.extension_name.is_empty() {
             lance_metadata.insert(ARROW_EXT_NAME_KEY.to_string(), field.extension_name.clone());
-        }
-        let legacy_blob_marker = lance_metadata
-            .get(LEGACY_STORAGE_CLASS_METADATA_KEY)
-            .map(|value| value.eq_ignore_ascii_case("blob"))
-            .unwrap_or(false);
-        if legacy_blob_marker {
-            lance_metadata
-                .entry(lance_arrow::BLOB_META_KEY.to_string())
-                .or_insert_with(|| "true".to_string());
-        }
-        // Drop the legacy storage class metadata key after translating it to blob semantics.
-        if legacy_blob_marker {
-            lance_metadata.remove(LEGACY_STORAGE_CLASS_METADATA_KEY);
         }
         Self {
             name: field.name.clone(),
@@ -70,7 +56,6 @@ impl From<&Field> for pb::Field {
         let pb_metadata = field
             .metadata
             .iter()
-            .filter(|(key, _)| key.as_str() != LEGACY_STORAGE_CLASS_METADATA_KEY)
             .map(|(key, value)| (key.clone(), value.clone().into_bytes()))
             .collect();
         Self {
@@ -282,7 +267,7 @@ mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use lance_core::datatypes::Schema;
 
-    use super::{Field, Fields, FieldsWithMeta, LEGACY_STORAGE_CLASS_METADATA_KEY};
+    use super::{Field, Fields, FieldsWithMeta};
     use crate::format::pb;
 
     #[test]
@@ -328,25 +313,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_proto_storage_class_sets_blob_metadata() {
+    fn large_binary_fields_marked_blob() {
         let proto = pb::Field {
             name: "blob".to_string(),
             logical_type: "large_binary".to_string(),
-            metadata: HashMap::from([(
-                LEGACY_STORAGE_CLASS_METADATA_KEY.to_string(),
-                b"blob".to_vec(),
-            )]),
             nullable: true,
             ..Default::default()
         };
         let field = Field::from(&proto);
         assert!(field.is_blob());
-        assert_eq!(
-            field.metadata.get(lance_arrow::BLOB_META_KEY),
-            Some(&"true".to_string())
-        );
-        assert!(!field
-            .metadata
-            .contains_key(LEGACY_STORAGE_CLASS_METADATA_KEY));
     }
 }

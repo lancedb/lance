@@ -31,8 +31,6 @@ use super::{
 };
 use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
 
-const LEGACY_STORAGE_CLASS_METADATA_KEY: &str = "lance-schema:storage-class";
-
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
 /// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
 /// A primary key column must satisfy:
@@ -931,23 +929,11 @@ impl TryFrom<&ArrowField> for Field {
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
-        let mut metadata = field.metadata().clone();
+        let metadata = field.metadata().clone();
         let unenforced_primary_key = metadata
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
-
-        if let Some(value) = metadata
-            .get(LEGACY_STORAGE_CLASS_METADATA_KEY)
-            .map(|v| v.to_ascii_lowercase())
-        {
-            if value == "blob" {
-                metadata
-                    .entry(lance_arrow::BLOB_META_KEY.to_string())
-                    .or_insert_with(|| "true".to_string());
-            }
-            metadata.remove(LEGACY_STORAGE_CLASS_METADATA_KEY);
-        }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
@@ -990,7 +976,6 @@ impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
-        metadata.remove(LEGACY_STORAGE_CLASS_METADATA_KEY);
 
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
@@ -1120,22 +1105,6 @@ mod tests {
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::from(&field), arrow_field);
-    }
-
-    #[test]
-    fn legacy_storage_class_metadata_sets_blob() {
-        let metadata = HashMap::from([(
-            super::LEGACY_STORAGE_CLASS_METADATA_KEY.to_string(),
-            "blob".to_string(),
-        )]);
-        let arrow_field =
-            ArrowField::new("blob", DataType::LargeBinary, false).with_metadata(metadata);
-        let field = Field::try_from(&arrow_field).unwrap();
-        assert!(field.is_blob());
-        assert_eq!(
-            field.metadata.get(lance_arrow::BLOB_META_KEY),
-            Some(&"true".to_string())
-        );
     }
 
     #[test]
