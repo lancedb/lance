@@ -41,7 +41,6 @@ async fn test_query_bool() {
 }
 
 #[tokio::test]
-#[cfg(feature = "slow_tests")]
 #[rstest::rstest]
 #[case::int8(DataType::Int8)]
 #[case::int16(DataType::Int16)]

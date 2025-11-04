@@ -22,7 +22,6 @@ fn date_as_i32(date: &str) -> i32 {
 }
 
 #[tokio::test]
-#[cfg(feature = "slow_tests")]
 async fn test_query_prefilter_date() {
     let batch = gen_batch()
         .col("id", array::step::<Int32Type>())
