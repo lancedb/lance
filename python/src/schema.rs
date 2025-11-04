@@ -4,8 +4,8 @@
 use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use lance::datatypes::{Field, Schema};
 use lance::dataset::utils::SchemaAdapter;
+use lance::datatypes::{Field, Schema};
 use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
