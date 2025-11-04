@@ -7,7 +7,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
-    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -35,7 +35,6 @@ use tracing::{info, instrument};
 use crate::session::Session;
 use crate::Dataset;
 
-use super::blob::BlobStreamExt;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
@@ -441,13 +440,6 @@ pub async fn do_write_fragments(
     Ok(fragments)
 }
 
-pub struct WrittenFragments {
-    /// The fragments written to the dataset (and the schema)
-    pub default: (Vec<Fragment>, Schema),
-    /// The fragments written to the blob dataset, if any
-    pub blob: Option<(Vec<Fragment>, Schema)>,
-}
-
 pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
@@ -571,7 +563,7 @@ pub async fn write_fragments_internal(
     data: SendableRecordBatchStream,
     mut params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-) -> Result<WrittenFragments> {
+) -> Result<(Vec<Fragment>, Schema)> {
     let adapter = SchemaAdapter::new(data.schema());
 
     let (data, converted_schema) = if adapter.requires_physical_conversion() {
@@ -604,7 +596,6 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
-                // Project from the dataset schema, because it has the correct field ids.
                 let write_schema = dataset.schema().project_by_schema(
                     &converted_schema,
                     OnMissing::Error,
@@ -636,67 +627,18 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    let data_schema = schema.project_by_schema(
-        data.schema().as_ref(),
-        OnMissing::Error,
-        OnTypeMismatch::Error,
-    )?;
-
-    let (data, blob_data) = data.extract_blob_stream(&data_schema);
-
-    // Some params we borrow from the normal write, some we override
-    let blob_write_params = WriteParams {
-        store_params: params.store_params.clone(),
-        commit_handler: params.commit_handler.clone(),
-        data_storage_version: params.data_storage_version,
-        enable_stable_row_ids: true,
-        // This shouldn't really matter since all commits are detached
-        enable_v2_manifest_paths: true,
-        max_bytes_per_file: params.max_bytes_per_file,
-        max_rows_per_file: params.max_rows_per_file,
-        ..Default::default()
-    };
-
-    if blob_data.is_some() && !params.enable_stable_row_ids {
-        return Err(Error::invalid_input(
-            "The blob storage class requires stable row ids",
-            location!(),
-        ));
-    }
-
-    let frag_schema = schema.retain_storage_class(StorageClass::Default);
-    let fragments_fut = do_write_fragments(
-        object_store.clone(),
+    let fragments = do_write_fragments(
+        object_store,
         base_dir,
-        &frag_schema,
+        &schema,
         data,
         params,
         storage_version,
         target_bases_info,
-    );
+    )
+    .await?;
 
-    let (default, blob) = if let Some(blob_data) = blob_data {
-        let blob_schema = schema.retain_storage_class(StorageClass::Blob);
-        let blobs_path = base_dir.child("_blobs");
-        let blob_fut = do_write_fragments(
-            object_store,
-            &blobs_path,
-            &blob_schema,
-            blob_data,
-            blob_write_params,
-            storage_version,
-            None, // Blobs don't use target_bases
-        );
-        let (fragments_res, blobs_res) = futures::join!(fragments_fut, blob_fut);
-        let fragments = fragments_res?;
-        let blobs = blobs_res?;
-        ((fragments, frag_schema), Some((blobs, blob_schema)))
-    } else {
-        let fragments = fragments_fut.await?;
-        ((fragments, frag_schema), None)
-    };
-
-    Ok(WrittenFragments { default, blob })
+    Ok((fragments, schema))
 }
 
 #[async_trait::async_trait]
@@ -1210,10 +1152,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );
 
-        let written = reader_to_frags(data_reader).await.unwrap();
-
-        assert!(written.blob.is_none());
-        let fragments = written.default.0;
+        let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
 
         assert_eq!(fragments.len(), 2);
     }
@@ -1257,7 +1196,7 @@ mod tests {
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
             let object_store = Arc::new(ObjectStore::memory());
-            let written = write_fragments_internal(
+            let (fragments, _) = write_fragments_internal(
                 None,
                 object_store,
                 &Path::from("test"),
@@ -1268,9 +1207,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-            assert!(written.blob.is_none());
-            let fragments = written.default.0;
 
             assert_eq!(fragments.len(), 1);
             let fragment = &fragments[0];
@@ -1335,7 +1271,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let written = write_fragments_internal(
+        let (fragments, _) = write_fragments_internal(
             None,
             object_store.clone(),
             &base_path,
@@ -1346,9 +1282,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        assert!(written.blob.is_none());
-        let fragments = written.default.0;
 
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];

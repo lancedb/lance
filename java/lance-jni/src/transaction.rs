@@ -397,18 +397,16 @@ fn convert_to_java_transaction<'local>(
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
     };
-    let operation = convert_to_java_operation_inner(env, transaction.operation)?;
-    let blobs_op = convert_to_java_operation(env, transaction.blobs_op)?;
+    let operation = convert_to_java_operation(env, Some(transaction.operation))?;
 
     let java_transaction = env.new_object(
         "com/lancedb/lance/Transaction",
-        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
         &[
             JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&blobs_op),
             JValue::Object(&JObject::null()),
             JValue::Object(&transaction_properties),
         ],
@@ -707,11 +705,6 @@ fn convert_to_rust_transaction(
         .l()?;
     let op = convert_to_rust_operation(env, &op, java_dataset)?;
 
-    let blobs_op =
-        env.get_optional_from_method(&java_transaction, "blobsOperation", |env, blobs_op| {
-            convert_to_rust_operation(env, &blobs_op, java_dataset)
-        })?;
-
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
         "transactionProperties",
@@ -722,7 +715,6 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
-        .blobs_op(blobs_op)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }

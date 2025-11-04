@@ -203,19 +203,6 @@ impl UpdateBuilder {
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .any(|f| !f.is_default_storage())
-        {
-            return Err(Error::NotSupported {
-                source: "Updating datasets containing non-default storage columns".into(),
-                location: location!(),
-            });
-        }
-
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
@@ -322,7 +309,7 @@ impl UpdateJob {
             .manifest()
             .data_storage_format
             .lance_file_version()?;
-        let written = write_fragments_internal(
+        let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
@@ -332,14 +319,6 @@ impl UpdateJob {
             None, // TODO: support multiple bases for update
         )
         .await?;
-
-        if written.blob.is_some() {
-            return Err(Error::NotSupported {
-                source: "Updating blob columns".into(),
-                location: location!(),
-            });
-        }
-        let mut new_fragments = written.default.0;
 
         let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
             message: format!("Failed to receive row ids: {}", err),
@@ -414,12 +393,7 @@ impl UpdateJob {
             update_mode: Some(RewriteRows),
         };
 
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

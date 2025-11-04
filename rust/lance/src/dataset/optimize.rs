@@ -609,7 +609,6 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
-        /*blob_op=*/ None,
         None,
     );
 
@@ -727,7 +726,7 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    let new_fragments = write_fragments_internal(
+    let (mut new_fragments, _) = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
@@ -737,10 +736,6 @@ async fn rewrite_files(
         None, // Compaction doesn't use target_bases
     )
     .await?;
-
-    // We should not be rewriting any blob data
-    assert!(new_fragments.blob.is_none());
-    let mut new_fragments = new_fragments.default.0;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -1065,8 +1060,6 @@ pub async fn commit_compaction(
             rewritten_indices,
             frag_reuse_index,
         },
-        // TODO: Add a blob compaction pass
-        /*blob_op= */ None,
         None,
     );
 

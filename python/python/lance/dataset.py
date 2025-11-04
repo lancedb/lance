@@ -3059,7 +3059,6 @@ class LanceDataset(pa.dataset.Dataset):
     def commit(
         base_uri: Union[str, Path, LanceDataset],
         operation: Union[LanceOperation.BaseOperation, Transaction],
-        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -3200,7 +3199,6 @@ class LanceDataset(pa.dataset.Dataset):
             new_ds = _Dataset.commit(
                 base_uri,
                 operation,
-                blobs_op,
                 read_version,
                 commit_lock,
                 storage_options=storage_options,
@@ -3649,7 +3647,6 @@ class Transaction:
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
-    blobs_op: Optional[LanceOperation.BaseOperation] = None
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
