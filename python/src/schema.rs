@@ -2,8 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow::pyarrow::PyArrowType;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema as ArrowSchema;
 use lance::datatypes::{Field, Schema};
+use lance::dataset::utils::SchemaAdapter;
+use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
@@ -166,67 +169,19 @@ impl LanceSchema {
     }
 }
 
-fn logical_data_type(data_type: &DataType) -> DataType {
+pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {
     use std::sync::Arc;
 
-    match data_type {
-        DataType::Struct(fields) => DataType::Struct(
-            fields
-                .iter()
-                .map(|f| Arc::new(logical_field(f.as_ref())))
-                .collect(),
-        ),
-        DataType::List(field) => DataType::List(Arc::new(logical_field(field.as_ref()))),
-        DataType::LargeList(field) => DataType::LargeList(Arc::new(logical_field(field.as_ref()))),
-        DataType::FixedSizeList(field, len) => {
-            DataType::FixedSizeList(Arc::new(logical_field(field.as_ref())), *len)
-        }
-        DataType::Map(field, keys_sorted) => {
-            DataType::Map(Arc::new(logical_field(field.as_ref())), *keys_sorted)
-        }
-        DataType::Dictionary(index_type, value_type) => DataType::Dictionary(
-            index_type.clone(),
-            Box::new(logical_data_type(value_type.as_ref())),
-        ),
-        _ => data_type.clone(),
+    let schema_ref = Arc::new(schema.clone());
+    if !SchemaAdapter::requires_logical_conversion(&schema_ref) {
+        return schema.clone();
     }
-}
 
-fn logical_field(field: &ArrowField) -> ArrowField {
-    use lance_arrow::json::{is_json_field, ARROW_JSON_EXT_NAME};
-    use lance_arrow::ARROW_EXT_NAME_KEY;
-
-    if is_json_field(field) {
-        let mut metadata = field.metadata().clone();
-        metadata.insert(
-            ARROW_EXT_NAME_KEY.to_string(),
-            ARROW_JSON_EXT_NAME.to_string(),
-        );
-        let mut new_field = ArrowField::new(field.name(), DataType::Utf8, field.is_nullable());
-        new_field.set_metadata(metadata);
-        new_field
-    } else {
-        let new_data_type = logical_data_type(field.data_type());
-        if new_data_type == *field.data_type() {
-            field.clone()
-        } else {
-            let mut new_field = ArrowField::new(field.name(), new_data_type, field.is_nullable());
-            let metadata = field.metadata().clone();
-            if !metadata.is_empty() {
-                new_field.set_metadata(metadata);
-            }
-            new_field
-        }
+    let empty_batch = RecordBatch::new_empty(schema_ref.clone());
+    match convert_lance_json_to_arrow(&empty_batch) {
+        Ok(converted) => converted.schema().as_ref().clone(),
+        Err(_) => schema.clone(),
     }
-}
-
-pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {
-    let fields: Vec<ArrowField> = schema
-        .fields()
-        .iter()
-        .map(|f| logical_field(f.as_ref()))
-        .collect();
-    ArrowSchema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 pub(crate) fn logical_schema_from_lance(schema: &Schema) -> ArrowSchema {
