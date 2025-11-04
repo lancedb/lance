@@ -144,6 +144,30 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --locked --features ${ALL_FEATURES}
+  query-integration-tests:
+    runs-on: ubuntu-2404-4x-arm64
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install dependencies
+        run: |
+          sudo apt -y -qq update
+          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Build query integration tests
+        run: |
+          cargo build --locked --profile release-with-debug --features fp16kernels --tests --test integration_tests
+      - name: Run query integration tests
+        run: |
+          cargo test --locked --profile release-with-debug --features fp16kernels --test integration_tests
   build-no-lock:
     runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
