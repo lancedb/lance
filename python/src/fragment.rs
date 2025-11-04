@@ -18,7 +18,6 @@ use std::sync::Arc;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
-use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
@@ -39,7 +38,7 @@ use snafu::location;
 
 use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
-use crate::schema::LanceSchema;
+use crate::schema::{logical_schema_from_lance, LanceSchema};
 use crate::utils::{export_vec, extract_vec, PyLance};
 use crate::{rt, Dataset, Scanner};
 
@@ -354,8 +353,8 @@ impl FileFragment {
 
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let schema = self_.fragment.dataset().schema();
-        let arrow_schema: ArrowSchema = schema.into();
-        arrow_schema.to_pyarrow(self_.py())
+        let logical_schema = logical_schema_from_lance(schema);
+        logical_schema.to_pyarrow(self_.py())
     }
 
     /// Returns the data file objects associated with this fragment.
