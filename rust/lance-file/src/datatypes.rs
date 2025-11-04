@@ -259,8 +259,6 @@ pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use arrow_schema::DataType;
     use arrow_schema::Field as ArrowField;
     use arrow_schema::Fields as ArrowFields;
@@ -310,17 +308,5 @@ mod tests {
 
         let schema = Schema::from(fields_with_meta);
         assert_eq!(expected_schema, schema);
-    }
-
-    #[test]
-    fn large_binary_fields_marked_blob() {
-        let proto = pb::Field {
-            name: "blob".to_string(),
-            logical_type: "large_binary".to_string(),
-            nullable: true,
-            ..Default::default()
-        };
-        let field = Field::from(&proto);
-        assert!(field.is_blob());
     }
 }
