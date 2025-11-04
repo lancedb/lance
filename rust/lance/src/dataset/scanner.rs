@@ -7341,7 +7341,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#;
+      MatchQuery: column=s, query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7357,7 +7357,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#;
+      PhraseQuery: column=s, query=hello world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7375,8 +7375,8 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: query=hello
-        MatchQuery: query=world"#;
+        MatchQuery: column=s, query=hello
+        MatchQuery: column=s, query=world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7398,7 +7398,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx
@@ -7409,7 +7409,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx"#
         };
@@ -7433,8 +7433,8 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
-            FlatMatchQuery: query=hello
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
@@ -7456,14 +7456,14 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
@@ -7473,10 +7473,10 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         };
