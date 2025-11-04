@@ -299,6 +299,18 @@ pub struct RestNamespace {
     reqwest_config: Configuration,
 }
 
+impl std::fmt::Debug for RestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
+impl std::fmt::Display for RestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
 impl RestNamespace {
     /// Create a new REST namespace from builder
     pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
@@ -690,6 +702,13 @@ impl LanceNamespace for RestNamespace {
         )
         .await
         .map_err(convert_api_error)
+    }
+
+    fn namespace_id(&self) -> String {
+        format!(
+            "RestNamespace {{ endpoint: {:?}, delimiter: {:?} }}",
+            self.reqwest_config.base_path, self.delimiter
+        )
     }
 }
 

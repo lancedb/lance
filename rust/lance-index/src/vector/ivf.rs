@@ -119,6 +119,33 @@ impl IvfTransformer {
         }
     }
 
+    pub fn new_partition_transformer(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+
+        let distance_type = if distance_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+
+        let partition_transform = Arc::new(PartitionTransformer::new(
+            centroids.clone(),
+            distance_type,
+            vector_column,
+        ));
+        transforms.push(partition_transform);
+        Self::new(centroids, distance_type, transforms)
+    }
+
     pub fn new_flat(
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
