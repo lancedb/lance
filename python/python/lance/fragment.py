@@ -28,6 +28,9 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    RowDatasetVersionMeta as RowDatasetVersionMeta,
+)
+from .lance import (
     RowIdMeta as RowIdMeta,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
@@ -67,6 +70,10 @@ class FragmentMetadata:
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
         The row id metadata, if any.
+    created_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row created at version metadata, if any.
+    last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row last updated at version metadata, if any.
     """
 
     id: int
@@ -74,6 +81,8 @@ class FragmentMetadata:
     physical_rows: int
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
+    created_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -110,6 +119,16 @@ class FragmentMetadata:
             row_id_meta=(
                 self.row_id_meta.asdict() if self.row_id_meta is not None else None
             ),
+            created_at_version_meta=(
+                json.loads(self.created_at_version_meta.json())
+                if self.created_at_version_meta is not None
+                else None
+            ),
+            last_updated_at_version_meta=(
+                json.loads(self.last_updated_at_version_meta.json())
+                if self.last_updated_at_version_meta is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -124,12 +143,26 @@ class FragmentMetadata:
         if row_id_meta is not None:
             row_id_meta = RowIdMeta(**row_id_meta)
 
+        created_at_version_meta = json_data.get("created_at_version_meta")
+        if created_at_version_meta is not None:
+            created_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(created_at_version_meta)
+            )
+
+        last_updated_at_version_meta = json_data.get("last_updated_at_version_meta")
+        if last_updated_at_version_meta is not None:
+            last_updated_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(last_updated_at_version_meta)
+            )
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
             physical_rows=json_data["physical_rows"],
             deletion_file=deletion_file,
             row_id_meta=row_id_meta,
+            created_at_version_meta=created_at_version_meta,
+            last_updated_at_version_meta=last_updated_at_version_meta,
         )
 
 
@@ -586,6 +619,106 @@ class LanceFragment(pa.dataset.Fragment):
         max_field_id = self._ds.max_field_id
         metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
         return metadata, schema
+
+    def update_columns(
+        self,
+        data_obj: ReaderLike,
+        left_on: str = "_rowid",
+        right_on: Optional[str] = None,
+        schema=None,
+    ) -> Tuple[FragmentMetadata, List[int]]:
+        """
+        Update existing columns in this fragment.
+
+        This operation performs a left-outer-hash-join with the right table (new data)
+        on the column specified by left_on and right_on. For every row in the current
+        fragment, the updated column value is:
+
+        1. If no matched row on the right side, the column value of the left side row.
+        2. If there is exactly one corresponding row on the right side, the column value
+           of the matching row.
+        3. If there are multiple corresponding rows, the column value of a random row.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be used for updating. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+            The data must include the join column (right_on) and the columns to update.
+        left_on: str, default "_rowid"
+            The name of the column in the fragment to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to left_on.
+        schema: pa.Schema, optional
+            The schema of the data. If not specified, the schema will be inferred.
+
+        Returns
+        -------
+        Tuple[FragmentMetadata, List[int]]
+            A tuple of:
+            - FragmentMetadata: The updated fragment metadata
+            - List[int]: The list of field IDs that were modified
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> # Create initial dataset
+        >>> df = pa.table({
+        ...     'id': [1, 2],
+        ...     'name': ['a', 'b'],
+        ...     'value': [10, 20]
+        ... })
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> # Prepare update data with _rowid (must be UInt64)
+        >>> update_data = pa.table({
+        ...     'id': [1],
+        ...     'name': ['x'],
+        ...     'value': [100]
+        ... })
+        >>> # Update the fragment
+        >>> fragment = dataset.get_fragment(0)
+        >>> updated_fragment, fields_modified = fragment.update_columns(
+        ...     update_data,
+        ...     left_on="id",
+        ...     right_on="id"
+        ... )
+        >>> # Commit the changes
+        >>> from lance import LanceOperation
+        >>> op = LanceOperation.Update(
+        ...     updated_fragments=[updated_fragment],
+        ...     fields_modified=fields_modified,
+        ... )
+        >>> dataset = lance.LanceDataset.commit(
+        ...     "dataset",
+        ...     op,
+        ...     read_version=dataset.version
+        ... )
+
+        See Also
+        --------
+        LanceFragment.merge :
+            Merge new columns into this fragment (adds columns).
+        LanceDataset.update :
+            Update rows in the entire dataset.
+
+        Notes
+        -----
+        - The columns to update must already exist in the fragment
+        - The join column (left_on/right_on) will not be updated
+        - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - This is a low-level API; for most use cases, use Dataset.update() instead
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+        metadata, fields_modified = self._fragment.update_columns(
+            reader, left_on, right_on
+        )
+        return metadata, fields_modified
 
     def merge_columns(
         self,

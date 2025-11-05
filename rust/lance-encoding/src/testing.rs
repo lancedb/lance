@@ -6,7 +6,9 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
-    format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
+    format::pb21::{
+        compressive_encoding::Compression, BufferCompression, CompressiveEncoding, PageLayout,
+    },
 };
 
 use arrow_array::{make_array, Array, StructArray, UInt64Array};
@@ -16,7 +18,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
-use log::{debug, trace};
+use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{utils::bit::pad_bytes, Result};
@@ -244,7 +246,10 @@ async fn test_decode(
                 }
             }
         }
-        offset += batch_size as usize;
+        offset += batch.num_rows();
+    }
+    if let Some(expected) = expected.as_ref() {
+        assert_eq!(offset, expected.len());
     }
 }
 
@@ -269,11 +274,16 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 }
 
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field, version: LanceFileVersion) {
+pub async fn check_basic_random(field: Field) {
+    check_specific_random(field, TestCases::basic()).await;
+}
+
+pub async fn check_specific_random(field: Field, test_cases: TestCases) {
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
-    check_round_trip_encoding_generated(field, Box::new(array_generator_provider), version).await;
+    check_round_trip_encoding_generated(field, Box::new(array_generator_provider), test_cases)
+        .await;
 }
 
 pub struct FnArrayGeneratorProvider<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> {
@@ -300,16 +310,23 @@ impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> ArrayGeneratorProvide
     }
 }
 
+pub async fn check_basic_generated(
+    field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+) {
+    check_round_trip_encoding_generated(field, array_generator_provider, TestCases::basic()).await;
+}
+
 pub async fn check_round_trip_encoding_generated(
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
-    version: LanceFileVersion,
+    test_cases: TestCases,
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for page_size in [4096, 1024 * 1024] {
+    for page_size in test_cases.page_sizes.iter().copied() {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = default_encoding_strategy(version);
-        let encoder_factory = || {
+        let encoder_factory = |version: LanceFileVersion| {
+            let encoding_strategy = default_encoding_strategy(version);
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
                 max_page_bytes: MAX_PAGE_BYTES,
@@ -327,23 +344,34 @@ pub async fn check_round_trip_encoding_generated(
                 .unwrap()
         };
 
-        // let array_generator_provider = RandomArrayGeneratorProvider{field: field.clone()};
-        check_round_trip_field_encoding_random(
+        check_round_trip_random(
             encoder_factory,
             field.clone(),
             array_generator_provider.copy(),
-            version,
+            &test_cases,
         )
         .await
     }
 }
 
 fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
-    // 2.0 doesn't support nullability for structs
-    !(matches!(data_type, DataType::Struct(_)) && version == LanceFileVersion::V2_0)
+    if let DataType::Struct(fields) = data_type {
+        if version == LanceFileVersion::V2_0 {
+            // 2.0 doesn't support nullability for structs
+            false
+        } else if fields.is_empty() {
+            // Even in 2.1 we don't support nulls for struct if there are no children because
+            // we have no spot to stick the repdef info (there is no column)
+            false
+        } else {
+            true
+        }
+    } else {
+        true
+    }
 }
 
-type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
+type EncodingVerificationFn = dyn Fn(&[EncodedColumn], &LanceFileVersion);
 
 // The default will just test the full read
 #[derive(Clone)]
@@ -354,7 +382,8 @@ pub struct TestCases {
     skip_validation: bool,
     max_page_size: Option<u64>,
     page_sizes: Vec<u64>,
-    file_version: LanceFileVersion,
+    min_file_version: Option<LanceFileVersion>,
+    max_file_version: Option<LanceFileVersion>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
 }
@@ -368,7 +397,8 @@ impl Default for TestCases {
             skip_validation: false,
             max_page_size: None,
             page_sizes: vec![4096, 1024 * 1024],
-            file_version: LanceFileVersion::default(),
+            min_file_version: None,
+            max_file_version: None,
             verify_encoding: None,
             expected_encoding: None,
         }
@@ -376,6 +406,21 @@ impl Default for TestCases {
 }
 
 impl TestCases {
+    pub fn basic() -> Self {
+        Self::default()
+            .with_range(0..500)
+            .with_range(100..1100)
+            .with_range(8000..8500)
+            .with_indices(vec![100])
+            .with_indices(vec![0])
+            .with_indices(vec![9999])
+            .with_indices(vec![100, 1100, 5000])
+            .with_indices(vec![1000, 2000, 3000])
+            .with_indices(vec![2000, 2001, 2002, 2003, 2004])
+            // Big take that spans multiple pages and generates multiple output batches
+            .with_indices((100..500).map(|i| i * 3).collect::<Vec<_>>())
+    }
+
     pub fn with_range(mut self, range: Range<u64>) -> Self {
         self.ranges.push(range);
         self
@@ -396,8 +441,13 @@ impl TestCases {
         self
     }
 
-    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
-        self.file_version = version;
+    pub fn with_min_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.min_file_version = Some(version);
+        self
+    }
+
+    pub fn with_max_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.max_file_version = Some(version);
         self
     }
 
@@ -415,14 +465,32 @@ impl TestCases {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
     }
 
+    fn get_versions(&self) -> Vec<LanceFileVersion> {
+        LanceFileVersion::iter_non_legacy()
+            .filter(|v| {
+                if let Some(min_file_version) = &self.min_file_version {
+                    if v < min_file_version {
+                        return false;
+                    }
+                }
+                if let Some(max_file_version) = &self.max_file_version {
+                    if v > max_file_version {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
     pub fn with_verify_encoding(mut self, verify_encoding: Arc<EncodingVerificationFn>) -> Self {
         self.verify_encoding = Some(verify_encoding);
         self
     }
 
-    fn verify_encoding(&self, encoding: &[EncodedColumn]) {
+    fn verify_encoding(&self, encoding: &[EncodedColumn], version: &LanceFileVersion) {
         if let Some(verify_encoding) = self.verify_encoding.as_ref() {
-            verify_encoding(encoding);
+            verify_encoding(encoding, version);
         }
     }
 
@@ -458,6 +526,7 @@ fn tag(e: &Compression) -> &'static str {
         General(_) => "general",
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
+        VariablePackedStruct(_) => "variable_packed_struct",
     }
 }
 
@@ -505,6 +574,18 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
             Some(children)
         }
         FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        VariablePackedStruct(v) => {
+            let nested: Vec<&CompressiveEncoding> = v
+                .fields
+                .iter()
+                .filter_map(|field| field.value.as_ref())
+                .collect();
+            if nested.is_empty() {
+                None
+            } else {
+                Some(nested)
+            }
+        }
         _ => None,
     }
 }
@@ -537,6 +618,39 @@ pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
     chain
 }
 
+fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) -> Result<()> {
+    // Extract encodings from the page layout
+    use crate::format::pb21::page_layout::Layout;
+    if let Some(ref layout_type) = layout.layout {
+        match layout_type {
+            Layout::MiniBlockLayout(mini_block) => {
+                // Check value compression
+                if let Some(ref value_comp) = mini_block.value_compression {
+                    let chain = extract_array_encoding_chain(value_comp);
+                    actual_chain.extend(chain);
+                }
+            }
+            Layout::FullZipLayout(full_zip) => {
+                // Check value compression in full zip layout
+                if let Some(ref value_comp) = full_zip.value_compression {
+                    let chain = extract_array_encoding_chain(value_comp);
+                    actual_chain.extend(chain);
+                }
+            }
+            Layout::AllNullLayout(_) => {
+                // No value encoding for all null
+            }
+            Layout::BlobLayout(blob) => {
+                if let Some(inner_layout) = &blob.inner_layout {
+                    collect_page_encoding(inner_layout.as_ref(), actual_chain)?
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Verify that a single page contains the expected encoding
 fn verify_page_encoding(
     page: &EncodedPage,
@@ -551,29 +665,7 @@ fn verify_page_encoding(
 
     match &page.description {
         PageEncoding::Structural(layout) => {
-            // Extract encodings from the page layout
-            use crate::format::pb21::page_layout::Layout;
-            if let Some(ref layout_type) = layout.layout {
-                match layout_type {
-                    Layout::MiniBlockLayout(mini_block) => {
-                        // Check value compression
-                        if let Some(ref value_comp) = mini_block.value_compression {
-                            let chain = extract_array_encoding_chain(value_comp);
-                            actual_chain.extend(chain);
-                        }
-                    }
-                    Layout::FullZipLayout(full_zip) => {
-                        // Check value compression in full zip layout
-                        if let Some(ref value_comp) = full_zip.value_compression {
-                            let chain = extract_array_encoding_chain(value_comp);
-                            actual_chain.extend(chain);
-                        }
-                    }
-                    Layout::AllNullLayout(_) => {
-                        // No value encoding for all null
-                    }
-                }
-            }
+            collect_page_encoding(layout, &mut actual_chain)?;
         }
         PageEncoding::Legacy(_) => {
             // We don't need to care about legacy.
@@ -611,24 +703,31 @@ pub async fn check_round_trip_encoding_of_data(
     let mut field = Field::new("", example_data.data_type().clone(), true);
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for page_size in test_cases.page_sizes.iter() {
-        let encoding_strategy = default_encoding_strategy(test_cases.file_version);
-        let mut column_index_seq = ColumnIndexSequence::default();
-        let encoding_options = EncodingOptions {
-            cache_bytes_per_column: *page_size,
-            max_page_bytes: test_cases.get_max_page_size(),
-            keep_original_array: true,
-            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
-        };
-        let encoder = encoding_strategy
-            .create_field_encoder(
-                encoding_strategy.as_ref(),
-                &lance_field,
-                &mut column_index_seq,
-                &encoding_options,
-            )
-            .unwrap();
-        check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
+    for file_version in test_cases.get_versions() {
+        for page_size in test_cases.page_sizes.iter() {
+            let encoding_strategy = default_encoding_strategy(file_version);
+            let mut column_index_seq = ColumnIndexSequence::default();
+            let encoding_options = EncodingOptions {
+                cache_bytes_per_column: *page_size,
+                max_page_bytes: test_cases.get_max_page_size(),
+                keep_original_array: true,
+                buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+            };
+            let encoder = encoding_strategy
+                .create_field_encoder(
+                    encoding_strategy.as_ref(),
+                    &lance_field,
+                    &mut column_index_seq,
+                    &encoding_options,
+                )
+                .unwrap();
+            info!(
+                "Testing round trip encoding of data with file version {} and page size {}",
+                file_version, page_size
+            );
+            check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases, file_version)
+                .await
+        }
     }
 }
 
@@ -697,8 +796,24 @@ async fn check_round_trip_encoding_inner(
     field: &Field,
     data: Vec<Arc<dyn Array>>,
     test_cases: &TestCases,
+    file_version: LanceFileVersion,
 ) {
     let mut writer = SimulatedWriter::new(encoder.num_columns());
+
+    let log_page = |encoded_page: &EncodedPage| {
+        debug!(
+            "Encoded page on column {} with {} rows and start row {} and buffer sizes [{}]",
+            encoded_page.column_idx,
+            encoded_page.num_rows,
+            encoded_page.row_number,
+            encoded_page
+                .data
+                .iter()
+                .map(|buf| buf.len().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
 
     let mut row_number = 0;
     for arr in &data {
@@ -719,9 +834,10 @@ async fn check_round_trip_encoding_inner(
         }
         for encode_task in encode_tasks {
             let encoded_page = encode_task.await.unwrap();
+            log_page(&encoded_page);
 
             // For V2.1, verify encoding in the page if expected
-            if test_cases.file_version >= LanceFileVersion::V2_1 {
+            if file_version >= LanceFileVersion::V2_1 {
                 if let Some(ref expected) = test_cases.expected_encoding {
                     verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
                         .unwrap();
@@ -740,9 +856,10 @@ async fn check_round_trip_encoding_inner(
     }
     for task in encode_tasks {
         let encoded_page = task.await.unwrap();
+        log_page(&encoded_page);
 
         // For V2.1, verify encoding in the page if expected
-        if test_cases.file_version >= LanceFileVersion::V2_1 {
+        if file_version >= LanceFileVersion::V2_1 {
             if let Some(ref expected) = test_cases.expected_encoding {
                 verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
                     .unwrap();
@@ -754,7 +871,7 @@ async fn check_round_trip_encoding_inner(
 
     let mut external_buffers = writer.new_external_buffers();
     let encoded_columns = encoder.finish(&mut external_buffers).await.unwrap();
-    test_cases.verify_encoding(&encoded_columns);
+    test_cases.verify_encoding(&encoded_columns, &file_version);
     for buffer in external_buffers.take_buffers() {
         writer.write_lance_buffer(buffer);
     }
@@ -807,7 +924,7 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    let is_structural_encoding = test_cases.file_version >= LanceFileVersion::V2_1;
+    let is_structural_encoding = file_version >= LanceFileVersion::V2_1;
 
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
@@ -925,74 +1042,42 @@ async fn check_round_trip_encoding_inner(
 const NUM_RANDOM_ROWS: u32 = 10000;
 
 /// Generates random data (parameterized by null rate, slicing, and # ingest batches)
-/// and tests with that.
-async fn check_round_trip_field_encoding_random(
-    encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
+/// and tests with that against default test cases.
+///
+/// To test specific test cases use the
+async fn check_round_trip_random(
+    encoder_factory: impl Fn(LanceFileVersion) -> Box<dyn FieldEncoder>,
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
-    version: LanceFileVersion,
+    test_cases: &TestCases,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
-            if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
-                continue;
-            }
-
-            let field = if null_rate.is_some() {
-                if !supports_nulls(field.data_type(), version) {
+            for file_version in test_cases.get_versions() {
+                if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
                     continue;
                 }
-                field.clone().with_nullable(true)
-            } else {
-                field.clone().with_nullable(false)
-            };
 
-            let test_cases = TestCases::default()
-                .with_file_version(version)
-                .with_range(0..500)
-                .with_range(100..1100)
-                .with_range(8000..8500)
-                .with_indices(vec![100])
-                .with_indices(vec![0])
-                .with_indices(vec![9999])
-                .with_indices(vec![100, 1100, 5000])
-                .with_indices(vec![1000, 2000, 3000])
-                .with_indices(vec![2000, 2001, 2002, 2003, 2004])
-                // Big take that spans multiple pages and generates multiple output batches
-                .with_indices((100..500).map(|i| i * 3).collect::<Vec<_>>());
-
-            for num_ingest_batches in [1, 5, 10] {
-                let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
-                let mut data = Vec::new();
-
-                // Test both ingesting one big array sliced into smaller arrays and smaller
-                // arrays independently generated.  These behave slightly differently.  For
-                // example, a list array sliced into smaller arrays will have arrays whose
-                // starting offset is not 0.
-                if use_slicing {
-                    let mut generator = gen_batch().anon_col(array_generator_provider.provide());
-                    if let Some(null_rate) = null_rate {
-                        // The null generator is the only generator that already inserts nulls
-                        // and attempting to do so again makes arrow-rs grumpy
-                        if !matches!(field.data_type(), DataType::Null) {
-                            generator.with_random_nulls(null_rate);
-                        }
+                let field = if null_rate.is_some() {
+                    if !supports_nulls(field.data_type(), file_version) {
+                        continue;
                     }
-                    let all_data = generator
-                        .into_batch_rows(RowCount::from(10000))
-                        .unwrap()
-                        .column(0)
-                        .clone();
-                    let mut offset = 0;
-                    for _ in 0..num_ingest_batches {
-                        data.push(all_data.slice(offset, rows_per_batch as usize));
-                        offset += rows_per_batch as usize;
-                    }
+                    field.clone().with_nullable(true)
                 } else {
-                    for i in 0..num_ingest_batches {
-                        let mut generator = gen_batch()
-                            .with_seed(Seed::from(i as u64))
-                            .anon_col(array_generator_provider.provide());
+                    field.clone().with_nullable(false)
+                };
+
+                for num_ingest_batches in [1, 5, 10] {
+                    let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
+                    let mut data = Vec::new();
+
+                    // Test both ingesting one big array sliced into smaller arrays and smaller
+                    // arrays independently generated.  These behave slightly differently.  For
+                    // example, a list array sliced into smaller arrays will have arrays whose
+                    // starting offset is not 0.
+                    if use_slicing {
+                        let mut generator =
+                            gen_batch().anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
                             // The null generator is the only generator that already inserts nulls
                             // and attempting to do so again makes arrow-rs grumpy
@@ -1000,24 +1085,55 @@ async fn check_round_trip_field_encoding_random(
                                 generator.with_random_nulls(null_rate);
                             }
                         }
-                        let arr = generator
-                            .into_batch_rows(RowCount::from(rows_per_batch as u64))
+                        let all_data = generator
+                            .into_batch_rows(RowCount::from(10000))
                             .unwrap()
                             .column(0)
                             .clone();
-                        data.push(arr);
+                        let mut offset = 0;
+                        for _ in 0..num_ingest_batches {
+                            data.push(all_data.slice(offset, rows_per_batch as usize));
+                            offset += rows_per_batch as usize;
+                        }
+                    } else {
+                        for i in 0..num_ingest_batches {
+                            let mut generator = gen_batch()
+                                .with_seed(Seed::from(i as u64))
+                                .anon_col(array_generator_provider.provide());
+                            if let Some(null_rate) = null_rate {
+                                // The null generator is the only generator that already inserts nulls
+                                // and attempting to do so again makes arrow-rs grumpy
+                                if !matches!(field.data_type(), DataType::Null) {
+                                    generator.with_random_nulls(null_rate);
+                                }
+                            }
+                            let arr = generator
+                                .into_batch_rows(RowCount::from(rows_per_batch as u64))
+                                .unwrap()
+                                .column(0)
+                                .clone();
+                            data.push(arr);
+                        }
                     }
-                }
 
-                debug!(
-                    "Testing with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
-                    NUM_RANDOM_ROWS,
-                    num_ingest_batches,
-                    rows_per_batch,
-                    null_rate,
-                    use_slicing
-                );
-                check_round_trip_encoding_inner(encoder_factory(), &field, data, &test_cases).await
+                    info!(
+                        "Testing version {} with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
+                        file_version,
+                        NUM_RANDOM_ROWS,
+                        num_ingest_batches,
+                        rows_per_batch,
+                        null_rate,
+                        use_slicing
+                    );
+                    check_round_trip_encoding_inner(
+                        encoder_factory(file_version),
+                        &field,
+                        data,
+                        test_cases,
+                        file_version,
+                    )
+                    .await
+                }
             }
         }
     }

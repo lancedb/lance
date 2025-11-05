@@ -23,7 +23,7 @@ use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
@@ -32,9 +32,9 @@ use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
-use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
+use crate::Result;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
@@ -57,7 +57,7 @@ pub struct DatasetPreFilter {
 impl DatasetPreFilter {
     pub fn new(
         dataset: Arc<Dataset>,
-        indices: &[Index],
+        indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();

@@ -30,7 +30,9 @@ use datafusion::logical_expr::{
     Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
-use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
+use datafusion::sql::planner::{
+    ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
+};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
     Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -50,9 +52,10 @@ use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 use snafu::location;
 
+use chrono::Utc;
 use lance_core::{Error, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CastListF16Udf {
     signature: Signature,
 }
@@ -448,6 +451,7 @@ impl Planner {
                 enable_options_value_normalization: false,
                 collect_spans: false,
                 map_string_types_to_utf8view: false,
+                default_null_ordering: NullOrdering::NullsMax,
             },
         );
 
@@ -708,7 +712,14 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                match escape_char {
+                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
+                    Some(value) => return Err(Error::invalid_input(
+                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
+                        location!()
+                    )),
+                    None => None,
+                },
                 true,
             ))),
             SQLExpr::Like {
@@ -721,7 +732,14 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                match escape_char {
+                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
+                    Some(value) => return Err(Error::invalid_input(
+                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
+                        location!()
+                    )),
+                    None => None,
+                },
                 false,
             ))),
             SQLExpr::Cast {
@@ -839,6 +857,10 @@ impl Planner {
     /// Note: the returned expression must be passed through [optimize_filter()]
     /// before being passed to [create_physical_expr()].
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        if self.schema.field_with_name(expr).is_ok() {
+            return Ok(col(expr));
+        }
+
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
@@ -888,7 +910,7 @@ impl Planner {
 
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::default();
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
         let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
@@ -937,10 +959,22 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
     fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
         match node {
             Expr::Column(Column { name, .. }) => {
+                // Build the field path from the column name and any nested fields
+                // The nested field names from get_field already come as literal strings,
+                // so we just need to concatenate them properly
                 let mut path = name.clone();
                 for part in self.current_path.drain(..) {
                     path.push('.');
-                    path.push_str(&part);
+                    // Check if the part needs quoting (contains dots)
+                    if part.contains('.') || part.contains('`') {
+                        // Quote the field name with backticks and escape any existing backticks
+                        let escaped = part.replace('`', "``");
+                        path.push('`');
+                        path.push_str(&escaped);
+                        path.push('`');
+                    } else {
+                        path.push_str(&part);
+                    }
                 }
                 self.columns.insert(path);
                 self.current_path.clear();
@@ -1705,5 +1739,89 @@ mod tests {
     fn test_lance_context_provider_expr_planners() {
         let ctx_provider = LanceContextProvider::default();
         assert!(!ctx_provider.get_expr_planners().is_empty());
+    }
+
+    #[test]
+    fn test_regexp_match_and_non_empty_captions() {
+        // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
+        // causing planning/evaluation failures. This should evaluate successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("Liberty for all"),
+                    Some("peace"),
+                    Some("revolution now"),
+                    Some("Liberty"),
+                    Some("revolutionary"),
+                    Some("none"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some(""),
+                    Some("c"),
+                    Some("d"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some(""),
+                    Some("y"),
+                    Some("z"),
+                    None,
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let result = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            result.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_regexp_match_infer_error_without_boolean_coercion() {
+        // With the fix applied, using parse_filter should coerce regexp_match to boolean
+        // even when nested in a larger AND expression, so this should plan successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema);
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        // Should not panic
+        let _physical = planner.create_physical_expr(&expr).unwrap();
     }
 }

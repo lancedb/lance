@@ -1,91 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# This script generates Lance files that are read by test_forward_compat.py
+# Data generation for forward compatibility tests
+#
+# This file will be run on the up-to-date version of Lance to generate
+# test data that will be read by older versions of Lance in test_compat.py
 
-from pathlib import Path
+import shutil
 
 import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 from lance.file import LanceFileWriter
+from lance.indices.builder import IndexConfig
 
-
-def get_path(name: str):
-    dataset_dir = (
-        Path(__file__).parent.parent.parent.parent.parent
-        / "test_data"
-        / "forward_compat"
-        / name
-    )
-    return dataset_dir
-
-
-def build_basic_types():
-    schema = pa.schema(
-        [
-            pa.field("int", pa.int64()),
-            pa.field("float", pa.float32()),
-            pa.field("str", pa.string()),
-            pa.field("list_int", pa.list_(pa.int64())),
-            pa.field("list_str", pa.list_(pa.string())),
-            pa.field("struct", pa.struct([pa.field("a", pa.int64())])),
-            pa.field("dict", pa.dictionary(pa.int16(), pa.string())),
-            pa.field("str_as_dict", pa.string()),
-        ]
-    )
-
-    return pa.table(
-        [
-            pa.array(range(1000)),
-            pa.array(range(1000), pa.float32()),
-            pa.array([str(i) for i in range(1000)]),
-            pa.array([list(range(i)) for i in range(1000)]),
-            pa.array([[str(i)] for i in range(1000)]),
-            pa.array([{"a": i} for i in range(1000)]),
-            pa.array(
-                [str(i % 10) for i in range(1000)],
-                pa.dictionary(pa.int16(), pa.string()),
-            ),
-            pa.array(["a"] * 500 + ["b"] * 500),
-        ],
-        schema=schema,
-    )
+from forward_compat.util import build_basic_types, build_large, get_path
 
 
 def write_basic_types():
     path = get_path("basic_types.lance")
     with LanceFileWriter(str(path)) as writer:
         writer.write_batch(build_basic_types())
-
-
-def build_large():
-    # ~40MB of vector embedding data (10K 1024-float32)
-    fsl_data = pa.array(range(1024 * 1000 * 10), pa.float32())
-    fsls = pa.FixedSizeListArray.from_arrays(fsl_data, 1024)
-    # ~40 MiB of binary data (10k 4KiB chunks)
-    bindata = pa.allocate_buffer(1024 * 1000 * 40)
-    offsets = pa.array(
-        range(0, (1024 * 1000 * 40) + 4 * 1024, 4 * 1024), pa.int32()
-    ).buffers()[1]
-    bins = pa.BinaryArray.from_buffers(pa.binary(), 10000, [None, offsets, bindata])
-
-    schema = pa.schema(
-        [
-            pa.field("int", pa.int32()),
-            pa.field("fsl", pa.list_(pa.float32())),
-            pa.field("bin", pa.binary()),
-        ]
-    )
-
-    return pa.table(
-        [
-            pa.array(range(10000), pa.int32()),
-            fsls,
-            bins,
-        ],
-        schema=schema,
-    )
 
 
 def write_large():
@@ -97,6 +32,8 @@ def write_large():
 def write_dataset_pq_buffer():
     # In https://github.com/lancedb/lance/pull/3829, we started storing the PQ
     # codebook in a global buffer instead of the schema metadata as JSON.
+
+    shutil.rmtree(get_path("pq_in_schema"), ignore_errors=True)
 
     ndims = 32
     nvecs = 512
@@ -119,7 +56,69 @@ def write_dataset_pq_buffer():
     )
 
 
+def write_dataset_json():
+    shutil.rmtree(get_path("json"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("json"))
+    dataset.create_scalar_index(
+        "json",
+        IndexConfig(
+            index_type="json", parameters={"target_index_type": "btree", "path": "val"}
+        ),
+    )
+
+
+def write_dataset_scalar_index():
+    shutil.rmtree(get_path("scalar_index"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "btree": pa.array(range(1000)),
+            "bitmap": pa.array(range(1000)),
+            "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
+            "ngram": pa.array([f"word{i}" for i in range(1000)]),
+            "zonemap": pa.array(range(1000)),
+            "bloomfilter": pa.array(range(1000)),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("scalar_index"))
+    dataset.create_scalar_index("btree", "BTREE")
+    dataset.create_scalar_index("bitmap", "BITMAP")
+    dataset.create_scalar_index("label_list", "LABEL_LIST")
+    dataset.create_scalar_index("ngram", "NGRAM")
+    dataset.create_scalar_index("zonemap", "ZONEMAP")
+    dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
+
+
+def write_dataset_fts_index():
+    shutil.rmtree(get_path("fts_index"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
+            "text": pa.array(
+                [f"document with words {i} and more text" for i in range(1000)]
+            ),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("fts_index"))
+    dataset.create_scalar_index("text", "INVERTED")
+
+
 if __name__ == "__main__":
     write_basic_types()
     write_large()
     write_dataset_pq_buffer()
+    write_dataset_scalar_index()
+    write_dataset_json()
+    write_dataset_fts_index()

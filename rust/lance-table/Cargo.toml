@@ -38,6 +38,7 @@ rangemap.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -51,7 +52,6 @@ criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

@@ -1,0 +1,26 @@
+name: Publish protobuf to BSR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  push-module:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref || github.ref }}
+        fetch-depth: 0
+        lfs: true
+    - uses: bufbuild/buf-setup-action@v1
+    - uses: bufbuild/buf-push-action@v1
+      with:
+        buf_token: ${{ secrets.BUF_TOKEN }}

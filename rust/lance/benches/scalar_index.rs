@@ -12,6 +12,7 @@ use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
 use lance_core::cache::LanceCache;
+use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};
 use lance_index::scalar::{
@@ -24,10 +25,9 @@ use lance_index::scalar::{
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
-use tempfile::TempDir;
 
 struct BenchmarkFixture {
-    _datadir: TempDir,
+    _datadir: TempStrDir,
     index_store: Arc<dyn IndexStore>,
     baseline_dataset: Arc<Dataset>,
 }
@@ -44,13 +44,12 @@ fn test_data_stream() -> SendableRecordBatchStream {
 }
 
 impl BenchmarkFixture {
-    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
+    fn test_store(tempdir: &TempStrDir) -> Arc<dyn IndexStore> {
+        let test_path = tempdir.as_str();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
         Arc::new(LanceIndexStore::new(
             object_store,
             test_path,
@@ -58,8 +57,8 @@ impl BenchmarkFixture {
         ))
     }
 
-    async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
-        let test_path = tempdir.path().as_os_str().to_str().unwrap();
+    async fn write_baseline_data(tempdir: &TempStrDir) -> Arc<Dataset> {
+        let test_path = tempdir.as_str();
         Arc::new(Dataset::write(test_data(), test_path, None).await.unwrap())
     }
 
@@ -78,7 +77,7 @@ impl BenchmarkFixture {
     }
 
     async fn open() -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
+        let tempdir = TempStrDir::default();
         let index_store = Self::test_store(&tempdir);
         let baseline_dataset = Self::write_baseline_data(&tempdir).await;
         Self::train_scalar_index(&index_store).await;
@@ -198,7 +197,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let fixture = rt.block_on(BenchmarkFixture::open());
     let details =
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap();
+        prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
 
     let index = rt
         .block_on(BTreeIndexPlugin.load_index(

@@ -153,6 +153,21 @@ message AllNullLayout {
   repeated RepDefLayer layers = 5;
 }
 
+// A layout where large binary data is encoded externally and only
+// the descriptions (position + size) are placed in the page
+//
+// Repdef information is stored in the descriptions.  A description with a size of
+// 0 and a position of 0 is an empty value.  A description with a size of 0 and a
+// non-zero position is a null value and the position is the repdef value.
+message BlobLayout {
+  // The inner layout used to store the descriptions
+  PageLayout inner_layout = 1;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  //
+  // The inner layout's repdef layers will always be 1 all valid item layer
+  repeated RepDefLayer layers = 2;
+}
+
 // Describes the structural encoding of a page
 message PageLayout {
   oneof layout {
@@ -162,6 +177,9 @@ message PageLayout {
     AllNullLayout all_null_layout = 2;
     // A layout used for pages where the data is large
     FullZipLayout full_zip_layout = 3;
+    // A layout where large binary data is encoded externally
+    // and only the descriptions are put in the page
+    BlobLayout blob_layout = 4;
   }
 }
 
@@ -255,7 +273,7 @@ message Variable {
 // There is no output.
 message Constant {
   // The value (TODO: define encoding for literals?)
-  bytes value = 1;
+  optional bytes value = 1;
 }
 
 // A compression scheme in which a single fixed-width block is "packed" into
@@ -361,21 +379,38 @@ message FixedSizeList {
   CompressiveEncoding values = 2;
 }
 
-// Converts a struct data block into either a fixed-width data block or a variable-width data block
+// Packs a struct containing only fixed-width children into a single fixed-width data block
 //
-// This encoding does not actually compress the data, it just converts the block into something workable
-//
-// This is a transparent encoding.
-//
-// TODO: This needs support for variable-width data blocks and more flexible compression
-//
-// The input is a single struct data block
-// The output is a single fixed-width or variable-width data block
+// The children are concatenated row by row and stored as a single fixed-width buffer. This is
+// the legacy packed struct representation and remains available for backwards compatibility.
 message PackedStruct {
-  // The number of bits per value for each field
+  // The number of bits contributed by each child field in the packed row
   repeated uint64 bits_per_value = 1;
-  // The compression used to store the values data block
+  // The compression used to store the packed fixed-width values
   CompressiveEncoding values = 2;
+}
+
+// Variable-width packed struct encoding (2.2 extension)
+//
+// Each child value is compressed independently before being transposed into
+// a row-major layout. This preserves per-field compression boundaries at the
+// cost of disabling mini-block compression. Readers must prefer this field
+// when present and fall back to the legacy encoding otherwise.
+message VariablePackedStruct {
+  // Per-field encoding metadata in struct order
+  repeated FieldEncoding fields = 1;
+
+  // Encoding description for a single child field
+  message FieldEncoding {
+    // Compression applied to individual field values before transposition
+    CompressiveEncoding value = 1;
+    oneof layout {
+      // Bit width of each compressed value (when fixed width)
+      uint64 bits_per_value = 2;
+      // Bit width of the length prefix for variable-width compressed values
+      uint64 bits_per_length = 3;
+    }
+  }
 }
 
 // A compression scheme that wraps the underlying data with general compression
@@ -445,6 +480,6 @@ message CompressiveEncoding {
         General general = 10;
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
+        VariablePackedStruct variable_packed_struct = 13;
     }
 }
-

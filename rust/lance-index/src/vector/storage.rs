@@ -95,7 +95,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
+    fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
@@ -110,8 +110,6 @@ pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
     quantizer: Q,
 
-    // this is for testing purpose
-    assert_num_columns: bool,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
@@ -126,15 +124,8 @@ impl<Q: Quantization> StorageBuilder<Q> {
             vector_column,
             distance_type,
             quantizer,
-            assert_num_columns: true,
             frag_reuse_index,
         })
-    }
-
-    // this is for testing purpose
-    pub fn assert_num_columns(mut self, assert_num_columns: bool) -> Self {
-        self.assert_num_columns = assert_num_columns;
-        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -154,9 +145,6 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        if self.assert_num_columns {
-            debug_assert_eq!(batch.num_columns(), 2, "{}", batch.schema());
-        }
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
@@ -258,6 +246,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn num_rows(&self) -> u64 {
         self.reader.num_rows()
+    }
+
+    pub fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {

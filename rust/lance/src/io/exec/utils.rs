@@ -1,12 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
-use lance_table::format::Index;
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
+use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
@@ -49,7 +50,7 @@ pub(crate) fn build_prefilter(
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
-    index_meta: &[Index],
+    index_meta: &[IndexMetadata],
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -371,16 +372,19 @@ impl ExecutionPlan for ReplayExec {
 
 #[derive(Debug, Clone)]
 pub struct IoMetrics {
-    iops: Count,
-    requests: Count,
-    bytes_read: Count,
+    // We use gauge and not counter here because the underlying ScanScheduler
+    // reports cumulative stats, not deltas. We use set_max to ensure the gauge
+    // always shows the highest value seen.
+    iops: Gauge,
+    requests: Gauge,
+    bytes_read: Gauge,
 }
 
 impl IoMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
-        let iops = metrics.new_count(IOPS_METRIC, partition);
-        let requests = metrics.new_count(REQUESTS_METRIC, partition);
-        let bytes_read = metrics.new_count(BYTES_READ_METRIC, partition);
+        let iops = metrics.new_gauge(IOPS_METRIC, partition);
+        let requests = metrics.new_gauge(REQUESTS_METRIC, partition);
+        let bytes_read = metrics.new_gauge(BYTES_READ_METRIC, partition);
         Self {
             iops,
             requests,
@@ -388,11 +392,13 @@ impl IoMetrics {
         }
     }
 
-    pub fn record_final(&self, scan_scheduler: &ScanScheduler) {
-        let stats = scan_scheduler.stats();
-        self.iops.add(stats.iops as usize);
-        self.requests.add(stats.requests as usize);
-        self.bytes_read.add(stats.bytes_read as usize);
+    pub fn record(&self, scan_scheduler: &ScanScheduler) {
+        let current_stats = scan_scheduler.stats();
+
+        // Use set_max to ensure gauge always shows the highest value seen
+        self.iops.set_max(current_stats.iops as usize);
+        self.requests.set_max(current_stats.requests as usize);
+        self.bytes_read.set_max(current_stats.bytes_read as usize);
     }
 }
 

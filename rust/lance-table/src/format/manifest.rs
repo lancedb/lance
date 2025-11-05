@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
@@ -15,14 +11,17 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Schema, StorageClass};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 use snafu::location;
 
@@ -37,11 +36,11 @@ pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
 
-    /// Local schema, only containing fields with the default storage class (not blobs)
-    pub local_schema: Schema,
-
     /// Dataset version
     pub version: u64,
+
+    /// Branch name, None if the dataset is the main branch.
+    pub branch: Option<String>,
 
     /// Version of the writer library that wrote this manifest.
     pub writer_version: Option<WriterVersion>,
@@ -70,7 +69,7 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far  
+    /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
@@ -90,8 +89,12 @@ pub struct Manifest {
     /// Table configuration.
     pub config: HashMap<String, String>,
 
-    /// Blob dataset version
-    pub blob_dataset_version: Option<u64>,
+    /// Table metadata.
+    ///
+    /// This is a key-value map that can be used to store arbitrary metadata
+    /// associated with the table. This is different than configuration, which
+    /// is used to tell libraries how to read, write, or manage the table.
+    pub table_metadata: HashMap<String, String>,
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
@@ -117,21 +120,62 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Default)]
+pub struct ManifestSummary {
+    pub total_fragments: u64,
+    pub total_data_files: u64,
+    pub total_files_size: u64,
+    pub total_deletion_files: u64,
+    pub total_data_file_rows: u64,
+    pub total_deletion_file_rows: u64,
+    pub total_rows: u64,
+}
+
+impl From<ManifestSummary> for BTreeMap<String, String> {
+    fn from(summary: ManifestSummary) -> Self {
+        let mut stats_map = Self::new();
+        stats_map.insert(
+            "total_fragments".to_string(),
+            summary.total_fragments.to_string(),
+        );
+        stats_map.insert(
+            "total_data_files".to_string(),
+            summary.total_data_files.to_string(),
+        );
+        stats_map.insert(
+            "total_files_size".to_string(),
+            summary.total_files_size.to_string(),
+        );
+        stats_map.insert(
+            "total_deletion_files".to_string(),
+            summary.total_deletion_files.to_string(),
+        );
+        stats_map.insert(
+            "total_data_file_rows".to_string(),
+            summary.total_data_file_rows.to_string(),
+        );
+        stats_map.insert(
+            "total_deletion_file_rows".to_string(),
+            summary.total_deletion_file_rows.to_string(),
+        );
+        stats_map.insert("total_rows".to_string(), summary.total_rows.to_string());
+        stats_map
+    }
+}
+
 impl Manifest {
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
-        blob_dataset_version: Option<u64>,
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Self {
             schema,
-            local_schema,
             version: 1,
+            branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -146,7 +190,7 @@ impl Manifest {
             next_row_id: 0,
             data_storage_format,
             config: HashMap::new(),
-            blob_dataset_version,
+            table_metadata: HashMap::new(),
             base_paths,
         }
     }
@@ -155,17 +199,13 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
-        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
-
-        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
 
         Self {
             schema,
-            local_schema,
             version: previous.version + 1,
+            branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -180,7 +220,7 @@ impl Manifest {
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
-            blob_dataset_version,
+            table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
         }
     }
@@ -188,11 +228,13 @@ impl Manifest {
     /// Performs a shallow_clone of the manifest entirely in memory without:
     /// - Any persistent storage operations
     /// - Modifications to the original data
+    /// - If the shallow clone is for branch, ref_name is the source branch
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
         ref_path: String,
         ref_base_id: u32,
+        branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
         let cloned_fragments = self
@@ -218,8 +260,8 @@ impl Manifest {
 
         Self {
             schema: self.schema.clone(),
-            local_schema: self.local_schema.clone(),
             version: self.version,
+            branch: branch_name,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
@@ -234,18 +276,13 @@ impl Manifest {
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
-            blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
-                let base_path = BasePath {
-                    id: ref_base_id,
-                    name: ref_name,
-                    is_dataset_root: true,
-                    path: ref_path,
-                };
+                let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
                 base_paths.insert(ref_base_id, base_path);
                 base_paths
             },
+            table_metadata: self.table_metadata.clone(),
         }
     }
 
@@ -265,18 +302,45 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
+    /// Get a mutable reference to the config
+    pub fn config_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.config
+    }
+
+    /// Get a mutable reference to the table metadata
+    pub fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.table_metadata
+    }
+
+    /// Get a mutable reference to the schema metadata
+    pub fn schema_metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.schema.metadata
+    }
+
+    /// Get a mutable reference to the field metadata for a specific field id
+    ///
+    /// Returns None if the field does not exist in the schema.
+    pub fn field_metadata_mut(&mut self, field_id: i32) -> Option<&mut HashMap<String, String>> {
+        self.schema
+            .field_by_id_mut(field_id)
+            .map(|field| &mut field.metadata)
+    }
+
     /// Set the `config` from an iterator
+    #[deprecated(note = "Use config_mut() for direct access to config HashMap")]
     pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
         self.config.extend(upsert_values);
     }
 
     /// Delete `config` keys using a slice of keys
+    #[deprecated(note = "Use config_mut() for direct access to config HashMap")]
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
         self.config
             .retain(|key, _| !delete_keys.contains(&key.as_str()));
     }
 
     /// Replaces the schema metadata with the given key-value pairs.
+    #[deprecated(note = "Use schema_metadata_mut() for direct access to schema metadata HashMap")]
     pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
         self.schema.metadata = new_metadata;
     }
@@ -284,6 +348,9 @@ impl Manifest {
     /// Replaces the metadata of the field with the given id with the given key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
+    #[deprecated(
+        note = "Use field_metadata_mut(field_id) for direct access to field metadata HashMap"
+    )]
     pub fn replace_field_metadata(
         &mut self,
         field_id: i32,
@@ -437,20 +504,103 @@ impl Manifest {
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
     }
+
+    /// Get the summary information of a manifest.
+    ///
+    /// This function calculates various statistics about the manifest, including:
+    /// - total_files_size: Total size of all data files in bytes
+    /// - total_fragments: Total number of fragments in the dataset
+    /// - total_data_files: Total number of data files across all fragments
+    /// - total_deletion_files: Total number of deletion files
+    /// - total_data_file_rows: Total number of rows in data files
+    /// - total_deletion_file_rows: Total number of deleted rows in deletion files
+    /// - total_rows: Total number of rows in the dataset
+    pub fn summary(&self) -> ManifestSummary {
+        // Calculate total fragments
+        let mut summary =
+            self.fragments
+                .iter()
+                .fold(ManifestSummary::default(), |mut summary, f| {
+                    // Count data files in the current fragment
+                    summary.total_data_files += f.files.len() as u64;
+                    // Sum the number of rows for the current fragment (if available)
+                    if let Some(num_rows) = f.num_rows() {
+                        summary.total_rows += num_rows as u64;
+                    }
+                    // Sum file sizes for all data files in the current fragment (if available)
+                    for data_file in &f.files {
+                        if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                            summary.total_files_size += size_bytes.get();
+                        }
+                    }
+                    // Check and count if the current fragment has a deletion file
+                    if f.deletion_file.is_some() {
+                        summary.total_deletion_files += 1;
+                    }
+                    // Sum the number of deleted rows from the deletion file (if available)
+                    if let Some(deletion_file) = &f.deletion_file {
+                        if let Some(num_deleted) = deletion_file.num_deleted_rows {
+                            summary.total_deletion_file_rows += num_deleted as u64;
+                        }
+                    }
+                    summary
+                });
+        summary.total_fragments = self.fragments.len() as u64;
+        summary.total_data_file_rows = summary.total_rows + summary.total_deletion_file_rows;
+
+        summary
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasePath {
     pub id: u32,
     pub name: Option<String>,
     pub is_dataset_root: bool,
+    /// The full URI string (e.g., "s3://bucket/path")
     pub path: String,
+}
+
+impl BasePath {
+    /// Create a new BasePath
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique identifier for this base path
+    /// * `path` - Full URI string (e.g., "s3://bucket/path", "/local/path")
+    /// * `name` - Optional human-readable name for this base
+    /// * `is_dataset_root` - Whether this is the dataset root or a data-only base
+    pub fn new(id: u32, path: String, name: Option<String>, is_dataset_root: bool) -> Self {
+        Self {
+            id,
+            name,
+            is_dataset_root,
+            path,
+        }
+    }
+
+    /// Extract the object store path from this BasePath's URI.
+    ///
+    /// This is a synchronous operation that parses the URI without initializing an object store.
+    pub fn extract_path(&self, registry: Arc<ObjectStoreRegistry>) -> Result<Path> {
+        ObjectStore::extract_path_from_uri(registry, &self.path)
+    }
+}
+
+impl DeepSizeOf for BasePath {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.name.deep_size_of_children(context)
+            + self.path.deep_size_of_children(context) * 2
+            + size_of::<bool>()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
+    pub prerelease: Option<String>,
+    pub build_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -496,45 +646,144 @@ pub enum VersionPart {
     Patch,
 }
 
+fn bump_version(version: &mut semver::Version, part: VersionPart) {
+    match part {
+        VersionPart::Major => {
+            version.major += 1;
+            version.minor = 0;
+            version.patch = 0;
+        }
+        VersionPart::Minor => {
+            version.minor += 1;
+            version.patch = 0;
+        }
+        VersionPart::Patch => {
+            version.patch += 1;
+        }
+    }
+}
+
 impl WriterVersion {
+    /// Split a version string into clean version (major.minor.patch), prerelease, and build metadata.
+    ///
+    /// Returns None if the input is not a valid semver string.
+    ///
+    /// For example:
+    /// - "2.0.0-rc.1" -> Some(("2.0.0", Some("rc.1"), None))
+    /// - "2.0.0-rc.1+build.123" -> Some(("2.0.0", Some("rc.1"), Some("build.123")))
+    /// - "2.0.0+build.123" -> Some(("2.0.0", None, Some("build.123")))
+    /// - "not-a-version" -> None
+    fn split_version(full_version: &str) -> Option<(String, Option<String>, Option<String>)> {
+        let mut parsed = semver::Version::parse(full_version).ok()?;
+
+        let prerelease = if parsed.pre.is_empty() {
+            None
+        } else {
+            Some(parsed.pre.to_string())
+        };
+
+        let build_metadata = if parsed.build.is_empty() {
+            None
+        } else {
+            Some(parsed.build.to_string())
+        };
+
+        // Remove prerelease and build metadata to get clean version
+        parsed.pre = semver::Prerelease::EMPTY;
+        parsed.build = semver::BuildMetadata::EMPTY;
+        Some((parsed.to_string(), prerelease, build_metadata))
+    }
+
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
+    #[deprecated(note = "Use `lance_lib_version()` instead")]
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
-        let mut parts = self.version.split('.');
+        // First split by '-' to separate the version from the pre-release tag
+        let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
+            (
+                &self.version[..dash_idx],
+                Some(&self.version[dash_idx + 1..]),
+            )
+        } else {
+            (self.version.as_str(), None)
+        };
+
+        let mut parts = version_part.split('.');
         let major = parts.next().unwrap_or("0").parse().ok()?;
         let minor = parts.next().unwrap_or("0").parse().ok()?;
         let patch = parts.next().unwrap_or("0").parse().ok()?;
-        let tag = parts.next();
+
         Some((major, minor, patch, tag))
     }
 
+    /// If the library is "lance", parse the version as semver and return it.
+    /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
+    ///
+    /// This method reconstructs the full semantic version by combining the version field
+    /// with the prerelease and build_metadata fields (if present). For example:
+    /// - version="2.0.0" + prerelease=Some("rc.1") -> "2.0.0-rc.1"
+    /// - version="2.0.0" + prerelease=Some("rc.1") + build_metadata=Some("build.123") -> "2.0.0-rc.1+build.123"
+    pub fn lance_lib_version(&self) -> Option<semver::Version> {
+        if self.library != "lance" {
+            return None;
+        }
+
+        let mut version = semver::Version::parse(&self.version).ok()?;
+
+        if let Some(ref prerelease) = self.prerelease {
+            version.pre = semver::Prerelease::new(prerelease).ok()?;
+        }
+
+        if let Some(ref build_metadata) = self.build_metadata {
+            version.build = semver::BuildMetadata::new(build_metadata).ok()?;
+        }
+
+        Some(version)
+    }
+
+    #[deprecated(
+        note = "Use `lance_lib_version()` instead, which safely checks the library field and returns Option"
+    )]
+    #[allow(deprecated)]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
             .unwrap_or_else(|| panic!("Invalid writer version: {}", self.version))
     }
 
-    /// Return true if self is older than the given major/minor/patch
+    /// Check if this is a Lance library version older than the given major/minor/patch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the library is not "lance" or the version cannot be parsed as semver.
+    #[deprecated(note = "Use `lance_lib_version()` and its `older_than` method instead.")]
     pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
-        let version = self.semver_or_panic();
-        (version.0, version.1, version.2) < (major, minor, patch)
+        let version = self
+            .lance_lib_version()
+            .expect("Not lance library or invalid version");
+        let other = semver::Version {
+            major: major.into(),
+            minor: minor.into(),
+            patch: patch.into(),
+            pre: semver::Prerelease::EMPTY,
+            build: semver::BuildMetadata::EMPTY,
+        };
+        version < other
     }
 
+    #[deprecated(note = "This is meant for testing and will be made private in future version.")]
     pub fn bump(&self, part: VersionPart, keep_tag: bool) -> Self {
-        let parts = self.semver_or_panic();
-        let tag = if keep_tag { parts.3 } else { None };
-        let new_parts = match part {
-            VersionPart::Major => (parts.0 + 1, parts.1, parts.2, tag),
-            VersionPart::Minor => (parts.0, parts.1 + 1, parts.2, tag),
-            VersionPart::Patch => (parts.0, parts.1, parts.2 + 1, tag),
-        };
-        let new_version = if let Some(tag) = tag {
-            format!("{}.{}.{}.{}", new_parts.0, new_parts.1, new_parts.2, tag)
-        } else {
-            format!("{}.{}.{}", new_parts.0, new_parts.1, new_parts.2)
-        };
+        let mut version = self.lance_lib_version().expect("Should be lance version");
+        bump_version(&mut version, part);
+        if !keep_tag {
+            version.pre = semver::Prerelease::EMPTY;
+        }
+        let (clean_version, prerelease, build_metadata) = Self::split_version(&version.to_string())
+            .expect("Bumped version should be valid semver");
         Self {
             library: self.library.clone(),
-            version: new_version,
+            version: clean_version,
+            prerelease,
+            build_metadata,
         }
     }
 }
@@ -542,18 +791,29 @@ impl WriterVersion {
 impl Default for WriterVersion {
     #[cfg(not(test))]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
     }
 
     // Unit tests always run as if they are in the next version.
     #[cfg(test)]
+    #[allow(deprecated)]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
         .bump(VersionPart::Patch, true)
     }
@@ -565,6 +825,12 @@ impl ProtoStruct for Manifest {
 
 impl From<pb::BasePath> for BasePath {
     fn from(p: pb::BasePath) -> Self {
+        Self::new(p.id, p.path, p.name, p.is_dataset_root)
+    }
+}
+
+impl From<BasePath> for pb::BasePath {
+    fn from(p: BasePath) -> Self {
         Self {
             id: p.id,
             name: p.name,
@@ -585,9 +851,17 @@ impl TryFrom<pb::Manifest> for Manifest {
         });
         // We only use the writer version if it is fully set.
         let writer_version = match p.writer_version {
-            Some(pb::manifest::WriterVersion { library, version }) => {
-                Some(WriterVersion { library, version })
-            }
+            Some(pb::manifest::WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }) => Some(WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }),
             _ => None,
         };
         let fragments = Arc::new(
@@ -599,7 +873,7 @@ impl TryFrom<pb::Manifest> for Manifest {
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
-            metadata: p.metadata,
+            metadata: p.schema_metadata,
         };
 
         if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
@@ -629,12 +903,11 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Ok(Self {
             schema,
-            local_schema,
             version: p.version,
+            branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -653,11 +926,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             next_row_id: p.next_row_id,
             data_storage_format,
             config: p.config,
-            blob_dataset_version: if p.blob_dataset_version == 0 {
-                None
-            } else {
-                Some(p.blob_dataset_version)
-            },
+            table_metadata: p.table_metadata,
             base_paths: p
                 .base_paths
                 .iter()
@@ -682,16 +951,25 @@ impl From<&Manifest> for pb::Manifest {
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
             fields: fields_with_meta.fields.0,
+            schema_metadata: m
+                .schema
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+                .collect(),
             version: m.version,
+            branch: m.branch.clone(),
             writer_version: m
                 .writer_version
                 .as_ref()
                 .map(|wv| pb::manifest::WriterVersion {
                     library: wv.library.clone(),
                     version: wv.version.clone(),
+                    prerelease: wv.prerelease.clone(),
+                    build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            metadata: fields_with_meta.metadata,
+            table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
@@ -706,7 +984,6 @@ impl From<&Manifest> for pb::Manifest {
                 version: m.data_storage_format.version.clone(),
             }),
             config: m.config.clone(),
-            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
             base_paths: m
                 .base_paths
                 .values()
@@ -786,7 +1063,8 @@ impl SelfDescribingFileReader for FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::format::DataFile;
+    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use std::num::NonZero;
 
     use super::*;
 
@@ -797,26 +1075,180 @@ mod tests {
     fn test_writer_version() {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
-        let parts = wv.semver().unwrap();
+
+        // Parse the actual cargo version to check if it has a pre-release tag
+        let cargo_version = env!("CARGO_PKG_VERSION");
+        let expected_tag = if cargo_version.contains('-') {
+            Some(cargo_version.split('-').nth(1).unwrap())
+        } else {
+            None
+        };
+
+        // Verify the version field contains only major.minor.patch
+        let version_parts: Vec<&str> = wv.version.split('.').collect();
         assert_eq!(
-            parts,
-            (
-                env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
-                env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
-                // Unit tests run against (major,minor,patch + 1)
-                env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap() + 1,
-                None
-            )
+            version_parts.len(),
+            3,
+            "Version should be major.minor.patch"
+        );
+        assert!(
+            !wv.version.contains('-'),
+            "Version field should not contain prerelease"
+        );
+
+        // Verify the prerelease field matches the expected tag
+        assert_eq!(wv.prerelease.as_deref(), expected_tag);
+        // Build metadata should be None for default version
+        assert_eq!(wv.build_metadata, None);
+
+        // Verify lance_lib_version() reconstructs the full semver correctly
+        let version = wv.lance_lib_version().unwrap();
+        assert_eq!(
+            version.major,
+            env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap()
         );
         assert_eq!(
-            format!("{}.{}.{}", parts.0, parts.1, parts.2 - 1),
-            env!("CARGO_PKG_VERSION")
+            version.minor,
+            env!("CARGO_PKG_VERSION_MINOR").parse::<u64>().unwrap()
         );
+        assert_eq!(
+            version.patch,
+            // Unit tests run against (major,minor,patch + 1)
+            env!("CARGO_PKG_VERSION_PATCH").parse::<u64>().unwrap() + 1
+        );
+        assert_eq!(version.pre.as_str(), expected_tag.unwrap_or(""));
+
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
-            let bumped = wv.bump(*part, false);
-            let bumped_parts = bumped.semver_or_panic();
-            assert!(wv.older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2));
+            let mut bumped_version = version.clone();
+            bump_version(&mut bumped_version, *part);
+            assert!(version < bumped_version);
         }
+    }
+
+    #[test]
+    fn test_writer_version_split() {
+        // Test splitting version with prerelease
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version without prerelease
+        let (version, prerelease, build_metadata) = WriterVersion::split_version("2.0.0").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version with prerelease and build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test splitting version with only build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test with invalid version returns None
+        assert!(WriterVersion::split_version("not-a-version").is_none());
+    }
+
+    #[test]
+    fn test_writer_version_comparison_with_prerelease() {
+        let v1 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        let v2 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        let semver1 = v1.lance_lib_version().unwrap();
+        let semver2 = v2.lance_lib_version().unwrap();
+
+        // rc.1 should be less than the release version
+        assert!(semver1 < semver2);
+    }
+
+    #[test]
+    fn test_writer_version_with_build_metadata() {
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: Some("build.123".to_string()),
+        };
+
+        let semver = v.lance_lib_version().unwrap();
+        assert_eq!(semver.to_string(), "2.0.0-rc.1+build.123");
+        assert_eq!(semver.major, 2);
+        assert_eq!(semver.minor, 0);
+        assert_eq!(semver.patch, 0);
+        assert_eq!(semver.pre.as_str(), "rc.1");
+        assert_eq!(semver.build.as_str(), "build.123");
+    }
+
+    #[test]
+    fn test_writer_version_non_semver() {
+        // Test that Lance library can have non-semver version strings
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "custom-build-v1".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // lance_lib_version should return None for non-semver
+        assert!(v.lance_lib_version().is_none());
+
+        // But the WriterVersion itself should still be valid and usable
+        assert_eq!(v.library, "lance");
+        assert_eq!(v.version, "custom-build-v1");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_older_than_with_prerelease() {
+        // Test that older_than correctly handles prerelease
+        let v_rc = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        // 2.0.0-rc.1 should be older than 2.0.0
+        assert!(v_rc.older_than(2, 0, 0));
+
+        // 2.0.0-rc.1 should be older than 2.0.1
+        assert!(v_rc.older_than(2, 0, 1));
+
+        // 2.0.0-rc.1 should not be older than 1.9.9
+        assert!(!v_rc.older_than(1, 9, 9));
+
+        let v_release = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // 2.0.0 should not be older than 2.0.0
+        assert!(!v_release.older_than(2, 0, 0));
+
+        // 2.0.0 should be older than 2.0.1
+        assert!(v_release.older_than(2, 0, 1));
     }
 
     #[test]
@@ -836,7 +1268,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -883,20 +1314,28 @@ mod tests {
         let fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    vec![0, 1, 2],
+                    None,
+                )],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
             Fragment {
                 id: 1,
                 files: vec![
-                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
-                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
+                    DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
             },
         ];
 
@@ -904,7 +1343,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -928,7 +1366,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -936,11 +1373,121 @@ mod tests {
         config.insert("lance.test".to_string(), "value".to_string());
         config.insert("other-key".to_string(), "other-value".to_string());
 
-        manifest.update_config(config.clone());
+        manifest.config_mut().extend(config.clone());
         assert_eq!(manifest.config, config.clone());
 
         config.remove("other-key");
-        manifest.delete_config_keys(&["other-key"]);
+        manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
+    }
+
+    #[test]
+    fn test_manifest_summary() {
+        // Step 1: test empty manifest summary
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", arrow_schema::DataType::Int64, false),
+            ArrowField::new("name", arrow_schema::DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let empty_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let empty_summary = empty_manifest.summary();
+        assert_eq!(empty_summary.total_rows, 0);
+        assert_eq!(empty_summary.total_files_size, 0);
+        assert_eq!(empty_summary.total_fragments, 0);
+        assert_eq!(empty_summary.total_data_files, 0);
+        assert_eq!(empty_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_summary.total_data_file_rows, 0);
+        assert_eq!(empty_summary.total_deletion_files, 0);
+
+        // Step 2: write empty files and verify summary
+        let empty_fragments = vec![
+            Fragment::with_file_legacy(0, "empty_file1.lance", &schema, Some(0)),
+            Fragment::with_file_legacy(1, "empty_file2.lance", &schema, Some(0)),
+        ];
+
+        let empty_files_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(empty_fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let empty_files_summary = empty_files_manifest.summary();
+        assert_eq!(empty_files_summary.total_rows, 0);
+        assert_eq!(empty_files_summary.total_files_size, 0);
+        assert_eq!(empty_files_summary.total_fragments, 2);
+        assert_eq!(empty_files_summary.total_data_files, 2);
+        assert_eq!(empty_files_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_files_summary.total_data_file_rows, 0);
+        assert_eq!(empty_files_summary.total_deletion_files, 0);
+
+        // Step 3: write real data and verify summary
+        let real_fragments = vec![
+            Fragment::with_file_legacy(0, "data_file1.lance", &schema, Some(100)),
+            Fragment::with_file_legacy(1, "data_file2.lance", &schema, Some(250)),
+            Fragment::with_file_legacy(2, "data_file3.lance", &schema, Some(75)),
+        ];
+
+        let real_data_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(real_fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let real_data_summary = real_data_manifest.summary();
+        assert_eq!(real_data_summary.total_rows, 425); // 100 + 250 + 75
+        assert_eq!(real_data_summary.total_files_size, 0); // Zero for unknown
+        assert_eq!(real_data_summary.total_fragments, 3);
+        assert_eq!(real_data_summary.total_data_files, 3);
+        assert_eq!(real_data_summary.total_deletion_file_rows, 0);
+        assert_eq!(real_data_summary.total_data_file_rows, 425);
+        assert_eq!(real_data_summary.total_deletion_files, 0);
+
+        let file_version = LanceFileVersion::default();
+        // Step 4: write deletion files and verify summary
+        let mut fragment_with_deletion = Fragment::new(0)
+            .with_file(
+                "data_with_deletion.lance",
+                vec![0, 1],
+                vec![0, 1],
+                &file_version,
+                NonZero::new(1000),
+            )
+            .with_physical_rows(50);
+        fragment_with_deletion.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(10),
+            base_id: None,
+        });
+
+        let manifest_with_deletion = Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_deletion]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let deletion_summary = manifest_with_deletion.summary();
+        assert_eq!(deletion_summary.total_rows, 40); // 50 - 10
+        assert_eq!(deletion_summary.total_files_size, 1000);
+        assert_eq!(deletion_summary.total_fragments, 1);
+        assert_eq!(deletion_summary.total_data_files, 1);
+        assert_eq!(deletion_summary.total_deletion_file_rows, 10);
+        assert_eq!(deletion_summary.total_data_file_rows, 50);
+        assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        //Just verify the transformation is OK
+        let stats_map: BTreeMap<String, String> = deletion_summary.into();
+        assert_eq!(stats_map.len(), 7)
     }
 }

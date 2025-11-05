@@ -22,6 +22,19 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+/// A [TableProvider] for Lance datasets.
+///
+/// Note: Datafusion has no concept of "system columns".  As a result, you must specify
+/// which schema columns should be included in the table's schema when you create the
+/// provider.
+///
+/// This table provider should support:
+///  - Filter pushdown
+///  - Limit pushdown
+///  - Projection pushdown
+///
+/// Note that LanceDB also has a TableProvider implementation that should be preferred
+/// if you are working in LanceDB.
 #[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
@@ -60,6 +73,10 @@ impl LanceTableProvider {
             row_addr_idx,
             ordered,
         }
+    }
+
+    pub fn dataset(&self) -> Arc<Dataset> {
+        self.dataset.clone()
     }
 }
 
@@ -249,8 +266,8 @@ pub mod tests {
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::prelude::SessionContext;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::array;
-    use tempfile::tempdir;
 
     use crate::{
         datafusion::LanceTableProvider,
@@ -259,13 +276,12 @@ pub mod tests {
 
     #[tokio::test]
     pub async fn test_table_provider() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
         let data = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
-                test_uri,
+                &test_uri,
                 FragmentCount::from(10),
                 FragmentRowCount::from(10),
             )

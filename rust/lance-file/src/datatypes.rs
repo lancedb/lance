@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::DataTypeExt;
@@ -12,13 +10,14 @@ use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_binary_array, read_fixed_stride_array};
 use snafu::location;
+use std::collections::HashMap;
 
 use crate::format::pb;
 
 #[allow(clippy::fallible_impl_from)]
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
-        let mut lance_metadata: HashMap<String, String> = field
+        let lance_metadata: HashMap<String, String> = field
             .metadata
             .iter()
             .map(|(key, value)| {
@@ -26,6 +25,7 @@ impl From<&pb::Field> for Field {
                 (key.clone(), string_value)
             })
             .collect();
+        let mut lance_metadata = lance_metadata;
         if !field.extension_name.is_empty() {
             lance_metadata.insert(ARROW_EXT_NAME_KEY.to_string(), field.extension_name.clone());
         }
@@ -45,7 +45,6 @@ impl From<&pb::Field> for Field {
             nullable: field.nullable,
             children: vec![],
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
-            storage_class: field.storage_class.parse().unwrap(),
             unenforced_primary_key: field.unenforced_primary_key,
         }
     }
@@ -55,9 +54,8 @@ impl From<&Field> for pb::Field {
     fn from(field: &Field) -> Self {
         let pb_metadata = field
             .metadata
-            .clone()
-            .into_iter()
-            .map(|(key, value)| (key, value.into_bytes()))
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone().into_bytes()))
             .collect();
         Self {
             id: field.id,
@@ -79,7 +77,6 @@ impl From<&Field> for pb::Field {
                 .map(|name| name.to_owned())
                 .unwrap_or_default(),
             r#type: 0,
-            storage_class: field.storage_class.to_string(),
             unenforced_primary_key: field.unenforced_primary_key,
         }
     }
@@ -261,16 +258,14 @@ pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use arrow_schema::DataType;
     use arrow_schema::Field as ArrowField;
     use arrow_schema::Fields as ArrowFields;
     use arrow_schema::Schema as ArrowSchema;
     use lance_core::datatypes::Schema;
+    use std::collections::HashMap;
 
-    use crate::datatypes::Fields;
-    use crate::datatypes::FieldsWithMeta;
+    use super::{Fields, FieldsWithMeta};
 
     #[test]
     fn test_schema_set_ids() {

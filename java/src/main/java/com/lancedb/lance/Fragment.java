@@ -14,6 +14,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.fragment.FragmentMergeResult;
+import com.lancedb.lance.fragment.FragmentUpdateResult;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 
@@ -160,6 +161,43 @@ public class Fragment {
       String rightOn);
 
   /**
+   * Update existed columns into this Fragment, will return the new fragment with the same
+   * FragmentId and updated field ids. This operation will perform a left-outer-hash-join with the
+   * right table (new data in stream) on the column specified by leftOn and rightOn. For every row
+   * in current fragment, the updated column value is:
+   *
+   * <ol>
+   *   <li>if no matched row on the right side, column value of the left side row.
+   *   <li>if there is exactly one corresponding row on the right side, column value of the matching
+   *       row.
+   *   <li>if there are multiple corresponding rows, column value of a random row.
+   * </ol>
+   *
+   * The returned Result will be further committed.
+   *
+   * @param stream the input data stream
+   * @param leftOn column name of current fragment to be joined on.
+   * @param rightOn column name of new data to be joined on.
+   * @return the fragment metadata.
+   */
+  public FragmentUpdateResult updateColumns(
+      ArrowArrayStream stream, String leftOn, String rightOn) {
+    return nativeUpdateColumns(
+        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+  }
+
+  public FragmentUpdateResult updateColumns(ArrowArrayStream stream) {
+    return updateColumns(stream, MetadataColumns.ROWID, MetadataColumns.ROWID);
+  }
+
+  private native FragmentUpdateResult nativeUpdateColumns(
+      Dataset dataset,
+      long fragmentId,
+      long arrowStreamMemoryAddress,
+      String leftOn,
+      String rightOn);
+
+  /**
    * Create a fragment from the given data.
    *
    * @param datasetUri the dataset uri
@@ -186,6 +224,7 @@ public class Fragment {
           params.getMaxBytesPerFile(),
           params.getMode(),
           params.getEnableStableRowIds(),
+          params.getDataStorageVersion(),
           params.getStorageOptions());
     }
   }
@@ -211,6 +250,7 @@ public class Fragment {
         params.getMaxBytesPerFile(),
         params.getMode(),
         params.getEnableStableRowIds(),
+        params.getDataStorageVersion(),
         params.getStorageOptions());
   }
 
@@ -228,6 +268,7 @@ public class Fragment {
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
       Map<String, String> storageOptions);
 
   /**
@@ -243,5 +284,6 @@ public class Fragment {
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
       Map<String, String> storageOptions);
 }

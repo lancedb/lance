@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::pbold;
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -44,7 +45,7 @@ use crate::{
     },
 };
 use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{pb, scalar::expression::ScalarQueryParser, scalar::IndexReader};
+use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
@@ -533,7 +534,8 @@ impl ScalarIndex for BitmapIndex {
         BitmapIndexPlugin::write_bitmap_index(state, dest_store, &self.value_type).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BitmapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
+                .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
     }
@@ -561,7 +563,8 @@ impl ScalarIndex for BitmapIndex {
         BitmapIndexPlugin::do_train_bitmap_index(new_data, state, dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BitmapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
+                .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
     }
@@ -740,7 +743,8 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
         Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BitmapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
+                .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
     }
@@ -766,18 +770,16 @@ pub mod tests {
     use arrow_schema::{Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
         // Create a temporary directory for the index
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -886,10 +888,8 @@ pub mod tests {
         use lance_core::cache::LanceCache;
         use lance_core::utils::mask::RowIdTreeMap;
         use lance_io::object_store::ObjectStore;
-        use object_store::path::Path;
         use std::collections::HashMap;
         use std::sync::Arc;
-        use tempfile::tempdir;
 
         // Adjust these numbers so that:
         //     m * (serialized size per bitmap) > 2^31 bytes.
@@ -909,10 +909,10 @@ pub mod tests {
         }
 
         // Create a temporary store.
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         );
 
@@ -1018,10 +1018,10 @@ pub mod tests {
     #[tokio::test]
     async fn test_bitmap_prewarm() {
         // Create a temporary directory for the index
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1118,10 +1118,10 @@ pub mod tests {
         use arrow_array::UInt32Array;
 
         // Create a temporary store.
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

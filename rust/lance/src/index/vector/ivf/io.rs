@@ -19,6 +19,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
 use lance_file::reader::FileReader;
@@ -43,7 +44,6 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::location;
-use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use crate::Result;
@@ -298,7 +298,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let object_store = ObjectStore::local();
     let mut part_files = Vec::with_capacity(ivf.num_partitions());
     let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
-    let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
+    let tmp_part_dir = Path::from_filesystem_path(TempStdDir::default())?;
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
@@ -322,10 +322,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
 
         let code_column = match &quantizer {
-            Quantizer::Flat(_) => None,
-            Quantizer::FlatBin(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
-            Quantizer::Scalar(_) => None,
+            _ => None,
         };
         merge_streams(
             &mut streams_heap,
@@ -556,6 +554,7 @@ mod tests {
     use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::IndexType;
     use lance_testing::datagen::generate_random_array;
@@ -577,15 +576,11 @@ mod tests {
         let batches =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
 
-        let tmp_uri = tempfile::tempdir().unwrap();
+        let tmp_uri = TempStrDir::default();
 
-        let mut ds = Dataset::write(
-            batches,
-            tmp_uri.path().to_str().unwrap(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let mut ds = Dataset::write(batches, tmp_uri.as_str(), Default::default())
+            .await
+            .unwrap();
 
         let idx_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
         ds.create_index(&["vector"], IndexType::Vector, None, &idx_params, true)

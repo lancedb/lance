@@ -4,7 +4,7 @@
 use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
 
 use arrow::{
-    array::{ArrayData, AsArray, Float32Builder, GenericStringBuilder},
+    array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
@@ -1093,6 +1093,85 @@ impl ArrayGenerator for PrefixPlusCounterGenerator {
     }
 }
 
+/// Generate a sequence of binary strings with a prefix and a counter
+///
+/// The counter will be encoded (little-endian) as a u8, u16, u32, or u64 and added to the prefix
+/// As long as more than 256 values are generated then the resulting array will have
+/// variable width
+#[derive(Debug)]
+pub struct BinaryPrefixPlusCounterGenerator {
+    prefix: Arc<[u8]>,
+    is_large: bool,
+    data_type: DataType,
+    current_counter: u64,
+}
+
+impl BinaryPrefixPlusCounterGenerator {
+    pub fn new(prefix: Arc<[u8]>, is_large: bool) -> Self {
+        Self {
+            prefix,
+            is_large,
+            data_type: if is_large {
+                DataType::LargeBinary
+            } else {
+                DataType::Binary
+            },
+            current_counter: 0,
+        }
+    }
+
+    fn generate_values<T: OffsetSizeTrait>(
+        &self,
+        start: u64,
+        num_values: u64,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let max_bytes = (self.prefix.len() + std::mem::size_of::<u64>()) * num_values as usize;
+        let mut builder = GenericBinaryBuilder::<T>::with_capacity(num_values as usize, max_bytes);
+        let mut word = Vec::with_capacity(self.prefix.len() + std::mem::size_of::<u64>());
+        word.extend_from_slice(&self.prefix);
+        for i in 0..num_values {
+            let counter = start + i;
+            word.truncate(self.prefix.len());
+            if counter < u8::MAX as u64 {
+                word.push(counter as u8);
+            } else if counter < u16::MAX as u64 {
+                word.extend_from_slice(&(counter as u16).to_le_bytes());
+            } else if counter < u32::MAX as u64 {
+                word.extend_from_slice(&(counter as u32).to_le_bytes());
+            } else {
+                word.extend_from_slice(&counter.to_le_bytes());
+            }
+            builder.append_value(&word);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+impl ArrayGenerator for BinaryPrefixPlusCounterGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        _rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let start = self.current_counter;
+        self.current_counter += length.0;
+        if self.is_large {
+            self.generate_values::<i64>(start, length.0)
+        } else {
+            self.generate_values::<i32>(start, length.0)
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        // It's not consistent
+        None
+    }
+}
+
 #[derive(Debug)]
 struct RandomSentenceGenerator {
     min_words: usize,
@@ -1931,7 +2010,7 @@ impl BatchGeneratorBuilder {
             )
             .sum::<Result<u64, ArrowError>>()?;
         let mut num_rows = RowCount::from(batch_size_bytes.0 / bytes_per_row);
-        if batch_size_bytes.0 % bytes_per_row != 0 {
+        if !batch_size_bytes.0.is_multiple_of(bytes_per_row) {
             match rounding {
                 RoundingBehavior::ExactOrErr => {
                     return Err(ArrowError::NotYetImplemented(
@@ -2250,6 +2329,21 @@ pub mod array {
         cycle_vec(underlying, dimension)
     }
 
+    /// Create a generator of 1d vectors (of a primitive type) consisting of randomly sampled nullable values
+    pub fn rand_vec_nullable<DataType>(
+        dimension: Dimension,
+        null_probability: f64,
+    ) -> Box<dyn ArrayGenerator>
+    where
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+        rand::distr::StandardUniform: rand::distr::Distribution<DataType::Native>,
+    {
+        let underlying = rand::<DataType>().with_random_nulls(null_probability);
+        cycle_vec(underlying, dimension)
+    }
+
     /// Create a generator of randomly sampled time32 values covering the entire
     /// range of 1 day
     pub fn rand_time32(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
@@ -2406,7 +2500,7 @@ pub mod array {
         let dist = Uniform::new(start_ticks, end_ticks).unwrap();
 
         let data_type = data_type.clone();
-        let sample_fn = move |rng: &mut _| (dist.sample(rng));
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
         let width = data_type
             .primitive_width()
             .map(|width| ByteCount::from(width as u64))
@@ -2510,6 +2604,13 @@ pub mod array {
         is_large: bool,
     ) -> Box<dyn ArrayGenerator> {
         Box::new(PrefixPlusCounterGenerator::new(prefix.into(), is_large))
+    }
+
+    pub fn binary_prefix_plus_counter(
+        prefix: Arc<[u8]>,
+        is_large: bool,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(BinaryPrefixPlusCounterGenerator::new(prefix, is_large))
     }
 
     /// Create a random generator of boolean values

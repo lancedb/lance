@@ -9,6 +9,7 @@ import platform
 import random
 import re
 import time
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List
@@ -30,6 +31,7 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
+from lance.file import stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
@@ -249,14 +251,15 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("a").metadata == {b"thisis": b"a"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
-    # Replace schema metadata
-    ds.replace_schema_metadata({"foo": "baz"})
+    # Replace schema metadata (using new unified API)
+    ds.update_schema_metadata({"foo": "baz"}, replace=True)
     assert ds.schema.metadata == {b"foo": b"baz"}
     assert ds.schema.field("a").metadata == {b"thisis": b"a"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
-    # Replace field metadata
-    ds.replace_field_metadata("a", {"thisis": "c"})
+    # Replace field metadata (using new unified API)
+    # Use field path instead of field ID
+    ds.update_field_metadata({"a": {"thisis": "c"}}, replace=True)
     assert ds.schema.field("a").metadata == {b"thisis": b"c"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
@@ -446,7 +449,7 @@ def test_tag(tmp_path: Path):
     ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
-    ds.tags.create("tag2", 1)
+    ds.tags.create("tag2", 1, None)
 
     assert len(ds.tags.list()) == 2
 
@@ -470,9 +473,9 @@ def test_tag(tmp_path: Path):
     with pytest.raises(
         ValueError, match="Ref not found error: tag tag3 does not exist"
     ):
-        ds.tags.update("tag3", 1)
+        ds.tags.update("tag3", 1, None)
 
-    ds.tags.update("tag1", 2)
+    ds.tags.update("tag1", 2, None)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
 
@@ -546,6 +549,88 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+def test_take_rowid_rowaddr(tmp_path: Path):
+    sample_size = 10
+    table1 = pa.table({"a": range(1000), "b": range(1000)})
+    base_dir = tmp_path / "test_take_rowid_rowaddr"
+    lance.write_dataset(
+        table1, base_dir, enable_stable_row_ids=False, max_rows_per_file=50
+    )
+    dataset = lance.dataset(base_dir)
+    total_rows = len(dataset)
+    sampled_indices = random.sample(range(total_rows), min(sample_size, total_rows))
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 1
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowaddr", "_rowid"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowaddr", "_rowid"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "_rowid", "_rowaddr"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "_rowid", "_rowaddr"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["_rowid", "_rowaddr", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["_rowid", "_rowaddr", "b"]
+    )
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 3
+
+    sample_dataset = dataset.take(sampled_indices, columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
+
+    sample_dataset = dataset.take([1, 2, 3, 4, 5, 6, 7, 8, 9, 100], columns=["a", "b"])
+    assert sample_dataset.num_rows == 10
+    assert sample_dataset.num_columns == 2
 
 
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
@@ -934,10 +1019,8 @@ def test_analyze_scan(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(table, tmp_path)
     plan = dataset.scanner().analyze_plan()
-    # The bytes_read part might get brittle if we change file versions a lot
-    # future us are free to ignore that part.
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=3643.*iops=3.*requests=3.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -947,7 +1030,7 @@ def test_analyze_take(tmp_path: Path):
     dataset.create_scalar_index("a", "BTREE")
     plan = dataset.scanner(filter="a = 50").analyze_plan()
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=16.*iops=2.*requests=2.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -1044,8 +1127,8 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1)
-    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("old-tag", 1, None)
+    dataset.tags.create("another-old-tag", 2, None)
 
     with pytest.raises(OSError):
         dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
@@ -1073,9 +1156,9 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    dataset.tags.create("old-tag", 1)
-    dataset.tags.create("another-old-tag", 2)
-    dataset.tags.create("tag-latest", 3)
+    dataset.tags.create("old-tag", 1, None)
+    dataset.tags.create("another-old-tag", 2, None)
+    dataset.tags.create("tag-latest", 3, None)
 
     stats = dataset.cleanup_old_versions(
         older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
@@ -1609,18 +1692,6 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     assert scanner.to_table().num_rows == 2 * 100
 
 
-def test_write_unstable_data_version(tmp_path: Path, capfd):
-    # Note: this test will only work if no earlier test attempts
-    # to use an unstable version.  If we need that later we can find a way to
-    # run this test in a separate process (pytest-xdist?)
-    tab = pa.table({"a": range(100), "b": range(100)})
-    ds = lance.write_dataset(
-        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
-    )
-    assert ds.to_table() == tab
-    assert "You have requested an unstable format version" in capfd.readouterr().err
-
-
 def test_merge_data(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100)})
     lance.write_dataset(tab, tmp_path / "dataset", mode="append")
@@ -2124,6 +2195,53 @@ def test_merge_insert_vector_column(tmp_path: Path):
 
     assert dataset.to_table().sort_by("key") == expected
     check_merge_stats(merge_dict, (1, 1, 0))
+
+
+def test_merge_insert_when_matched_fail(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    ds = lance.write_dataset(data, tmp_path / "dataset")
+    version = ds.version
+
+    # No matching rows should succeed
+    new_data = pa.table({"id": [6, 7, 8], "val": [60, 70, 80]})
+    result = (
+        ds.merge_insert("id")
+        .when_matched_fail()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+    assert result["num_deleted_rows"] == 0
+
+    # Matching rows should fail
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    new_data = pa.table({"id": [1, 2, 9], "val": [100, 200, 900]})
+    with pytest.raises(Exception):
+        ds.merge_insert("id").when_matched_fail().when_not_matched_insert_all().execute(
+            new_data
+        )
+
+    # Test with execute_uncommitted
+    # This should raise an exception because there are matching rows
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    with pytest.raises(Exception):
+        transaction, _ = (
+            ds.merge_insert("id")
+            .when_matched_fail()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(new_data)
+        )
+
+    # Verify that the data remains unchanged after failed operation
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+    unchanged_ds = lance.dataset(tmp_path / "dataset")
+    unchanged_data = unchanged_ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]})
+    assert unchanged_data == expected
 
 
 def test_merge_insert_large():
@@ -3506,7 +3624,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
-    assert dataset.data_storage_version == "2.0"
+    assert dataset.data_storage_version == stable_version()
 
     # Append will write v2 if dataset was originally created with v2
     dataset = lance.write_dataset(table, tmp_path, mode="append")
@@ -3648,9 +3766,9 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
-EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
-EXPECTED_MAJOR_VERSION = 2
-EXPECTED_MINOR_VERSION = 0
+EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
+EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
+EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
 def test_stats(tmp_path: Path):
@@ -3665,9 +3783,9 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 32
+    assert data_stats.fields[0].bytes_on_disk > 0
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk > 0
 
     dataset.add_columns({"z": "y"})
 
@@ -3676,11 +3794,11 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 40
+    assert data_stats.fields[0].bytes_on_disk > 0
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk > 0
     assert data_stats.fields[2].id == 2
-    assert data_stats.fields[2].bytes_on_disk == 56  # 16 bytes data + 40 bytes offset
+    assert data_stats.fields[2].bytes_on_disk > 0
 
 
 def test_default_storage_version(tmp_path: Path):
@@ -4127,46 +4245,521 @@ def test_commit_message_and_get_properties(tmp_path):
     # The latest transaction from delete should have no properties.
     assert transactions[0].transaction_properties == {}
 
-
-def test_diff_meta(tmp_path: Path):
-    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
-    lance.write_dataset(table1, tmp_path)
-
-    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
-    dataset = lance.write_dataset(
-        table2, tmp_path, mode="append", commit_message="Append data"
+    # 4. Test case: Commit using the commit method instead of write_dataset
+    frags = lance.fragment.write_fragments(pa.table({"a": [5]}), dataset.uri)
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Append(frags),
+        read_version=dataset.version,
+        commit_message="Use Dataset.commit",
     )
 
-    dataset.delete("id = 2")
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 4
+    assert (
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "Use Dataset.commit"
+    )
 
-    diff = dataset.diff_meta(1)
 
-    assert len(diff) == 2
+def test_table_metadata_updates(tmp_path: Path):
+    """Test table metadata incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
 
-    for transaction in diff:
-        assert hasattr(transaction, "read_version")
-        assert hasattr(transaction, "transaction_properties")
+    # Test incremental updates
+    ds.update_metadata({"key1": "value1", "key2": "value2"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "value1"
+    assert metadata["key2"] == "value2"
 
-    dataset_v2 = lance.dataset(tmp_path, version=2)
-    diff_v2 = dataset_v2.diff_meta(1)
+    # Test updating existing key
+    ds.update_metadata({"key1": "updated_value1", "key3": "value3"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "updated_value1"
+    assert metadata["key2"] == "value2"  # Should remain
+    assert metadata["key3"] == "value3"
 
-    assert len(diff_v2) == 1
+    # Test deletion with None values
+    ds.update_metadata({"key2": None, "key4": "value4"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "updated_value1"
+    assert "key2" not in metadata  # Should be deleted
+    assert metadata["key3"] == "value3"
+    assert metadata["key4"] == "value4"
 
-    # Test diff with current version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version)
+    # Test full replacement
+    ds.update_metadata({"new_key": "new_value"}, replace=True)
+    metadata = ds.metadata
+    assert metadata == {"new_key": "new_value"}  # All previous keys gone
 
-    # Test diff with future version (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(dataset.version + 1)
 
-    # Test diff with non-existent version after cleanup
-    moment = datetime.now()
-    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
-    dataset = lance.write_dataset(table3, tmp_path, mode="append")
+def test_config_updates(tmp_path: Path):
+    """Test config incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
 
-    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    original_config = ds.config()
 
-    # Now try to diff with the cleaned up version 1 (should raise error)
-    with pytest.raises(ValueError):
-        dataset.diff_meta(1)
+    # Test incremental updates
+    ds.update_config({"custom_key1": "value1", "custom_key2": "value2"})
+    config = ds.config()
+    assert config["custom_key1"] == "value1"
+    assert config["custom_key2"] == "value2"
+    # Original config should still be there
+    for key, value in original_config.items():
+        assert config[key] == value
+
+    # Test updating existing custom key
+    ds.update_config({"custom_key1": "updated_value1", "custom_key3": "value3"})
+    config = ds.config()
+    assert config["custom_key1"] == "updated_value1"
+    assert config["custom_key2"] == "value2"
+    assert config["custom_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_config({"custom_key2": None, "custom_key4": "value4"})
+    config = ds.config()
+    assert config["custom_key1"] == "updated_value1"
+    assert "custom_key2" not in config
+    assert config["custom_key3"] == "value3"
+    assert config["custom_key4"] == "value4"
+
+    # Test full replacement (should preserve original config plus new values)
+    ds.update_config({"only_custom": "only_value"}, replace=True)
+    config = ds.config()
+    assert config == {"only_custom": "only_value"}
+
+
+def test_schema_metadata_updates(tmp_path: Path):
+    """Test schema metadata incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test incremental updates
+    ds.update_schema_metadata({"schema_key1": "value1", "schema_key2": "value2"})
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "value1"
+    assert schema_metadata["schema_key2"] == "value2"
+
+    # Test updating existing key
+    ds.update_schema_metadata(
+        {"schema_key1": "updated_value1", "schema_key3": "value3"}
+    )
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "updated_value1"
+    assert schema_metadata["schema_key2"] == "value2"
+    assert schema_metadata["schema_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_schema_metadata({"schema_key2": None, "schema_key4": "value4"})
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "updated_value1"
+    assert "schema_key2" not in schema_metadata
+    assert schema_metadata["schema_key3"] == "value3"
+    assert schema_metadata["schema_key4"] == "value4"
+
+    # Test full replacement
+    ds.update_schema_metadata({"only_schema": "only_value"}, replace=True)
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata == {"only_schema": "only_value"}
+
+
+def test_field_metadata_updates(tmp_path: Path):
+    """Test field metadata updates using field paths."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test incremental updates using field path
+    ds.update_field_metadata({"a": {"field_key1": "value1", "field_key2": "value2"}})
+
+    # Get field metadata for verification
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "value1"
+    assert field_metadata["field_key2"] == "value2"
+
+    # Test updating existing key
+    ds.update_field_metadata(
+        {"a": {"field_key1": "updated_value1", "field_key3": "value3"}}
+    )
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "updated_value1"
+    assert field_metadata["field_key2"] == "value2"  # Should remain
+    assert field_metadata["field_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_field_metadata({"a": {"field_key2": None, "field_key4": "value4"}})
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "updated_value1"
+    assert "field_key2" not in field_metadata  # Should be deleted
+    assert field_metadata["field_key3"] == "value3"
+    assert field_metadata["field_key4"] == "value4"
+
+    # Test full replacement
+    ds.update_field_metadata({"a": {"only_field": "only_value"}}, replace=True)
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata == {"only_field": "only_value"}
+
+
+def test_field_metadata_multiple_fields(tmp_path: Path):
+    """Test field metadata updates on multiple fields at once."""
+    arr1 = pa.array([1, 2, 3])
+    arr2 = pa.array(["a", "b", "c"])
+    tbl = pa.table({"num": arr1, "str": arr2})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Update metadata for both fields
+    ds.update_field_metadata(
+        {
+            "num": {"type": "numeric", "unit": "count"},
+            "str": {"type": "string", "encoding": "utf8"},
+        }
+    )
+
+    # Verify both fields got updated
+    num_field = None
+    str_field = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "num":
+            num_field = f
+        elif f.name() == "str":
+            str_field = f
+
+    assert num_field.metadata["type"] == "numeric"
+    assert num_field.metadata["unit"] == "count"
+    assert str_field.metadata["type"] == "string"
+    assert str_field.metadata["encoding"] == "utf8"
+
+    # Update one field while leaving the other
+    ds.update_field_metadata({"num": {"unit": "items", "description": "Item count"}})
+
+    num_field = None
+    str_field = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "num":
+            num_field = f
+        elif f.name() == "str":
+            str_field = f
+
+    # num field should be updated
+    assert num_field.metadata["type"] == "numeric"  # preserved
+    assert num_field.metadata["unit"] == "items"  # updated
+    assert num_field.metadata["description"] == "Item count"  # added
+
+    # str field should be unchanged
+    assert str_field.metadata["type"] == "string"
+    assert str_field.metadata["encoding"] == "utf8"
+
+
+def test_metadata_apis_return_post_image(tmp_path: Path):
+    """Test that metadata update methods return the post-update state."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test table metadata
+    result = ds.update_metadata({"key1": "value1", "key2": "value2"})
+    assert result["key1"] == "value1"
+    assert result["key2"] == "value2"
+
+    result = ds.update_metadata({"key1": "updated", "key3": "value3"})
+    assert result["key1"] == "updated"
+    assert result["key2"] == "value2"
+    assert result["key3"] == "value3"
+
+    # Test config
+    original_config = ds.config()
+    result = ds.update_config({"custom": "value"})
+    expected = {**original_config, "custom": "value"}
+    assert result == expected
+
+    # Test schema metadata
+    result = ds.update_schema_metadata({"schema_key": "schema_value"})
+    assert result["schema_key"] == "schema_value"
+
+
+def test_update_config_transaction(tmp_path: Path):
+    """Test UpdateConfig operation using transaction with new UpdateMap pattern."""
+    # Create initial dataset
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr, "b": [10, 20, 30]})
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"field_a": b"original"}),
+            pa.field("b", pa.int64(), metadata={b"field_b": b"original"}),
+        ],
+        metadata={b"schema_key": b"original"},
+    )
+    tbl = tbl.replace_schema_metadata(schema.metadata)
+    ds = lance.write_dataset(tbl, tmp_path, schema=schema)
+
+    # Test 1: Update configuration using UpdateConfig transaction
+    config_update_map = lance.LanceOperation.UpdateMap(
+        updates={"key1": "value1", "key2": "value2"}, replace=False
+    )
+
+    update_config_op = lance.LanceOperation.UpdateConfig(
+        config_updates=config_update_map,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction = lance.Transaction(
+        read_version=ds.version, operation=update_config_op, uuid=str(uuid.uuid4())
+    )
+
+    # Commit transaction
+    ds_v2 = lance.LanceDataset.commit(tmp_path, transaction)
+    assert ds_v2.version == 2
+    config = ds_v2.config()
+    assert config["key1"] == "value1"
+    assert config["key2"] == "value2"
+
+    # Test 2: Delete configuration key with null value
+    config_delete_map = lance.LanceOperation.UpdateMap(
+        updates={"key1": None},  # None means delete
+        replace=False,
+    )
+
+    update_config_op2 = lance.LanceOperation.UpdateConfig(
+        config_updates=config_delete_map,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction2 = lance.Transaction(
+        read_version=ds_v2.version, operation=update_config_op2, uuid=str(uuid.uuid4())
+    )
+
+    ds_v3 = lance.LanceDataset.commit(tmp_path, transaction2)
+    assert ds_v3.version == 3
+    config = ds_v3.config()
+    assert "key1" not in config
+    assert config["key2"] == "value2"
+
+    # Test 3: Update schema metadata
+    schema_update_map = lance.LanceOperation.UpdateMap(
+        updates={"schema_new": "schema_value", "schema_key": "updated"}, replace=False
+    )
+
+    update_config_op3 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=None,
+        schema_metadata_updates=schema_update_map,
+        field_metadata_updates=None,
+    )
+
+    transaction3 = lance.Transaction(
+        read_version=ds_v3.version, operation=update_config_op3, uuid=str(uuid.uuid4())
+    )
+
+    ds_v4 = lance.LanceDataset.commit(tmp_path, transaction3)
+    assert ds_v4.version == 4
+    schema_metadata = ds_v4.schema_metadata
+    assert schema_metadata["schema_new"] == "schema_value"
+    assert schema_metadata["schema_key"] == "updated"
+
+    # Test 4: Update field metadata for multiple fields
+    field_a_update_map = lance.LanceOperation.UpdateMap(
+        updates={"field_a": "updated_a", "new_key_a": "new_value_a"}, replace=False
+    )
+
+    field_b_update_map = lance.LanceOperation.UpdateMap(
+        updates={"field_b": "updated_b", "new_key_b": "new_value_b"}, replace=False
+    )
+
+    update_config_op4 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates={
+            0: field_a_update_map,  # field "a"
+            1: field_b_update_map,  # field "b"
+        },
+    )
+
+    transaction4 = lance.Transaction(
+        read_version=ds_v4.version, operation=update_config_op4, uuid=str(uuid.uuid4())
+    )
+
+    ds_v5 = lance.LanceDataset.commit(tmp_path, transaction4)
+    assert ds_v5.version == 5
+
+    # Verify field metadata updates
+    field_a = None
+    field_b = None
+    for field in ds_v5.lance_schema.fields():
+        if field.name() == "a":
+            field_a = field
+        elif field.name() == "b":
+            field_b = field
+
+    assert field_a is not None
+    assert field_b is not None
+    assert field_a.metadata["field_a"] == "updated_a"
+    assert field_a.metadata["new_key_a"] == "new_value_a"
+    assert field_b.metadata["field_b"] == "updated_b"
+    assert field_b.metadata["new_key_b"] == "new_value_b"
+
+    # Test 5: Replace mode - completely replace metadata
+    table_replace_map = lance.LanceOperation.UpdateMap(
+        updates={"only_key": "only_value"},
+        replace=True,  # This will replace all existing table metadata
+    )
+
+    # First add some table metadata to replace
+    ds_v5.update_metadata(
+        {"existing_key": "existing_value", "another_key": "another_value"}
+    )
+    # Reload dataset to get the updated version
+    ds_v6 = lance.dataset(tmp_path)
+
+    update_config_op5 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=table_replace_map,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction5 = lance.Transaction(
+        read_version=ds_v6.version,  # Use the actual latest version
+        operation=update_config_op5,
+        uuid=str(uuid.uuid4()),
+    )
+
+    ds_v7 = lance.LanceDataset.commit(tmp_path, transaction5)
+    table_metadata = ds_v7.metadata
+    assert table_metadata == {
+        "only_key": "only_value"
+    }  # All previous metadata should be gone
+
+
+def test_shallow_clone(tmp_path: Path):
+    """Shallow clone a filesystem dataset by version number and by tag.
+
+    Arrange:
+      - Create a source dataset at a filesystem path with two versions
+        (create v1, then overwrite to v2).
+      - Create a tag "v1" pointing to version 1.
+    Act:
+      - Shallow clone by version=2 (numeric) to one destination.
+      - Shallow clone by version="v1" (tag) to another destination.
+    Assert:
+      - Re-open cloned datasets and verify their tables equal the source
+        version they were cloned from (schema and record count).
+
+    This test uses pathlib paths and tmp_path for cross-platform compatibility
+    and should not skip on Windows.
+    """
+    # Prepare source dataset with two versions
+    src_dir = tmp_path / "shallow_src"
+    table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
+    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+
+    # Create a tag pointing to version 1
+    ds.tags.create("v1", 1, None)
+
+    # Clone by numeric version (v2) and assert equality
+    clone_v2_dir = tmp_path / "clone_v2"
+    ds_clone_v2 = ds.shallow_clone(clone_v2_dir, version=2)
+    assert ds_clone_v2.to_table() == table_v2
+    assert lance.dataset(clone_v2_dir).to_table() == table_v2
+
+    # Clone by tag (v1) and assert equality
+    clone_v1_tag_dir = tmp_path / "clone_v1_tag"
+    ds_clone_v1_tag = ds.shallow_clone(clone_v1_tag_dir, version="v1")
+    assert ds_clone_v1_tag.to_table() == table_v1
+    assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1
+
+
+def test_branches(tmp_path: Path):
+    # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
+    base_dir = tmp_path / "test_branches"
+    main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
+    ds_main = lance.write_dataset(main_table, base_dir)
+
+    branch1 = ds_main.create_branch("branch1")
+    assert branch1.version == 1
+    branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
+    branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
+    assert branch1.version == 2
+
+    expected_branch1 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8], "b": [4, 5, 6, 9, 10]}
+    )
+    assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
+
+    # Step 2: tag latest of branch1 → create branch2 from that tag
+    tag_name = "branch1_latest"
+    branch1.tags.create(tag_name, branch1.latest_version, "branch1")
+    branch2 = branch1.create_branch("branch2", tag_name)
+    assert branch2.version == 2
+
+    # Step 3: append more data to branch2 → verify contains branch1 data + new
+    branch2_append = pa.Table.from_pydict({"a": [11], "b": [12]})
+    branch2 = lance.write_dataset(branch2_append, branch2, mode="append")
+    assert branch2.version == 3
+
+    expected_branch2 = pa.Table.from_pydict(
+        {"a": [1, 2, 3, 7, 8, 11], "b": [4, 5, 6, 9, 10, 12]}
+    )
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+
+    # Step 4: validate branches.list() and metadata
+    # delete branch1; validate list after deletion
+    branches = ds_main.branches.list()
+    assert "branch1" in branches
+    assert "branch2" in branches
+
+    b1_meta = branches["branch1"]
+    assert isinstance(b1_meta["parent_version"], int)
+    assert b1_meta["manifest_size"] > 0
+    assert "create_at" in b1_meta
+
+    try:
+        ds_main.branches.delete("branch1")
+    except OSError as e:
+        if "Not found" not in str(e):
+            raise
+    branches_after = ds_main.branches.list()
+    assert "branch1" not in branches_after
+    assert "branch2" in branches_after
+
+    branch2 = ds_main.checkout_branch("branch2")
+    assert branch2.version == 3
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+    branch2 = ds_main.checkout_version(("branch2", 2))
+    assert branch2.version == 2
+    assert branch2.to_table().combine_chunks() == expected_branch1.combine_chunks()
+    branch2.checkout_latest()
+    assert branch2.version == 3
+    assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()

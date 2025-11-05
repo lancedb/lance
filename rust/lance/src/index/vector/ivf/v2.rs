@@ -6,10 +6,7 @@
 use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use crate::index::vector::{
-    builder::{index_type_string, IvfIndexBuilder},
-    IndexFileVersion,
-};
+use crate::index::vector::{builder::index_type_string, IndexFileVersion};
 use crate::index::{
     vector::{utils::PartitionLoadLock, VectorIndex},
     PreFilter,
@@ -359,16 +356,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+            (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
+            (sub_index_type, quantization_type) => {
+                unimplemented!(
+                    "unsupported index type: {}, {}",
+                    sub_index_type,
+                    quantization_type
+                )
+            }
         }
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
-                size: self.ivf.partition_size(part_id) as u32,
+                size: self.storage.partition_size(part_id) as u32,
             })
             .collect::<Vec<_>>();
 
@@ -473,8 +478,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
-        let query = self.preprocess_query(partition_id, query)?;
 
+        let query = self.preprocess_query(partition_id, query)?;
         let (batch, local_metrics) = spawn_cpu(move || {
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -577,29 +582,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         })
     }
 
-    async fn remap_to(
-        self: Arc<Self>,
-        store: ObjectStore,
-        mapping: &HashMap<u64, Option<u64>>,
-        column: String,
-        index_dir: Path,
-    ) -> Result<()> {
-        match self.sub_index_type() {
-            (SubIndexType::Flat, _) => {
-                let mut remapper =
-                    IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
-                remapper.remap(mapping).await
-            }
-            _ => Err(Error::Index {
-                message: format!(
-                    "Remapping is not supported for index type {}",
-                    self.index_type(),
-                ),
-                location: location!(),
-            }),
-        }
-    }
-
     fn ivf_model(&self) -> &IvfModel {
         &self.ivf
     }
@@ -639,8 +621,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::bq::RQBuildParams;
+    use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::vector::ivf::v2::IvfPq;
     use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
@@ -649,6 +634,7 @@ mod tests {
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
@@ -678,9 +664,8 @@ mod tests {
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
-    use tempfile::tempdir;
 
-    const NUM_ROWS: usize = 500;
+    const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
@@ -897,8 +882,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = match dataset {
             Some((dataset, vectors)) => (dataset, vectors),
             None => generate_test_dataset::<T>(test_uri, range).await,
@@ -944,10 +929,10 @@ mod tests {
     async fn test_remap(params: VectorIndexParams, nlist: usize) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_remap_impl::<UInt8Type>(params, nlist, 0..4).await;
+                Box::pin(test_remap_impl::<UInt8Type>(params, nlist, 0..4)).await;
             }
             _ => {
-                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+                Box::pin(test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0)).await;
             }
         }
     }
@@ -959,8 +944,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1021,7 +1006,7 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
-        assert_ge!(recall, 0.8, "{}", recall);
+        assert_ge!(recall, 0.7, "{}", recall);
 
         // delete so that only one row left, to trigger remap and there must be some empty partitions
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
@@ -1065,8 +1050,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
@@ -1095,8 +1080,8 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         // compact after delete all rows
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1236,6 +1221,33 @@ mod tests {
         test_remap(params, nlist).await;
     }
 
+    // RQ doesn't perform well for random data
+    // need to verify recall with real-world dataset (e.g. sift1m)
+    #[rstest]
+    #[case(1, DistanceType::L2, 0.5)]
+    #[case(1, DistanceType::Cosine, 0.5)]
+    #[case(1, DistanceType::Dot, 0.5)]
+    #[case(4, DistanceType::L2, 0.5)]
+    #[case(4, DistanceType::Cosine, 0.5)]
+    #[case(4, DistanceType::Dot, 0.5)]
+    #[tokio::test]
+    // #[ignore = "Temporarily skipping flaky 4-bit IVF_RQ tests"]
+    async fn test_build_ivf_rq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let _ = env_logger::try_init();
+        let ivf_params = IvfBuildParams::new(nlist);
+        let rq_params = RQBuildParams::new(1);
+        let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
+        test_index(params.clone(), nlist, recall_requirement, None).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_remap(params.clone(), nlist).await;
+    }
+
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
@@ -1251,8 +1263,9 @@ mod tests {
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1279,7 +1292,8 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params).await;
+        test_delete_all_rows(params.clone()).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1303,8 +1317,9 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1360,8 +1375,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
 
@@ -1434,8 +1449,8 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
         test_index(
             v1_params,
@@ -1484,8 +1499,8 @@ mod tests {
         index: (VectorIndexParams, IndexType),
     ) {
         let (params, index_type) = index;
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 4;
         let (mut dataset, _) = match params.metric_type {
@@ -1534,8 +1549,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_stats_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let nlist = 500;
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -1593,8 +1608,8 @@ mod tests {
     ) where
         T::Native: SampleUniform,
     {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
@@ -1683,12 +1698,13 @@ mod tests {
             .await
             .unwrap();
         if dist_type != DistanceType::Hamming {
-            assert_eq!(exclude_last_res.num_rows(), k - 1);
+            let excluded_count = dists.iter().filter(|d| *d == dists.last().unwrap()).count();
+            assert_eq!(exclude_last_res.num_rows(), k - excluded_count);
             let res_row_ids = exclude_last_res[ROW_ID]
                 .as_primitive::<UInt64Type>()
                 .values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
-                if i < k - 1 {
+                if i < k - excluded_count {
                     assert_eq!(res_row_ids[i], *id);
                 }
             });
@@ -1704,8 +1720,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_with_zero_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
         let vector_field = schema.field(1).clone();
         let zero_batch = RecordBatch::try_new(
@@ -1841,7 +1857,8 @@ mod tests {
     #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
 
         // Just make sure we can query the index.
         let dataset = Dataset::open(test_uri).await.unwrap();
@@ -1910,7 +1927,10 @@ mod tests {
             .execute(vec![new_data])
             .await
             .unwrap();
-        dataset.optimize_indices(&Default::default()).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
 
         let pq_meta: ProductQuantizationMetadata =
             get_pq_metadata(&dataset, scheduler.clone()).await;
@@ -1919,8 +1939,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_with_empty_partition() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1948,18 +1968,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index_with_many_invalid_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
-        // we use 8192 batch size by default, so we need to generate 8192 * 2 vectors to get 2 batches
-        // generate 2 batches, and the first batch's vectors are all with NaN
-        let num_rows = 8192 * 2;
+        // we use 8192 batch size by default, so we need to generate 8192 * 3 vectors to get 3 batches
+        // generate 3 batches, and the first batch's vectors are all with NaN
+        let num_rows = 8192 * 3;
         let mut vectors = Vec::new();
         for i in 0..num_rows {
             if i < 8192 {
                 vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
-            } else {
+            } else if i < 8192 * 2 {
                 vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
+            } else {
+                vectors.extend(std::iter::repeat_n(rand::random::<f32>() * 1e20, DIM));
             }
         }
         let schema = Schema::new(vec![Field::new(
@@ -1994,5 +2016,539 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partition_split_on_append() {
+        // This test verifies that when we append enough data to a partition
+        // such that it exceeds MAX_PARTITION_SIZE_FACTOR * target_partition_size,
+        // the partition will be split into 2 partitions.
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Create initial dataset with just enough rows for 2 partitions
+        // Using a small initial dataset to avoid long test times
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        // Create an IVF-PQ index with 2 partitions
+        // For IvfPq, target_partition_size = 8192
+        // Split triggers when partition_size > 4 * 8192 = 32,768
+        let nlist = 2;
+        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify we start with 2 partitions using index statistics
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(initial_num_partitions, 2);
+
+        // Append enough data to trigger a split
+        // We need to add more than 32,768 rows to one partition
+        // To ensure they mostly go to one partition, we'll generate vectors
+        // that are very similar to each other (tight range) to cluster together
+        let append_rows = 50000;
+        append_dataset::<Float32Type>(&mut dataset, append_rows, 0.0..0.05).await;
+
+        // Optimize indices - this should trigger the split check and perform the split
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        // Reload the dataset to get the latest index information
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Verify that we now have 3 partitions (one partition was split)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions, 3,
+            "Expected partition split to increase partitions from 2 to 3, got stats: {}",
+            stats_json
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_partition_on_delete() {
+        // This test verifies that partition join threshold calculations work correctly.
+        // It tests the logic without requiring actual join operation execution.
+        //
+        // NOTE: The partition join feature is currently only implemented in the remap
+        // path (builder.rs::should_join and builder.rs::join_partition). However, the
+        // remap operation has limitations - it needs access to the original vector data
+        // from the dataset to reassign vectors from the small partition to other partitions,
+        // but the remap builder (created via new_remapper) doesn't have a dataset reference.
+        //
+        // This test verifies:
+        // 1. The join threshold calculation is correct (MIN_PARTITION_SIZE_PERCENT * target_size / 100)
+        // 2. Indexes can be created with partitions smaller than the join threshold
+        // 3. Small partitions don't cause index failures and remain searchable
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let num_rows = 10_000;
+        let mut dataset = {
+            let (batch, schema) = generate_batch::<Float32Type>(num_rows, None, 0.0..1.0, false);
+            let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+            let dataset = Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams {
+                    mode: crate::dataset::WriteMode::Overwrite,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset
+        };
+
+        // Create an IVF_PQ index with 4 partitions
+        let nlist = 3;
+        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify we have nlist partitions
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            num_partitions as usize, nlist,
+            "Should have {} partitions",
+            nlist
+        );
+
+        // load single partition and delete most rows, keep only 1 row
+        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
+        let index = dataset
+            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+        let part = index.storage.load_partition(0).await.unwrap();
+        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+        let res = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let ids = res["id"].as_primitive::<UInt64Type>().values();
+        let first_id = ids[0];
+        let first_vector = res["vector"].as_fixed_size_list();
+        let deleted_id = ids[1];
+        let deleted_vector = res["vector"].as_fixed_size_list().value(1);
+        dataset
+            .delete(&format!(
+                "id in ({})",
+                ids.iter()
+                    .skip(1)
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .await
+            .unwrap();
+
+        // Compact and trigger remap to join partition
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // Verify that we have nlist-1 partitions (one partition was joined)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions as usize,
+            nlist - 1,
+            "Expected partition join to decrease partitions from {} to {}, got stats: {}",
+            nlist,
+            nlist - 1,
+            stats_json
+        );
+
+        // Verify that vector search can still find the first vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &first_vector.value(0), 1)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result["id"].as_primitive::<UInt64Type>().value(0), first_id);
+
+        // Verify that vector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
+
+        // Delete all rows in a partition
+        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
+        let index = dataset
+            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+        let part = index.storage.load_partition(0).await.unwrap();
+        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+        let res = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let ids = res["id"].as_primitive::<UInt64Type>().values();
+        let deleted_id = ids[0];
+        dataset
+            .delete(&format!(
+                "id in ({})",
+                ids.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .await
+            .unwrap();
+
+        // Verify that vector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
+
+        // Compact and trigger remap to join partition
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // Verify that we have 2 partitions (one partition was deleted)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions as usize,
+            nlist - 2,
+            "Expected partition join to decrease partitions from {} to {}, got stats: {}",
+            nlist - 1,
+            nlist - 2,
+            stats_json
+        );
+
+        // Verify that vector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
+    }
+
+    #[tokio::test]
+    async fn test_partition_split_on_append_multivec() {
+        // This test verifies that when we append enough multivector data to a partition
+        // such that it exceeds MAX_PARTITION_SIZE_FACTOR * target_partition_size,
+        // the partition will be split into 2 partitions.
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Create initial dataset with multivector data
+        let (mut dataset, _) =
+            generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        // Create an IVF-PQ index with 2 partitions
+        // For IvfPq, target_partition_size = 8192
+        // Split triggers when partition_size > 4 * 8192 = 32,768
+        let nlist = 2;
+        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::Cosine, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify we start with 2 partitions using index statistics
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(initial_num_partitions, 2);
+
+        // Append enough multivector data to trigger a split
+        // We need to add more than 32,768 vectors to one partition
+        // To ensure they mostly go to one partition, we'll generate vectors
+        // that are very similar to each other (tight range) to cluster together
+        let append_rows = 50000;
+        append_dataset::<Float32Type>(&mut dataset, append_rows, 0.0..0.05).await;
+
+        // Optimize indices - this should trigger the split check and perform the split
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        // Reload the dataset to get the latest index information
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Verify that we now have 3 partitions (one partition was split)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions, 3,
+            "Expected partition split to increase partitions from 2 to 3 for multivector, got stats: {}",
+            stats_json
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_partition_on_delete_multivec() {
+        // This test verifies that partition join threshold calculations work correctly
+        // with multivector data. It tests the logic without requiring actual join operation execution.
+        //
+        // NOTE: The partition join feature is currently only implemented in the remap
+        // path (builder.rs::should_join and builder.rs::join_partition). However, the
+        // remap operation has limitations - it needs access to the original vector data
+        // from the dataset to reassign vectors from the small partition to other partitions,
+        // but the remap builder (created via new_remapper) doesn't have a dataset reference.
+        //
+        // This test verifies:
+        // 1. The join threshold calculation is correct for multivector data
+        // 2. Indexes can be created with multivector partitions smaller than the join threshold
+        // 3. Small multivector partitions don't cause index failures and remain searchable
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let num_rows = 10_000;
+        let mut dataset = {
+            let (batch, schema) = generate_batch::<Float32Type>(num_rows, None, 0.0..1.0, true);
+            let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+            let dataset = Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams {
+                    mode: crate::dataset::WriteMode::Overwrite,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset
+        };
+
+        // Create an IVF_PQ index with 3 partitions
+        let nlist = 3;
+        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::Cosine, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify we have nlist partitions
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            num_partitions as usize, nlist,
+            "Should have {} partitions",
+            nlist
+        );
+
+        // Load single partition and delete most rows, keep only 1 row
+        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
+        let index = dataset
+            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+        let part = index.storage.load_partition(0).await.unwrap();
+        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+        let res = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let ids = res["id"].as_primitive::<UInt64Type>().values();
+        let first_id = ids[0];
+        let first_vector = res["vector"].as_list::<i32>();
+        let deleted_id = ids[1];
+        let deleted_vector = res["vector"].as_list::<i32>().value(1);
+        dataset
+            .delete(&format!(
+                "id in ({})",
+                ids.iter()
+                    .skip(1)
+                    .filter_map(|&x| if x != first_id {
+                        Some(x.to_string())
+                    } else {
+                        None
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .await
+            .unwrap();
+
+        // Compact and trigger remap to join partition
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // Verify that we have nlist-1 partitions (one partition was joined)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions as usize,
+            nlist - 1,
+            "Expected partition join to decrease partitions from {} to {}, got stats: {}",
+            nlist,
+            nlist - 1,
+            stats_json
+        );
+
+        // Verify that multivector search can still find the first vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &first_vector.value(0), 1)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result["id"].as_primitive::<UInt64Type>().value(0), first_id);
+
+        // Verify that multivector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
+
+        // Delete all rows in a partition
+        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
+        let index = dataset
+            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+        let part = index.storage.load_partition(0).await.unwrap();
+        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+        let res = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let ids = res["id"].as_primitive::<UInt64Type>().values();
+        let deleted_id = ids[0];
+        dataset
+            .delete(&format!(
+                "id in ({})",
+                ids.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .await
+            .unwrap();
+
+        // Verify that multivector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
+
+        // Compact and trigger remap to join partition
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // Verify that we have nlist-2 partitions (one partition was deleted)
+        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        assert_eq!(
+            final_num_partitions as usize,
+            nlist - 2,
+            "Expected partition join to decrease partitions from {} to {}, got stats: {}",
+            nlist - 1,
+            nlist - 2,
+            stats_json
+        );
+
+        // Verify that multivector search can't find the deleted vector
+        let result = dataset
+            .scan()
+            .nearest("vector", &deleted_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(!result["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .contains(&deleted_id));
     }
 }

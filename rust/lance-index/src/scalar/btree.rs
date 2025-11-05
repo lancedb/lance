@@ -14,9 +14,9 @@ use super::{
     flat::FlatIndexMetadata, AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter,
     MetricsCollector, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pb,
     scalar::{
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
@@ -1218,7 +1218,8 @@ impl ScalarIndex for BTreeIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }
@@ -1243,7 +1244,8 @@ impl ScalarIndex for BTreeIndex {
         .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }
@@ -1980,7 +1982,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )
         .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }
@@ -2012,12 +2015,11 @@ mod tests {
     use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     use crate::metrics::LocalMetricsCollector;
     use crate::{
@@ -2052,10 +2054,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_null_ids() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2079,10 +2081,10 @@ mod tests {
 
         assert_eq!(index.page_lookup.null_pages.len(), 10);
 
-        let remap_dir = Arc::new(tempdir().unwrap());
+        let remap_dir = TempObjDir::default();
         let remap_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(remap_dir.path()).unwrap(),
+            remap_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2117,10 +2119,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_nan_ordering() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2172,10 +2174,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_page_cache() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2213,17 +2215,17 @@ mod tests {
     #[tokio::test]
     async fn test_fragment_btree_index_consistency() {
         // Setup stores for both indexes
-        let full_tmpdir = Arc::new(tempdir().unwrap());
+        let full_tmpdir = TempObjDir::default();
         let full_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(full_tmpdir.path()).unwrap(),
+            full_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let fragment_tmpdir = Arc::new(tempdir().unwrap());
+        let fragment_tmpdir = TempObjDir::default();
         let fragment_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(fragment_tmpdir.path()).unwrap(),
+            fragment_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2397,17 +2399,17 @@ mod tests {
     #[tokio::test]
     async fn test_fragment_btree_index_boundary_queries() {
         // Setup stores for both indexes
-        let full_tmpdir = Arc::new(tempdir().unwrap());
+        let full_tmpdir = TempObjDir::default();
         let full_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(full_tmpdir.path()).unwrap(),
+            full_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let fragment_tmpdir = Arc::new(tempdir().unwrap());
+        let fragment_tmpdir = TempObjDir::default();
         let fragment_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(fragment_tmpdir.path()).unwrap(),
+            fragment_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -2848,10 +2850,10 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_partition_files() {
         // Create a test store
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store: Arc<dyn crate::scalar::IndexStore> = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

@@ -74,11 +74,11 @@ mod tests {
     use crate::Dataset;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ADDR;
     use lance_encoding::version::LanceFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
-    use tempfile::tempdir;
 
     #[rstest]
     #[tokio::test]
@@ -86,8 +86,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()
@@ -140,8 +140,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset
             .get_fragments()

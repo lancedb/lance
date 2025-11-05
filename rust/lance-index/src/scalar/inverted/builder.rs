@@ -1,37 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::{fmt::Debug, sync::atomic::AtomicU64};
-
+use super::{
+    index::*,
+    merger::{Merger, SizeBasedMerger},
+    InvertedIndexParams,
+};
+use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::lance_tokenizer::DocType;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::iter_str_array;
+use futures::{stream, Stream, StreamExt, TryStreamExt};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
+use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use tempfile::{tempdir, TempDir};
+use std::task::{Context, Poll};
+use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
-
-use super::{
-    index::*,
-    merger::{Merger, SizeBasedMerger},
-    InvertedIndexParams,
-};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -80,6 +85,7 @@ pub struct InvertedIndexBuilder {
     pub(crate) partitions: Vec<u64>,
     new_partitions: Vec<u64>,
     fragment_mask: Option<u64>,
+    token_set_format: TokenSetFormat,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -91,7 +97,13 @@ impl InvertedIndexBuilder {
     }
 
     pub fn new_with_fragment_mask(params: InvertedIndexParams, fragment_mask: Option<u64>) -> Self {
-        Self::from_existing_index(params, None, Vec::new(), fragment_mask)
+        Self::from_existing_index(
+            params,
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            fragment_mask,
+        )
     }
 
     /// Creates an InvertedIndexBuilder from existing index with fragment filtering.
@@ -104,12 +116,13 @@ impl InvertedIndexBuilder {
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
         partitions: Vec<u64>,
+        token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
     ) -> Self {
-        let tmpdir = tempdir().unwrap();
+        let tmpdir = TempDir::default();
         let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
         let src_store = store.unwrap_or_else(|| local_store.clone());
@@ -120,6 +133,7 @@ impl InvertedIndexBuilder {
             _tmpdir: tmpdir,
             local_store,
             src_store,
+            token_set_format,
             fragment_mask,
         }
     }
@@ -129,6 +143,19 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
+        let schema = new_data.schema();
+        let doc_col = schema.field(0).name();
+
+        // infer lance_tokenizer based on document type
+        if self.params.lance_tokenizer.is_none() {
+            let schema = new_data.schema();
+            let field = schema.column_with_name(doc_col).expect_ok()?.1;
+            let doc_type = DocType::try_from(field)?;
+            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        }
+
+        let new_data = document_input(new_data, doc_col)?;
+
         self.update_index(new_data).await?;
         self.write(dest_store).await?;
         Ok(())
@@ -136,23 +163,6 @@ impl InvertedIndexBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
-        let flatten_stream = stream.map(|batch| {
-            let batch = batch?;
-            let doc_col = batch.column(0);
-            match doc_col.data_type() {
-                datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => Ok(batch),
-                datatypes::DataType::List(_)   => {
-                    flatten_string_list::<i32>(&batch, doc_col)
-                }
-                datatypes::DataType::LargeList(_) => {
-                    flatten_string_list::<i64>(&batch, doc_col)
-                }
-                _ => {
-                   Err(Error::Index { message: format!("expect data type String, LargeString or List of String/LargeString, but got {}", doc_col.data_type()), location: location!() })
-                }
-            }
-        });
-
         let num_workers = *LANCE_FTS_NUM_SHARDS;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -166,10 +176,17 @@ impl InvertedIndexBuilder {
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
             let fragment_mask = self.fragment_mask;
+            let token_set_format = self.token_set_format;
             let task = tokio::task::spawn(async move {
-                let mut worker =
-                    IndexWorker::new(store, tokenizer, with_position, id_alloc, fragment_mask)
-                        .await?;
+                let mut worker = IndexWorker::new(
+                    store,
+                    tokenizer,
+                    with_position,
+                    id_alloc,
+                    fragment_mask,
+                    token_set_format,
+                )
+                .await?;
                 while let Ok(batch) = receiver.recv().await {
                     worker.process_batch(batch).await?;
                 }
@@ -181,7 +198,7 @@ impl InvertedIndexBuilder {
 
         let sender = Arc::new(sender);
 
-        let mut stream = Box::pin(flatten_stream.then({
+        let mut stream = Box::pin(stream.then({
             |batch_result| {
                 let sender = sender.clone();
                 async move {
@@ -232,9 +249,14 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part =
-                InvertedPartition::load(src_store.clone(), *part, None, &LanceCache::no_cache())
-                    .await?;
+            let part = InvertedPartition::load(
+                src_store.clone(),
+                *part,
+                None,
+                &LanceCache::no_cache(),
+                self.token_set_format,
+            )
+            .await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
@@ -254,6 +276,10 @@ impl InvertedIndexBuilder {
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
+            ),
         ]);
         let mut writer = dest_store
             .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
@@ -275,6 +301,10 @@ impl InvertedIndexBuilder {
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
+            ),
         ]);
         // Use partition ID to generate a unique temporary filename
         let file_name = part_metadata_file_path(partition);
@@ -290,13 +320,32 @@ impl InvertedIndexBuilder {
         let partitions = futures::future::try_join_all(
             self.partitions
                 .iter()
-                .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None, &no_cache))
+                .map(|part| {
+                    InvertedPartition::load(
+                        self.src_store.clone(),
+                        *part,
+                        None,
+                        &no_cache,
+                        self.token_set_format,
+                    )
+                })
                 .chain(self.new_partitions.iter().map(|part| {
-                    InvertedPartition::load(self.local_store.clone(), *part, None, &no_cache)
+                    InvertedPartition::load(
+                        self.local_store.clone(),
+                        *part,
+                        None,
+                        &no_cache,
+                        self.token_set_format,
+                    )
                 })),
         )
         .await?;
-        let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
+        let mut merger = SizeBasedMerger::new(
+            dest_store,
+            partitions,
+            *LANCE_FTS_TARGET_SIZE << 20,
+            self.token_set_format,
+        );
         let partitions = merger.merge().await?;
 
         if self.fragment_mask.is_none() {
@@ -322,16 +371,18 @@ impl Default for InvertedIndexBuilder {
 pub struct InnerBuilder {
     id: u64,
     with_position: bool,
+    token_set_format: TokenSetFormat,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
 
 impl InnerBuilder {
-    pub fn new(id: u64, with_position: bool) -> Self {
+    pub fn new(id: u64, with_position: bool, token_set_format: TokenSetFormat) -> Self {
         Self {
             id,
             with_position,
+            token_set_format,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -448,7 +499,7 @@ impl InnerBuilder {
     async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
-        let batch = tokens.to_batch()?;
+        let batch = tokens.to_batch(self.token_set_format)?;
         let mut writer = store
             .new_index_file(&token_file_path(self.id), batch.schema())
             .await?;
@@ -472,7 +523,7 @@ impl InnerBuilder {
 
 struct IndexWorker {
     store: Arc<dyn IndexStore>,
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: Box<dyn LanceTokenizer>,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -480,15 +531,17 @@ struct IndexWorker {
     estimated_size: u64,
     total_doc_length: usize,
     fragment_mask: Option<u64>,
+    token_set_format: TokenSetFormat,
 }
 
 impl IndexWorker {
     async fn new(
         store: Arc<dyn IndexStore>,
-        tokenizer: tantivy::tokenizer::TextAnalyzer,
+        tokenizer: Box<dyn LanceTokenizer>,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
+        token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
@@ -499,6 +552,7 @@ impl IndexWorker {
                 id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | fragment_mask.unwrap_or(0),
                 with_position,
+                token_set_format,
             ),
             partitions: Vec::new(),
             id_alloc,
@@ -506,6 +560,7 @@ impl IndexWorker {
             estimated_size: 0,
             total_doc_length: 0,
             fragment_mask,
+            token_set_format,
         })
     }
 
@@ -526,7 +581,7 @@ impl IndexWorker {
             let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
-                let mut token_stream = self.tokenizer.token_stream(doc);
+                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
@@ -586,6 +641,7 @@ impl IndexWorker {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | self.fragment_mask.unwrap_or(0),
                 with_position,
+                self.token_set_format,
             ),
         );
         builder.write(self.store.as_ref()).await?;
@@ -722,7 +778,94 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
-pub fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
+/// Flatten the string list stream into a string stream
+pub struct FlattenStream {
+    /// Inner record batch stream with 2 columns:
+    /// 1. doc_col: List(Utf8) or List(LargeUtf8)
+    /// 2. row_id_col: UInt64
+    inner: SendableRecordBatchStream,
+    field_type: DataType,
+    data_type: DataType,
+}
+
+impl FlattenStream {
+    pub fn new(input: SendableRecordBatchStream) -> Self {
+        let schema = input.schema();
+        let field = schema.field(0);
+        let data_type = match field.data_type() {
+            DataType::List(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
+            DataType::List(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
+                DataType::LargeUtf8
+            }
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
+                DataType::LargeUtf8
+            }
+            _ => panic!(
+                "expect data type List(Utf8) or List(LargeUtf8) but got {:?}",
+                field.data_type()
+            ),
+        };
+        Self {
+            inner: input,
+            field_type: field.data_type().clone(),
+            data_type,
+        }
+    }
+}
+
+impl Stream for FlattenStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let doc_col = batch.column(0);
+                let batch = match self.field_type {
+                    DataType::List(_) => flatten_string_list::<i32>(&batch, doc_col).map_err(|e| {
+                        datafusion_common::error::DataFusionError::Execution(format!(
+                            "flatten string list error: {}",
+                            e
+                        ))
+                    }),
+                    DataType::LargeList(_) => {
+                        flatten_string_list::<i64>(&batch, doc_col).map_err(|e| {
+                            datafusion_common::error::DataFusionError::Execution(format!(
+                                "flatten string list error: {}",
+                                e
+                            ))
+                        })
+                    }
+                    _ => unreachable!(
+                        "expect data type List or LargeList but got {:?}",
+                        self.field_type
+                    ),
+                };
+                Poll::Ready(Some(batch))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for FlattenStream {
+    fn schema(&self) -> SchemaRef {
+        let schema = Schema::new(vec![
+            Field::new(
+                self.inner.schema().field(0).name(),
+                self.data_type.clone(),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]);
+
+        Arc::new(schema)
+    }
+}
+
+fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     batch: &RecordBatch,
     doc_col: &Arc<dyn Array>,
 ) -> Result<RecordBatch> {
@@ -831,6 +974,7 @@ async fn merge_metadata_files(
     // Collect all partition IDs and params
     let mut all_partitions = Vec::new();
     let mut params = None;
+    let mut token_set_format = None;
 
     for file_name in part_metadata_files {
         let reader = store.open_index_file(file_name).await?;
@@ -862,6 +1006,12 @@ async fn merge_metadata_files(
                     }
                 })?,
             );
+        }
+
+        if token_set_format.is_none() {
+            if let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY) {
+                token_set_format = Some(TokenSetFormat::from_str(name)?);
+            }
         }
     }
 
@@ -937,7 +1087,14 @@ async fn merge_metadata_files(
     // Write merged metadata with remapped IDs
     let remapped_partitions: Vec<u64> = (0..id_mapping.len() as u64).collect();
     let params = params.unwrap_or_default();
-    let builder = InvertedIndexBuilder::new_with_fragment_mask(params, None);
+    let token_set_format = token_set_format.unwrap_or(TokenSetFormat::Arrow);
+    let builder = InvertedIndexBuilder::from_existing_index(
+        params,
+        None,
+        remapped_partitions.clone(),
+        token_set_format,
+        None,
+    );
     builder
         .write_metadata(&*store, &remapped_partitions)
         .await?;
@@ -950,4 +1107,44 @@ async fn merge_metadata_files(
     }
 
     Ok(())
+}
+
+/// Convert input stream into a stream of documents.
+///
+/// The input stream must be one of:
+/// 1. Document in Utf8 or LargeUtf8 format.
+/// 2. Document in List(Utf8) or List(LargeUtf8) format.
+/// 3. Json document in LargeBinary format.
+pub fn document_input(
+    input: SendableRecordBatchStream,
+    column: &str,
+) -> Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let field = schema.column_with_name(column).expect_ok()?.1;
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::List(field) | DataType::LargeList(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Ok(Box::pin(FlattenStream::new(input)))
+        }
+        DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
+            Some(name) if name.as_str() == JSON_EXT_NAME => {
+                Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
+            }
+            _ => Err(Error::InvalidInput {
+                source: format!("column {} is not json", column).into(),
+                location: location!(),
+            }),
+        },
+        _ => Err(Error::InvalidInput {
+            source: format!(
+                "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
+                column,
+                field.data_type()
+            )
+            .into(),
+            location: location!(),
+        }),
+    }
 }

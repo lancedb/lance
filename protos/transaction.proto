@@ -68,6 +68,8 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
     // Key-value pairs to merge with existing config.
     map<string, string> config_upsert_values = 4;
+    // The base paths to be added for the initial dataset creation
+    repeated BasePath initial_bases = 5;
   }
 
   // Add or replace a new secondary index.
@@ -172,13 +174,14 @@ message Transaction {
     //          integrity guarantees provided by the storage backend.
     bool is_shallow = 1;
     // the reference name in the source dataset
-    // for branch scenario, this is the branch name in the source dataset
-    // for non branch scenario(normal cloning), this is an optional tag name in the source dataset
+    // in most cases it should be the the branch or tag name in the source dataset
     optional string ref_name = 2;
     // the version of the source dataset for cloning
     uint64 ref_version = 3;
     // the absolute base path of the source dataset for cloning
     string ref_path = 4;
+    // if the target dataset is a branch, this is the branch name of the target dataset
+    optional string branch_name = 5;
   }
   
   // An operation that updates rows but does not add or remove rows.
@@ -214,9 +217,31 @@ message Transaction {
     /// but a small subset of columns are affected.
     REWRITE_COLUMNS = 1;
   }
+
+  // An entry for a map update. If value is not set, the key will be removed from the map.
+  message UpdateMapEntry {
+    // The key of the map entry to update.
+    string key = 1;
+    // The value to set for the key.
+    optional string value = 2;
+  }
+
+  message UpdateMap {
+    repeated UpdateMapEntry update_entries = 1;
+    // If true, the map will be replaced entirely with the new entries.
+    // If false, the new entries will be merged with the existing map.
+    bool replace = 2;
+  }
   
-  // An operation that updates the table config.
+  // An operation that updates the table config, table metadata, schema metadata,
+  // or field metadata.
   message UpdateConfig {
+    UpdateMap config_updates = 6;
+    UpdateMap table_metadata_updates = 7;
+    UpdateMap schema_metadata_updates = 8;
+    map<int32, UpdateMap> field_metadata_updates = 9;
+
+    // Deprecated -------------------------------
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
     map<string, string> schema_metadata = 3;
@@ -248,6 +273,12 @@ message Transaction {
     repeated MemWalIndexDetails.MemWal removed = 3;
   }
 
+  // An operation that updates base paths in the dataset.
+  message UpdateBases {
+    // The new base paths to add to the manifest.
+    repeated BasePath new_bases = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -264,11 +295,10 @@ message Transaction {
     DataReplacement data_replacement = 111;
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
+    UpdateBases update_bases = 114;
   }
 
-  // An operation to apply to the blob dataset
-  oneof blob_operation {
-    Append blob_append = 200;
-    Overwrite blob_overwrite = 202;
-  }  
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 200, 202;
+  reserved "blob_append", "blob_overwrite";
 }

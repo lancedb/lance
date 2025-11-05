@@ -103,17 +103,20 @@ impl Stream for LanceStream {
         let this = self.get_mut();
         let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
 
-        let poll_result = match this.inner_stream.poll_next_unpin(cx) {
+        let inner_poll = this.inner_stream.poll_next_unpin(cx);
+        timer.done();
+
+        let poll_result = match inner_poll {
             Poll::Ready(None) => {
                 if let Some(scheduler) = &this.scan_scheduler {
-                    this.scan_metrics.io_metrics.record_final(scheduler);
+                    this.scan_metrics.io_metrics.record(scheduler);
                 }
                 Poll::Ready(None)
             }
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
             other => other,
         };
 
-        timer.done();
         this.scan_metrics.baseline_metrics.record_poll(poll_result)
     }
 }
@@ -289,7 +292,11 @@ impl LanceStream {
                             project_schema,
                             FragReadConfig::default()
                                 .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address),
+                                .with_row_address(config.with_row_address)
+                                .with_row_last_updated_at_version(
+                                    config.with_row_last_updated_at_version,
+                                )
+                                .with_row_created_at_version(config.with_row_created_at_version),
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
@@ -376,7 +383,11 @@ impl LanceStream {
                         project_schema.clone(),
                         FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -405,7 +416,11 @@ impl LanceStream {
                         project_schema.clone(),
                         FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -462,6 +477,16 @@ impl RecordBatchStream for LanceStream {
         if self.config.with_row_address {
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
+        if self.config.with_row_last_updated_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if self.config.with_row_created_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
         Arc::new(schema)
     }
 }
@@ -474,6 +499,8 @@ pub struct LanceScanConfig {
     pub io_buffer_size: u64,
     pub with_row_id: bool,
     pub with_row_address: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
 }
@@ -489,6 +516,8 @@ impl Default for LanceScanConfig {
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: false,
             with_row_address: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
         }
@@ -563,6 +592,16 @@ impl LanceScanExec {
         if config.with_row_address {
             output_schema = output_schema
                 .try_with_column(ROW_ADDR_FIELD.clone())
+                .unwrap();
+        }
+        if config.with_row_last_updated_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if config.with_row_created_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
@@ -695,6 +734,10 @@ impl ExecutionPlan for LanceScanExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

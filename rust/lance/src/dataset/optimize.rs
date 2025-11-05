@@ -35,8 +35,8 @@
 //! # let mut rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! #
-//! # let test_dir = tempfile::tempdir().unwrap();
-//! # let uri = test_dir.path().to_str().unwrap().to_string();
+//! # let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+//! # let uri = test_dir.to_string();
 //! let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
 //! let data = RecordBatch::try_new(
 //!     schema.clone(),
@@ -609,7 +609,6 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
-        /*blob_op=*/ None,
         None,
     );
 
@@ -727,19 +726,16 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    let new_fragments = write_fragments_internal(
+    let (mut new_fragments, _) = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema().clone(),
         reader,
         params,
+        None, // Compaction doesn't use target_bases
     )
     .await?;
-
-    // We should not be rewriting any blob data
-    assert!(new_fragments.blob.is_none());
-    let mut new_fragments = new_fragments.default.0;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -752,7 +748,7 @@ async fn rewrite_files(
         let row_addrs = captured_ids.row_addrs(None).into_owned();
 
         log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row ids",
+            "Compaction task {}: reserving fragment ids and transposing row addrs",
             task_id
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
@@ -762,12 +758,20 @@ async fn rewrite_files(
             row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
-            let row_id_map = remapping::transpose_row_ids(row_addrs, &fragments, &new_fragments);
+            let row_id_map = remapping::transpose_row_addrs(row_addrs, &fragments, &new_fragments);
             (Some(row_id_map), None)
         }
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+        if dataset.manifest.uses_stable_row_ids() {
+            recalc_versions_for_rewritten_fragments(
+                dataset.as_ref(),
+                &mut new_fragments,
+                &fragments,
+            )
+            .await?;
+        }
 
         if options.defer_index_remap {
             let no_addrs = RoaringTreemap::new();
@@ -860,6 +864,104 @@ async fn rechunk_stable_row_ids(
         // TODO: if large enough, serialize to separate file
         let serialized = lance_table::rowids::write_row_ids(&sequence);
         fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+    }
+
+    Ok(())
+}
+
+/// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
+async fn recalc_versions_for_rewritten_fragments(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    old_fragments: &[Fragment],
+) -> Result<()> {
+    // Load old per-row last_updated_at version sequences
+    let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+    // Load old per-row created_at version sequences
+    let mut old_created_at_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+
+    for frag in old_fragments.iter() {
+        let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
+            match row_id_meta {
+                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
+                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+            }
+        } else {
+            frag.physical_rows.unwrap_or(0) as u64
+        };
+
+        // Load created_at sequence (default to version 1 if missing)
+        let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load created_at version sequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            // Default: treat all rows as created at version 1
+            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
+        };
+
+        // Load last_updated_at sequence (default to same as created_at sequence)
+        let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load last_updated_at version sequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            created_at_seq.clone()
+        };
+
+        // Apply deletion mask if present (positions are local offsets)
+        if let Some(deletion_file) = &frag.deletion_file {
+            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+            last_updated_seq.mask(deletions.to_sorted_iter())?;
+            created_at_seq.mask(deletions.to_sorted_iter())?;
+        }
+
+        old_last_updated_sequences.push(last_updated_seq);
+        old_created_at_sequences.push(created_at_seq);
+    }
+
+    // Ensure row counts match new fragments total
+    let old_total: u64 = old_last_updated_sequences.iter().map(|s| s.len()).sum();
+    let new_total: u64 = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .sum();
+    debug_assert_eq!(old_total, new_total);
+
+    // Rechunk version runs aligned to new fragment sizes
+    let chunk_sizes: Vec<u64> = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .collect();
+
+    let new_last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_last_updated_sequences,
+        chunk_sizes.clone(),
+        false,
+    )?;
+
+    let new_created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_created_at_sequences,
+        chunk_sizes,
+        false,
+    )?;
+
+    // Set both version metadata on new fragments
+    for ((fragment, last_updated_seq), created_at_seq) in new_fragments
+        .iter_mut()
+        .zip(new_last_updated_sequences.into_iter())
+        .zip(new_created_at_sequences.into_iter())
+    {
+        fragment.last_updated_at_version_meta = Some(
+            lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
+        );
+        fragment.created_at_version_meta = Some(
+            lance_table::format::RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
+        );
     }
 
     Ok(())
@@ -958,8 +1060,6 @@ pub async fn commit_compaction(
             rewritten_indices,
             frag_reuse_index,
         },
-        // TODO: Add a blob compaction pass
-        /*blob_op= */ None,
         None,
     );
 
@@ -976,7 +1076,7 @@ mod tests {
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
-    use crate::dataset::optimize::remapping::{transpose_row_ids, transpose_row_ids_from_digest};
+    use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
     use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
@@ -990,6 +1090,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::Error;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
@@ -1004,7 +1105,6 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
-    use tempfile::tempdir;
     use uuid::Uuid;
 
     #[test]
@@ -1024,6 +1124,8 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
@@ -1152,8 +1254,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         // Compact an empty table
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
@@ -1190,8 +1292,8 @@ mod tests {
         data_storage_version: LanceFileVersion,
     ) {
         // Compact a table with nothing to do
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
@@ -1232,7 +1334,7 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
-    fn row_ids(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
+    fn row_addrs(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
         let start = RowAddress::new_from_parts(frag_idx, offsets.start);
         let end = RowAddress::new_from_parts(frag_idx, offsets.end);
         start.into()..end.into()
@@ -1275,8 +1377,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1329,22 +1431,22 @@ mod tests {
             &[
                 vec![
                     // 3 small fragments are rewritten to frags 7 & 8
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addrs(0, 0..400), true),
+                    (row_addrs(1, 0..400), true),
+                    (row_addrs(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addrs(2, 200..400), true)],
                 // frag 3 is skipped since it does not have enough missing data
                 // Frags 4, 5, and 6 are rewritten to frags 9 & 10
                 vec![
                     // Only 800 of the 1000 rows taken from frag 4
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
+                    (row_addrs(4, 0..200), true),
+                    (row_addrs(4, 200..400), false),
+                    (row_addrs(4, 400..1000), true),
                     // frags 5 compacted with frag 4
-                    (row_ids(5, 0..200), true),
+                    (row_addrs(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
             ],
             first_new_frag_idx,
         );
@@ -1352,19 +1454,19 @@ mod tests {
             &[
                 // Frags 4, 5, and 6 are rewritten to frags 7 & 8
                 vec![
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
-                    (row_ids(5, 0..200), true),
+                    (row_addrs(4, 0..200), true),
+                    (row_addrs(4, 200..400), false),
+                    (row_addrs(4, 400..1000), true),
+                    (row_addrs(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
                 // 3 small fragments rewritten to frags 9 & 10
                 vec![
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addrs(0, 0..400), true),
+                    (row_addrs(1, 0..400), true),
+                    (row_addrs(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addrs(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -1423,8 +1525,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1463,8 +1565,8 @@ mod tests {
         let expected_remap = expect_remap(
             &[vec![
                 // 3 small fragments are rewritten entirely
-                (row_ids(0, 0..5000), true),
-                (row_ids(1, 0..5000), true),
+                (row_addrs(0, 0..5000), true),
+                (row_addrs(1, 0..5000), true),
             ]],
             2,
         );
@@ -1512,8 +1614,8 @@ mod tests {
         // For files that have few rows, we don't want to compact just 1 since
         // that won't do anything. But if there are deletions to materialize,
         // we want to do groups of 1. This test checks that.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1589,8 +1691,8 @@ mod tests {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
         // Once committed, can't commit remaining tasks
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let data = sample_data();
 
@@ -1889,7 +1991,7 @@ mod tests {
             let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
 
             // Use transpose_row_ids to convert changed_row_addrs to row_id_map
-            let transposed_map = transpose_row_ids(
+            let transposed_map = transpose_row_addrs(
                 changed_row_addrs,
                 &deferred_result.original_fragments,
                 &deferred_result.new_fragments,

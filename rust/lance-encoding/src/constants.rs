@@ -16,7 +16,14 @@ pub const RLE_THRESHOLD_META_KEY: &str = "lance-encoding:rle-threshold";
 
 // Dictionary encoding metadata keys
 /// Metadata key for specifying dictionary encoding threshold divisor
+/// Set to a large value to discourage dictionary encoding
+/// Set to a small value to encourage dictionary encoding
 pub const DICT_DIVISOR_META_KEY: &str = "lance-encoding:dict-divisor";
+/// Metadata key for dictionary encoding size ratio threshold (0.0-1.0]
+/// If estimated_dict_size/raw_size < ratio, use dictionary encoding.
+/// Example: 0.8 means use dict if encoded size < 80% of raw size
+/// Default: 0.8
+pub const DICT_SIZE_RATIO_META_KEY: &str = "lance-encoding:dict-size-ratio";
 
 // NOTE: BLOB_META_KEY is defined in lance-core to avoid circular dependency
 

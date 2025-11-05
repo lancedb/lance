@@ -21,18 +21,22 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::pbold::{
+    BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+};
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::{
     bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use snafu::location;
 use tracing::instrument;
@@ -198,7 +202,12 @@ pub(crate) async fn load_training_data(
     if train {
         // Use the training request to scan data with fragment filtering
         if let Some(ref fragment_ids) = training_request.fragment_ids {
-            let fragment_ids = fragment_ids.clone().into_iter().dedup().collect_vec();
+            let fragment_ids = fragment_ids
+                .clone()
+                .into_iter()
+                .sorted()
+                .dedup()
+                .collect_vec();
             let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
             let frags: Result<Vec<_>> = fragment_ids
                 .iter()
@@ -301,7 +310,7 @@ pub(super) async fn build_scalar_index(
 pub async fn fetch_index_details(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
 ) -> Result<Arc<prost_types::Any>> {
     let index_details = match index.index_details.as_ref() {
         Some(details) => details.clone(),
@@ -314,7 +323,7 @@ pub async fn fetch_index_details(
 pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
@@ -337,7 +346,7 @@ pub async fn open_scalar_index(
 pub(crate) async fn infer_scalar_index_details(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
 ) -> Result<Arc<prost_types::Any>> {
     let uuid = index.uuid.to_string();
     let type_key = crate::session::index_caches::ScalarIndexDetailsKey { uuid: &uuid };
@@ -358,18 +367,30 @@ pub(crate) async fn infer_scalar_index_details(
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_details = if let DataType::List(_) = col.data_type() {
-        prost_types::Any::from_msg(&lance_index::pb::LabelListIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
-        prost_types::Any::from_msg(&lance_index::pb::BitmapIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&inverted_list_lookup).await?
-        || dataset
-            .object_store
-            .exists(&legacy_inverted_list_lookup)
-            .await?
+        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
+    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+        // Try to infer inverted index details from metadata file to capture with_position and other params
+        // Fall back to defaults if anything goes wrong
+        let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
+        let parse_params = async || {
+            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).ok()?;
+            let reader = index_store.open_index_file(METADATA_FILE).await.ok()?;
+            let params_str = reader.schema().metadata.get("params")?;
+            let params = ::serde_json::from_str::<InvertedIndexParams>(params_str).ok()?;
+            let details = InvertedIndexDetails::try_from(&params).ok()?;
+            Some(prost_types::Any::from_msg(&details).unwrap())
+        };
+        parse_params().await.unwrap_or(default_details)
+    } else if dataset
+        .object_store
+        .exists(&legacy_inverted_list_lookup)
+        .await?
     {
-        prost_types::Any::from_msg(&lance_index::pb::InvertedIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
 
     let index_details = Arc::new(index_details);
@@ -383,10 +404,11 @@ pub(crate) async fn infer_scalar_index_details(
 }
 
 pub fn index_matches_criteria(
-    index: &Index,
+    index: &IndexMetadata,
     criteria: &ScalarIndexCriteria,
     field: &Field,
     has_multiple_indices: bool,
+    schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
     if let Some(name) = &criteria.has_name {
         if &index.name != name {
@@ -398,7 +420,14 @@ pub fn index_matches_criteria(
         if index.fields.len() != 1 {
             return Ok(false);
         }
-        if for_column != field.name {
+        // Build the full field path for nested fields
+        let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+            let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+            lance_core::datatypes::format_field_path(&field_refs)
+        } else {
+            field.name.clone()
+        };
+        if for_column != field_path {
             return Ok(false);
         }
     }
@@ -444,7 +473,7 @@ pub fn index_matches_criteria(
 pub async fn initialize_scalar_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
-    source_index: &Index,
+    source_index: &IndexMetadata,
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {
@@ -514,12 +543,11 @@ mod tests {
     };
     use arrow_schema::DataType;
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::{
-        pb::{BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails},
-        IndexType,
-    };
+    use lance_index::pbold::NGramIndexDetails;
+    use lance_index::IndexType;
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -571,10 +599,14 @@ mod tests {
         };
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
-        let result = index_matches_criteria(&index1, &criteria, &field, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let result = index_matches_criteria(&index1, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
 
-        let result = index_matches_criteria(&index1, &criteria, &field, false).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
     }
 
@@ -592,10 +624,16 @@ mod tests {
         };
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         // test for_column
@@ -605,11 +643,13 @@ mod tests {
             for_column: Some("mycol"),
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test has_name
@@ -619,15 +659,19 @@ mod tests {
             for_column: None,
             has_name: Some("btree_index"),
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test supports_exact_equality
@@ -637,15 +681,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
 
         // test multiple indices
@@ -655,15 +702,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
     }
 
@@ -716,11 +766,10 @@ mod tests {
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with BTree index
         let source_reader = lance_datagen::gen_batch()
@@ -821,11 +870,10 @@ mod tests {
         use lance_datagen::{array, BatchCount, RowCount};
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with low cardinality column for bitmap index
         let source_reader = lance_datagen::gen_batch()
@@ -902,11 +950,10 @@ mod tests {
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with text column for inverted index
         let source_reader = lance_datagen::gen_batch()
@@ -1044,11 +1091,10 @@ mod tests {
         use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::DatasetIndexExt;
-        use tempfile::tempdir;
 
-        let test_dir = tempdir().unwrap();
-        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
-        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
 
         // Create source dataset with ZoneMap index
         let source_reader = lance_datagen::gen_batch()

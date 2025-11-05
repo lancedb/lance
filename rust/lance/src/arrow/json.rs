@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Serialization and deserialization of Arrow Schema to JSON.
+//!
+//! This serialization is a convenience utility.  It is not intended to be a standard
+//! serialization format for Arrow.  No guarantees are made about the stability of the
+//! serialization format.  Use at your own risk.
 
 use std::collections::HashMap;
 use std::sync::Arc;

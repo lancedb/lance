@@ -12,6 +12,7 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -19,7 +20,7 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
 };
-use crate::{pb, Any};
+use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
@@ -606,7 +607,8 @@ impl ScalarIndex for ZoneMapIndex {
         combined_builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
@@ -1001,7 +1003,8 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
@@ -1031,13 +1034,12 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{stream, StreamExt, TryStreamExt};
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
-    use tempfile::tempdir;
 
     use crate::scalar::{
         lance_format::LanceIndexStore,
@@ -1076,10 +1078,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_zonemap_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1120,10 +1122,10 @@ mod tests {
     #[tokio::test]
     // Test that a zonemap index can be created with null values from few fragments
     async fn test_null_zonemap_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1247,10 +1249,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_nan_zonemap_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1442,10 +1444,10 @@ mod tests {
     #[tokio::test]
     // Test data that belongs to the same fragment but coming from different batches
     async fn test_basic_zonemap_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1656,10 +1658,10 @@ mod tests {
     #[tokio::test]
     // Test zonemap with same fragment from multiple batches
     async fn test_complex_zonemap_index() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 
@@ -1776,10 +1778,10 @@ mod tests {
     #[tokio::test]
     // Test zonemap with multiple fragments from different batches
     async fn test_multiple_fragments_zonemap() {
-        let tmpdir = Arc::new(tempdir().unwrap());
+        let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
 

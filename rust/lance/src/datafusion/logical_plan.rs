@@ -65,9 +65,16 @@ impl TableProvider for Dataset {
             schema_ref.clone()
         };
 
-        let scan_range = limit.map(|l| (0..l as u64));
-        let plan: Arc<dyn ExecutionPlan> =
-            scanner.scan(false, false, false, scan_range, projections.into());
+        let scan_range = limit.map(|l| 0..l as u64);
+        let plan: Arc<dyn ExecutionPlan> = scanner.scan(
+            false,
+            false,
+            false,
+            false,
+            false,
+            scan_range,
+            projections.into(),
+        );
 
         Ok(plan)
     }
@@ -84,7 +91,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use datafusion::prelude::*;
     use datafusion_physical_plan::coop::CooperativeExec;
-    use tempfile::tempdir;
+    use lance_core::utils::tempfile::TempStrDir;
 
     fn create_batches() -> (SchemaRef, Vec<RecordBatch>) {
         let nested_fields = vec![
@@ -143,17 +150,16 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_logicalplan_projection_pd() {
         let (schema, batches) = create_batches();
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
 
         let batch_reader =
             RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
 
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+        Dataset::write(batch_reader, &test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx.sql("SELECT vector, utf8 FROM my_table").await.unwrap();
@@ -190,17 +196,16 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_logicalplan_struct_fields() {
         let (schema, batches) = create_batches();
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
 
         let batch_reader =
             RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
 
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+        Dataset::write(batch_reader, &test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx

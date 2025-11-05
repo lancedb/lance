@@ -609,6 +609,30 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
 
 
+def test_index_size_stats(tmp_path: Path):
+    num_rows = 512
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(num_rows * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    index_name = "vec_idx"
+    dataset.create_index(
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+    )
+
+    # Expect to see non-zero sizes here but all sizes are zero
+    stats = dataset.stats.index_stats(index_name)
+    stats = stats["indices"][0]
+    assert stats["partitions"][0]["size"] + stats["partitions"][1]["size"] == num_rows
+
+
 def test_ivf_flat_over_binary_vector(tmp_path):
     dim = 128
     nvec = 1000
@@ -641,6 +665,53 @@ def test_create_ivf_sq_index(dataset, tmp_path):
         num_partitions=4,
     )
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_ivf_rq_index():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+    assert ds.list_indices()[0]["fields"] == ["vector"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Creating empty vector indices with train=False is not yet implemented",
+    ):
+        ds.delete("id>=0")
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+            replace=True,
+        )
+
+    zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(zero_vectors, type=pa.list_(pa.float32(), 128))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.zeros(128),
+            "k": 10,
+        }
+    )
+    assert res.num_rows == 10
+    assert res["_distance"].to_numpy().min() == 0.0
+    assert res["_distance"].to_numpy().max() == 0.0
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
@@ -1515,3 +1586,138 @@ def test_knn_deleted_rows(tmp_path):
     )
     assert 0 not in results["id"]
     assert results.num_rows == ds.count_rows()
+
+
+def test_nested_field_vector_index(tmp_path):
+    """Test vector index creation and querying on nested fields
+
+    Note: While scalar indices work on nested fields, vector indices currently
+    have a limitation in the DataFusion integration layer that prevents them
+    from working with nested field paths. The Python validation layer now
+    correctly handles nested paths, but the Rust planner needs additional work.
+    """
+    # Create a dataset with nested vector field
+    dimensions = 128
+    num_rows = 256
+
+    # Generate random vectors
+    vectors = np.random.randn(num_rows, dimensions).astype(np.float32)
+    vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors.flatten()), dimensions
+    )
+
+    # Create nested structure with vector field
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "data",
+                pa.struct(
+                    [
+                        pa.field("embedding", pa.list_(pa.float32(), dimensions)),
+                        pa.field("label", pa.string()),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    # Create struct array
+    struct_array = pa.StructArray.from_arrays(
+        [vector_array, pa.array([f"label_{i}" for i in range(num_rows)])],
+        names=["embedding", "label"],
+    )
+
+    data = pa.table({"id": list(range(num_rows)), "data": struct_array}, schema=schema)
+
+    # Create dataset
+    uri = tmp_path / "test_nested_vector"
+    dataset = lance.write_dataset(data, uri)
+
+    # Verify the schema
+    assert "data" in dataset.schema.names
+    field = dataset.schema.field("data")
+    assert pa.types.is_struct(field.type)
+
+    # Create vector index on nested column
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+
+    # Verify index was created
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["data.embedding"]
+
+    # Test querying with the index
+    query_vec = vectors[0]
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    # Verify results
+    assert len(result) == 10
+    assert "data" in result.column_names
+    assert "_distance" in result.column_names
+
+    # The first result should be the query vector itself (or very close)
+    assert result["id"][0].as_py() == 0
+    assert result["_distance"][0].as_py() < 0.01  # Should be nearly zero
+
+    # Write additional data to the dataset
+    new_vectors = np.random.randn(50, dimensions).astype(np.float32)
+    new_vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(new_vectors.flatten()), dimensions
+    )
+
+    new_struct_array = pa.StructArray.from_arrays(
+        [new_vector_array, pa.array([f"new_label_{i}" for i in range(50)])],
+        names=["embedding", "label"],
+    )
+
+    new_data = pa.table(
+        {"id": list(range(num_rows, num_rows + 50)), "data": new_struct_array},
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(new_data, uri, mode="append")
+
+    # Verify query still works after appending data
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 15, "nprobes": 2}
+    )
+
+    assert len(result) == 15
+    assert "data" in result.column_names
+
+    # Optimize the index to include new data
+    dataset.optimize.optimize_indices()
+
+    # Verify query works after optimization
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 20, "nprobes": 2}
+    )
+
+    assert len(result) == 20
+
+    # Test with cosine metric
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="cosine",
+        replace=True,
+    )
+
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    assert len(result) == 10
+
+    # Verify total row count
+    assert dataset.count_rows() == num_rows + 50

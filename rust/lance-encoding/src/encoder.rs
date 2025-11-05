@@ -275,10 +275,10 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
 pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEncodingStrategy> {
     match version.resolve() {
         LanceFileVersion::Legacy => panic!(),
-        LanceFileVersion::V2_0 => {
-            Box::new(crate::previous::encoder::CoreFieldEncodingStrategy::default())
-        }
-        _ => Box::new(StructuralEncodingStrategy::default()),
+        LanceFileVersion::V2_0 => Box::new(
+            crate::previous::encoder::CoreFieldEncodingStrategy::new(version),
+        ),
+        _ => Box::new(StructuralEncodingStrategy::with_version(version)),
     }
 }
 
@@ -293,7 +293,8 @@ pub fn default_encoding_strategy_with_params(
             location!(),
         )),
         _ => {
-            let compression_strategy = Arc::new(DefaultCompressionStrategy::with_params(params));
+            let compression_strategy =
+                Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,
@@ -322,6 +323,13 @@ impl Default for StructuralEncodingStrategy {
 }
 
 impl StructuralEncodingStrategy {
+    pub fn with_version(version: LanceFileVersion) -> Self {
+        Self {
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
+            version,
+        }
+    }
+
     fn is_primitive_type(data_type: &DataType) -> bool {
         matches!(
             data_type,
@@ -414,8 +422,9 @@ impl StructuralEncodingStrategy {
                         child_encoder,
                     )))
                 }
-                DataType::Struct(_) => {
-                    if field.is_packed_struct() {
+                DataType::Struct(fields) => {
+                    if field.is_packed_struct() || fields.is_empty() {
+                        // Both packed structs and empty structs are encoded as primitive
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),

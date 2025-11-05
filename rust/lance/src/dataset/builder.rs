@@ -2,19 +2,20 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use super::refs::{Ref, Tags};
+use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
+use crate::dataset::branch_location::BranchLocation;
+use crate::{session::Session, Dataset, Error, Result};
+use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
+use lance_namespace::models::DescribeTableRequest;
+use lance_namespace::LanceNamespace;
 use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler},
@@ -26,8 +27,9 @@ use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
+
 /// builder for loading a [`Dataset`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
     index_cache_size_bytes: usize,
@@ -42,6 +44,27 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
+    /// Storage options that override user-provided options (e.g., from namespace)
+    storage_options_override: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for DatasetBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatasetBuilder")
+            .field("index_cache_size_bytes", &self.index_cache_size_bytes)
+            .field("metadata_cache_size_bytes", &self.metadata_cache_size_bytes)
+            .field("manifest", &self.manifest.is_some())
+            .field("session", &self.session.is_some())
+            .field("commit_handler", &self.commit_handler.is_some())
+            .field("version", &self.version)
+            .field("table_uri", &self.table_uri)
+            .field("file_reader_options", &self.file_reader_options)
+            .field(
+                "storage_options_override",
+                &self.storage_options_override.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl DatasetBuilder {
@@ -56,7 +79,98 @@ impl DatasetBuilder {
             version: None,
             manifest: None,
             file_reader_options: None,
+            storage_options_override: None,
         }
+    }
+
+    /// Create a DatasetBuilder from a LanceNamespace
+    ///
+    /// This will automatically fetch the table location and storage options from the namespace
+    /// via `describe_table()`.
+    ///
+    /// Storage options from the namespace will override any user-provided storage options
+    /// set via `.with_storage_options()`. This ensures the namespace is always the source
+    /// of truth for storage options.
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace implementation to fetch table info from
+    /// * `table_id` - The table identifier (e.g., vec!["my_table"])
+    /// * `ignore_namespace_table_storage_options` - If true, storage options returned from
+    ///   the namespace's `describe_table()` will be ignored (treated as None). Defaults to false.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use lance_namespace_impls::ConnectBuilder;
+    /// use lance::dataset::DatasetBuilder;
+    ///
+    /// // Connect to a REST namespace
+    /// let namespace = ConnectBuilder::new("rest")
+    ///     .property("uri", "http://localhost:8080")
+    ///     .connect()
+    ///     .await?;
+    ///
+    /// // Load a dataset using storage options from namespace
+    /// let dataset = DatasetBuilder::from_namespace(
+    ///     namespace.clone(),
+    ///     vec!["my_table".to_string()],
+    ///     false,
+    /// )
+    /// .await?
+    /// .load()
+    /// .await?;
+    ///
+    /// // Load a dataset ignoring namespace storage options
+    /// let dataset = DatasetBuilder::from_namespace(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    ///     true,
+    /// )
+    /// .await?
+    /// .load()
+    /// .await?;
+    /// ```
+    pub async fn from_namespace(
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        ignore_namespace_table_storage_options: bool,
+    ) -> Result<Self> {
+        let request = DescribeTableRequest {
+            id: Some(table_id.clone()),
+            version: None,
+        };
+
+        let response = namespace
+            .describe_table(request)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: Box::new(e),
+                location: location!(),
+            })?;
+
+        let table_uri = response.location.ok_or_else(|| Error::Namespace {
+            source: Box::new(std::io::Error::other(
+                "Table location not found in namespace response",
+            )),
+            location: location!(),
+        })?;
+
+        let mut builder = Self::from_uri(table_uri);
+
+        let namespace_storage_options = if ignore_namespace_table_storage_options {
+            None
+        } else {
+            response.storage_options
+        };
+
+        builder.storage_options_override = namespace_storage_options.clone();
+
+        if namespace_storage_options.is_some() {
+            builder.options.storage_options_provider = Some(Arc::new(
+                LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+            ));
+        }
+
+        Ok(builder)
     }
 }
 
@@ -90,7 +204,7 @@ impl DatasetBuilder {
         note = "Use `with_metadata_cache_size_bytes` instead"
     )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
+        let assumed_entry_size = 10 * 1024 * 1024; // 10MB per entry
         self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
@@ -107,6 +221,13 @@ impl DatasetBuilder {
     /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
         self.version = Some(Ref::from(version));
+        self
+    }
+
+    /// Sets `version` for the builder using a branch and optional version number
+    /// If version_number is null, checkout the latest version
+    pub fn with_branch(mut self, branch: &str, version_number: Option<u64>) -> Self {
+        self.version = Some(Ref::from((branch, version_number)));
         self
     }
 
@@ -183,6 +304,58 @@ impl DatasetBuilder {
         let mut storage_options = self.options.storage_options.unwrap_or_default();
         storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
         self.options.storage_options = Some(storage_options);
+        self
+    }
+
+    /// Enable credential vending from a LanceNamespace
+    ///
+    /// Credentials will be automatically refreshed from the namespace
+    /// before they expire. The namespace should return `expires_at_millis`
+    /// in the storage_options from `describe_table()`.
+    ///
+    /// Use `with_s3_credentials_refresh_offset()` to configure how early
+    /// credentials should be refreshed before they expire (default is 5 minutes).
+    ///
+    /// # Arguments
+    /// * `provider` - The storage options provider to fetch credentials from
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use lance_namespace_impls::ConnectBuilder;
+    /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
+    ///
+    /// // Connect to a REST namespace
+    /// let namespace = ConnectBuilder::new("rest")
+    ///     .property("uri", "http://localhost:8080")
+    ///     .connect()
+    ///     .await?;
+    ///
+    /// // Create a storage options provider from namespace
+    /// let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    /// ));
+    ///
+    /// // With default settings (5 minute refresh offset)
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_storage_options_provider(provider)
+    ///     .load()
+    ///     .await?;
+    /// ```
+    ///
+    /// // With custom refresh offset (refresh 10 minutes before expiration)
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_storage_options_provider(provider.clone())
+    ///     .with_s3_credentials_refresh_offset(Duration::from_secs(600))
+    ///     .load()
+    ///     .await?;
+    pub fn with_storage_options_provider(
+        mut self,
+        provider: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
+    ) -> Self {
+        self.options.storage_options_provider = Some(provider);
         self
     }
 
@@ -289,8 +462,30 @@ impl DatasetBuilder {
     }
 
     #[instrument(skip_all)]
-    pub async fn load(mut self) -> Result<Dataset> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
+    pub async fn load(self) -> Result<Dataset> {
+        let uri = self.table_uri.clone();
+        let target_ref = self.version.clone();
+        match self.load_impl().boxed().await {
+            Ok(dataset) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
+                Ok(dataset)
+            }
+            Err(e) => {
+                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
+                Err(e)
+            }
+        }
+    }
+
+    async fn load_impl(mut self) -> Result<Dataset> {
+        // Apply storage_options_override last to ensure namespace options take precedence
+        if let Some(override_opts) = self.storage_options_override.take() {
+            let mut merged_opts = self.options.storage_options.clone().unwrap_or_default();
+            // Override with namespace storage options - they take precedence
+            merged_opts.extend(override_opts);
+            self.options.storage_options = Some(merged_opts);
+        }
+
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
@@ -300,31 +495,99 @@ impl DatasetBuilder {
             )),
         };
 
-        let mut version: Option<u64> = None;
-        let cloned_ref = self.version.clone();
+        let target_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
 
         // How do we detect which version scheme is in use?
-
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
+        let store_params = self.options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
-        if let Some(r) = cloned_ref {
-            version = match r {
-                Ref::Version(v) => Some(v),
-                Ref::Tag(t) => {
-                    let tags = Tags::new(
-                        object_store.clone(),
-                        commit_handler.clone(),
-                        base_path.clone(),
-                    );
-                    Some(tags.get_version(t.as_str()).await?)
+        // Two cases that need to check out after loading the manifest:
+        // 1. If the target is configured as a branch, we need to check the branch field in the manifest
+        // and reload the right branch in case the uri is not the right one.
+        // 2. If the target is configured as a tag, and we don't find the tag under the table_uri,
+        // we need to get the root_location after loading the manifest and get the right version.
+        // In practice, we should try best to use the right uri and avoid double loading.
+        let mut need_delay_checkout = false;
+        let (mut branch, mut version_number) = match target_ref.clone() {
+            Some(Ref::Version(branch, version_number)) => {
+                if branch.is_some() {
+                    need_delay_checkout = true;
+                }
+                (branch, version_number)
+            }
+            // Here we assume the uri and path is the root.
+            // If tag not found, we need to delay checkout after loading by uri
+            Some(Ref::Tag(tag_name)) => {
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    BranchLocation {
+                        path: base_path.clone(),
+                        uri: table_uri.clone(),
+                        branch: None,
+                    },
+                );
+                let tag_content = refs.tags().get(&tag_name).await;
+                if let Ok(tag_content) = tag_content {
+                    (tag_content.branch.clone(), Some(tag_content.version))
+                } else {
+                    need_delay_checkout = true;
+                    (None, None)
                 }
             }
-        }
+            None => (None, None),
+        };
 
+        let dataset = Self::load_by_uri(
+            session,
+            manifest,
+            file_reader_options,
+            table_uri,
+            version_number,
+            object_store,
+            base_path,
+            commit_handler,
+            Some(store_params),
+        )
+        .await?;
+
+        if need_delay_checkout {
+            if let Some(Ref::Tag(tag_name)) = target_ref {
+                let tag_content = dataset.tags().get(tag_name.as_str()).await?;
+                branch = tag_content.branch.clone();
+                version_number = Some(tag_content.version);
+            }
+
+            if branch.as_deref() != dataset.manifest.branch.as_deref() {
+                return dataset.checkout_version((branch, version_number)).await;
+            }
+        }
+        if let Some(version_number) = version_number {
+            if version_number != dataset.manifest.version {
+                return Err(Error::VersionNotFound {
+                    message: format!("version {} not found", version_number),
+                });
+            }
+        }
+        Ok(dataset)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_by_uri(
+        session: Arc<Session>,
+        manifest: Option<Manifest>,
+        file_reader_options: Option<FileReaderOptions>,
+        table_uri: String,
+        version_number: Option<u64>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        commit_handler: Arc<dyn CommitHandler>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
@@ -335,11 +598,26 @@ impl DatasetBuilder {
             }
             (manifest, location)
         } else {
-            let manifest_location = match version {
+            let manifest_location = match version_number {
                 Some(version) => {
-                    commit_handler
+                    let target_manifest_result = commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
-                        .await?
+                        .await;
+                    // This may fail due to the uri is not the right branch
+                    // In this case we should try to load the latest version and checkout the right branch and version_number
+                    match target_manifest_result {
+                        Ok(manifest_location) => manifest_location,
+                        Err(e) => {
+                            if let Error::VersionNotFound { message: _ } = e {
+                                // If the version is not found, we need to try to load the latest version.
+                                commit_handler
+                                    .resolve_latest_location(&base_path, &object_store)
+                                    .await?
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
@@ -350,7 +628,6 @@ impl DatasetBuilder {
                         location: location!(),
                     })?,
             };
-
             let manifest = Dataset::load_manifest(
                 &object_store,
                 &manifest_location,
@@ -370,6 +647,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             file_reader_options,
+            store_params,
         )
     }
 }

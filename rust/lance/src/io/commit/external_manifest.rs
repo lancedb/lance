@@ -25,6 +25,7 @@ mod test {
         dataset::{ReadParams, WriteMode, WriteParams},
         Dataset,
     };
+    use lance_core::utils::tempfile::TempStrDir;
 
     // sleep for 1 second to simulate a slow external store on write
     #[derive(Debug)]
@@ -146,8 +147,8 @@ mod test {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
         let reader = data_gen.batch(100);
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
         Dataset::write(reader, ds_uri, None).await.unwrap();
 
         // Then try to load the dataset with external store handler set
@@ -187,8 +188,8 @@ mod test {
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
         let reader = data_gen.batch(100);
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
         Dataset::write(reader, ds_uri, Some(write_params(handler.clone())))
             .await
             .unwrap();
@@ -215,8 +216,8 @@ mod test {
 
             let mut data_gen =
                 BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-            let dir = tempfile::tempdir().unwrap();
-            let ds_uri = dir.path().to_str().unwrap();
+            let dir = TempStrDir::default();
+            let ds_uri = &dir;
 
             Dataset::write(
                 data_gen.batch(10),
@@ -255,7 +256,7 @@ mod test {
             assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
             // No temporary manifests left over
-            let manifest_path = dir.path().join("_versions/");
+            let manifest_path = format!("{}/{}", dir, "_versions/");
             let unexpected_entries = std::fs::read_dir(manifest_path)
                 .unwrap()
                 .filter(|entry| {
@@ -294,8 +295,8 @@ mod test {
 
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
 
         let mut ds = Dataset::write(
             data_gen.batch(10),
@@ -370,7 +371,7 @@ mod test {
         assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // No temporary manifests left over
-        let manifest_path = dir.path().join("_versions/");
+        let manifest_path = format!("{}/{}", dir, "_versions/");
         let unexpected_entries = std::fs::read_dir(manifest_path)
             .unwrap()
             .filter(|entry| {

@@ -111,6 +111,11 @@ pub enum Error {
         minor_version: u16,
         location: Location,
     },
+    #[snafu(display("Namespace error: {source}, {location}"))]
+    Namespace {
+        source: BoxedError,
+        location: Location,
+    },
 }
 
 impl Error {

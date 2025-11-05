@@ -15,13 +15,149 @@ use std::{
 
 use lance_core::{
     datatypes::{OnMissing, Projectable, Projection, Schema},
-    Error, Result, ROW_ADDR, ROW_ID, ROW_OFFSET,
+    Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
+    ROW_OFFSET, WILDCARD,
 };
 
 use crate::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
     planner::Planner,
 };
+
+struct ProjectionBuilder {
+    base: Arc<dyn Projectable>,
+    planner: Planner,
+    output: HashMap<String, Expr>,
+    output_cols: Vec<OutputColumn>,
+    physical_cols_set: HashSet<String>,
+    physical_cols: Vec<String>,
+    needs_row_id: bool,
+    needs_row_addr: bool,
+    needs_row_last_updated_at: bool,
+    needs_row_created_at: bool,
+    must_add_row_offset: bool,
+    has_wildcard: bool,
+}
+
+impl ProjectionBuilder {
+    fn new(base: Arc<dyn Projectable>) -> Self {
+        let full_schema = Arc::new(Projection::full(base.clone()).to_arrow_schema());
+        let full_schema = Arc::new(ProjectionPlan::add_system_columns(&full_schema));
+        let planner = Planner::new(full_schema);
+
+        Self {
+            base,
+            planner,
+            output: HashMap::default(),
+            output_cols: Vec::default(),
+            physical_cols_set: HashSet::default(),
+            physical_cols: Vec::default(),
+            needs_row_id: false,
+            needs_row_addr: false,
+            needs_row_created_at: false,
+            needs_row_last_updated_at: false,
+            must_add_row_offset: false,
+            has_wildcard: false,
+        }
+    }
+
+    fn check_duplicate_column(&self, name: &str) -> Result<()> {
+        if self.output.contains_key(name) {
+            return Err(Error::io(
+                format!("Duplicate column name: {}", name),
+                location!(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_column(&mut self, output_name: &str, raw_expr: &str) -> Result<()> {
+        self.check_duplicate_column(output_name)?;
+
+        let expr = self.planner.parse_expr(raw_expr)?;
+
+        // If the expression is a bare column reference to a system column, mark that we need it
+        if let Expr::Column(Column {
+            name,
+            relation: None,
+            ..
+        }) = &expr
+        {
+            if name == ROW_ID {
+                self.needs_row_id = true;
+            } else if name == ROW_ADDR {
+                self.needs_row_addr = true;
+            } else if name == ROW_OFFSET {
+                self.must_add_row_offset = true;
+            } else if name == ROW_LAST_UPDATED_AT_VERSION {
+                self.needs_row_last_updated_at = true;
+            } else if name == ROW_CREATED_AT_VERSION {
+                self.needs_row_created_at = true;
+            }
+        }
+
+        for col in Planner::column_names_in_expr(&expr) {
+            if self.physical_cols_set.contains(&col) {
+                continue;
+            }
+            self.physical_cols.push(col.clone());
+            self.physical_cols_set.insert(col);
+        }
+        self.output.insert(output_name.to_string(), expr.clone());
+
+        self.output_cols.push(OutputColumn {
+            expr,
+            name: output_name.to_string(),
+        });
+
+        Ok(())
+    }
+
+    fn add_columns(&mut self, columns: &[(impl AsRef<str>, impl AsRef<str>)]) -> Result<()> {
+        for (output_name, raw_expr) in columns {
+            if raw_expr.as_ref() == WILDCARD {
+                self.has_wildcard = true;
+                for col in self.base.schema().fields.iter().map(|f| f.name.as_str()) {
+                    self.check_duplicate_column(col)?;
+                    self.output_cols.push(OutputColumn {
+                        expr: Expr::Column(Column::from_name(col)),
+                        name: col.to_string(),
+                    });
+                    // Throw placeholder expr in self.output, this will trigger error on duplicates
+                    self.output.insert(col.to_string(), Expr::default());
+                }
+            } else {
+                self.add_column(output_name.as_ref(), raw_expr.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn build(self) -> Result<ProjectionPlan> {
+        // Now, calculate the physical projection from the columns referenced by the expressions
+        //
+        // If a column is missing it might be a system column (_rowid, _distance, etc.) and so
+        // we ignore it.  We don't need to load that column from disk at least, which is all we are
+        // trying to calculate here.
+        let mut physical_projection = if self.has_wildcard {
+            Projection::full(self.base.clone())
+        } else {
+            Projection::empty(self.base.clone())
+                .union_columns(&self.physical_cols, OnMissing::Ignore)?
+        };
+
+        physical_projection.with_row_id = self.needs_row_id;
+        physical_projection.with_row_addr = self.needs_row_addr || self.must_add_row_offset;
+        physical_projection.with_row_last_updated_at_version = self.needs_row_last_updated_at;
+        physical_projection.with_row_created_at_version = self.needs_row_created_at;
+
+        Ok(ProjectionPlan {
+            physical_projection,
+            must_add_row_offset: self.must_add_row_offset,
+            requested_output_expr: self.output_cols,
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OutputColumn {
@@ -53,6 +189,12 @@ impl ProjectionPlan {
             DataType::UInt64,
             true,
         )));
+        fields.push(Arc::new(
+            (*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone(),
+        ));
+        fields.push(Arc::new(
+            (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
+        ));
         ArrowSchema::new(fields)
     }
 
@@ -61,77 +203,9 @@ impl ProjectionPlan {
         base: Arc<dyn Projectable>,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<Self> {
-        // First, look at the expressions to figure out which physical columns are needed
-        let full_schema = Arc::new(Projection::full(base.clone()).to_arrow_schema());
-        let full_schema = Arc::new(Self::add_system_columns(&full_schema));
-        let planner = Planner::new(full_schema);
-        let mut output = HashMap::new();
-        let mut physical_cols_set = HashSet::new();
-        let mut physical_cols = vec![];
-        let mut needs_row_id = false;
-        let mut needs_row_addr = false;
-        let mut must_add_row_offset = false;
-        for (output_name, raw_expr) in columns {
-            if output.contains_key(output_name.as_ref()) {
-                return Err(Error::io(
-                    format!("Duplicate column name: {}", output_name.as_ref()),
-                    location!(),
-                ));
-            }
-
-            let expr = planner.parse_expr(raw_expr.as_ref())?;
-
-            // If the expression is a bare column reference to a system column, mark that we need it
-            if let Expr::Column(Column {
-                name,
-                relation: None,
-                ..
-            }) = &expr
-            {
-                if name == ROW_ID {
-                    needs_row_id = true;
-                } else if name == ROW_ADDR {
-                    needs_row_addr = true;
-                } else if name == ROW_OFFSET {
-                    must_add_row_offset = true;
-                }
-            }
-
-            for col in Planner::column_names_in_expr(&expr) {
-                if physical_cols_set.contains(&col) {
-                    continue;
-                }
-                physical_cols.push(col.clone());
-                physical_cols_set.insert(col);
-            }
-            output.insert(output_name.as_ref().to_string(), expr);
-        }
-
-        // Now, calculate the physical projection from the columns referenced by the expressions
-        //
-        // If a column is missing it might be a metadata column (_rowid, _distance, etc.) and so
-        // we ignore it.  We don't need to load that column from disk at least, which is all we are
-        // trying to calculate here.
-        let mut physical_projection =
-            Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
-
-        physical_projection.with_row_id = needs_row_id;
-        physical_projection.with_row_addr = needs_row_addr || must_add_row_offset;
-
-        // Save off the expressions (they will be evaluated later to run the projection)
-        let mut output_cols = vec![];
-        for (name, _) in columns {
-            output_cols.push(OutputColumn {
-                expr: output[name.as_ref()].clone(),
-                name: name.as_ref().to_string(),
-            });
-        }
-
-        Ok(Self {
-            physical_projection,
-            must_add_row_offset,
-            requested_output_expr: output_cols,
-        })
+        let mut builder = ProjectionBuilder::new(base);
+        builder.add_columns(columns)?;
+        builder.build()
     }
 
     /// Set the projection from a schema
@@ -169,28 +243,59 @@ impl ProjectionPlan {
     ///
     /// This is something that cannot be done easily using expressions.
     pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
-        // Calculate the physical projection directly from the schema
-        //
-        // The _rowid and _rowaddr columns will be recognized and added to the physical projection
-        //
-        // Any columns with an id of -1 (e.g. _rowoffset) will be ignored
-        let physical_projection = Projection::empty(base).union_schema(projection);
+        // Separate data columns from system columns
+        // System columns (_rowid, _rowaddr, etc.) are handled via flags in Projection,
+        // not as fields in the Schema
+        let mut data_fields = Vec::new();
+        let mut with_row_id = false;
+        let mut with_row_addr = false;
         let mut must_add_row_offset = false;
-        // Now calculate the output expressions.  This will only reorder top-level columns.  We don't
-        // support reordering nested fields.
+
+        for field in projection.fields.iter() {
+            if lance_core::is_system_column(&field.name) {
+                // Handle known system columns that can be included in projections
+                if field.name == ROW_ID {
+                    with_row_id = true;
+                    must_add_row_offset = true;
+                } else if field.name == ROW_ADDR {
+                    with_row_addr = true;
+                    must_add_row_offset = true;
+                }
+                // Note: Other system columns like _rowoffset are computed differently
+                // and shouldn't appear in the schema at this point
+            } else {
+                // Regular data column - validate it exists in base schema
+                if base.schema().field(&field.name).is_none() {
+                    return Err(Error::io(
+                        format!("Column '{}' not found in schema", field.name),
+                        location!(),
+                    ));
+                }
+                data_fields.push(field.clone());
+            }
+        }
+
+        // Create a schema with only data columns for the physical projection
+        let data_schema = Schema {
+            fields: data_fields,
+            metadata: projection.metadata.clone(),
+        };
+
+        // Calculate the physical projection from data columns only
+        let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
+        physical_projection.with_row_id = with_row_id;
+        physical_projection.with_row_addr = with_row_addr;
+
+        // Build output expressions preserving the original order (including system columns)
         let exprs = projection
             .fields
             .iter()
-            .map(|f| {
-                if f.name == ROW_ADDR {
-                    must_add_row_offset = true;
-                }
-                OutputColumn {
-                    expr: Expr::Column(Column::from_name(&f.name)),
-                    name: f.name.clone(),
-                }
+            .map(|f| OutputColumn {
+                expr: Expr::Column(Column::from_name(&f.name)),
+                name: f.name.clone(),
             })
             .collect::<Vec<_>>();
+
         Ok(Self {
             physical_projection,
             requested_output_expr: exprs,
@@ -199,13 +304,29 @@ impl ProjectionPlan {
     }
 
     pub fn full(base: Arc<dyn Projectable>) -> Result<Self> {
-        let projection = base
+        let physical_cols: Vec<&str> = base
             .schema()
             .fields
             .iter()
-            .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
+            .map(|f| f.name.as_ref())
             .collect::<Vec<_>>();
-        Self::from_expressions(base.clone(), &projection)
+
+        let physical_projection =
+            Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
+
+        let requested_output_expr = physical_cols
+            .into_iter()
+            .map(|col_name| OutputColumn {
+                expr: Expr::Column(Column::from_name(col_name)),
+                name: col_name.to_string(),
+            })
+            .collect();
+
+        Ok(Self {
+            physical_projection,
+            must_add_row_offset: false,
+            requested_output_expr,
+        })
     }
 
     /// Convert the projection to a list of physical expressions
@@ -257,22 +378,6 @@ impl ProjectionPlan {
             self.requested_output_expr.push(OutputColumn {
                 expr: Expr::Column(Column::from_name(ROW_ADDR)),
                 name: ROW_ADDR.to_string(),
-            });
-        }
-    }
-
-    pub fn include_row_offset(&mut self) {
-        // Need row addr to get row offset
-        self.physical_projection.with_row_addr = true;
-        self.must_add_row_offset = true;
-        if !self
-            .requested_output_expr
-            .iter()
-            .any(|OutputColumn { name, .. }| name == ROW_OFFSET)
-        {
-            self.requested_output_expr.push(OutputColumn {
-                expr: Expr::Column(Column::from_name(ROW_OFFSET)),
-                name: ROW_OFFSET.to_string(),
             });
         }
     }

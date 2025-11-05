@@ -10,7 +10,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
-use lance_table::format::{Fragment, Index as IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -22,6 +22,7 @@ use crate::dataset::Dataset;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
+#[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
@@ -82,10 +83,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             location: location!(),
         })?;
 
+    let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
         let index = dataset
-            .open_generic_index(&column.name, &idx.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
             .await?;
         indices.push(index);
     }
@@ -116,7 +118,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let index = dataset
                 .open_scalar_index(
-                    &column.name,
+                    &field_path,
                     &old_indices[0].uuid.to_string(),
                     &NoOpMetricsCollector,
                 )
@@ -131,7 +133,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
-                &column.name,
+                &field_path,
                 &update_criteria.data_criteria,
                 fragments,
                 true,
@@ -148,14 +150,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             Ok((new_uuid, 1, created_index))
         }
         it if it.is_vector() => {
-            let start_pos = old_indices
-                .len()
-                .saturating_sub(options.num_indices_to_merge);
-            let indices_to_merge = &old_indices[start_pos..];
-            indices_to_merge.iter().for_each(|idx| {
-                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-            });
-
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -163,9 +157,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 scanner
                     .with_fragments(unindexed.to_vec())
                     .with_row_id()
-                    .project(&[&column.name])?;
+                    .project(&[&field_path])?;
                 if column.nullable {
-                    scanner.filter_expr(datafusion_expr::col(&column.name).is_not_null());
+                    let column_expr =
+                        lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
+                    scanner.filter_expr(column_expr.is_not_null());
                 }
                 Some(scanner.try_into_stream().await?)
             };
@@ -173,12 +169,19 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let (new_uuid, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
-                &column.name,
+                &field_path,
                 &indices,
                 options,
             )
             .boxed()
             .await?;
+
+            old_indices[old_indices.len() - indices_merged..]
+                .iter()
+                .for_each(|idx| {
+                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+                });
+
             Ok((
                 new_uuid,
                 indices_merged,
@@ -219,13 +222,13 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::storage::VectorStore;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
@@ -233,11 +236,9 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-    use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
-    use crate::index::vector::ivf::v2;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -246,8 +247,8 @@ mod tests {
         const DIM: usize = 64;
         const IVF_PARTITIONS: usize = 2;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(1000 * DIM);
 
@@ -305,9 +306,12 @@ mod tests {
             .unwrap();
         assert_eq!(results[0].num_rows(), 10); // Flat search.
 
-        dataset.optimize_indices(&Default::default()).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let index = &dataset.load_indices().await.unwrap()[0];
+        let indices = dataset.load_indices().await.unwrap();
 
         assert!(dataset
             .unindexed_fragments(&index.name)
@@ -340,26 +344,19 @@ mod tests {
         assert!(contained);
 
         // Check that the index has all 2000 rows.
-        let binding = dataset
-            .open_vector_index(
-                "vector",
-                index.uuid.to_string().as_str(),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let ivf_index = binding.as_any().downcast_ref::<v2::IvfPq>().unwrap();
-        let row_in_index = stream::iter(0..IVF_PARTITIONS)
-            .map(|part_id| async move {
-                let part = ivf_index.load_partition_storage(part_id).await.unwrap();
-                part.len()
-            })
-            .buffered(2)
-            .collect::<Vec<usize>>()
-            .await
-            .iter()
-            .sum::<usize>();
-        assert_eq!(row_in_index, 2000);
+        let mut num_rows = 0;
+        for index in indices.iter() {
+            let index = dataset
+                .open_vector_index(
+                    "vector",
+                    index.uuid.to_string().as_str(),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            num_rows += index.num_rows();
+        }
+        assert_eq!(num_rows, 2000);
     }
 
     #[rstest]
@@ -379,8 +376,8 @@ mod tests {
         const DIM: usize = 64;
         const TOTAL: usize = 1000;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(TOTAL * DIM);
 
@@ -437,10 +434,7 @@ mod tests {
         assert_eq!(stats["num_unindexed_fragments"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
@@ -468,8 +462,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_indices_after_merge_insert() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         // Create initial dataset using lance_datagen
         let mut dataset = lance_datagen::gen_batch()
@@ -560,7 +554,7 @@ mod tests {
             updated_dataset.clone(),
             &old_indices_refs,
             &unindexed_fragments,
-            &OptimizeOptions::default(),
+            &OptimizeOptions::merge(old_indices.len()),
         )
         .await
         .unwrap();
