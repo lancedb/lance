@@ -27,7 +27,9 @@ pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
 pub mod floats;
+use crate::list::ListArrayExt;
 pub use floats::*;
+
 pub mod cast;
 pub mod json;
 pub mod list;
@@ -1308,8 +1310,8 @@ fn merge_with_schema(
                             .unwrap();
                         let merged_values = merge_list_child_values(
                             child_field.as_ref(),
-                            get_list_values(left_list).clone(),
-                            get_list_values(right_list).clone(),
+                            left_list.trimmed_values(),
+                            right_list.trimmed_values(),
                         );
                         let merged_validity =
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
@@ -1333,8 +1335,8 @@ fn merge_with_schema(
                             .unwrap();
                         let merged_values = merge_list_child_values(
                             child_field.as_ref(),
-                            get_list_values(left_list).clone(),
-                            get_list_values(right_list).clone(),
+                            left_list.trimmed_values(),
+                            right_list.trimmed_values(),
                         );
                         let merged_validity =
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
@@ -1388,15 +1390,6 @@ fn merge_with_schema(
     }
 
     StructArray::try_new(Fields::from(output_fields), columns, merged_validity).unwrap()
-}
-
-fn get_list_values<O: OffsetSizeTrait>(list_array: &GenericListArray<O>) -> ArrayRef {
-    let offsets = list_array.value_offsets();
-    let start = offsets[0].to_usize().expect("offset overflow");
-    let end = offsets[list_array.len()]
-        .to_usize()
-        .expect("offset overflow");
-    list_array.values().slice(start, end - start)
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
@@ -2058,37 +2051,6 @@ mod tests {
             .unwrap();
         assert!(count.is_null(0));
         assert!(count.is_null(1));
-    }
-
-    #[test]
-    fn test_get_list_values() {
-        let values = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
-
-        // case 1
-        let offsets1 = OffsetBuffer::from_lengths([2, 2, 2]); // [1,2], [3,4], [5,6]
-        let list_array1 = ListArray::new(
-            Arc::new(Field::new("item", DataType::Int32, true)),
-            offsets1,
-            values.clone(),
-            None,
-        );
-
-        let extracted_values1 = get_list_values(&list_array1);
-        assert_eq!(extracted_values1.len(), 6);
-        assert_eq!(extracted_values1.as_ref(), values.as_ref());
-
-        // case 2
-        let offsets2 = OffsetBuffer::from_lengths([2, 2]); // [1,2], [3, 4]
-        let list_array2 = ListArray::new(
-            Arc::new(Field::new("item", DataType::Int32, true)),
-            offsets2,
-            values.clone(),
-            None,
-        );
-
-        let extracted_values2 = get_list_values(&list_array2);
-        assert_eq!(extracted_values2.len(), 4);
-        assert_eq!(*extracted_values2.as_ref(), values.as_ref().slice(0, 4));
     }
 
     #[test]
