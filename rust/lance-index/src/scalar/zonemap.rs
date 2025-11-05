@@ -61,10 +61,11 @@ struct ZoneMapStatistics {
     // only apply to float type
     nan_count: u32,
     fragment_id: u64,
-    // zone_start is the start row of the zone in the fragment, also known
-    // as local row offset
+    // zone_start is the actual first row address (local offset within fragment)
     zone_start: u64,
-    zone_length: usize,
+    // zone_length is the address span: (last_row_addr - first_row_addr + 1)
+    // AKA offset in the fragment, which allows handling non-contiguous addresses after deletions
+    zone_length: u64,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -459,6 +460,7 @@ impl ZoneMapIndex {
             let max = ScalarValue::try_from_array(max_col, i)?;
             let null_count = null_count_col.value(i);
             let nan_count = nan_count_col.value(i);
+
             zones.push(ZoneMapStatistics {
                 min,
                 max,
@@ -466,7 +468,7 @@ impl ZoneMapIndex {
                 nan_count,
                 fragment_id: fragment_id_col.value(i),
                 zone_start: zone_start_col.value(i),
-                zone_length: zone_length.value(i) as usize,
+                zone_length: zone_length.value(i),
             });
         }
 
@@ -543,9 +545,10 @@ impl ScalarIndex for ZoneMapIndex {
             // Check if this zone matches the query
             if self.evaluate_zone_against_query(zone, query)? {
                 // Calculate the range of row addresses for this zone
-                // Row addresses are: (fragment_id << 32) + zone_start
+                // zone_length is the address span (not row count), so we can directly use it
+                // This handles non-contiguous addresses from deletions correctly
                 let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
-                let zone_end_addr = zone_start_addr + (zone.zone_length as u64);
+                let zone_end_addr = zone_start_addr + zone.zone_length;
 
                 // Add all row addresses in this zone to the result
                 row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
@@ -669,6 +672,10 @@ pub struct ZoneMapIndexBuilder {
     // The local offset within the current zone
     cur_zone_offset: usize,
     cur_fragment_id: u64,
+    // Track the actual first and last row addresses in the current zone
+    // This handles non-contiguous addresses after deletions
+    cur_zone_first_row_addr: Option<u64>,
+    cur_zone_last_row_addr: Option<u64>,
 
     min: MinAccumulator,
     max: MaxAccumulator,
@@ -686,6 +693,8 @@ impl ZoneMapIndexBuilder {
             maps: Vec::new(),
             cur_zone_offset: 0,
             cur_fragment_id: 0,
+            cur_zone_first_row_addr: None,
+            cur_zone_last_row_addr: None,
             min,
             max,
             null_count: 0,
@@ -729,13 +738,15 @@ impl ZoneMapIndexBuilder {
     }
 
     fn new_map(&mut self, fragment_id: u64) -> Result<()> {
-        // Calculate zone_start based on existing zones in the same fragment
-        let zone_start = self
-            .maps
-            .iter()
-            .filter(|zone| zone.fragment_id == fragment_id)
-            .map(|zone| zone.zone_length as u64)
-            .sum::<u64>();
+        // Use the actual first and last row addresses we tracked
+        // zone_length is the address span (last - first + 1), not row count
+        // This correctly handles non-contiguous addresses after deletions
+        let zone_start = self.cur_zone_first_row_addr.unwrap_or(0);
+        let zone_length = self
+            .cur_zone_last_row_addr
+            .map(|last_addr| last_addr - zone_start + 1)
+            .unwrap_or(self.cur_zone_offset as u64);
+
         let new_map = ZoneMapStatistics {
             min: self.min.evaluate()?,
             max: self.max.evaluate()?,
@@ -743,12 +754,14 @@ impl ZoneMapIndexBuilder {
             nan_count: self.nan_count,
             fragment_id,
             zone_start,
-            zone_length: self.cur_zone_offset,
+            zone_length,
         };
 
         self.maps.push(new_map);
 
         self.cur_zone_offset = 0;
+        self.cur_zone_first_row_addr = None;
+        self.cur_zone_last_row_addr = None;
         self.min = MinAccumulator::try_new(&self.items_type)?;
         self.max = MaxAccumulator::try_new(&self.items_type)?;
         self.null_count = 0;
@@ -807,11 +820,30 @@ impl ZoneMapIndexBuilder {
                 if desired > remaining {
                     // Not enough data to fill a map, just increment counts
                     self.update_stats(&data_array.slice(array_offset, remaining))?;
+
+                    // Track first and last row addresses (local offsets within fragment)
+                    let first_addr = row_addrs_array.value(array_offset) & 0xFFFFFFFF;
+                    let last_addr =
+                        row_addrs_array.value(array_offset + remaining - 1) & 0xFFFFFFFF;
+                    if self.cur_zone_first_row_addr.is_none() {
+                        self.cur_zone_first_row_addr = Some(first_addr);
+                    }
+                    self.cur_zone_last_row_addr = Some(last_addr);
+
                     self.cur_zone_offset += remaining;
                     break;
                 } else if desired > 0 {
                     // There is enough data, create a new zone map
                     self.update_stats(&data_array.slice(array_offset, desired))?;
+
+                    // Track first and last row addresses (local offsets within fragment)
+                    let first_addr = row_addrs_array.value(array_offset) & 0xFFFFFFFF;
+                    let last_addr = row_addrs_array.value(array_offset + desired - 1) & 0xFFFFFFFF;
+                    if self.cur_zone_first_row_addr.is_none() {
+                        self.cur_zone_first_row_addr = Some(first_addr);
+                    }
+                    self.cur_zone_last_row_addr = Some(last_addr);
+
                     self.cur_zone_offset += desired;
                     self.new_map(row_addrs_array.value(array_offset) >> 32)?;
                 } else if desired == 0 {
@@ -856,7 +888,7 @@ impl ZoneMapIndexBuilder {
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
 
         let zone_lengths =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length as u64));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length));
 
         let zone_starts =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));

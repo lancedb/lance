@@ -5,7 +5,8 @@
 
 pub(crate) mod future;
 pub(crate) mod temporal;
+// Public test utilities module - only available during testing
 #[cfg(test)]
-pub(crate) mod test;
+pub mod test;
 #[cfg(feature = "tensorflow")]
 pub mod tfrecord;
