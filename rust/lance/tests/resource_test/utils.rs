@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use all_asserts::assert_ge;
 use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Once};
@@ -72,6 +73,9 @@ impl AllocationTracker for MemoryTracker {
         }
         let mut guard = GLOBAL_STATS.lock().unwrap();
         let stats = guard.entry(group_id).or_default();
+        // Track size of wrapped allocation and not total allocation size. The
+        // tracking_allocator keeps some bookkeeping data in addition to the requested
+        // allocation, which we don't want to count here.
         stats.total_bytes_deallocated += wrapped_size as isize;
         stats.total_deallocations += 1;
     }
@@ -186,12 +190,6 @@ async fn check_test_spawn_alloc() {
     }
     let stats = tracker.stats();
     assert_eq!(stats.total_allocations, 4);
-    assert_eq!(
-        stats.total_bytes_allocated >= (256 * 1024 + 512 * 1024),
-        true
-    );
-    assert_eq!(
-        stats.total_bytes_deallocated >= (256 * 1024 + 512 * 1024),
-        true
-    );
+    assert_ge!(stats.total_bytes_allocated, 256 * 1024 + 512 * 1024);
+    assert_ge!(stats.total_bytes_deallocated, 256 * 1024 + 512 * 1024);
 }
