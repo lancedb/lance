@@ -1913,7 +1913,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
-            .nprobs(nlist)
+            .nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
