@@ -119,6 +119,45 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             download_retry_count,
         })
     }
+
+    //.parse_url("az://container@account.dfs.core.windows.net/path-part/file")
+    fn calculcate_object_store_prefix(
+        &self,
+        scheme: &str,
+        authority: &str,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let (container, account) = match authority.find("@") {
+            Some(at_index) => {
+                // The URI looks like 'az://container@account.dfs.core.windows.net/path-part/file',
+                // or possibly 'az://container@account/path-part/file'.
+                let container = &authority[..at_index];
+                let account = &authority[at_index + 1..];
+                (
+                    container,
+                    account.split(".").next().unwrap_or_default().to_string(),
+                )
+            }
+            None => {
+                // The URI looks like 'az://container/path-part/file'.
+                // We must look at the storage options to find the account.
+                let opts = storage_options.ok_or(Error::invalid_input(
+                    "Unable to find object store prefix: no Azure "
+                        + "account name in URI, and no storage options configured.",
+                    location!(),
+                ))?;
+                let account = opts
+                    .get("azure_storage_account_name")
+                    .ok_or(Error::invalid_input(
+                    "Unable to find object store prefix: no Azure "
+                        + "account name in URI, and no azure_storage_account_name storage option.",
+                    location!(),
+                ))?;
+                (authority, account.to_string())
+            }
+        };
+        Ok(format!("{}${}@{}", scheme, container, account))
+    }
 }
 
 impl StorageOptions {

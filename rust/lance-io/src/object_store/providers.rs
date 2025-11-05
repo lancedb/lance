@@ -41,22 +41,29 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
         })
     }
 
-    /// Generate a cache URL for this provider.
+    /// Calculcate the unique prefix that should be used for this object store.
     ///
-    /// Providers can override this to implement custom cache key generation
-    /// that takes into account provider-specific requirements like namespace
-    /// isolation.
-    fn cache_url(&self, url: &Url) -> String {
-        if ["file", "file-object-store", "memory"].contains(&url.scheme()) {
-            // For file URLs, cache the URL without the path.
-            // The path can be different for different object stores,
-            // but we want to cache the object store itself.
-            format!("{}://", url.scheme())
-        } else {
-            // Bucket is parsed as domain, so drop the path.
-            let mut url = url.clone();
-            url.set_path("");
-            url.to_string()
+    /// For object stores that don't have the concept of buckets, this will just be something like
+    /// 'file' or 'memory'.
+    ///
+    /// In object stores where all bucket names are unique, like s3, this will be
+    /// simply 's3$my_bucket_name' or similar.
+    ///
+    /// In Azure, only the combination of (account name, container name) is unique, so
+    /// this will be something like 'az$account_name@container'
+    ///
+    /// Providers should override this if they have special requirements like Azure's.
+    fn calculcate_object_store_prefix(
+        &self,
+        scheme: &str,
+        authority: &str,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        match scheme {
+            "file" => Ok("file".to_string()),
+            "file-object-store" => Ok("file-object-store".to_string()),
+            "memory" => Ok("memory".to_string()),
+            _ => Ok(format!("{}${}", scheme, authority)),
         }
     }
 }
@@ -141,6 +148,15 @@ impl ObjectStoreRegistry {
         output
     }
 
+    fn scheme_not_found_error(&self, scheme: &str) -> Error {
+        let mut message = format!("No object store provider found for scheme: '{}'", scheme);
+        if let Ok(providers) = self.providers.read() {
+            let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
+            message.push_str(&format!("\nValid schemes: {}", valid_schemes));
+        }
+        return Error::invalid_input(message, location!());
+    }
+
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
@@ -153,16 +169,15 @@ impl ObjectStoreRegistry {
     ) -> Result<Arc<ObjectStore>> {
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
-            let mut message = format!("No object store provider found for scheme: '{}'", scheme);
-            if let Ok(providers) = self.providers.read() {
-                let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
-                message.push_str(&format!("\nValid schemes: {}", valid_schemes));
-            }
-            return Err(Error::invalid_input(message, location!()));
+            return Err(self.scheme_not_found_error(scheme));
         };
 
-        let cache_path = provider.cache_url(&base_path);
-        let cache_key = (cache_path, params.clone());
+        let cache_path = provider.calculcate_object_store_prefix(
+            base_path.scheme(),
+            base_path.authority(),
+            params.storage_options.as_ref(),
+        )?;
+        let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params
         {
@@ -197,7 +212,7 @@ impl ObjectStoreRegistry {
         store.inner = store.inner.traced();
 
         if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(store.inner, params.storage_options.as_ref());
+            store.inner = wrapper.wrap(&cache_path, store.inner);
         }
 
         let store = Arc::new(store);
@@ -209,6 +224,44 @@ impl ObjectStoreRegistry {
         }
 
         Ok(store)
+    }
+
+    /// Calculate the datastore prefix based on the URI and the storage options.
+    /// The data store prefix should uniquely identify the datastore.
+    pub fn calculate_object_store_prefix(
+        &self,
+        uri: &str,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let (scheme, authority) = match uri.find("://") {
+            None => {
+                // If there is no scheme, this is a file:// URI.
+                return Ok("file/".to_string());
+            }
+            Some(index) => {
+                let scheme = &uri[..index];
+                let authority = match uri[index + 1..].find("/") {
+                    None => &uri[index + 1..],
+                    Some(sindex) => &uri[index + 1..sindex],
+                };
+                (scheme, authority)
+            }
+        };
+        match self.get_provider(scheme) {
+            None => {
+                if scheme.len() == 1 {
+                    // On Windows, drive letters such as C:/ can sometimes be confused for schemes.
+                    // So if there is no known object store for this single-letter scheme, treat it
+                    // as the local store.
+                    return Ok("file/".to_string());
+                } else {
+                    return Err(self.scheme_not_found_error(scheme));
+                }
+            }
+            Some(provider) => {
+                provider.calculcate_object_store_prefix(scheme, authority, storage_options)
+            }
+        }
     }
 }
 
