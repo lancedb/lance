@@ -53,7 +53,6 @@ def query_seven(ds, filt: str):
     assert table.column("idx").to_pylist() == [7]
 
     explain = ds.scanner(filter=filt).explain_plan()
-    print(explain)
     assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
 
