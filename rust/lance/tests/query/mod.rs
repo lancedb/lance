@@ -38,12 +38,15 @@ async fn test_scan(original: &RecordBatch, ds: &Dataset) {
 async fn test_take(original: &RecordBatch, ds: &Dataset) {
     let num_rows = original.num_rows();
     let cases: Vec<Vec<usize>> = vec![
-        vec![0, 1, 2],                   // First few rows
-        vec![5, 3, 1],                   // Out of order
-        vec![0],                         // Single row
-        vec![],                          // Empty
-        (0..num_rows.min(10)).collect(), // Sequential
-        vec![num_rows - 1, 0],           // Last and first
+        vec![0, 1, 2],                    // First few rows
+        vec![5, 3, 1],                    // Out of order
+        vec![0],                          // Single row
+        vec![],                           // Empty
+        (0..num_rows.min(10)).collect(),  // Sequential
+        vec![num_rows - 1, 0],            // Last and first
+        vec![1, 1, 2],                    // Duplicate indices
+        vec![0, 0, 0],                    // All same index
+        vec![num_rows - 1, num_rows - 1], // Duplicate of last row
     ];
 
     for indices in cases {
@@ -157,8 +160,12 @@ async fn test_ann(original: &RecordBatch, ds: &Dataset, column: &str, predicate:
     let expected_batches = df.collect().await.unwrap();
     let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
 
-    // Compare only the main data (excluding _distance column which Lance adds)
-    // We validate that both return the same number of rows and same row ordering
+    // Compare only the main data (excluding _distance column which Lance adds).
+    // We validate that both return the same number of rows and same row ordering.
+    // Note: We don't validate the _distance column values because:
+    // 1. ANN indices provide approximate distances, not exact values
+    // 2. Some distance functions return ordering values (e.g., squared euclidean
+    //    without the final sqrt step) rather than true distances
     assert_eq!(
         expected.num_rows(),
         result.num_rows(),

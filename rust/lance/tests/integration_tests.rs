@@ -5,4 +5,5 @@
 
 #[cfg(feature = "slow_tests")]
 mod query;
+#[cfg(feature = "slow_tests")]
 mod utils;
