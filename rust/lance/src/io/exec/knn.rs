@@ -1033,7 +1033,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let mut query = query.clone();
                     query.minimum_nprobes = std::cmp::min(
                         query.minimum_nprobes,
-                        early_pruning(dists.values(), query.k),
+                        early_pruning(q_c_dists.values(), query.k),
                     );
                     async move {
                         let raw_index = ds
