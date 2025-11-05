@@ -1718,39 +1718,6 @@ def test_zonemap_deletion_handling(tmp_path: Path):
     assert ids == [0, 2, 4, 6, 8]
 
 
-def test_bloomfilter_index(tmp_path: Path):
-    """Test create bloomfilter index"""
-    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
-    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
-    indices = dataset.list_indices()
-    assert len(indices) == 1
-
-    # Get detailed index statistics
-    index_stats = dataset.stats.index_stats("values_idx")
-    assert index_stats["index_type"] == "BloomFilter"
-    assert "indices" in index_stats
-    assert len(index_stats["indices"]) == 1
-
-    # Verify bloomfilter statistics
-    bloom_stats = index_stats["indices"][0]
-    assert "num_blocks" in bloom_stats
-    assert bloom_stats["num_blocks"] == 2
-    assert bloom_stats["number_of_items"] == 8192
-    assert "probability" in bloom_stats
-    assert bloom_stats["probability"] == 0.00057  # Default probability
-
-    # Test that the bloomfilter index is being used in the query plan
-    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
-    plan = scanner.explain_plan()
-    assert "ScalarIndexQuery" in plan
-
-    # Verify the query returns correct results
-    result = scanner.to_table()
-    assert result.num_rows == 1
-    assert result["values"][0].as_py() == 1234
-
-
 def test_zonemap_index_remapping(tmp_path: Path):
     """Test zonemap index remapping after compaction and optimization"""
     # Create a dataset with 5 fragments by writing data in chunks
@@ -1805,6 +1772,68 @@ def test_zonemap_index_remapping(tmp_path: Path):
 
     result = scanner.to_table()
     assert result.num_rows == 501  # 1000..1500 inclusive
+
+
+def test_bloomfilter_index(tmp_path: Path):
+    """Test create bloomfilter index"""
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+
+    # Get detailed index statistics
+    index_stats = dataset.stats.index_stats("values_idx")
+    assert index_stats["index_type"] == "BloomFilter"
+    assert "indices" in index_stats
+    assert len(index_stats["indices"]) == 1
+
+    # Verify bloomfilter statistics
+    bloom_stats = index_stats["indices"][0]
+    assert "num_blocks" in bloom_stats
+    assert bloom_stats["num_blocks"] == 2
+    assert bloom_stats["number_of_items"] == 8192
+    assert "probability" in bloom_stats
+    assert bloom_stats["probability"] == 0.00057  # Default probability
+
+    # Test that the bloomfilter index is being used in the query plan
+    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 1
+    assert result["values"][0].as_py() == 1234
+
+
+def test_bloomfilter_deletion_handling(tmp_path: Path):
+    """Test bloomfilter deletion handling"""
+    data = pa.table(
+        {
+            "id": range(10),
+            "value": [1, 0] * 5,
+        }
+    )
+    ds = lance.write_dataset(data, "memory://")
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    # now create the index before deletion
+    ds = lance.write_dataset(data, "memory://")
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
 
 def test_json_index():
@@ -2336,9 +2365,9 @@ def compare_fts_results(
     if "_rowid" in single_df.columns:
         single_rowids = set(single_df["_rowid"])
         distributed_rowids = set(distributed_df["_rowid"])
-        assert (
-            single_rowids == distributed_rowids
-        ), f"Row ID mismatch: single={single_rowids}, distributed={distributed_rowids}"
+        assert single_rowids == distributed_rowids, (
+            f"Row ID mismatch: single={single_rowids}, distributed={distributed_rowids}"
+        )
 
     # Compare scores with tolerance
     if "_score" in single_df.columns:
@@ -2366,9 +2395,9 @@ def compare_fts_results(
             )
 
             if isinstance(single_values, set):
-                assert (
-                    single_values == distributed_values
-                ), f"Column {col} content mismatch"
+                assert single_values == distributed_values, (
+                    f"Column {col} content mismatch"
+                )
             else:
                 np.testing.assert_array_equal(
                     single_values,
@@ -2705,9 +2734,9 @@ def generate_multi_fragment_dataset(tmp_path, num_fragments=4, rows_per_fragment
 
     # Verify we have the expected number of fragments
     fragments = ds.get_fragments()
-    assert (
-        len(fragments) == num_fragments
-    ), f"Expected {num_fragments} fragments, got {len(fragments)}"
+    assert len(fragments) == num_fragments, (
+        f"Expected {num_fragments} fragments, got {len(fragments)}"
+    )
 
     return ds
 
@@ -2743,9 +2772,9 @@ def test_build_distributed_fts_index_basic(tmp_path):
             break
 
     assert distributed_index is not None, "Distributed index not found"
-    assert (
-        distributed_index["type"] == "Inverted"
-    ), f"Expected Inverted index, got {distributed_index['type']}"
+    assert distributed_index["type"] == "Inverted", (
+        f"Expected Inverted index, got {distributed_index['type']}"
+    )
 
     # Test that the index works for searching
     results = distributed_ds.scanner(
@@ -2852,9 +2881,9 @@ def test_validate_distributed_fts_basic_search(tmp_path):
     # Both should have the same number of rows
     single_rows = results["single_machine"].num_rows
     distributed_rows = results["distributed"].num_rows
-    assert (
-        single_rows == distributed_rows
-    ), f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    assert single_rows == distributed_rows, (
+        f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    )
 
     # Should have found some results for 'frodo'
     assert single_rows > 0, "No results found for search term 'frodo'"
@@ -2882,12 +2911,12 @@ def test_validate_distributed_fts_score_consistency(tmp_path):
     single_results = results["single_machine"]
     distributed_results = results["distributed"]
 
-    assert (
-        "_score" in single_results.column_names
-    ), "Missing _score in single machine results"
-    assert (
-        "_score" in distributed_results.column_names
-    ), "Missing _score in distributed results"
+    assert "_score" in single_results.column_names, (
+        "Missing _score in single machine results"
+    )
+    assert "_score" in distributed_results.column_names, (
+        "Missing _score in distributed results"
+    )
 
     # Scores should be very close (within 1e-6 tolerance)
     single_scores = single_results.column("_score").to_pylist()
@@ -2913,9 +2942,9 @@ def test_validate_distributed_fts_empty_results(tmp_path):
     )
 
     # Both should return empty results
-    assert (
-        results["single_machine"].num_rows == 0
-    ), "Single machine should return 0 results"
+    assert results["single_machine"].num_rows == 0, (
+        "Single machine should return 0 results"
+    )
     assert results["distributed"].num_rows == 0, "Distributed should return 0 results"
 
 
@@ -2941,9 +2970,9 @@ def test_validate_distributed_fts_large_dataset(tmp_path):
     distributed_rows = results["distributed"].num_rows
 
     assert single_rows > 0, "Should find results for 'gandalf'"
-    assert (
-        single_rows == distributed_rows
-    ), f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    assert single_rows == distributed_rows, (
+        f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    )
 
 
 # ============================================================================
@@ -3170,9 +3199,9 @@ def test_distribute_fts_index_build(tmp_path):
             our_index = idx
             break
     assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert (
-        our_index["type"] == "Inverted"
-    ), f"Expected Inverted index, got {our_index['type']}"
+    assert our_index["type"] == "Inverted", (
+        f"Expected Inverted index, got {our_index['type']}"
+    )
 
     # Test that the index works for searching
     # Get a sample text from the dataset to search for
@@ -3362,9 +3391,9 @@ def test_distribute_btree_index_build(tmp_path):
             break
 
     assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert (
-        our_index["type"] == "BTree"
-    ), f"Expected BTree index, got {our_index['type']}"
+    assert our_index["type"] == "BTree", (
+        f"Expected BTree index, got {our_index['type']}"
+    )
 
     # Test that the index works for searching
     # Test exact equality queries

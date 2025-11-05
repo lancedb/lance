@@ -1262,22 +1262,18 @@ mod tests {
             .copied()
             .collect();
 
-        println!("Before index: {:?}", before_ids);
-        println!("After index:  {:?}", after_ids);
-        println!("BUG: Expected [0, 2, 4, 6, 8] but may get only [0, 2, 4]");
-
         // This assertion will FAIL if bug #4758 is present
         assert_eq!(
             after_ids.len(),
             5,
-            "BUG #4758: Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
             after_ids.len(),
             after_ids
         );
         assert_eq!(
             after_ids,
             vec![0, 2, 4, 6, 8],
-            "BUG #4758: Zonemap index with deletions returns wrong results"
+            "Zonemap index with deletions returns wrong results"
         );
     }
 
@@ -1318,8 +1314,6 @@ mod tests {
             .await
             .unwrap();
 
-        println!("Created zonemap index on 'value' column");
-
         // Query with index before deletion - should return all 5 rows with value=true
         let before_deletion: Vec<arrow_array::RecordBatch> = ds
             .scan()
@@ -1343,7 +1337,6 @@ mod tests {
             .copied()
             .collect();
 
-        println!("Before deletion (with index): {:?}", before_deletion_ids);
         assert_eq!(
             before_deletion_ids,
             vec![0, 2, 4, 6, 8],
@@ -1352,7 +1345,6 @@ mod tests {
 
         // NOW DELETE rows where value=false (rows 1, 3, 5, 7, 9)
         ds.delete("NOT value").await.unwrap();
-        println!("Deleted rows where value=false");
 
         // Query after deletion - should still return 5 rows with value=true
         let after_deletion: Vec<arrow_array::RecordBatch> = ds
@@ -1376,8 +1368,6 @@ mod tests {
             .iter()
             .copied()
             .collect();
-
-        println!("After deletion (with index): {:?}", after_deletion_ids);
 
         // Verify we get the correct data after deletion
         assert_eq!(
@@ -1409,46 +1399,6 @@ mod tests {
             "All returned rows should have value=true"
         );
 
-        // Check dataset statistics after deletion
-        let count_after_deletion = ds.count_rows(None).await.unwrap();
-        println!("Dataset count after deletion: {}", count_after_deletion);
-
-        // Count all rows by scanning (to see actual visible rows)
-        let count_by_scan_all: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let scan_count: usize = count_by_scan_all.iter().map(|b| b.num_rows()).sum();
-        println!("Rows visible in scan: {}", scan_count);
-
-        // Debug: What IDs and values are in the unfiltered scan?
-        if !count_by_scan_all.is_empty() {
-            let scan_ids_debug: Vec<u64> = count_by_scan_all[0]
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .unwrap()
-                .values()
-                .iter()
-                .copied()
-                .collect();
-            let scan_values_debug: Vec<Option<bool>> = count_by_scan_all[0]
-                .column_by_name("value")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::BooleanArray>()
-                .unwrap()
-                .iter()
-                .collect();
-            println!("Unfiltered scan IDs: {:?}", scan_ids_debug);
-            println!("Unfiltered scan values: {:?}", scan_values_debug);
-        }
-
         // Count rows matching "value = true"
         let count_true: Vec<arrow_array::RecordBatch> = ds
             .scan()
@@ -1461,7 +1411,6 @@ mod tests {
             .await
             .unwrap();
         let count_true_rows: usize = count_true.iter().map(|b| b.num_rows()).sum();
-        println!("Rows with value=true: {}", count_true_rows);
 
         // Count rows matching "value = false" (should be 0 after deletion)
         let count_false: Vec<arrow_array::RecordBatch> = ds
@@ -1475,7 +1424,6 @@ mod tests {
             .await
             .unwrap();
         let count_false_rows: usize = count_false.iter().map(|b| b.num_rows()).sum();
-        println!("Rows with value=false: {}", count_false_rows);
 
         // The key assertions: filtered queries should return correct data
         assert_eq!(
@@ -1486,17 +1434,277 @@ mod tests {
             count_false_rows, 0,
             "Should have 0 rows with value=false after deletion"
         );
+    }
 
-        println!("\n=== Test Results ===");
-        println!("✓ Zonemap index correctly filters for value=true: 5 rows");
-        println!("✓ Zonemap index correctly filters for value=false: 0 rows (deleted)");
-        println!("✓ Filtered query after deletion returns correct IDs: [0, 2, 4, 6, 8]");
-        println!("✓ Filtered query after deletion returns correct values: all true");
+    #[tokio::test]
+    async fn test_bloomfilter_deletion_then_index() {
+        // Reproduces the same bug as #4758 but for bloom filter indexes
+        // After deleting rows and creating a bloom filter index, queries return fewer results than expected
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
 
-        // Note: Unfiltered scans may show different behavior with deletion vectors
-        // The critical functionality is that filtered queries work correctly
-        println!("\nNote: Unfiltered scan shows {} rows", scan_count);
-        println!("This is expected behavior - deletion vectors are applied during filtering");
-        println!("✓ Test passed: Index-then-deletion scenario validates correctly");
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        // Delete rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Verify data before index creation: should have 5 rows with value="apple"
+        let before_index: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let before_ids: Vec<u64> = before_index[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(
+            before_ids,
+            vec![0, 2, 4, 6, 8],
+            "Before index: should have 5 rows"
+        );
+
+        // Create bloom filter index on "value" column with small zone size to ensure the bug is triggered
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let after_index: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let after_ids: Vec<u64> = after_index[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        // This assertion verifies the fix works
+        assert_eq!(
+            after_ids.len(),
+            5,
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            after_ids.len(),
+            after_ids
+        );
+        assert_eq!(
+            after_ids,
+            vec![0, 2, 4, 6, 8],
+            "Bloom filter index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_index_then_deletion() {
+        // Tests the opposite scenario: create bloom filter index FIRST, then perform deletions
+        // Verifies that bloom filter index properly handles deletions that occur after index creation
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        // Verify initial data: should have 10 rows
+        let initial_data: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let initial_count: usize = initial_data.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(initial_count, 10, "Should start with 10 rows");
+
+        // CREATE INDEX FIRST (before deletion)
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Query with index before deletion - should return all 5 rows with value="apple"
+        let before_deletion: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let before_deletion_ids: Vec<u64> = before_deletion[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        assert_eq!(
+            before_deletion_ids,
+            vec![0, 2, 4, 6, 8],
+            "Before deletion: should return 5 rows with value='apple'"
+        );
+
+        // NOW DELETE rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Query after deletion - should still return 5 rows with value="apple"
+        let after_deletion: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let after_deletion_ids: Vec<u64> = after_deletion[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        // Verify we get the correct data after deletion
+        assert_eq!(
+            after_deletion_ids.len(),
+            5,
+            "After deletion: Expected 5 rows, got {}",
+            after_deletion_ids.len()
+        );
+        assert_eq!(
+            after_deletion_ids,
+            vec![0, 2, 4, 6, 8],
+            "After deletion: Should return rows [0, 2, 4, 6, 8] with value='apple'"
+        );
+
+        // Verify the actual values are correct
+        let after_deletion_values: Vec<&str> = after_deletion[0]
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            after_deletion_values,
+            vec!["apple", "apple", "apple", "apple", "apple"],
+            "All returned rows should have value='apple'"
+        );
+
+        // Count rows matching "value = 'apple'"
+        let count_apple: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let count_apple_rows: usize = count_apple.iter().map(|b| b.num_rows()).sum();
+
+        // Count rows matching "value = 'banana'" (should be 0 after deletion)
+        let count_banana: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .filter("value = 'banana'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let count_banana_rows: usize = count_banana.iter().map(|b| b.num_rows()).sum();
+
+        // The key assertions: filtered queries should return correct data
+        assert_eq!(
+            count_apple_rows, 5,
+            "Should have exactly 5 rows with value='apple'"
+        );
+        assert_eq!(
+            count_banana_rows, 0,
+            "Should have 0 rows with value='banana' after deletion"
+        );
     }
 }
