@@ -612,7 +612,7 @@ impl RowIdTreeMap {
 
     /// Serialize the set into the given buffer
     ///
-    /// Keep the serialization format stable, it is used for serializing indexes data.
+    /// The serialization format is stable and used for index serialization
     ///
     /// The serialization format is:
     /// * u32: num_entries
