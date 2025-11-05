@@ -1,6 +1,7 @@
 use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Once};
+use tracing::Instrument;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
 use tracking_allocator::{
@@ -161,4 +162,34 @@ fn check_memory_leak() {
     assert_eq!(stats.total_bytes_deallocated, (1024 * 1024) + 8);
     assert_eq!(stats.total_allocations, 2);
     assert_eq!(stats.net_bytes_allocated(), 1024 + 8);
+}
+
+#[tokio::test]
+async fn check_test_spawn_alloc() {
+    let tracker = AllocTracker::new();
+    {
+        let _guard = tracker.enter();
+        let future1 = async {
+            let v = vec![0u8; 256 * 1024];
+            drop(v);
+        };
+        let handle = tokio::spawn(future1.in_current_span());
+        let future2 = async {
+            let v = vec![0u8; 512 * 1024];
+            drop(v);
+        };
+        let handle2 = tokio::spawn(future2.in_current_span());
+        handle.await.unwrap();
+        handle2.await.unwrap();
+    }
+    let stats = tracker.stats();
+    assert_eq!(stats.total_allocations, 4);
+    assert_eq!(
+        stats.total_bytes_allocated >= (256 * 1024 + 512 * 1024),
+        true
+    );
+    assert_eq!(
+        stats.total_bytes_deallocated >= (256 * 1024 + 512 * 1024),
+        true
+    );
 }

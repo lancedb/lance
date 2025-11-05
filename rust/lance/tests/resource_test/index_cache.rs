@@ -92,26 +92,6 @@ async fn test_cache_accounting<F, Fut>(
     }
 }
 
-// fn test_deep_size_of(value: impl deepsize::DeepSizeOf) {
-//     let tracker = AllocTracker::new();
-//     let reported_size = deepsize::DeepSizeOf::deep_size_of(&value);
-//     {
-//         let _guard = tracker.enter();
-//         drop(value);
-//     }
-//     let stats = tracker.stats();
-//     let actual_freed = stats.total_bytes_deallocated.saturating_sub(stats.total_bytes_allocated) as usize;
-//     assert_eq!(reported_size, actual_freed);
-// }
-
-// #[test]
-// fn test_deep_size_of_label_list_index() {
-//     AllocTracker::init();
-//     LabelListIndex::nemw
-//     let value = todo!();
-//     test_deep_size_of(value);
-// }
-
 #[tokio::test]
 async fn test_label_list_index_cache_accounting() {
     AllocTracker::init();

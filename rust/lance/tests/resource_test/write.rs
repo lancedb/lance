@@ -5,13 +5,11 @@ use lance::dataset::InsertBuilder;
 use lance_datafusion::datagen::DatafusionDatagenExt;
 use lance_datagen::{array, gen_batch, BatchCount, ByteCount, RoundingBehavior};
 
-// TODO: also add IO
-
 #[tokio::test]
 async fn test_insert_memory() {
     // Create a stream of 100MB of data, in batches
-    let batch_size = 1024 * 1024; // 1MB
-    let num_batches = BatchCount::from(100);
+    let batch_size = 10 * 1024 * 1024; // 10MB
+    let num_batches = BatchCount::from(10);
     let data = gen_batch()
         .col("a", array::rand_type(&DataType::Int32))
         .into_df_stream_bytes(
@@ -35,14 +33,11 @@ async fn test_insert_memory() {
     }
 
     let stats = alloc_tracker.stats();
-    // Allow for 15x the batch size to account for:
-    // - Allocator metadata overhead (wrapped_size vs object_size)
-    // - Internal buffering and temporary allocations
-    // - Arrow array overhead
+    // Allow for 2x the batch size to account for overheads.
     // The key test is that we don't load all 100MB into memory at once
     assert_le!(
         stats.max_bytes_allocated,
-        (batch_size * 15) as isize,
+        (batch_size * 2) as isize,
         "Max memory usage exceeded"
     );
 }
