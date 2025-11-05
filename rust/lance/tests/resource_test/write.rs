@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use super::utils::AllocTracker;
 use all_asserts::assert_le;
 use arrow_schema::DataType;

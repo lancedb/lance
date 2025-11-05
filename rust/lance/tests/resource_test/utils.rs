@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Once};
