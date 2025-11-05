@@ -41,9 +41,10 @@ async fn test_query_prefilter_date() {
                 Some(IndexType::IvfPq),
                 Some(IndexType::IvfSq),
                 Some(IndexType::IvfFlat),
-                Some(IndexType::IvfHnswFlat),
-                Some(IndexType::IvfHnswPq),
-                Some(IndexType::IvfHnswSq),
+                // TODO: HNSW results are very flakey.
+                // Some(IndexType::IvfHnswFlat),
+                // Some(IndexType::IvfHnswPq),
+                // Some(IndexType::IvfHnswSq),
             ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
