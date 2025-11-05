@@ -61,13 +61,39 @@ impl DatasetTestCases {
     }
 
     fn generate_index_combinations(&self) -> Vec<Vec<(&str, IndexType)>> {
-        let mut combinations = Vec::new();
-        for (column, index_types) in &self.index_options {
-            for index_type in index_types.iter().flatten() {
-                combinations.push(vec![(column.as_str(), *index_type)]);
+        if self.index_options.is_empty() {
+            return vec![vec![]];
+        }
+
+        fn generate_recursive<'a>(
+            options: &'a [(String, Vec<Option<IndexType>>)],
+            current_idx: usize,
+            current_combination: Vec<(&'a str, IndexType)>,
+            results: &mut Vec<Vec<(&'a str, IndexType)>>,
+        ) {
+            if current_idx == options.len() {
+                // Only add non-empty combinations (filter out all-None case)
+                if !current_combination.is_empty() {
+                    results.push(current_combination);
+                }
+                return;
+            }
+
+            let (column, index_types) = &options[current_idx];
+
+            // Try each index type for this column (including None)
+            for index_type_opt in index_types {
+                let mut next_combination = current_combination.clone();
+                if let Some(index_type) = index_type_opt {
+                    next_combination.push((column.as_str(), *index_type));
+                }
+                generate_recursive(options, current_idx + 1, next_combination, results);
             }
         }
-        combinations
+
+        let mut results = Vec::new();
+        generate_recursive(&self.index_options, 0, Vec::new(), &mut results);
+        results
     }
 
     pub async fn run<F, Fut>(self, test_fn: F) -> Fut::Output
@@ -126,15 +152,20 @@ async fn build_dataset(
         })
         .execute(vec![data_to_write])
         .await
-        .unwrap();
+        .expect("Failed to create test dataset");
 
-    ds.delete("id = -1").await.unwrap();
+    ds.delete("id = -1")
+        .await
+        .expect("Failed to delete filler rows (id = -1)");
 
     assert_eq!(ds.count_rows(None).await.unwrap(), original.num_rows());
 
     for (column, index_type) in indices.iter() {
         // TODO: when possible, make indices cover a portion of rows and not be
         // aligned between indices.
+
+        // Index parameters are chosen to make search results deterministic for small
+        // test datasets, not for production use.
         let index_params: Box<dyn IndexParams> = match index_type {
             IndexType::BTree
             | IndexType::Bitmap
@@ -182,7 +213,12 @@ async fn build_dataset(
 
         ds.create_index_builder(&[column], *index_type, index_params.as_ref())
             .await
-            .unwrap();
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to create index on column '{}' with type {:?}: {}",
+                    column, index_type, e
+                )
+            });
     }
 
     ds
