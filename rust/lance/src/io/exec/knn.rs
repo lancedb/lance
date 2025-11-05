@@ -306,11 +306,6 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             false,
         ),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
-        Field::new(
-            DIST_COL,
-            DataType::List(Field::new_list_field(DataType::Float32, false).into()),
-            false,
-        ),
     ]))
 });
 
