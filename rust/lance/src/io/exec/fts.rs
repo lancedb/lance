@@ -26,6 +26,7 @@ use super::PreFilterSource;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
+use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
@@ -80,10 +81,20 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -255,7 +266,14 @@ impl ExecutionPlan for MatchQueryExec {
                     let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
                         tantivy::tokenizer::SimpleTokenizer::default(),
                     );
-                    Box::new(TextTokenizer::new(tokenizer))
+                    match inverted_idx.tokenizer().doc_type() {
+                        DocType::Text => {
+                            Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                        DocType::Json => {
+                            Box::new(JsonTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                    }
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
@@ -263,7 +281,7 @@ impl ExecutionPlan for MatchQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     query.operator,
                     pre_filter,
@@ -325,10 +343,20 @@ impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlatMatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlatMatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -483,10 +511,20 @@ impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "PhraseQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "PhraseQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -646,7 +684,7 @@ impl ExecutionPlan for PhraseQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
                     pre_filter,

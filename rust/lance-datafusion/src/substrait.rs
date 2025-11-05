@@ -53,6 +53,11 @@ pub fn encode_substrait(
 fn count_fields(dtype: &Type) -> usize {
     match dtype.kind.as_ref().unwrap() {
         Kind::Struct(struct_type) => struct_type.types.iter().map(count_fields).sum::<usize>() + 1,
+        Kind::List(list_type) => {
+            // Recursively count fields in the list's child type
+            // This is critical for schemas with List<Struct> patterns
+            count_fields(list_type.r#type.as_ref().unwrap())
+        }
         _ => 1,
     }
 }
@@ -390,5 +395,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded, expr);
+    }
+
+    /// Helper to create a simple equality filter on the "id" field
+    fn id_filter(value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("id"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to test substrait roundtrip encode/decode
+    async fn assert_substrait_roundtrip(schema: Schema, expr: Expr) {
+        let schema = Arc::new(schema);
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    /// Helper to create List<Struct> field
+    fn list_of_struct(name: &str, fields: Vec<Field>) -> Field {
+        Field::new(
+            name,
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(fields.into()),
+                true,
+            ))),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_of_struct() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_of_struct(
+                "top_previous_companies",
+                vec![
+                    Field::new("company_id", DataType::Int64, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_struct_struct() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_of_struct(
+                "employees_count_breakdown_by_month",
+                vec![
+                    Field::new("date", DataType::Utf8, true),
+                    Field::new(
+                        "breakdown",
+                        DataType::Struct(
+                            vec![
+                                Field::new("employees_count_owner", DataType::Int64, true),
+                                Field::new("employees_count_founder", DataType::Int64, true),
+                                Field::new("employees_count_clevel", DataType::Int64, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_many_nested_columns() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "location",
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("country", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            list_of_struct(
+                "top_previous_companies",
+                vec![
+                    Field::new("company_id", DataType::Int64, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                ],
+            ),
+            list_of_struct(
+                "employees_by_month",
+                vec![
+                    Field::new("date", DataType::Utf8, true),
+                    Field::new(
+                        "breakdown",
+                        DataType::Struct(
+                            vec![
+                                Field::new("count_owner", DataType::Int64, true),
+                                Field::new("count_founder", DataType::Int64, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
     }
 }

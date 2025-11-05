@@ -577,9 +577,25 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                Operation::DataReplacement { replacements } => {
+                    // A data replacement only conflicts if it is updating the field that
+                    // is being indexed.
+                    let newly_indexed_fields = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter())
+                        .collect::<HashSet<_>>();
+                    for replacement in replacements {
+                        for field in &replacement.1.fields {
+                            if newly_indexed_fields.contains(&field) {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
@@ -832,33 +848,68 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        match &other_transaction.operation {
-            Operation::Append { .. }
-            | Operation::Clone { .. }
-            | Operation::Delete { .. }
-            | Operation::Update { .. }
-            | Operation::Merge { .. }
-            | Operation::UpdateConfig { .. }
-            | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
-            | Operation::UpdateBases { .. } => Ok(()),
-            Operation::CreateIndex { .. } => {
-                // TODO(rmeng): check that the new indices isn't on the column being replaced
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+        if let Operation::DataReplacement { replacements } = &self.transaction.operation {
+            match &other_transaction.operation {
+                Operation::Append { .. }
+                | Operation::Clone { .. }
+                | Operation::Delete { .. }
+                | Operation::Update { .. }
+                | Operation::Merge { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateBases { .. } => Ok(()),
+                Operation::CreateIndex { new_indices, .. } => {
+                    // A data replacement only conflicts if it is updating the field that
+                    // is being indexed.
+                    //
+                    // TODO: We could potentially just drop the fragments being replaced from
+                    // the index's fragment bitmap, which would lead to fewer conflicts.  However
+                    // this would introduce fragment bitmaps with holes which may not be well tested
+                    // yet.  For now, we don't allow this case.
+                    let newly_indexed_fields = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter())
+                        .collect::<HashSet<_>>();
+                    for replacement in replacements {
+                        for field in &replacement.1.fields {
+                            if newly_indexed_fields.contains(&field) {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Operation::Rewrite { .. } => {
+                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
+                    Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ))
+                }
+                Operation::DataReplacement { .. } => {
+                    // TODO(rmeng): check cell conflicts
+                    Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    ))
+                }
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                )),
             }
-            Operation::Rewrite { .. } => {
-                // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
-            }
-            Operation::DataReplacement { .. } => {
-                // TODO(rmeng): check cell conflicts
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
-            }
-            Operation::Overwrite { .. }
-            | Operation::Restore { .. }
-            | Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
-            }
+        } else {
+            Err(wrong_operation_err(&self.transaction.operation))
         }
     }
 
@@ -2160,7 +2211,7 @@ mod tests {
         ];
         let other_transactions = other_operations
             .iter()
-            .map(|op| Transaction::new(0, op.clone(), None, None))
+            .map(|op| Transaction::new(0, op.clone(), None))
             .collect::<Vec<_>>();
 
         // Transactions and whether they are expected to conflict with each
@@ -2518,7 +2569,7 @@ mod tests {
         ];
 
         for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None, None);
+            let transaction = Transaction::new(0, operation.clone(), None);
             let mut rebase = TransactionRebase {
                 transaction,
                 initial_fragments: HashMap::new(),

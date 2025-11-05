@@ -34,6 +34,7 @@ use url::Url;
 use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
+pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
@@ -61,6 +62,9 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use storage_options::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+};
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -189,6 +193,8 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Dynamic storage options provider for automatic credential refresh
+    pub storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
     /// Use constant size upload parts for multipart uploads. Only necessary
     /// for Cloudflare R2, which doesn't support variable size parts. When this
     /// is false, max upload size is 2.5TB. When this is true, the max size is
@@ -208,6 +214,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            storage_options_provider: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
         }
@@ -218,7 +225,7 @@ impl Default for ObjectStoreParams {
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For hashing, we use pointer values for ObjectStore, S3 credentials, and wrapper
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper, and storage options provider
         self.block_size.hash(state);
         if let Some((store, url)) = &self.object_store {
             Arc::as_ptr(store).hash(state);
@@ -238,6 +245,9 @@ impl std::hash::Hash for ObjectStoreParams {
                 value.hash(state);
             }
         }
+        if let Some(provider) = &self.storage_options_provider {
+            provider.provider_id().hash(state);
+        }
         self.use_constant_size_upload_parts.hash(state);
         self.list_is_lexically_ordered.hash(state);
     }
@@ -253,7 +263,8 @@ impl PartialEq for ObjectStoreParams {
             return false;
         }
 
-        // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
+        // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
+        // For storage_options_provider, we use provider_id() for semantic equality
         self.block_size == other.block_size
             && self
                 .object_store
@@ -267,6 +278,14 @@ impl PartialEq for ObjectStoreParams {
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self.storage_options == other.storage_options
+            && self
+                .storage_options_provider
+                .as_ref()
+                .map(|p| p.provider_id())
+                == other
+                    .storage_options_provider
+                    .as_ref()
+                    .map(|p| p.provider_id())
             && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
             && self.list_is_lexically_ordered == other.list_is_lexically_ordered
     }
@@ -699,6 +718,13 @@ impl StorageOptions {
 
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.get(key)
+    }
+
+    /// Get the expiration time in milliseconds since epoch, if present
+    pub fn expires_at_millis(&self) -> Option<u64> {
+        self.0
+            .get(EXPIRES_AT_MILLIS_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
     }
 }
 

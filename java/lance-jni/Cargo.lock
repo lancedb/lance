@@ -2290,18 +2290,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
-name = "fastbloom"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c1ddb9231d8554c2d6bdf4cfaabf0c59251658c68b6c95cd52dd0c513a912a"
-dependencies = [
- "getrandom 0.3.3",
- "libm",
- "rand 0.9.1",
- "siphasher",
-]
-
-[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2379,7 +2367,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3145,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3194,6 +3182,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.1",
  "roaring",
+ "semver",
  "serde",
  "serde_json",
  "snafu",
@@ -3207,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3225,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3234,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3270,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3300,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3317,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3354,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3379,7 +3368,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "roaring",
  "snafu",
  "tokio",
  "tracing",
@@ -3387,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3409,7 +3397,6 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "dirs",
- "fastbloom",
  "fst",
  "futures",
  "half",
@@ -3449,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3489,10 +3476,11 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "async-trait",
  "chrono",
  "env_logger",
  "jni",
@@ -3504,42 +3492,37 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
  "log",
  "object_store",
  "prost",
  "prost-types",
  "roaring",
  "serde_json",
+ "snafu",
  "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-ord",
  "arrow-schema",
- "bitvec",
  "cc",
  "deepsize",
- "futures",
  "half",
  "lance-arrow",
  "lance-core",
- "log",
  "num-traits",
  "rand 0.9.1",
- "rayon",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "lance-namespace"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3564,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3589,6 +3572,7 @@ dependencies = [
  "rand 0.9.1",
  "rangemap",
  "roaring",
+ "semver",
  "serde",
  "serde_json",
  "snafu",
@@ -3914,12 +3898,9 @@ dependencies = [
 
 [[package]]
 name = "mock_instant"
-version = "0.3.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
-dependencies = [
- "once_cell",
-]
+checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "moka"

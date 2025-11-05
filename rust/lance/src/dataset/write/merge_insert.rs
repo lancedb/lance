@@ -877,7 +877,7 @@ impl MergeInsertJob {
                     .as_ref()
                     .without_column(ROW_ADDR)
                     .without_column(ROW_ID);
-                let write_schema = dataset.local_schema().project_by_schema(
+                let write_schema = dataset.schema().project_by_schema(
                     &write_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
@@ -1097,7 +1097,7 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let fragments = write_fragments_internal(
+                let (fragments, _) = write_fragments_internal(
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -1108,7 +1108,7 @@ impl MergeInsertJob {
                 )
                 .await?;
 
-                new_fragments.lock().unwrap().extend(fragments.default.0);
+                new_fragments.lock().unwrap().extend(fragments);
                 Ok(reservation_size)
             }
             // We shouldn't need much more memory beyond what is already in the batches.
@@ -1392,7 +1392,7 @@ impl MergeInsertJob {
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
-        let full_schema = self.dataset.local_schema();
+        let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -1432,7 +1432,7 @@ impl MergeInsertJob {
 
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
-        let full_schema = self.dataset.local_schema();
+        let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -1487,7 +1487,7 @@ impl MergeInsertJob {
             // we can't use affected rows here.
             (operation, None)
         } else {
-            let written = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
@@ -1497,9 +1497,6 @@ impl MergeInsertJob {
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
-
-            assert!(written.blob.is_none());
-            let mut new_fragments = written.default.0;
 
             if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
                 let fragment_sizes = new_fragments
@@ -1570,12 +1567,7 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(
-            self.dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
 
         Ok(UncommittedMergeInsert {
             transaction,
@@ -2127,6 +2119,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use mock_instant::thread_local::MockClock;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -4070,9 +4063,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
-        use lance_core::utils::testing::MockClock;
-        let clock = MockClock::new();
-
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("{}/{}", tmpdir, "test_dataset");
 
@@ -4099,7 +4089,7 @@ mod tests {
         };
 
         // Start at 1 second after epoch
-        clock.set_system_time(chrono::Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let dataset = Dataset::write(data, &dataset_uri, Some(write_params))
             .await
@@ -4107,7 +4097,7 @@ mod tests {
         assert_eq!(dataset.version().version, 1);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         // First merge insert WITHOUT skip_auto_cleanup - should trigger cleanup
         let new_data = lance_datagen::gen_batch()
@@ -4128,7 +4118,7 @@ mod tests {
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         // Need to do another merge insert for cleanup to take effect since cleanup runs on the old dataset
         let new_data_extra = lance_datagen::gen_batch()
@@ -4164,7 +4154,7 @@ mod tests {
         );
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         // Second merge insert WITH skip_auto_cleanup - should NOT trigger cleanup
         let new_data2 = lance_datagen::gen_batch()

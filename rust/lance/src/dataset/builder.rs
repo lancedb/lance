@@ -11,8 +11,11 @@ use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
+use lance_namespace::models::DescribeTableRequest;
+use lance_namespace::LanceNamespace;
 use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler},
@@ -26,7 +29,7 @@ use tracing::{info, instrument};
 use url::Url;
 
 /// builder for loading a [`Dataset`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
     index_cache_size_bytes: usize,
@@ -41,6 +44,27 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
+    /// Storage options that override user-provided options (e.g., from namespace)
+    storage_options_override: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for DatasetBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatasetBuilder")
+            .field("index_cache_size_bytes", &self.index_cache_size_bytes)
+            .field("metadata_cache_size_bytes", &self.metadata_cache_size_bytes)
+            .field("manifest", &self.manifest.is_some())
+            .field("session", &self.session.is_some())
+            .field("commit_handler", &self.commit_handler.is_some())
+            .field("version", &self.version)
+            .field("table_uri", &self.table_uri)
+            .field("file_reader_options", &self.file_reader_options)
+            .field(
+                "storage_options_override",
+                &self.storage_options_override.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl DatasetBuilder {
@@ -55,7 +79,98 @@ impl DatasetBuilder {
             version: None,
             manifest: None,
             file_reader_options: None,
+            storage_options_override: None,
         }
+    }
+
+    /// Create a DatasetBuilder from a LanceNamespace
+    ///
+    /// This will automatically fetch the table location and storage options from the namespace
+    /// via `describe_table()`.
+    ///
+    /// Storage options from the namespace will override any user-provided storage options
+    /// set via `.with_storage_options()`. This ensures the namespace is always the source
+    /// of truth for storage options.
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace implementation to fetch table info from
+    /// * `table_id` - The table identifier (e.g., vec!["my_table"])
+    /// * `ignore_namespace_table_storage_options` - If true, storage options returned from
+    ///   the namespace's `describe_table()` will be ignored (treated as None). Defaults to false.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use lance_namespace_impls::ConnectBuilder;
+    /// use lance::dataset::DatasetBuilder;
+    ///
+    /// // Connect to a REST namespace
+    /// let namespace = ConnectBuilder::new("rest")
+    ///     .property("uri", "http://localhost:8080")
+    ///     .connect()
+    ///     .await?;
+    ///
+    /// // Load a dataset using storage options from namespace
+    /// let dataset = DatasetBuilder::from_namespace(
+    ///     namespace.clone(),
+    ///     vec!["my_table".to_string()],
+    ///     false,
+    /// )
+    /// .await?
+    /// .load()
+    /// .await?;
+    ///
+    /// // Load a dataset ignoring namespace storage options
+    /// let dataset = DatasetBuilder::from_namespace(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    ///     true,
+    /// )
+    /// .await?
+    /// .load()
+    /// .await?;
+    /// ```
+    pub async fn from_namespace(
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        ignore_namespace_table_storage_options: bool,
+    ) -> Result<Self> {
+        let request = DescribeTableRequest {
+            id: Some(table_id.clone()),
+            version: None,
+        };
+
+        let response = namespace
+            .describe_table(request)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: Box::new(e),
+                location: location!(),
+            })?;
+
+        let table_uri = response.location.ok_or_else(|| Error::Namespace {
+            source: Box::new(std::io::Error::other(
+                "Table location not found in namespace response",
+            )),
+            location: location!(),
+        })?;
+
+        let mut builder = Self::from_uri(table_uri);
+
+        let namespace_storage_options = if ignore_namespace_table_storage_options {
+            None
+        } else {
+            response.storage_options
+        };
+
+        builder.storage_options_override = namespace_storage_options.clone();
+
+        if namespace_storage_options.is_some() {
+            builder.options.storage_options_provider = Some(Arc::new(
+                LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+            ));
+        }
+
+        Ok(builder)
     }
 }
 
@@ -192,6 +307,58 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable credential vending from a LanceNamespace
+    ///
+    /// Credentials will be automatically refreshed from the namespace
+    /// before they expire. The namespace should return `expires_at_millis`
+    /// in the storage_options from `describe_table()`.
+    ///
+    /// Use `with_s3_credentials_refresh_offset()` to configure how early
+    /// credentials should be refreshed before they expire (default is 5 minutes).
+    ///
+    /// # Arguments
+    /// * `provider` - The storage options provider to fetch credentials from
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use lance_namespace_impls::ConnectBuilder;
+    /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
+    ///
+    /// // Connect to a REST namespace
+    /// let namespace = ConnectBuilder::new("rest")
+    ///     .property("uri", "http://localhost:8080")
+    ///     .connect()
+    ///     .await?;
+    ///
+    /// // Create a storage options provider from namespace
+    /// let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+    ///     namespace,
+    ///     vec!["my_table".to_string()],
+    /// ));
+    ///
+    /// // With default settings (5 minute refresh offset)
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_storage_options_provider(provider)
+    ///     .load()
+    ///     .await?;
+    /// ```
+    ///
+    /// // With custom refresh offset (refresh 10 minutes before expiration)
+    /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
+    ///     .with_storage_options_provider(provider.clone())
+    ///     .with_s3_credentials_refresh_offset(Duration::from_secs(600))
+    ///     .load()
+    ///     .await?;
+    pub fn with_storage_options_provider(
+        mut self,
+        provider: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
+    ) -> Self {
+        self.options.storage_options_provider = Some(provider);
+        self
+    }
+
     /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
@@ -311,6 +478,14 @@ impl DatasetBuilder {
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
+        // Apply storage_options_override last to ensure namespace options take precedence
+        if let Some(override_opts) = self.storage_options_override.take() {
+            let mut merged_opts = self.options.storage_options.clone().unwrap_or_default();
+            // Override with namespace storage options - they take precedence
+            merged_opts.extend(override_opts);
+            self.options.storage_options = Some(merged_opts);
+        }
+
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(

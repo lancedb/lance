@@ -19,7 +19,7 @@ use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Schema, StorageClass};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
@@ -35,9 +35,6 @@ use snafu::location;
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
-
-    /// Local schema, only containing fields with the default storage class (not blobs)
-    pub local_schema: Schema,
 
     /// Dataset version
     pub version: u64,
@@ -98,9 +95,6 @@ pub struct Manifest {
     /// associated with the table. This is different than configuration, which
     /// is used to tell libraries how to read, write, or manage the table.
     pub table_metadata: HashMap<String, String>,
-
-    /// Blob dataset version
-    pub blob_dataset_version: Option<u64>,
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
@@ -174,15 +168,12 @@ impl Manifest {
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
-        blob_dataset_version: Option<u64>,
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Self {
             schema,
-            local_schema,
             version: 1,
             branch: None,
             writer_version: Some(WriterVersion::default()),
@@ -200,7 +191,6 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             table_metadata: HashMap::new(),
-            blob_dataset_version,
             base_paths,
         }
     }
@@ -209,16 +199,11 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
-        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
-
-        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
 
         Self {
             schema,
-            local_schema,
             version: previous.version + 1,
             branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
@@ -236,7 +221,6 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
-            blob_dataset_version,
             base_paths: previous.base_paths.clone(),
         }
     }
@@ -276,7 +260,6 @@ impl Manifest {
 
         Self {
             schema: self.schema.clone(),
-            local_schema: self.local_schema.clone(),
             version: self.version,
             branch: branch_name,
             writer_version: self.writer_version.clone(),
@@ -293,7 +276,6 @@ impl Manifest {
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
-            blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
                 let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
@@ -617,6 +599,8 @@ impl DeepSizeOf for BasePath {
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
+    pub prerelease: Option<String>,
+    pub build_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -662,9 +646,57 @@ pub enum VersionPart {
     Patch,
 }
 
+fn bump_version(version: &mut semver::Version, part: VersionPart) {
+    match part {
+        VersionPart::Major => {
+            version.major += 1;
+            version.minor = 0;
+            version.patch = 0;
+        }
+        VersionPart::Minor => {
+            version.minor += 1;
+            version.patch = 0;
+        }
+        VersionPart::Patch => {
+            version.patch += 1;
+        }
+    }
+}
+
 impl WriterVersion {
+    /// Split a version string into clean version (major.minor.patch), prerelease, and build metadata.
+    ///
+    /// Returns None if the input is not a valid semver string.
+    ///
+    /// For example:
+    /// - "2.0.0-rc.1" -> Some(("2.0.0", Some("rc.1"), None))
+    /// - "2.0.0-rc.1+build.123" -> Some(("2.0.0", Some("rc.1"), Some("build.123")))
+    /// - "2.0.0+build.123" -> Some(("2.0.0", None, Some("build.123")))
+    /// - "not-a-version" -> None
+    fn split_version(full_version: &str) -> Option<(String, Option<String>, Option<String>)> {
+        let mut parsed = semver::Version::parse(full_version).ok()?;
+
+        let prerelease = if parsed.pre.is_empty() {
+            None
+        } else {
+            Some(parsed.pre.to_string())
+        };
+
+        let build_metadata = if parsed.build.is_empty() {
+            None
+        } else {
+            Some(parsed.build.to_string())
+        };
+
+        // Remove prerelease and build metadata to get clean version
+        parsed.pre = semver::Prerelease::EMPTY;
+        parsed.build = semver::BuildMetadata::EMPTY;
+        Some((parsed.to_string(), prerelease, build_metadata))
+    }
+
     /// Try to parse the version string as a semver string. Returns None if
     /// not successful.
+    #[deprecated(note = "Use `lance_lib_version()` instead")]
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
         // First split by '-' to separate the version from the pre-release tag
         let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
@@ -684,33 +716,74 @@ impl WriterVersion {
         Some((major, minor, patch, tag))
     }
 
+    /// If the library is "lance", parse the version as semver and return it.
+    /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
+    ///
+    /// This method reconstructs the full semantic version by combining the version field
+    /// with the prerelease and build_metadata fields (if present). For example:
+    /// - version="2.0.0" + prerelease=Some("rc.1") -> "2.0.0-rc.1"
+    /// - version="2.0.0" + prerelease=Some("rc.1") + build_metadata=Some("build.123") -> "2.0.0-rc.1+build.123"
+    pub fn lance_lib_version(&self) -> Option<semver::Version> {
+        if self.library != "lance" {
+            return None;
+        }
+
+        let mut version = semver::Version::parse(&self.version).ok()?;
+
+        if let Some(ref prerelease) = self.prerelease {
+            version.pre = semver::Prerelease::new(prerelease).ok()?;
+        }
+
+        if let Some(ref build_metadata) = self.build_metadata {
+            version.build = semver::BuildMetadata::new(build_metadata).ok()?;
+        }
+
+        Some(version)
+    }
+
+    #[deprecated(
+        note = "Use `lance_lib_version()` instead, which safely checks the library field and returns Option"
+    )]
+    #[allow(deprecated)]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
             .unwrap_or_else(|| panic!("Invalid writer version: {}", self.version))
     }
 
-    /// Return true if self is older than the given major/minor/patch
+    /// Check if this is a Lance library version older than the given major/minor/patch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the library is not "lance" or the version cannot be parsed as semver.
+    #[deprecated(note = "Use `lance_lib_version()` and its `older_than` method instead.")]
     pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
-        let version = self.semver_or_panic();
-        (version.0, version.1, version.2) < (major, minor, patch)
+        let version = self
+            .lance_lib_version()
+            .expect("Not lance library or invalid version");
+        let other = semver::Version {
+            major: major.into(),
+            minor: minor.into(),
+            patch: patch.into(),
+            pre: semver::Prerelease::EMPTY,
+            build: semver::BuildMetadata::EMPTY,
+        };
+        version < other
     }
 
+    #[deprecated(note = "This is meant for testing and will be made private in future version.")]
     pub fn bump(&self, part: VersionPart, keep_tag: bool) -> Self {
-        let parts = self.semver_or_panic();
-        let tag = if keep_tag { parts.3 } else { None };
-        let new_parts = match part {
-            VersionPart::Major => (parts.0 + 1, parts.1, parts.2, tag),
-            VersionPart::Minor => (parts.0, parts.1 + 1, parts.2, tag),
-            VersionPart::Patch => (parts.0, parts.1, parts.2 + 1, tag),
-        };
-        let new_version = if let Some(tag) = tag {
-            format!("{}.{}.{}-{}", new_parts.0, new_parts.1, new_parts.2, tag)
-        } else {
-            format!("{}.{}.{}", new_parts.0, new_parts.1, new_parts.2)
-        };
+        let mut version = self.lance_lib_version().expect("Should be lance version");
+        bump_version(&mut version, part);
+        if !keep_tag {
+            version.pre = semver::Prerelease::EMPTY;
+        }
+        let (clean_version, prerelease, build_metadata) = Self::split_version(&version.to_string())
+            .expect("Bumped version should be valid semver");
         Self {
             library: self.library.clone(),
-            version: new_version,
+            version: clean_version,
+            prerelease,
+            build_metadata,
         }
     }
 }
@@ -718,18 +791,29 @@ impl WriterVersion {
 impl Default for WriterVersion {
     #[cfg(not(test))]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
     }
 
     // Unit tests always run as if they are in the next version.
     #[cfg(test)]
+    #[allow(deprecated)]
     fn default() -> Self {
+        let full_version = env!("CARGO_PKG_VERSION");
+        let (version, prerelease, build_metadata) =
+            Self::split_version(full_version).expect("CARGO_PKG_VERSION should be valid semver");
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
+            prerelease,
+            build_metadata,
         }
         .bump(VersionPart::Patch, true)
     }
@@ -767,9 +851,17 @@ impl TryFrom<pb::Manifest> for Manifest {
         });
         // We only use the writer version if it is fully set.
         let writer_version = match p.writer_version {
-            Some(pb::manifest::WriterVersion { library, version }) => {
-                Some(WriterVersion { library, version })
-            }
+            Some(pb::manifest::WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }) => Some(WriterVersion {
+                library,
+                version,
+                prerelease,
+                build_metadata,
+            }),
             _ => None,
         };
         let fragments = Arc::new(
@@ -811,11 +903,9 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Ok(Self {
             schema,
-            local_schema,
             version: p.version,
             branch: p.branch,
             writer_version,
@@ -837,11 +927,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
-            blob_dataset_version: if p.blob_dataset_version == 0 {
-                None
-            } else {
-                Some(p.blob_dataset_version)
-            },
             base_paths: p
                 .base_paths
                 .iter()
@@ -880,6 +965,8 @@ impl From<&Manifest> for pb::Manifest {
                 .map(|wv| pb::manifest::WriterVersion {
                     library: wv.library.clone(),
                     version: wv.version.clone(),
+                    prerelease: wv.prerelease.clone(),
+                    build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             table_metadata: m.table_metadata.clone(),
@@ -897,7 +984,6 @@ impl From<&Manifest> for pb::Manifest {
                 version: m.data_storage_format.version.clone(),
             }),
             config: m.config.clone(),
-            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
             base_paths: m
                 .base_paths
                 .values()
@@ -989,7 +1075,6 @@ mod tests {
     fn test_writer_version() {
         let wv = WriterVersion::default();
         assert_eq!(wv.library, "lance");
-        let parts = wv.semver().unwrap();
 
         // Parse the actual cargo version to check if it has a pre-release tag
         let cargo_version = env!("CARGO_PKG_VERSION");
@@ -999,29 +1084,171 @@ mod tests {
             None
         };
 
+        // Verify the version field contains only major.minor.patch
+        let version_parts: Vec<&str> = wv.version.split('.').collect();
         assert_eq!(
-            parts,
-            (
-                env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
-                env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
-                // Unit tests run against (major,minor,patch + 1)
-                env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap() + 1,
-                expected_tag
-            )
+            version_parts.len(),
+            3,
+            "Version should be major.minor.patch"
+        );
+        assert!(
+            !wv.version.contains('-'),
+            "Version field should not contain prerelease"
         );
 
-        // Verify the base version (without tag) matches CARGO_PKG_VERSION
-        let base_version = cargo_version.split('-').next().unwrap();
+        // Verify the prerelease field matches the expected tag
+        assert_eq!(wv.prerelease.as_deref(), expected_tag);
+        // Build metadata should be None for default version
+        assert_eq!(wv.build_metadata, None);
+
+        // Verify lance_lib_version() reconstructs the full semver correctly
+        let version = wv.lance_lib_version().unwrap();
         assert_eq!(
-            format!("{}.{}.{}", parts.0, parts.1, parts.2 - 1),
-            base_version
+            version.major,
+            env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap()
         );
+        assert_eq!(
+            version.minor,
+            env!("CARGO_PKG_VERSION_MINOR").parse::<u64>().unwrap()
+        );
+        assert_eq!(
+            version.patch,
+            // Unit tests run against (major,minor,patch + 1)
+            env!("CARGO_PKG_VERSION_PATCH").parse::<u64>().unwrap() + 1
+        );
+        assert_eq!(version.pre.as_str(), expected_tag.unwrap_or(""));
 
         for part in &[VersionPart::Major, VersionPart::Minor, VersionPart::Patch] {
-            let bumped = wv.bump(*part, false);
-            let bumped_parts = bumped.semver_or_panic();
-            assert!(wv.older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2));
+            let mut bumped_version = version.clone();
+            bump_version(&mut bumped_version, *part);
+            assert!(version < bumped_version);
         }
+    }
+
+    #[test]
+    fn test_writer_version_split() {
+        // Test splitting version with prerelease
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version without prerelease
+        let (version, prerelease, build_metadata) = WriterVersion::split_version("2.0.0").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, None);
+
+        // Test splitting version with prerelease and build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0-rc.1+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, Some("rc.1".to_string()));
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test splitting version with only build metadata
+        let (version, prerelease, build_metadata) =
+            WriterVersion::split_version("2.0.0+build.123").unwrap();
+        assert_eq!(version, "2.0.0");
+        assert_eq!(prerelease, None);
+        assert_eq!(build_metadata, Some("build.123".to_string()));
+
+        // Test with invalid version returns None
+        assert!(WriterVersion::split_version("not-a-version").is_none());
+    }
+
+    #[test]
+    fn test_writer_version_comparison_with_prerelease() {
+        let v1 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        let v2 = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        let semver1 = v1.lance_lib_version().unwrap();
+        let semver2 = v2.lance_lib_version().unwrap();
+
+        // rc.1 should be less than the release version
+        assert!(semver1 < semver2);
+    }
+
+    #[test]
+    fn test_writer_version_with_build_metadata() {
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: Some("build.123".to_string()),
+        };
+
+        let semver = v.lance_lib_version().unwrap();
+        assert_eq!(semver.to_string(), "2.0.0-rc.1+build.123");
+        assert_eq!(semver.major, 2);
+        assert_eq!(semver.minor, 0);
+        assert_eq!(semver.patch, 0);
+        assert_eq!(semver.pre.as_str(), "rc.1");
+        assert_eq!(semver.build.as_str(), "build.123");
+    }
+
+    #[test]
+    fn test_writer_version_non_semver() {
+        // Test that Lance library can have non-semver version strings
+        let v = WriterVersion {
+            library: "lance".to_string(),
+            version: "custom-build-v1".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // lance_lib_version should return None for non-semver
+        assert!(v.lance_lib_version().is_none());
+
+        // But the WriterVersion itself should still be valid and usable
+        assert_eq!(v.library, "lance");
+        assert_eq!(v.version, "custom-build-v1");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_older_than_with_prerelease() {
+        // Test that older_than correctly handles prerelease
+        let v_rc = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: Some("rc.1".to_string()),
+            build_metadata: None,
+        };
+
+        // 2.0.0-rc.1 should be older than 2.0.0
+        assert!(v_rc.older_than(2, 0, 0));
+
+        // 2.0.0-rc.1 should be older than 2.0.1
+        assert!(v_rc.older_than(2, 0, 1));
+
+        // 2.0.0-rc.1 should not be older than 1.9.9
+        assert!(!v_rc.older_than(1, 9, 9));
+
+        let v_release = WriterVersion {
+            library: "lance".to_string(),
+            version: "2.0.0".to_string(),
+            prerelease: None,
+            build_metadata: None,
+        };
+
+        // 2.0.0 should not be older than 2.0.0
+        assert!(!v_release.older_than(2, 0, 0));
+
+        // 2.0.0 should be older than 2.0.1
+        assert!(v_release.older_than(2, 0, 1));
     }
 
     #[test]
@@ -1041,7 +1268,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1117,7 +1343,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1141,7 +1366,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1170,7 +1394,6 @@ mod tests {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1193,7 +1416,6 @@ mod tests {
             schema.clone(),
             Arc::new(empty_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1217,7 +1439,6 @@ mod tests {
             schema.clone(),
             Arc::new(real_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1253,7 +1474,6 @@ mod tests {
             schema,
             Arc::new(vec![fragment_with_deletion]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 

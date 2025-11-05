@@ -8,12 +8,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
+};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
+use tracing::info;
 
 use super::{
     current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
@@ -167,12 +171,17 @@ impl ExternalManifestCommitHandler {
             Err(ObjectStoreError::NotFound { .. }) => false, // Another writer beat us to it.
             Err(e) => return Err(e.into()),
         };
+        if copied {
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
+        }
 
         // On S3, the etag can change if originally was MultipartUpload and later was Copy
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
         // We only do MultipartUpload for > 5MB files, so we can skip this check
-        // if size < 5MB
-        let e_tag = if size < 5 * 1024 * 1024 {
+        // if size < 5MB. However, we need to double check the final_manifest_path
+        // exists before we change the external store, otherwise we may point to a
+        // non-existing manifest.
+        let e_tag = if copied && size < 5 * 1024 * 1024 {
             e_tag
         } else {
             let meta = store.head(&final_manifest_path).await?;
@@ -208,6 +217,7 @@ impl ExternalManifestCommitHandler {
             Err(ObjectStoreError::NotFound { .. }) => {}
             Err(e) => return Err(e.into()),
         }
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_manifest_path.as_ref());
 
         Ok(location)
     }
@@ -397,6 +407,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 Err(ObjectStoreError::NotFound { .. }) => {}
                 Err(e) => return Err(CommitError::OtherError(e.into())),
             }
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
             return Err(err);
         }
 

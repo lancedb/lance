@@ -31,48 +31,121 @@ use lance_core::{box_error, Error, Result};
 
 use lance_namespace::LanceNamespace;
 
-/// Configuration for REST namespace
+/// Builder for creating a RestNamespace.
+///
+/// This builder provides a fluent API for configuring and establishing
+/// connections to REST-based Lance namespaces.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use lance_namespace_impls::RestNamespaceBuilder;
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create a REST namespace
+/// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
+///     .delimiter(".")
+///     .header("Authorization", "Bearer token")
+///     .build();
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
-pub struct RestNamespaceConfig {
-    /// The delimiter used for object identifiers
+pub struct RestNamespaceBuilder {
+    uri: String,
     delimiter: String,
-    /// Additional headers to send with requests
-    additional_headers: HashMap<String, String>,
-    /// The base URI for the REST API
-    uri: Option<String>,
-    /// Path to the client certificate file (PEM format) for mTLS
+    headers: HashMap<String, String>,
     cert_file: Option<String>,
-    /// Path to the client private key file (PEM format) for mTLS
     key_file: Option<String>,
-    /// Path to the CA certificate file for server verification (PEM format)
     ssl_ca_cert: Option<String>,
-    /// Whether to verify the hostname in the server's certificate
     assert_hostname: bool,
 }
 
-impl RestNamespaceConfig {
-    /// Header prefix for additional headers
-    const HEADER_PREFIX: &'static str = "header.";
-
-    /// Default delimiter
+impl RestNamespaceBuilder {
+    /// Default delimiter for object identifiers
     const DEFAULT_DELIMITER: &'static str = ".";
 
-    /// Create a new configuration from a map of properties
-    pub fn new(properties: HashMap<String, String>) -> Self {
+    /// Create a new RestNamespaceBuilder with the specified URI.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - Base URI for the REST API
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            delimiter: Self::DEFAULT_DELIMITER.to_string(),
+            headers: HashMap::new(),
+            cert_file: None,
+            key_file: None,
+            ssl_ca_cert: None,
+            assert_hostname: true,
+        }
+    }
+
+    /// Create a RestNamespaceBuilder from properties HashMap.
+    ///
+    /// This method parses a properties map into builder configuration.
+    /// It expects:
+    /// - `uri`: The base URI for the REST API (required)
+    /// - `delimiter`: Delimiter for object identifiers (optional, defaults to ".")
+    /// - `header.*`: Additional headers (optional, prefix will be stripped)
+    /// - `tls.cert_file`: Path to client certificate file (optional)
+    /// - `tls.key_file`: Path to client private key file (optional)
+    /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
+    /// - `tls.assert_hostname`: Whether to verify hostname (optional, defaults to true)
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - Configuration properties
+    ///
+    /// # Returns
+    ///
+    /// Returns a `RestNamespaceBuilder` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `uri` property is missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::RestNamespaceBuilder;
+    /// # use std::collections::HashMap;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut properties = HashMap::new();
+    /// properties.insert("uri".to_string(), "http://localhost:8080".to_string());
+    /// properties.insert("delimiter".to_string(), "/".to_string());
+    /// properties.insert("header.Authorization".to_string(), "Bearer token".to_string());
+    ///
+    /// let namespace = RestNamespaceBuilder::from_properties(properties)?
+    ///     .build();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
+        // Extract URI (required)
+        let uri = properties
+            .get("uri")
+            .cloned()
+            .ok_or_else(|| Error::Namespace {
+                source: "Missing required property 'uri' for REST namespace".into(),
+                location: snafu::location!(),
+            })?;
+
+        // Extract delimiter (optional)
         let delimiter = properties
             .get("delimiter")
             .cloned()
             .unwrap_or_else(|| Self::DEFAULT_DELIMITER.to_string());
 
-        let uri = properties.get("uri").cloned();
-
-        let mut additional_headers = HashMap::new();
+        // Extract headers (properties prefixed with "header.")
+        let mut headers = HashMap::new();
         for (key, value) in &properties {
-            if let Some(header_name) = key.strip_prefix(Self::HEADER_PREFIX) {
-                additional_headers.insert(header_name.to_string(), value.clone());
+            if let Some(header_name) = key.strip_prefix("header.") {
+                headers.insert(header_name.to_string(), value.clone());
             }
         }
 
+        // Extract TLS options
         let cert_file = properties.get("tls.cert_file").cloned();
         let key_file = properties.get("tls.key_file").cloned();
         let ssl_ca_cert = properties.get("tls.ssl_ca_cert").cloned();
@@ -81,30 +154,95 @@ impl RestNamespaceConfig {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        Self {
-            delimiter,
-            additional_headers,
+        Ok(Self {
             uri,
+            delimiter,
+            headers,
             cert_file,
             key_file,
             ssl_ca_cert,
             assert_hostname,
-        }
+        })
     }
 
-    /// Get the delimiter
-    pub fn delimiter(&self) -> &str {
-        &self.delimiter
+    /// Set the delimiter for object identifiers.
+    ///
+    /// # Arguments
+    ///
+    /// * `delimiter` - Delimiter string (e.g., ".", "/")
+    pub fn delimiter(mut self, delimiter: impl Into<String>) -> Self {
+        self.delimiter = delimiter.into();
+        self
     }
 
-    /// Get additional headers
-    pub fn additional_headers(&self) -> &HashMap<String, String> {
-        &self.additional_headers
+    /// Add a custom header to the HTTP requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Header name
+    /// * `value` - Header value
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
     }
 
-    /// Get the URI
-    pub fn uri(&self) -> Option<&str> {
-        self.uri.as_deref()
+    /// Add multiple custom headers to the HTTP requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `headers` - HashMap of headers to add
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers.extend(headers);
+        self
+    }
+
+    /// Set the client certificate file for mTLS.
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_file` - Path to the certificate file (PEM format)
+    pub fn cert_file(mut self, cert_file: impl Into<String>) -> Self {
+        self.cert_file = Some(cert_file.into());
+        self
+    }
+
+    /// Set the client private key file for mTLS.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_file` - Path to the private key file (PEM format)
+    pub fn key_file(mut self, key_file: impl Into<String>) -> Self {
+        self.key_file = Some(key_file.into());
+        self
+    }
+
+    /// Set the CA certificate file for server verification.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssl_ca_cert` - Path to the CA certificate file (PEM format)
+    pub fn ssl_ca_cert(mut self, ssl_ca_cert: impl Into<String>) -> Self {
+        self.ssl_ca_cert = Some(ssl_ca_cert.into());
+        self
+    }
+
+    /// Set whether to verify the hostname in the server's certificate.
+    ///
+    /// # Arguments
+    ///
+    /// * `assert_hostname` - Whether to verify hostname
+    pub fn assert_hostname(mut self, assert_hostname: bool) -> Self {
+        self.assert_hostname = assert_hostname;
+        self
+    }
+
+    /// Build the RestNamespace.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `RestNamespace` instance.
+    pub fn build(self) -> RestNamespace {
+        RestNamespace::from_builder(self)
     }
 }
 
@@ -144,23 +282,45 @@ fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -
 }
 
 /// REST implementation of Lance Namespace
+///
+/// # Examples
+///
+/// ```no_run
+/// # use lance_namespace_impls::RestNamespaceBuilder;
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Use the builder to create a namespace
+/// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
+///     .build();
+/// # Ok(())
+/// # }
+/// ```
 pub struct RestNamespace {
-    config: RestNamespaceConfig,
+    delimiter: String,
     reqwest_config: Configuration,
 }
 
-impl RestNamespace {
-    /// Create a new REST namespace with the given configuration
-    pub fn new(properties: HashMap<String, String>) -> Self {
-        let config = RestNamespaceConfig::new(properties);
+impl std::fmt::Debug for RestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
 
+impl std::fmt::Display for RestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.namespace_id())
+    }
+}
+
+impl RestNamespace {
+    /// Create a new REST namespace from builder
+    pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
         // Build reqwest client with custom headers if provided
         let mut client_builder = reqwest::Client::builder();
 
         // Add custom headers to the client
-        if !config.additional_headers().is_empty() {
+        if !builder.headers.is_empty() {
             let mut headers = reqwest::header::HeaderMap::new();
-            for (key, value) in config.additional_headers() {
+            for (key, value) in &builder.headers {
                 if let (Ok(header_name), Ok(header_value)) = (
                     reqwest::header::HeaderName::from_bytes(key.as_bytes()),
                     reqwest::header::HeaderValue::from_str(value),
@@ -172,7 +332,7 @@ impl RestNamespace {
         }
 
         // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&config.cert_file, &config.key_file) {
+        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file) {
             if let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file)) {
                 if let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat()) {
                     client_builder = client_builder.identity(identity);
@@ -181,7 +341,7 @@ impl RestNamespace {
         }
 
         // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &config.ssl_ca_cert {
+        if let Some(ca_cert_file) = &builder.ssl_ca_cert {
             if let Ok(ca_cert) = std::fs::read(ca_cert_file) {
                 if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert) {
                     client_builder = client_builder.add_root_certificate(ca_cert);
@@ -190,7 +350,7 @@ impl RestNamespace {
         }
 
         // Configure hostname verification
-        client_builder = client_builder.danger_accept_invalid_hostnames(!config.assert_hostname);
+        client_builder = client_builder.danger_accept_invalid_hostnames(!builder.assert_hostname);
 
         let client = client_builder
             .build()
@@ -198,26 +358,19 @@ impl RestNamespace {
 
         let mut reqwest_config = Configuration::new();
         reqwest_config.client = client;
-        if let Some(uri) = config.uri() {
-            reqwest_config.base_path = uri.to_string();
-        }
+        reqwest_config.base_path = builder.uri;
 
         Self {
-            config,
+            delimiter: builder.delimiter,
             reqwest_config,
         }
     }
 
     /// Create a new REST namespace with custom configuration (for testing)
     #[cfg(test)]
-    pub fn with_configuration(
-        properties: HashMap<String, String>,
-        reqwest_config: Configuration,
-    ) -> Self {
-        let config = RestNamespaceConfig::new(properties);
-
+    pub fn with_configuration(delimiter: String, reqwest_config: Configuration) -> Self {
         Self {
-            config,
+            delimiter,
             reqwest_config,
         }
     }
@@ -229,12 +382,12 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         namespace_api::list_namespaces(
             &self.reqwest_config,
             &id,
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
             request.page_token.as_deref(),
             request.limit,
         )
@@ -246,67 +399,47 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        namespace_api::describe_namespace(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        namespace_api::describe_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn create_namespace(
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        namespace_api::create_namespace(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        namespace_api::create_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        namespace_api::drop_namespace(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        namespace_api::drop_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        namespace_api::namespace_exists(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        namespace_api::namespace_exists(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         table_api::list_tables(
             &self.reqwest_config,
             &id,
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
             request.page_token.as_deref(),
             request.limit,
         )
@@ -315,84 +448,54 @@ impl LanceNamespace for RestNamespace {
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::describe_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::describe_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::register_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::register_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::table_exists(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::table_exists(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::drop_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::drop_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn deregister_table(
         &self,
         request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::deregister_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::deregister_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::count_table_rows(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::count_table_rows(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn create_table(
@@ -400,7 +503,7 @@ impl LanceNamespace for RestNamespace {
         request: CreateTableRequest,
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         let properties_json = request
             .properties
@@ -418,7 +521,7 @@ impl LanceNamespace for RestNamespace {
             &self.reqwest_config,
             &id,
             request_data.to_vec(),
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
             mode,
             request.location.as_deref(),
             properties_json.as_deref(),
@@ -431,16 +534,11 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::create_empty_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::create_empty_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn insert_into_table(
@@ -448,7 +546,7 @@ impl LanceNamespace for RestNamespace {
         request: InsertIntoTableRequest,
         request_data: Bytes,
     ) -> Result<InsertIntoTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         use lance_namespace::models::insert_into_table_request::Mode;
         let mode = request.mode.as_ref().map(|m| match m {
@@ -460,7 +558,7 @@ impl LanceNamespace for RestNamespace {
             &self.reqwest_config,
             &id,
             request_data.to_vec(),
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
             mode,
         )
         .await
@@ -472,7 +570,7 @@ impl LanceNamespace for RestNamespace {
         request: MergeInsertIntoTableRequest,
         request_data: Bytes,
     ) -> Result<MergeInsertIntoTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         let on = request.on.as_deref().ok_or_else(|| Error::Namespace {
             source: "'on' field is required for merge insert".into(),
@@ -484,7 +582,7 @@ impl LanceNamespace for RestNamespace {
             &id,
             on,
             request_data.to_vec(),
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
             request.when_matched_update_all,
             request.when_matched_update_all_filt.as_deref(),
             request.when_not_matched_insert_all,
@@ -496,45 +594,31 @@ impl LanceNamespace for RestNamespace {
     }
 
     async fn update_table(&self, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::update_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::update_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn delete_from_table(
         &self,
         request: DeleteFromTableRequest,
     ) -> Result<DeleteFromTableResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::delete_from_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::delete_from_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        let response = table_api::query_table(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)?;
+        let response =
+            table_api::query_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+                .await
+                .map_err(convert_api_error)?;
 
         // Convert response to bytes
         let bytes = response.bytes().await.map_err(|e| Error::IO {
@@ -549,39 +633,29 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::create_table_index(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::create_table_index(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn list_table_indices(
         &self,
         request: ListTableIndicesRequest,
     ) -> Result<ListTableIndicesResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::list_table_indices(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(self.config.delimiter()),
-        )
-        .await
-        .map_err(convert_api_error)
+        table_api::list_table_indices(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
     }
 
     async fn describe_table_index_stats(
         &self,
         request: DescribeTableIndexStatsRequest,
     ) -> Result<DescribeTableIndexStatsResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         // Note: The index_name parameter seems to be missing from the request structure
         // This might need to be adjusted based on the actual API
@@ -592,7 +666,7 @@ impl LanceNamespace for RestNamespace {
             &id,
             index_name,
             request,
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
         )
         .await
         .map_err(convert_api_error)
@@ -602,13 +676,13 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         transaction_api::describe_transaction(
             &self.reqwest_config,
             &id,
             request,
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
         )
         .await
         .map_err(convert_api_error)
@@ -618,16 +692,23 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: AlterTransactionRequest,
     ) -> Result<AlterTransactionResponse> {
-        let id = object_id_str(&request.id, self.config.delimiter())?;
+        let id = object_id_str(&request.id, &self.delimiter)?;
 
         transaction_api::alter_transaction(
             &self.reqwest_config,
             &id,
             request,
-            Some(self.config.delimiter()),
+            Some(&self.delimiter),
         )
         .await
         .map_err(convert_api_error)
+    }
+
+    fn namespace_id(&self) -> String {
+        format!(
+            "RestNamespace {{ endpoint: {:?}, delimiter: {:?} }}",
+            self.reqwest_config.base_path, self.delimiter
+        )
     }
 }
 
@@ -641,10 +722,9 @@ mod tests {
 
     /// Create a test REST namespace instance
     fn create_test_namespace() -> RestNamespace {
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), "http://localhost:8080".to_string());
-        properties.insert("delimiter".to_string(), ".".to_string());
-        RestNamespace::new(properties)
+        RestNamespaceBuilder::new("http://localhost:8080")
+            .delimiter(".")
+            .build()
     }
 
     #[test]
@@ -658,7 +738,9 @@ mod tests {
         );
         properties.insert("header.X-Custom".to_string(), "value".to_string());
 
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         // Successfully created the namespace - test passes if no panic
     }
@@ -697,7 +779,9 @@ mod tests {
             "custom-value".to_string(),
         );
 
-        let namespace = RestNamespace::new(properties);
+        let namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -713,8 +797,11 @@ mod tests {
 
     #[test]
     fn test_default_configuration() {
-        let properties = HashMap::new();
-        let _namespace = RestNamespace::new(properties);
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "http://localhost:8080".to_string());
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
 
         // The default delimiter should be "." - test passes if no panic
     }
@@ -724,7 +811,9 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert("uri".to_string(), "https://api.example.com/v1".to_string());
 
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
         // Test passes if no panic
     }
 
@@ -737,33 +826,38 @@ mod tests {
         properties.insert("tls.ssl_ca_cert".to_string(), "/path/to/ca.pem".to_string());
         properties.insert("tls.assert_hostname".to_string(), "true".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
-        assert_eq!(config.cert_file, Some("/path/to/cert.pem".to_string()));
-        assert_eq!(config.key_file, Some("/path/to/key.pem".to_string()));
-        assert_eq!(config.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
-        assert!(config.assert_hostname);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.cert_file, Some("/path/to/cert.pem".to_string()));
+        assert_eq!(builder.key_file, Some("/path/to/key.pem".to_string()));
+        assert_eq!(builder.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
+        assert!(builder.assert_hostname);
     }
 
     #[test]
     fn test_tls_config_default_assert_hostname() {
         let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
         properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
         properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
         // Default should be true
-        assert!(config.assert_hostname);
+        assert!(builder.assert_hostname);
     }
 
     #[test]
     fn test_tls_config_disable_hostname_verification() {
         let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
         properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
         properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
         properties.insert("tls.assert_hostname".to_string(), "false".to_string());
 
-        let config = RestNamespaceConfig::new(properties);
-        assert!(!config.assert_hostname);
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert!(!builder.assert_hostname);
     }
 
     #[test]
@@ -784,7 +878,9 @@ mod tests {
         );
 
         // Should not panic even with nonexistent files (they're just ignored)
-        let _namespace = RestNamespace::new(properties);
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
     }
 
     #[tokio::test]
@@ -805,14 +901,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-        properties.insert("delimiter".to_string(), ".".to_string());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -848,13 +940,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -903,13 +992,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
@@ -942,13 +1028,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -983,13 +1066,10 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut properties = HashMap::new();
-        properties.insert("uri".to_string(), mock_server.uri());
-
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(properties, reqwest_config);
+        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
 
         let request = InsertIntoTableRequest {
             id: Some(vec![

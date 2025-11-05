@@ -11,6 +11,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -365,6 +366,13 @@ impl FilteredReadStream {
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
 
+        log::debug!(
+            "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
+            fragments.len(),
+            fragment_readahead,
+            io_parallelism
+        );
+
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
         let frag_futs = fragments
@@ -386,7 +394,13 @@ impl FilteredReadStream {
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
-        let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
+            SchedulerConfig {
+                io_buffer_size_bytes,
+            }
+        } else {
+            SchedulerConfig::max_bandwidth(obj_store.as_ref())
+        };
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
         let (scoped_fragments, scan_planned_with_limit_pushed_down) = Self::plan_scan(
@@ -412,7 +426,7 @@ impl FilteredReadStream {
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    tokio::task::spawn(
+                    SpawnedTask::spawn(
                         Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
@@ -1133,35 +1147,41 @@ impl FilteredReadStream {
         let start = range.start as usize;
         let end = range.end as usize;
         let rows_seen = Arc::new(AtomicUsize::new(0));
+        let rows_seen_clone = rows_seen.clone();
 
-        stream.try_filter_map(move |batch| {
-            if batch.num_rows() == 0 {
-                return future::ready(Ok(None));
-            }
+        stream
+            .take_while(move |_| {
+                let rows_seen = rows_seen.load(Ordering::Relaxed);
+                future::ready(rows_seen <= end)
+            })
+            .try_filter_map(move |batch| {
+                if batch.num_rows() == 0 {
+                    return future::ready(Ok(None));
+                }
 
-            let batch_rows = batch.num_rows();
-            let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
-            let batch_end = current_position + batch_rows;
+                let batch_rows = batch.num_rows();
+                let current_position = rows_seen_clone.fetch_add(batch_rows, Ordering::Relaxed);
+                let batch_end = current_position + batch_rows;
 
-            if batch_end <= start || current_position >= end {
-                return future::ready(Ok(None));
-            }
+                if batch_end <= start || current_position >= end {
+                    return future::ready(Ok(None));
+                }
 
-            let skip = start.saturating_sub(current_position);
-            let end_pos = (end - current_position).min(batch_rows);
-            let take = end_pos.saturating_sub(skip);
+                let skip = start.saturating_sub(current_position);
+                let end_pos = (end - current_position).min(batch_rows);
+                let take = end_pos.saturating_sub(skip);
 
-            if take == 0 {
-                return future::ready(Ok(None));
-            }
+                if take == 0 {
+                    return future::ready(Ok(None));
+                }
 
-            let result = if skip == 0 && take == batch_rows {
-                batch
-            } else {
-                batch.slice(skip, take)
-            };
-            future::ready(Ok(Some(result)))
-        })
+                let result = if skip == 0 && take == batch_rows {
+                    batch
+                } else {
+                    batch.slice(skip, take)
+                };
+                future::ready(Ok(Some(result)))
+            })
     }
 }
 
@@ -1191,6 +1211,8 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// The size of the I/O buffer to use for the scan
+    pub io_buffer_size_bytes: Option<u64>,
 }
 
 impl FilteredReadOptions {
@@ -1217,6 +1239,7 @@ impl FilteredReadOptions {
             projection,
             refine_filter: None,
             full_filter: None,
+            io_buffer_size_bytes: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1357,6 +1380,14 @@ impl FilteredReadOptions {
     /// the row address.
     pub fn with_projection(mut self, projection: Projection) -> Self {
         self.projection = projection;
+        self
+    }
+
+    /// Specify the size of the I/O buffer (in bytes) to use for the scan
+    ///
+    /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
+    pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
+        self.io_buffer_size_bytes = Some(io_buffer_size);
         self
     }
 }

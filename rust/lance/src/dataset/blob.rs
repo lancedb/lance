@@ -6,23 +6,12 @@ use std::{future::Future, ops::DerefMut, sync::Arc};
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
 use arrow_schema::DataType;
-use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
 use super::Dataset;
-use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
-use lance_core::{
-    datatypes::{Schema, StorageClass},
-    error::CloneableResult,
-    utils::{
-        address::RowAddress,
-        futures::{Capacity, SharedStreamExt},
-    },
-    Error, Result,
-};
+use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
 /// Current state of the reader.  Held in a mutex for easy sharing
@@ -225,62 +214,6 @@ pub(super) async fn take_blobs(
             )
         })
         .collect())
-}
-
-pub trait BlobStreamExt: Sized {
-    /// Splits a stream into a regular portion (the first stream)
-    /// and a blob portion (the second stream)
-    ///
-    /// The first stream contains all fields with the default storage class and
-    /// may be identical to self.
-    ///
-    /// The second stream may be None (if there are no fields with the blob storage class)
-    /// or it contains all fields with the blob storage class.
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>);
-}
-
-impl BlobStreamExt for SendableRecordBatchStream {
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>) {
-        let mut indices_with_blob = Vec::with_capacity(schema.fields.len());
-        let mut indices_without_blob = Vec::with_capacity(schema.fields.len());
-        for (idx, field) in schema.fields.iter().enumerate() {
-            if field.storage_class() == StorageClass::Blob {
-                indices_with_blob.push(idx);
-            } else {
-                indices_without_blob.push(idx);
-            }
-        }
-        if indices_with_blob.is_empty() {
-            (self, None)
-        } else {
-            let left_schema = Arc::new(self.schema().project(&indices_without_blob).unwrap());
-            let right_schema = Arc::new(self.schema().project(&indices_with_blob).unwrap());
-
-            let (left, right) = ShareableRecordBatchStream(self)
-                .boxed()
-                // If we are working with blobs then we are probably working with rather large batches
-                // We don't want to read too far ahead.
-                .share(Capacity::Bounded(1));
-
-            let left = left.map(move |batch| match batch {
-                CloneableResult(Ok(batch)) => {
-                    CloneableResult(Ok(batch.project(&indices_without_blob).unwrap()))
-                }
-                CloneableResult(Err(err)) => CloneableResult(Err(err)),
-            });
-
-            let right = right.map(move |batch| match batch {
-                CloneableResult(Ok(batch)) => {
-                    CloneableResult(Ok(batch.project(&indices_with_blob).unwrap()))
-                }
-                CloneableResult(Err(err)) => CloneableResult(Err(err)),
-            });
-
-            let left = ShareableRecordBatchStreamAdapter::new(left_schema, left);
-            let right = ShareableRecordBatchStreamAdapter::new(right_schema, right);
-            (Box::pin(left), Some(Box::pin(right)))
-        }
-    }
 }
 
 #[cfg(test)]

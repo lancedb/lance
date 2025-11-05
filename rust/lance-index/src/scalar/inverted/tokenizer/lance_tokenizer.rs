@@ -1,9 +1,73 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_schema::{DataType, Field};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use serde_json::Value;
 use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
+
+/// Document type for full text search.
+#[derive(Debug, Clone)]
+pub enum DocType {
+    Text,
+    Json,
+}
+
+impl AsRef<str> for DocType {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl TryFrom<&Field> for DocType {
+    type Error = lance_core::Error;
+
+    fn try_from(field: &Field) -> Result<Self, Self::Error> {
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
+            DataType::List(field) | DataType::LargeList(field)
+                if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                Ok(Self::Text)
+            }
+            DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
+                Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
+                _ => Err(lance_core::Error::InvalidInput {
+                    source: format!("field {} is not json", field.name()).into(),
+                    location: location!(),
+                }),
+            },
+            _ => Err(lance_core::Error::InvalidInput {
+                source: format!("field {} is not json", field.name()).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+impl DocType {
+    /// Get the length of the prefix before value.
+    ///  - JSON Token: path,type,value
+    ///  - Text Token: value
+    pub fn prefix_len(&self, token: &str) -> usize {
+        match self {
+            Self::Json => {
+                if let Some(pos) = token.find(',') {
+                    if let Some(second_pos) = token[pos + 1..].find(',') {
+                        return pos + second_pos + 2;
+                    }
+                }
+                panic!("json token must be in format of <path>,<type>,<value>")
+            }
+            Self::Text => 0,
+        }
+    }
+}
 
 /// Lance full text search tokenizer.
 ///
@@ -19,6 +83,8 @@ pub trait LanceTokenizer: Send + Sync {
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a>;
     /// Clone the tokenizer.
     fn box_clone(&self) -> Box<dyn LanceTokenizer>;
+    /// Get document type.
+    fn doc_type(&self) -> DocType;
 }
 
 impl Clone for Box<dyn LanceTokenizer> {
@@ -49,6 +115,10 @@ impl LanceTokenizer for TextTokenizer {
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
         Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Text
     }
 }
 
@@ -84,6 +154,10 @@ impl LanceTokenizer for JsonTokenizer {
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
         Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Json
     }
 }
 

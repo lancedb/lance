@@ -14,8 +14,7 @@ use std::{
 
 use crate::{
     constants::{
-        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
@@ -65,6 +64,10 @@ use crate::{
 };
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
+use crate::constants::DICT_SIZE_RATIO_META_KEY;
+use crate::encodings::logical::primitive::dict::{
+    DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
+};
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
@@ -127,7 +130,7 @@ struct ChunkMeta {
 }
 
 /// A mini-block chunk that has been decoded and decompressed
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedMiniBlockChunk {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
@@ -527,13 +530,42 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
-        // Now we iterate through each instruction and process it
-        for (instructions, chunk) in self.instructions.iter() {
-            // TODO: It's very possible that we have duplicate `buf` in self.instructions and we
-            // don't want to decode the buf again and again on the same thread.
 
-            let DecodedMiniBlockChunk { rep, def, values } =
-                self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
+        // Pre-compute caching needs for each chunk by checking if the next chunk is the same
+        let needs_caching: Vec<bool> = self
+            .instructions
+            .windows(2)
+            .map(|w| w[0].1.chunk_idx == w[1].1.chunk_idx)
+            .chain(std::iter::once(false)) // the last one never needs caching
+            .collect();
+
+        // Cache for storing decoded chunks when beneficial
+        let mut chunk_cache: Option<(usize, DecodedMiniBlockChunk)> = None;
+
+        // Now we iterate through each instruction and process it
+        for (idx, (instructions, chunk)) in self.instructions.iter().enumerate() {
+            let should_cache_this_chunk = needs_caching[idx];
+
+            let decoded_chunk = match &chunk_cache {
+                Some((cached_chunk_idx, ref cached_chunk))
+                    if *cached_chunk_idx == chunk.chunk_idx =>
+                {
+                    // Clone only when we have a cache hit (much cheaper than decoding)
+                    cached_chunk.clone()
+                }
+                _ => {
+                    // Cache miss, need to decode
+                    let decoded = self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
+
+                    // Only update cache if this chunk will benefit the next access
+                    if should_cache_this_chunk {
+                        chunk_cache = Some((chunk.chunk_idx, decoded.clone()));
+                    }
+                    decoded
+                }
+            };
+
+            let DecodedMiniBlockChunk { rep, def, values } = decoded_chunk;
 
             // Our instructions tell us which rows we want to take from this chunk
             let row_range_start =
@@ -569,7 +601,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let mut data = data_builder.finish();
 
-        let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
+        let unraveler =
+            RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
 
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
@@ -919,7 +952,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
-        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
+        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning, num_values);
         Ok(DecodedPage {
             data,
             repdef: unraveler,
@@ -972,6 +1005,7 @@ impl DecodePageTask for SimpleAllNullDecodePageTask {
             None,
             Some(vec![1; self.num_values as usize]),
             Arc::new([DefinitionInterpretation::NullableItem]),
+            self.num_values,
         );
         Ok(DecodedPage {
             data: DataBlock::AllNull(AllNullDataBlock {
@@ -1235,9 +1269,17 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 16,
                     num_dictionary_items,
                 }),
-                _ => {
-                    unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
-                }
+                Compression::General(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 1,
+                    num_dictionary_items,
+                }),
+                _ => unreachable!(
+                    "Mini-block dictionary encoding must use Variable, Flat, or General compression"
+                ),
             }
         } else {
             None
@@ -2638,7 +2680,12 @@ impl DecodePageTask for VariableFullZipDecodeTask {
         } else {
             Some(self.def.to_vec())
         };
-        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
+        let unraveler = RepDefUnraveler::new(
+            rep,
+            def,
+            self.details.def_meaning.clone(),
+            self.num_visible_items,
+        );
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -2691,7 +2738,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..task_item.rows_in_buf);
             }
 
-            let unraveler = RepDefUnraveler::new(None, None, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                None,
+                None,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
 
             Ok(DecodedPage {
                 data: data_builder.finish(),
@@ -2753,8 +2805,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            let unraveler =
-                RepDefUnraveler::new(repetition, definition, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                repetition,
+                definition,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
             let data = data_builder.finish();
 
             Ok(DecodedPage {
@@ -4117,7 +4173,70 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    /// Estimates the total size of dictionary-encoded data
+    ///
+    /// Dictionary encoding splits data into two parts:
+    /// 1. Dictionary: stores unique values
+    /// 2. Indices: maps each value to a dictionary entry
+    ///
+    /// For FixedWidth (e.g., 128-bit Decimal):
+    /// - Dictionary: cardinality × 16 bytes (128 bits per value)
+    /// - Indices: num_values × 4 bytes (32-bit i32)
+    ///
+    /// For VariableWidth (strings/binary):
+    /// - Dictionary values: cardinality × avg_value_size (actual data)
+    /// - Dictionary offsets: cardinality × offset_size (32 or 64 bits)
+    /// - Indices: num_values × offset_size (same as dictionary offsets)
+    fn estimate_dict_size(data_block: &DataBlock) -> Option<u64> {
+        let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
+            cardinality_array.as_primitive::<UInt64Type>().value(0)
+        } else {
+            return None;
+        };
+
+        let num_values = data_block.num_values();
+
+        match data_block {
+            DataBlock::FixedWidth(_) => {
+                // Dictionary: cardinality unique values at 128 bits each
+                let dict_size = cardinality * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+                // Indices: num_values indices at 32 bits each
+                let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
+                Some(dict_size + indices_size)
+            }
+            DataBlock::VariableWidth(var) => {
+                // Only 32-bit and 64-bit offsets are supported
+                if var.bits_per_offset != 32 && var.bits_per_offset != 64 {
+                    return None;
+                }
+                let bits_per_offset = var.bits_per_offset as u64;
+
+                let data_size = data_block.data_size();
+                let avg_value_size = data_size / num_values;
+
+                // Dictionary values: actual bytes of unique strings/binary
+                let dict_values_size = cardinality * avg_value_size;
+                // Dictionary offsets: pointers into dictionary values
+                let dict_offsets_size = cardinality * (bits_per_offset / 8);
+                // Indices: map each row to dictionary entry
+                let indices_size = num_values * (bits_per_offset / 8);
+
+                Some(dict_values_size + dict_offsets_size + indices_size)
+            }
+            _ => None,
+        }
+    }
+
     fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
+        // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
+        // estimating the size
+        if !matches!(
+            data_block,
+            DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_)
+        ) {
+            return false;
+        }
+
         // Don't dictionary encode tiny arrays
         let too_small = env::var("LANCE_ENCODING_DICT_TOO_SMALL")
             .ok()
@@ -4127,35 +4246,40 @@ impl PrimitiveStructuralEncoder {
             return false;
         }
 
-        // Somewhat arbitrary threshold rule.  Apply dictionary encoding if the number of unique
-        // values is less than 1/2 the total number of values.
-        let divisor: u64 = field
+        // Get size ratio from metadata or env var, default to 0.8
+        let threshold_ratio = field
             .metadata
-            .get(DICT_DIVISOR_META_KEY)
-            .map(|val| val.parse().ok())
-            .unwrap_or_else(|| {
-                env::var("LANCE_ENCODING_DICT_DIVISOR")
+            .get(DICT_SIZE_RATIO_META_KEY)
+            .and_then(|val| val.parse::<f64>().ok())
+            .or_else(|| {
+                env::var("LANCE_ENCODING_DICT_SIZE_RATIO")
                     .ok()
                     .and_then(|val| val.parse().ok())
             })
-            .unwrap_or(2);
+            .unwrap_or(0.8);
 
-        // Cap on cardinality.  This should be pushed into the cardinality estimation to avoid
-        // spending too much time estimating cardinality.
-        let max_cardinality = env::var("LANCE_ENCODING_DICT_MAX_CARDINALITY")
-            .ok()
-            .and_then(|val| val.parse().ok())
-            .unwrap_or(100000);
+        // Validate size ratio is in valid range
+        if threshold_ratio <= 0.0 || threshold_ratio > 1.0 {
+            panic!(
+                "Invalid parameter: dict-size-ratio is {} which is not in the range (0, 1].",
+                threshold_ratio
+            );
+        }
 
-        let threshold = (data_block.num_values() / divisor).min(max_cardinality);
+        // Get raw data size
+        let data_size = data_block.data_size();
 
-        let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
-            cardinality_array.as_primitive::<UInt64Type>().value(0)
-        } else {
-            u64::MAX
+        // Estimate dictionary-encoded size
+        let Some(encoded_size) = Self::estimate_dict_size(data_block) else {
+            return false;
         };
 
-        cardinality < threshold
+        let size_ratio_actual = if data_size > 0 {
+            encoded_size as f64 / data_size as f64
+        } else {
+            return false;
+        };
+        size_ratio_actual < threshold_ratio
     }
 
     // Creates an encode task, consuming all buffered data
@@ -4220,15 +4344,28 @@ impl PrimitiveStructuralEncoder {
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-            // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
-            if let DataBlock::Struct(ref struct_data_block) = data_block {
-                if struct_data_block
-                    .children
-                    .iter()
-                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                {
-                    panic!("packed struct encoding currently only supports fixed-width fields.")
-                }
+            let requires_full_zip_packed_struct =
+                if let DataBlock::Struct(ref struct_data_block) = data_block {
+                    struct_data_block.has_variable_width_child()
+                } else {
+                    false
+                };
+
+            if requires_full_zip_packed_struct {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip packed struct layout",
+                    column_idx,
+                    num_values
+                );
+                return Self::encode_full_zip(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdefs,
+                    row_number,
+                    num_rows,
+                );
             }
 
             if let DataBlock::Dictionary(dict) = data_block {
@@ -4400,7 +4537,14 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
+    use super::{
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
+        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
+        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
+        StructuralPageScheduler,
+    };
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
+    use crate::data::BlockInfo;
     use crate::decoder::PageEncoding;
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
@@ -4409,17 +4553,10 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
     use crate::version::LanceFileVersion;
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{ArrayRef, Int8Array, StringArray, UInt64Array};
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
-
-    use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
-        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
-        StructuralPageScheduler,
-    };
 
     #[test]
     fn test_is_narrow() {
@@ -5438,5 +5575,126 @@ mod tests {
             }));
 
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    // Dictionary encoding decision tests
+    /// Helper to create FixedWidth test data block with exact cardinality stat injected
+    /// to ensure consistent test behavior (avoids HLL estimation error)
+    fn create_test_fixed_data_block(num_values: u64, cardinality: u64) -> DataBlock {
+        use crate::statistics::Stat;
+
+        let block_info = BlockInfo::default();
+
+        // Manually inject exact cardinality stat for consistent test behavior
+        let cardinality_array = Arc::new(UInt64Array::from(vec![cardinality]));
+        block_info
+            .0
+            .write()
+            .unwrap()
+            .insert(Stat::Cardinality, cardinality_array);
+
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: crate::buffer::LanceBuffer::from(vec![0u8; (num_values * 4) as usize]),
+            num_values,
+            block_info,
+        })
+    }
+
+    /// Helper to create VariableWidth (string) test data block with exact cardinality
+    fn create_test_variable_width_block(num_values: u64, cardinality: u64) -> DataBlock {
+        use crate::statistics::Stat;
+        use arrow_array::StringArray;
+
+        assert!(cardinality <= num_values && cardinality > 0);
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..num_values {
+            values.push(format!("value_{:016}", i % cardinality));
+        }
+
+        let array = StringArray::from(values);
+        let block = DataBlock::from_array(Arc::new(array) as ArrayRef);
+
+        // Manually inject stats for consistent test behavior
+        if let DataBlock::VariableWidth(ref var_block) = block {
+            let mut info = var_block.block_info.0.write().unwrap();
+            // Cardinality: exact value to avoid HLL estimation error
+            info.insert(
+                Stat::Cardinality,
+                Arc::new(UInt64Array::from(vec![cardinality])),
+            );
+        }
+
+        block
+    }
+
+    #[test]
+    fn test_estimate_dict_size_fixed_width() {
+        use crate::encodings::logical::primitive::dict::{
+            DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
+        };
+
+        let block = create_test_fixed_data_block(1000, 400);
+        let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
+
+        // Dictionary: 400 * 16 bytes (128-bit values)
+        // Indices: 1000 * 4 bytes (32-bit i32)
+        let expected_dict_size = 400 * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+        let expected_indices_size = 1000 * (DICT_INDICES_BITS_PER_VALUE / 8);
+        let expected_total = expected_dict_size + expected_indices_size;
+
+        assert_eq!(estimated_size, expected_total);
+    }
+
+    #[test]
+    fn test_estimate_dict_size_variable_width() {
+        let block = create_test_variable_width_block(1000, 400);
+        let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
+
+        // Get actual data size
+        let data_size = block.data_size();
+        let avg_value_size = data_size / 1000;
+
+        let expected = 400 * avg_value_size + 400 * 4 + 1000 * 4;
+
+        assert_eq!(estimated_size, expected);
+    }
+
+    #[test]
+    fn test_should_dictionary_encode() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        // Create data where dict encoding saves space
+        let block = create_test_variable_width_block(1000, 10);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+
+        assert!(result, "Should use dictionary encode based on size");
+    }
+
+    #[test]
+    fn test_should_not_dictionary_encode() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let block = create_test_fixed_data_block(1000, 10);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+
+        assert!(!result, "Should not use dictionary encode based on size");
     }
 }

@@ -417,6 +417,8 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
+        storage_options_provider: Optional[Any] = None,
+        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -447,6 +449,8 @@ class LanceDataset(pa.dataset.Dataset):
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
             session=session,
+            storage_options_provider=storage_options_provider,
+            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -558,6 +562,86 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         return Tags(self._ds)
+
+    @property
+    def branches(self) -> "Branches":
+        """Branch management for the dataset.
+
+        Examples
+        --------
+        --------
+
+        .. code-block:: python
+
+            ds = lance.open("dataset.lance")
+            ds.create_branch("v2-prod-20250203")
+
+            branches = ds.branches.list()
+
+        """
+        return Branches(self._ds)
+
+    def create_branch(
+        self,
+        branch: str,
+        reference: Optional[int | str | Tuple[str, int]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> "LanceDataset":
+        """Create a new branch from a version or tag.
+
+        Parameters
+        ----------
+        branch: str
+            Name of the branch to create.
+        reference: Optional[int | str | Tuple[str, int]]
+            The reference which could be a version_number, a tag name or a tuple of
+            (branch_name, version_number) to create the branch from.
+            If None, the latest version of the current branch is used.
+        storage_options: Optional[Dict[str, str]]
+            Storage options for the underlying object store. If not provided,
+            the storage options from the current dataset will be used.
+
+        Returns
+        -------
+        LanceDataset
+            A dataset instance pointing to the new branch.
+        """
+        if storage_options is None:
+            storage_options = self._storage_options
+        new_ds = self._ds.create_branch(branch, reference, storage_options)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = self._storage_options
+        ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params
+        return ds
+
+    def checkout_branch(self, branch: str) -> "LanceDataset":
+        """Check out the latest version of a branch.
+
+        Parameters
+        ----------
+        branch: str
+            The branch name to checkout.
+
+        Returns
+        -------
+        LanceDataset
+            A dataset instance at the latest version of the branch.
+        """
+        inner = self._ds.checkout_branch(branch)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = inner
+        ds._uri = inner.uri
+        ds._storage_options = self._storage_options
+        ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params
+        return ds
+
+    def checkout_latest(self):
+        """Check out the latest version of the current branch."""
+        self._ds.checkout_latest()
 
     def list_indices(self) -> List[Index]:
         return self._ds.load_indices()
@@ -2036,7 +2120,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version: int | str) -> "LanceDataset":
+    def checkout_version(self, version: int | str | Tuple[str, int]) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -2046,9 +2130,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        version: int | str,
-            The version to check out. A version number (`int`) or a tag
-            (`str`) can be provided.
+        version: int | str | Tuple[str, int],
+            The version to check out. A version number on main (`int`), a tag
+            (`str`) or a tuple of ('branch_name', 'version_number') can be provided.
 
         Returns
         -------
@@ -2341,7 +2425,8 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        if column not in self.schema.names:
+        lance_field = self._ds.lance_schema.field(column)
+        if lance_field is None:
             raise KeyError(f"{column} not found in schema")
 
         # TODO: Add documentation of IndexConfig approach for creating
@@ -2365,9 +2450,10 @@ class LanceDataset(pa.dataset.Dataset):
                     )
                 )
 
-            field = self.schema.field(column)
+            field = lance_field.to_arrow()
 
             field_type = field.type
+            field_meta = field.metadata
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
@@ -2396,12 +2482,17 @@ class LanceDataset(pa.dataset.Dataset):
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
-                if not pa.types.is_string(value_type) and not pa.types.is_large_string(
-                    value_type
+                if (
+                    not pa.types.is_string(value_type)
+                    and not pa.types.is_large_string(value_type)
+                    and not (
+                        pa.types.is_large_binary(value_type)
+                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
+                    )
                 ):
                     raise TypeError(
                         f"INVERTED index column {column} must be string, large string"
-                        " or list of strings, but got {value_type}"
+                        f" or list of strings, or json, but got {value_type}"
                     )
 
             if pa.types.is_duration(field_type):
@@ -2618,9 +2709,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            if c not in self.schema.names:
+            lance_field = self._ds.lance_schema.field(c)
+            if lance_field is None:
                 raise KeyError(f"{c} not found in schema")
-            field = self.schema.field(c)
+            field = lance_field.to_arrow()
             is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
@@ -2967,7 +3059,6 @@ class LanceDataset(pa.dataset.Dataset):
     def commit(
         base_uri: Union[str, Path, LanceDataset],
         operation: Union[LanceOperation.BaseOperation, Transaction],
-        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -3108,7 +3199,6 @@ class LanceDataset(pa.dataset.Dataset):
             new_ds = _Dataset.commit(
                 base_uri,
                 operation,
-                blobs_op,
                 read_version,
                 commit_lock,
                 storage_options=storage_options,
@@ -3258,7 +3348,8 @@ class LanceDataset(pa.dataset.Dataset):
             in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints).
+            endpoints). If not specified, the storage options of the source dataset
+            will be used.
 
         Returns
         -------
@@ -3270,6 +3361,8 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
+        if storage_options is None:
+            storage_options = self._storage_options
         self._ds.shallow_clone(target_uri, version, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
@@ -3375,7 +3468,7 @@ class LanceDataset(pa.dataset.Dataset):
             import lance
             dataset = lance.dataset("/tmp/data.lance")
             query = dataset.sql("SELECT id, name FROM dataset WHERE age > 30").build()
-            query.to_list()
+            query.to_batch_records()
 
         """
         return SqlQueryBuilder(self._ds.sql(sql))
@@ -3484,24 +3577,6 @@ class SqlQuery:
         """
         return self._query.to_stream_reader()
 
-    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
-        """
-        Explain the query plan.
-
-        Parameters
-        ----------
-        verbose: bool, default False
-            If True, print the verbose plan.
-        analyze: bool, default False
-            If True, analyze the query and print the statistics.
-
-        Returns
-        -------
-        str
-            The query plan.
-        """
-        return self._query.explain_plan(verbose, analyze)
-
 
 class SqlQueryBuilder:
     """
@@ -3572,7 +3647,6 @@ class Transaction:
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
-    blobs_op: Optional[LanceOperation.BaseOperation] = None
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
@@ -3580,6 +3654,13 @@ class Transaction:
 
 class Tag(TypedDict):
     version: int
+    manifest_size: int
+
+
+class Branch(TypedDict):
+    parent_branch: Optional[str]
+    parent_version: int
+    create_at: int
     manifest_size: int
 
 
@@ -3834,12 +3915,16 @@ class LanceOperation:
             the frag bitmap of the specified indices.
         """
 
-        removed_fragment_ids: List[int]
-        updated_fragments: List[FragmentMetadata]
-        new_fragments: List[FragmentMetadata]
-        fields_modified: List[int]
-        fields_for_preserving_frag_bitmap: List[int]
-        update_mode: str
+        removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
+        updated_fragments: List[FragmentMetadata] = dataclasses.field(
+            default_factory=list
+        )
+        new_fragments: List[FragmentMetadata] = dataclasses.field(default_factory=list)
+        fields_modified: List[int] = dataclasses.field(default_factory=list)
+        fields_for_preserving_frag_bitmap: List[int] = dataclasses.field(
+            default_factory=list
+        )
+        update_mode: str = ""
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -4347,10 +4432,11 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        if self.ds.schema.get_field_index(column) < 0:
+        lance_field = self.ds._ds.lance_schema.field(column)
+        if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
 
-        column_field = self.ds.schema.field(column)
+        column_field = lance_field.to_arrow()
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
@@ -4758,7 +4844,7 @@ class DatasetOptimizer:
 
         Parameters
         ----------
-        num_indices_to_merge: int, default 1
+        num_indices_to_merge: optional, int, default None
             The number of indices to merge.
             If set to 0, new delta index will be created.
         index_names: List[str], default None
@@ -4853,7 +4939,7 @@ class Tags:
         """
         return self._ds.tags_ordered(order)
 
-    def create(self, tag: str, version: int) -> None:
+    def create(self, tag: str, version: int, branch: Optional[str] = None) -> None:
         """
         Create a tag for a given dataset version.
 
@@ -4864,8 +4950,10 @@ class Tags:
             names for the dataset.
         version: int,
             The dataset version to tag.
+        branch: Optional[str],
+            The specified branch to create the tag, None if the specified branch is main
         """
-        self._ds.create_tag(tag, version)
+        self._ds.create_tag(tag, version, branch)
 
     def delete(self, tag: str) -> None:
         """
@@ -4879,7 +4967,7 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
-    def update(self, tag: str, version: int) -> None:
+    def update(self, tag: str, version: int, branch: Optional[str] = None) -> None:
         """
         Update tag to a new version.
 
@@ -4889,8 +4977,42 @@ class Tags:
             The name of the tag to update.
         version: int,
             The new dataset version to tag.
+        branch: Optional[str],
+            The specified branch to create the tag, None if the specified branch is main
         """
-        self._ds.update_tag(tag, version)
+        self._ds.update_tag(tag, version, branch)
+
+
+class Branches:
+    """
+    Dataset branch manager.
+    """
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def list(self) -> dict[str, Branch]:
+        """
+        List all dataset branches.
+
+        Returns
+        -------
+        dict[str, Branch]
+            A dictionary mapping branch names to branch metadata.
+        """
+        return self._ds.branches()
+
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Branch]]:
+        """
+        List all dataset branches ordered by parent version.
+        """
+        return self._ds.branches_ordered(order)
+
+    def delete(self, branch: str) -> None:
+        """
+        Delete a branch.
+        """
+        self._ds.delete_branch(branch)
 
 
 @dataclass
@@ -4953,7 +5075,7 @@ class LanceStats:
 
 def write_dataset(
     data_obj: ReaderLike,
-    uri: Union[str, Path, LanceDataset],
+    uri: Optional[Union[str, Path, LanceDataset]] = None,
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
@@ -4974,6 +5096,8 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    namespace: Optional[any] = None,
+    table_id: Optional[list] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4983,9 +5107,10 @@ def write_dataset(
         The data to be written. Acceptable types are:
         - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
         - Huggingface dataset
-    uri: str, Path, or LanceDataset
+    uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,
         the session will be reused.
+        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
     schema: Schema, optional
         If specified and the input is a pandas DataFrame, use this schema
         instead of the default pandas to arrow table conversion.
@@ -5065,7 +5190,65 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    namespace : optional, any
+        A namespace instance from which to fetch table location and storage options.
+        Must be provided together with `table_id`. Cannot be used with `uri`.
+        When provided, the table location will be fetched automatically from the
+        namespace via describe_table(). Storage options will be automatically refreshed
+        before they expire.
+    table_id : optional, list of str
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace`. Cannot be used with `uri`.
+
+    Notes
+    -----
+    When using `namespace` and `table_id`:
+    - The `uri` parameter is optional and will be fetched from the namespace
+    - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
+      storage options refresh
+    - Initial storage options from describe_table() will be merged with
+      any provided `storage_options`
     """
+    # Validate that user provides either uri OR (namespace + table_id), not both
+    has_uri = uri is not None
+    has_namespace = namespace is not None or table_id is not None
+
+    if has_uri and has_namespace:
+        raise ValueError(
+            "Cannot specify both 'uri' and 'namespace/table_id'. "
+            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+        )
+    elif not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+        )
+
+    # Handle namespace-based dataset writing
+    if namespace is not None:
+        if table_id is None:
+            raise ValueError(
+                "Both 'namespace' and 'table_id' must be provided together."
+            )
+
+        # Call describe_table to get location and storage options
+        table_info = namespace.describe_table(table_id=table_id, version=None)
+
+        # Extract location from namespace response
+        uri = table_info.get("location")
+        if not uri:
+            raise ValueError("Namespace did not return a table location")
+
+        # Merge initial storage options from describe_table with user-provided options
+        namespace_storage_options = table_info.get("storage_options", {})
+        if storage_options:
+            # User-provided options take precedence
+            merged_storage_options = {**namespace_storage_options, **storage_options}
+        else:
+            merged_storage_options = namespace_storage_options
+        storage_options = merged_storage_options
+    elif table_id is not None:
+        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+
     if use_legacy_format is not None:
         warnings.warn(
             "use_legacy_format is deprecated, use data_storage_version instead",

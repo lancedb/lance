@@ -22,6 +22,7 @@ use lance_core::utils::tempfile::TempStdDir;
 use lance_file::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -632,6 +633,7 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    OptimizeOptions::new(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
@@ -647,6 +649,7 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    OptimizeOptions::new(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
@@ -670,6 +673,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::new(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -686,6 +690,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::new(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -702,6 +707,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
+                OptimizeOptions::new(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -730,6 +736,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::new(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
@@ -745,6 +752,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::new(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
@@ -760,6 +768,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
+                        OptimizeOptions::new(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
@@ -1180,7 +1189,6 @@ pub async fn initialize_vector_index(
             new_indices: vec![new_idx],
             removed_indices: vec![],
         },
-        None,
         None,
     );
 
@@ -1848,9 +1856,8 @@ mod tests {
         // Run optimize_indices to index the newly added data and merge indices
         // We set num_indices_to_merge to a high value to force merging all indices into one
         use lance_index::optimize::OptimizeOptions;
-        let optimize_options = OptimizeOptions::new().num_indices_to_merge(10);
         target_dataset
-            .optimize_indices(&optimize_options)
+            .optimize_indices(&OptimizeOptions::merge(10))
             .await
             .unwrap();
 

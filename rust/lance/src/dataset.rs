@@ -127,7 +127,6 @@ pub use write::{
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
-pub const BLOB_DIR: &str = "_blobs";
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -514,7 +513,7 @@ impl Dataset {
             ref_path: String::from(self.uri()),
             branch_name: Some(branch.to_string()),
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             .with_store_params(store_params.unwrap_or_default())
@@ -846,36 +845,6 @@ impl Dataset {
     }
 
     // TODO: Cache this
-    pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
-        if let Some(blobs_version) = self.manifest.blob_dataset_version {
-            let blobs_path = self.base.child(BLOB_DIR);
-            let blob_manifest_location = self
-                .commit_handler
-                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
-                .await?;
-            let manifest = read_manifest(
-                &self.object_store,
-                &blob_manifest_location.path,
-                blob_manifest_location.size,
-            )
-            .await?;
-            let blobs_dataset = Self::checkout_manifest(
-                self.object_store.clone(),
-                blobs_path,
-                format!("{}/{}", self.uri, BLOB_DIR),
-                Arc::new(manifest),
-                blob_manifest_location,
-                self.session.clone(),
-                self.commit_handler.clone(),
-                self.file_reader_options.clone(),
-                self.store_params.as_deref().cloned(),
-            )?;
-            Ok(Some(Arc::new(blobs_dataset)))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn is_legacy_storage(&self) -> bool {
         self.manifest
             .data_storage_format
@@ -992,7 +961,6 @@ impl Dataset {
             Operation::Restore {
                 version: self.manifest.version,
             },
-            /*blobs_op=*/ None,
             None,
         );
 
@@ -1069,7 +1037,6 @@ impl Dataset {
     async fn do_commit(
         base_uri: WriteDestination<'_>,
         operation: Operation,
-        blobs_op: Option<Operation>,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -1088,7 +1055,7 @@ impl Dataset {
             Ok,
         )?;
 
-        let transaction = Transaction::new(read_version, operation, blobs_op, None);
+        let transaction = Transaction::new(read_version, operation, None);
 
         let mut builder = CommitBuilder::new(base_uri)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
@@ -1152,9 +1119,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1185,9 +1149,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1416,6 +1377,13 @@ impl Dataset {
         &self.object_store
     }
 
+    /// Returns the storage options used when opening this dataset, if any.
+    pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref())
+    }
+
     pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -1585,11 +1553,7 @@ impl Dataset {
         &self.manifest.schema
     }
 
-    /// Similar to [Self::schema], but only returns fields with the default storage class
-    pub fn local_schema(&self) -> &Schema {
-        &self.manifest.local_schema
-    }
-
+    /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())
@@ -1947,7 +1911,7 @@ impl Dataset {
             ref_path: self.uri.clone(),
             branch_name: None,
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.unwrap_or_default())
@@ -2266,9 +2230,6 @@ impl Dataset {
                 fragments: updated_fragments,
                 schema: new_schema,
             },
-            // It is not possible to add blob columns using merge
-            /*blobs_op=*/
-            None,
             None,
         );
 
@@ -2604,6 +2565,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::copy_test_data_to_tmp;
     use lance_arrow::FixedSizeListArrayExt;
+    use mock_instant::thread_local::MockClock;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -2617,15 +2579,14 @@ mod tests {
     };
     use arrow_array::{
         Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
-        StructArray, UInt64Array,
+        LargeBinaryArray, StructArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
-    use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
@@ -4300,7 +4261,7 @@ mod tests {
             initial_bases: None,
         };
         let test_uri = TempStrDir::default();
-        let read_version_0_transaction = Transaction::new(0, operation, None, None);
+        let read_version_0_transaction = Transaction::new(0, operation, None);
         let strict_builder = CommitBuilder::new(&test_uri).with_max_retries(0);
         let unstrict_builder = CommitBuilder::new(&test_uri).with_max_retries(1);
         strict_builder
@@ -6540,8 +6501,12 @@ mod tests {
         let mut doc_array = (0..4096)
             .map(|_| {
                 let mut rng = rand::rng();
-                let mut text = String::with_capacity(4);
-                for _ in 0..rng.random_range(127..512) {
+                let mut text = String::with_capacity(512);
+                let len = rng.random_range(127..512);
+                for i in 0..len {
+                    if i > 0 {
+                        text.push(' ');
+                    }
                     text.push_str(words[rng.random_range(0..words.len())]);
                 }
                 if text.contains("lance search") {
@@ -6553,10 +6518,16 @@ mod tests {
                 text
             })
             .collect_vec();
+        // Ensure at least one doc matches each phrase deterministically
+        doc_array.push("lance search".to_owned());
+        lance_search_count += 1;
+        doc_array.push("full text".to_owned());
+        full_text_count += 1;
         doc_array.push("position for phrase query".to_owned());
 
-        let params = InvertedIndexParams::default().with_position(true);
-        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array));
+        // 1) Build index without positions and assert phrase query errors
+        let params_no_pos = InvertedIndexParams::default().with_position(false);
+        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array.clone()));
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
@@ -6571,7 +6542,29 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
         dataset
-            .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+            .create_index(&["doc"], IndexType::Inverted, None, &params_no_pos, true)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"), "{}", err);
+        assert!(err.starts_with("Invalid user input: "), "{}", err);
+
+        // 2) Recreate index with positions and assert phrase query works
+        let params_with_pos = InvertedIndexParams::default().with_position(true);
+        dataset
+            .create_index(&["doc"], IndexType::Inverted, None, &params_with_pos, true)
             .await
             .unwrap();
 
@@ -6806,6 +6799,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
         // Looking at the fragments, there is no data file with the missing field
         let fragments = dataset.get_fragments();
@@ -6837,6 +6831,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
 
         // When reading back, only missing data is null, otherwise is filled in
         let data = dataset.scan().try_into_batch().await.unwrap();
@@ -7014,20 +7009,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_balanced_subschemas() {
-        // TODO: support this.
         let test_uri = TempStrDir::default();
 
         let field_a = ArrowField::new("a", DataType::Int32, true);
-        let field_b = ArrowField::new("b", DataType::Int64, true);
+        let field_b = ArrowField::new("b", DataType::LargeBinary, true);
         let schema = Arc::new(ArrowSchema::new(vec![
             field_a.clone(),
-            field_b.clone().with_metadata(
-                [(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                )]
-                .into(),
-            ),
+            field_b
+                .clone()
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
         ]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
@@ -7045,18 +7035,52 @@ mod tests {
         let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
 
         // Insert right side
         let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
-        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            just_b.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter(vec![Some(vec![2u8])]))],
+        )
+        .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].metadata.files.len(), 1);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+
+        let data = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["a"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.num_rows(), 2);
+        let a_column = data.column(0).as_primitive::<Int32Type>();
+        assert_eq!(a_column.value(0), 1);
+        assert!(a_column.is_null(1));
+
+        let blob_batch = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["b"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        let blob_descriptions = blob_batch.column(0).as_struct();
+        assert!(blob_descriptions.is_null(0));
+        assert!(blob_descriptions.is_valid(1));
     }
 
     #[tokio::test]
@@ -7711,9 +7735,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_skip_auto_cleanup() {
-        use lance_core::utils::testing::MockClock;
-        let clock = MockClock::new();
-
         let test_uri = TempStrDir::default();
 
         // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
@@ -7731,7 +7752,7 @@ mod tests {
         };
 
         // Start at 1 second after epoch
-        clock.set_system_time(chrono::Duration::seconds(1));
+        MockClock::set_system_time(std::time::Duration::from_secs(1));
 
         let dataset = Dataset::write(data, &test_uri, Some(write_params))
             .await
@@ -7739,7 +7760,7 @@ mod tests {
         assert_eq!(dataset.version().version, 1);
 
         // Advance time by 1 second
-        clock.set_system_time(chrono::Duration::seconds(2));
+        MockClock::set_system_time(std::time::Duration::from_secs(2));
 
         // First append WITHOUT skip_auto_cleanup - should trigger cleanup
         let data1 = gen_batch()
@@ -7761,7 +7782,7 @@ mod tests {
         assert_eq!(dataset2.version().version, 2);
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(3));
+        MockClock::set_system_time(std::time::Duration::from_secs(3));
 
         // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
         let data1_extra = gen_batch()
@@ -7788,7 +7809,7 @@ mod tests {
         );
 
         // Advance time
-        clock.set_system_time(chrono::Duration::seconds(4));
+        MockClock::set_system_time(std::time::Duration::from_secs(4));
 
         // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
         let data2 = gen_batch()
@@ -8172,6 +8193,130 @@ mod tests {
             .unwrap();
 
         (dataset, json_col)
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_fuzziness_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().lance_tokenizer("json".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query with fuzziness
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Dursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Dontent,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
     }
 
     #[tokio::test]
@@ -9491,5 +9636,39 @@ mod tests {
 
         // Should have both data writes (10 rows total)
         assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_auto_infer_lance_tokenizer() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col. Expect auto-infer 'json' for lance tokenizer.
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query succeed only when lance tokenizer is 'json'
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,once".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
     }
 }

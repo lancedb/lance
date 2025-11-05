@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.80"
@@ -19,6 +19,7 @@ lance-encoding = { path = "../../rust/lance-encoding" }
 lance-linalg = { path = "../../rust/lance-linalg" }
 lance-index = { path = "../../rust/lance-index" }
 lance-io = { path = "../../rust/lance-io" }
+lance-namespace = { path = "../../rust/lance-namespace" }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 arrow = { version = "56.1", features = ["ffi"] }
@@ -30,6 +31,8 @@ tokio = { version = "1.23", features = [
     "fs",
     "sync",
 ] }
+async-trait = "0.1"
+snafu = "0.8"
 jni = "0.21.1"
 serde_json = { version = "1" }
 log = "0.4"

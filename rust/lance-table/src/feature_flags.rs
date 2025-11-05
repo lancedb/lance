@@ -143,7 +143,6 @@ mod tests {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(), // Empty base_paths
         );
         apply_feature_flags(&mut normal_manifest, false).unwrap();
@@ -164,7 +163,6 @@ mod tests {
             schema,
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            None,
             base_paths,
         );
         apply_feature_flags(&mut multi_base_manifest, false).unwrap();

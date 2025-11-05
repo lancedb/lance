@@ -1124,7 +1124,7 @@ dependencies = [
  "lazy_static",
  "lazycell",
  "log",
- "prettyplease 0.2.35",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1238,7 +1238,7 @@ checksum = "40d1dad34aa19bf02295382f08d9bc40651585bd497266831d40ee6296fb49ca"
 dependencies = [
  "darling",
  "ident_case",
- "prettyplease 0.2.35",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -2783,18 +2783,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
-name = "fastbloom"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c1ddb9231d8554c2d6bdf4cfaabf0c59251658c68b6c95cd52dd0c513a912a"
-dependencies = [
- "getrandom 0.3.3",
- "libm",
- "rand 0.9.1",
- "siphasher",
-]
-
-[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2890,7 +2878,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3172,12 +3160,6 @@ name = "hashbrown"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
-name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "heck"
@@ -3664,15 +3646,6 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "itertools"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
@@ -3843,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3894,6 +3867,7 @@ dependencies = [
  "prost-types 0.13.5",
  "rand 0.9.1",
  "roaring",
+ "semver",
  "serde",
  "serde_json",
  "snafu",
@@ -3908,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3926,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3935,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3971,7 +3945,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4001,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4018,7 +3992,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4055,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4080,7 +4054,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "roaring",
  "snafu",
  "tokio",
  "tracing",
@@ -4088,7 +4061,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4110,7 +4083,6 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "dirs",
- "fastbloom",
  "fst",
  "futures",
  "half",
@@ -4153,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4193,36 +4165,46 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-ord",
  "arrow-schema",
- "bitvec",
  "cc",
  "deepsize",
- "futures",
  "half",
  "lance-arrow",
  "lance-core",
- "log",
  "num-traits",
  "rand 0.9.1",
- "rayon",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "lance-namespace"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "async-trait",
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
+ "snafu",
+]
+
+[[package]]
+name = "lance-namespace-impls"
+version = "0.39.0"
+dependencies = [
+ "arrow",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "lance",
+ "lance-core",
+ "lance-io",
+ "lance-namespace",
+ "object_store",
  "snafu",
 ]
 
@@ -4241,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4268,6 +4250,7 @@ dependencies = [
  "rand 0.9.1",
  "rangemap",
  "roaring",
+ "semver",
  "serde",
  "serde_json",
  "snafu",
@@ -4804,12 +4787,9 @@ dependencies = [
 
 [[package]]
 name = "mock_instant"
-version = "0.3.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
-dependencies = [
- "once_cell",
-]
+checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "moka"
@@ -5284,7 +5264,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6eea3058763d6e656105d1403cb04e0a41b7bbac6362d413e7c33be0c32279c9"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "itertools 0.13.0",
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -5598,16 +5578,6 @@ dependencies = [
 
 [[package]]
 name = "prettyplease"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c8646e95016a7a6c4adea95bafa8a16baab64b583356217f2c85db4a39d9a86"
-dependencies = [
- "proc-macro2",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "prettyplease"
 version = "0.2.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "061c1221631e079b26479d25bbf2275bfe5917ae8419cd7e34f13bfc2aa7539a"
@@ -5651,16 +5621,6 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b82eaa1d779e9a4bc1c3217db8ffbeabaae1dca241bf70183242128d48681cd"
-dependencies = [
- "bytes",
- "prost-derive 0.11.9",
-]
-
-[[package]]
-name = "prost"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
@@ -5681,40 +5641,18 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "119533552c9a7ffacc21e099c24a0ac8bb19c2a2a3f363de84cd9b844feab270"
-dependencies = [
- "bytes",
- "heck 0.4.1",
- "itertools 0.10.5",
- "lazy_static",
- "log",
- "multimap",
- "petgraph 0.6.5",
- "prettyplease 0.1.25",
- "prost 0.11.9",
- "prost-types 0.11.9",
- "regex",
- "syn 1.0.109",
- "tempfile",
- "which",
-]
-
-[[package]]
-name = "prost-build"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.5.0",
+ "heck",
  "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
  "petgraph 0.6.5",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.12.6",
  "prost-types 0.12.6",
  "regex",
@@ -5728,31 +5666,18 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
  "petgraph 0.7.1",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "regex",
  "syn 2.0.106",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d2d8d10f3c6ded6da8b05b5fb3b8a5082514344d56c9f871412d29b4e075b4"
-dependencies = [
- "anyhow",
- "itertools 0.10.5",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -5779,15 +5704,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "213622a1460818959ac1181aaeb2dc9c7f63df720db7d788b3e24eacd1983e13"
-dependencies = [
- "prost 0.11.9",
 ]
 
 [[package]]
@@ -5819,13 +5735,12 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.38.3-beta.8"
+version = "0.39.0"
 dependencies = [
  "arrow",
  "arrow-array",
  "arrow-data",
  "arrow-schema",
- "arrow-select",
  "async-trait",
  "bytes",
  "chrono",
@@ -5845,13 +5760,13 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-namespace",
+ "lance-namespace-impls",
  "lance-table",
  "libc",
  "log",
  "object_store",
- "once_cell",
  "prost 0.13.5",
- "prost-build 0.11.9",
  "prost-types 0.13.5",
  "pyo3",
  "regex",
@@ -5924,7 +5839,7 @@ version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4109984c22491085343c05b0dbc54ddc405c3cf7b4374fc533f5c3313a572ccc"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "pyo3-build-config",
  "quote",
@@ -6939,7 +6854,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -7076,7 +6991,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -7089,7 +7004,7 @@ version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c77a8c5abcaf0f9ce05d62342b7d298c346515365c36b673df4ebe3ced01fde8"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -7102,11 +7017,11 @@ version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de6d24c270c6c672a86c183c3a8439ba46c1936f93cf7296aa692de3b0ff0228"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "pbjson",
  "pbjson-build",
  "pbjson-types",
- "prettyplease 0.2.35",
+ "prettyplease",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
@@ -7775,7 +7690,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "741b7f1e2e1338c0bee5ad5a7d3a9bbd4e24c33765c08b7691810e68d879365d"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "log",
  "proc-macro2",
  "quote",

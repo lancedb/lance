@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import os
 import random
 import re
@@ -1771,7 +1772,6 @@ def test_zonemap_index_remapping(tmp_path: Path):
     # Test with a different query to ensure index works properly
     scanner = dataset.scanner(filter="values BETWEEN 1000 AND 1500", prefilter=True)
     plan = scanner.explain_plan()
-    print(f"Query plan after optimization: {plan}")
     assert "ScalarIndexQuery" in plan
 
     result = scanner.to_table()
@@ -3075,16 +3075,13 @@ def test_distribute_fts_index_build(tmp_path):
     import uuid
 
     index_id = str(uuid.uuid4())
-    print(f"Using index ID: {index_id}")
     index_name = "multiple_fragment_idx"
 
     fragments = ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
 
     for fragment in ds.get_fragments():
         fragment_id = fragment.fragment_id
-        print(f"Creating index for fragment {fragment_id}")
 
         # Use the new fragment_ids and fragment_uuid parameters
         ds.create_scalar_index(
@@ -3133,8 +3130,6 @@ def test_distribute_fts_index_build(tmp_path):
         read_version=ds.version,
     )
 
-    print("Successfully committed multiple fragment index")
-
     # Verify the index was created and is functional
     indices = ds_committed.list_indices()
     assert len(indices) > 0, "No indices found after commit"
@@ -3162,7 +3157,6 @@ def test_distribute_fts_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    print(f"Search for '{search_word}' returned {results.num_rows} results")
     # We should get at least one result since we searched for a word from the dataset
     assert results.num_rows > 0, f"No results found for search term '{search_word}'"
 
@@ -3690,3 +3684,325 @@ def test_scan_statistics_callback(tmp_path):
     for key, value in scan_stats.all_counts.items():
         assert isinstance(key, str)
         assert isinstance(value, int)
+
+
+def test_nested_field_btree_index(tmp_path):
+    """Test BTREE index creation and querying on nested fields"""
+    # Create a dataset with nested structure
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "meta",
+                pa.struct(
+                    [pa.field("lang", pa.string()), pa.field("version", pa.int32())]
+                ),
+            ),
+        ]
+    )
+
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "meta": [
+                {"lang": "en", "version": 1},
+                {"lang": "fr", "version": 2},
+                {"lang": "en", "version": 1},
+                {"lang": "es", "version": 3},
+                {"lang": "fr", "version": 2},
+            ],
+        },
+        schema=schema,
+    )
+
+    # Create dataset
+    uri = tmp_path / "test_nested_btree"
+    dataset = lance.write_dataset(data, uri)
+
+    # Create BTREE index on nested string column
+    dataset.create_scalar_index(column="meta.lang", index_type="BTREE")
+
+    # Verify index was created
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["meta.lang"]
+    assert indices[0]["type"] == "BTree"
+
+    # Test query using the index - filter for English language
+    result = dataset.scanner(filter="meta.lang = 'en'").to_table()
+    assert len(result) == 2
+    for i in range(len(result)):
+        assert result["meta"][i]["lang"].as_py() == "en"
+
+    # Test query for French language
+    result = dataset.scanner(filter="meta.lang = 'fr'").to_table()
+    assert len(result) == 2
+    for i in range(len(result)):
+        assert result["meta"][i]["lang"].as_py() == "fr"
+
+    # Verify the index is being used
+    plan = dataset.scanner(filter="meta.lang = 'en'").explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Write additional data to the dataset
+    new_data = pa.table(
+        {
+            "id": [6, 7, 8],
+            "meta": [
+                {"lang": "de", "version": 4},
+                {"lang": "en", "version": 2},
+                {"lang": "de", "version": 4},
+            ],
+        },
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(new_data, uri, mode="append")
+
+    # Verify query still works after appending data
+    result = dataset.scanner(filter="meta.lang = 'en'").to_table()
+    assert len(result) == 3, f"Expected 3 English records, got {len(result)}"
+    for i in range(len(result)):
+        assert result["meta"][i]["lang"].as_py() == "en"
+
+    # Test query for new German language entries
+    result = dataset.scanner(filter="meta.lang = 'de'").to_table()
+    assert len(result) == 2
+    for i in range(len(result)):
+        assert result["meta"][i]["lang"].as_py() == "de"
+
+    # Test optimize_indices with nested field BTREE index
+    dataset.optimize.optimize_indices()
+
+    # Verify query still works after optimization
+    result = dataset.scanner(filter="meta.lang = 'en'").to_table()
+    assert len(result) == 3
+    result = dataset.scanner(filter="meta.lang = 'de'").to_table()
+    assert len(result) == 2
+
+    # Create BTREE index on nested integer column
+    dataset.create_scalar_index(column="meta.version", index_type="BTREE", replace=True)
+
+    # Test query using the version index
+    result = dataset.scanner(filter="meta.version = 1").to_table()
+    assert len(result) == 2
+    for i in range(len(result)):
+        assert result["meta"][i]["version"].as_py() == 1
+
+    # Test query for version 4 (new data)
+    result = dataset.scanner(filter="meta.version = 4").to_table()
+    assert len(result) == 2
+    for i in range(len(result)):
+        assert result["meta"][i]["version"].as_py() == 4
+
+    # Verify total row count
+    total = dataset.count_rows()
+    assert total == 8, f"Expected 8 total rows, got {total}"
+
+
+def test_nested_field_fts_index(tmp_path):
+    """Test FTS index creation and querying on nested fields"""
+    # Create dataset with nested text field
+    data = pa.table(
+        {
+            "id": range(100),
+            "data": pa.StructArray.from_arrays(
+                [
+                    pa.array(
+                        [f"document {i} about lance database" for i in range(100)]
+                    ),
+                    pa.array([f"label_{i}" for i in range(100)]),
+                ],
+                names=["text", "label"],
+            ),
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Create FTS index on nested field
+    ds.create_scalar_index("data.text", index_type="INVERTED", with_position=False)
+
+    # Verify index was created
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["data.text"]
+    assert indices[0]["type"] == "Inverted"
+
+    # Test full text search on nested field
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 100
+
+    # Verify the results contain the expected text
+    for i in range(results.num_rows):
+        text = results["data"][i]["text"].as_py()
+        assert "lance" in text
+
+    # Test with prefilter using another nested field
+    results = ds.to_table(
+        full_text_query="database",
+        filter="data.label = 'label_5'",
+        prefilter=True,
+    )
+    assert results.num_rows == 1
+    assert results["id"][0].as_py() == 5
+
+    # Test optimize_indices with nested field FTS index
+    # Append more data
+    new_data = pa.table(
+        {
+            "id": range(100, 150),
+            "data": pa.StructArray.from_arrays(
+                [
+                    pa.array(
+                        [f"document {i} about lance search" for i in range(100, 150)]
+                    ),
+                    pa.array([f"label_{i}" for i in range(100, 150)]),
+                ],
+                names=["text", "label"],
+            ),
+        }
+    )
+    ds = lance.write_dataset(new_data, tmp_path, mode="append")
+
+    # Optimize indices
+    ds.optimize.optimize_indices()
+
+    # Verify search still works after optimization
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 150
+
+    results = ds.to_table(full_text_query="search")
+    assert results.num_rows == 50
+
+
+def test_nested_field_bitmap_index(tmp_path):
+    """Test BITMAP index creation and querying on nested fields"""
+    # Create dataset with nested categorical field
+    data = pa.table(
+        {
+            "id": range(100),
+            "attributes": pa.StructArray.from_arrays(
+                [
+                    pa.array(["red", "green", "blue"][i % 3] for i in range(100)),
+                    pa.array([f"size_{i % 5}" for i in range(100)]),
+                ],
+                names=["color", "size"],
+            ),
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Create BITMAP index on nested field
+    ds.create_scalar_index("attributes.color", index_type="BITMAP")
+
+    # Verify index was created
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["attributes.color"]
+    assert indices[0]["type"] == "Bitmap"
+
+    # Test equality query
+    results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)
+    assert results.num_rows == 34  # 0, 3, 6, 9, ... 99 (34 values)
+
+    # Verify the index is being used
+    plan = ds.scanner(filter="attributes.color = 'red'", prefilter=True).explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Test with different color
+    results = ds.to_table(filter="attributes.color = 'green'", prefilter=True)
+    assert results.num_rows == 33  # 1, 4, 7, 10, ... 97 (33 values)
+
+    results = ds.to_table(filter="attributes.color = 'blue'", prefilter=True)
+    assert results.num_rows == 33  # 2, 5, 8, 11, ... 98 (33 values)
+
+    # Test optimize_indices with nested field BITMAP index
+    new_data = pa.table(
+        {
+            "id": range(100, 150),
+            "attributes": pa.StructArray.from_arrays(
+                [
+                    pa.array(["red", "green", "blue"][i % 3] for i in range(50)),
+                    pa.array([f"size_{i % 5}" for i in range(50)]),
+                ],
+                names=["color", "size"],
+            ),
+        }
+    )
+    ds = lance.write_dataset(new_data, tmp_path, mode="append")
+
+    # Optimize indices
+    ds.optimize.optimize_indices()
+
+    # Verify query still works after optimization
+    results = ds.to_table(filter="attributes.color = 'red'", prefilter=True)
+    assert results.num_rows == 51  # 34 + 17 from new data
+
+
+def test_json_inverted_match_query(tmp_path):
+    # Prepare dataset with JSON data
+    json_data = [
+        {
+            "Title": "HarryPotter Chapter One",
+            "Content": "Once upon a time, there was a boy named Harry.",
+            "Author": "J.K. Rowling",
+            "Price": 99,
+            "Language": ["english", "french"],
+        },
+        {
+            "Title": "HarryPotter Chapter Two",
+            "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+            "Author": "J.K. Rowling",
+            "Price": 128,
+            "Language": ["english", "chinese"],
+        },
+        {
+            "Title": "The Hobbit",
+            "Content": "In a hole in the ground there lived a hobbit.",
+            "Author": "J.R.R. Tolkien",
+            "Price": 89,
+            "Language": ["english"],
+        },
+    ]
+
+    # Convert to JSON strings
+    json_strings = pa.array([json.dumps(doc) for doc in json_data], type=pa.json_())
+    table = pa.table({"json_col": json_strings, "id": range(len(json_data))})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Create inverted index with JSON tokenizer
+    dataset.create_scalar_index(
+        "json_col",
+        index_type="INVERTED",
+        base_tokenizer="simple",
+        max_token_length=10,
+        stem=True,
+        lower_case=True,
+        remove_stop_words=True,
+    )
+
+    # Test match query with token exceeding max_token_length
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Title,str,harrypotter", "json_col")
+    )
+    assert results.num_rows == 0
+
+    # Test stemming
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Content,str,onc", "json_col")
+    )
+    assert results.num_rows == 1
+
+    # Test language match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Language,str,english", "json_col")
+    )
+    assert results.num_rows == 3
+
+    # Test author match
+    results = dataset.to_table(
+        full_text_query=MatchQuery("Author,str,tolkien", "json_col")
+    )
+    assert results.num_rows == 1

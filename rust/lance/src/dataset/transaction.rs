@@ -88,21 +88,8 @@ pub struct Transaction {
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
-    /// If the transaction modified the blobs dataset, this is the operation
-    /// to apply to the blobs dataset.
-    ///
-    /// If this is `None`, then the blobs dataset was not modified
-    pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum BlobsOperation {
-    /// The operation did not modify the blobs dataset
-    Unchanged,
-    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
-    Updated(u64),
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1430,7 +1417,6 @@ pub struct TransactionBuilder {
     // uuid is optional for builder since it can autogenerate
     uuid: Option<String>,
     operation: Operation,
-    blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
@@ -1441,7 +1427,6 @@ impl TransactionBuilder {
             read_version,
             uuid: None,
             operation,
-            blobs_op: None,
             tag: None,
             transaction_properties: None,
         }
@@ -1449,11 +1434,6 @@ impl TransactionBuilder {
 
     pub fn uuid(mut self, uuid: String) -> Self {
         self.uuid = Some(uuid);
-        self
-    }
-
-    pub fn blobs_op(mut self, blobs_op: Option<Operation>) -> Self {
-        self.blobs_op = blobs_op;
         self
     }
 
@@ -1478,7 +1458,6 @@ impl TransactionBuilder {
             read_version: self.read_version,
             uuid,
             operation: self.operation,
-            blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
         }
@@ -1490,18 +1469,8 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation).build()
     }
 
-    pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
-        Self { blobs_op, ..self }
-    }
-
-    pub fn new(
-        read_version: u64,
-        operation: Operation,
-        blobs_op: Option<Operation>,
-        tag: Option<String>,
-    ) -> Self {
+    pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
         TransactionBuilder::new(read_version, operation)
-            .blobs_op(blobs_op)
             .tag(tag)
             .build()
     }
@@ -1572,7 +1541,6 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-        new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -2191,12 +2159,8 @@ impl Transaction {
         let mut manifest = if let Some(current_manifest) = current_manifest {
             // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
             // So we always use new_from_previous which preserves base_paths
-            let mut prev_manifest = Manifest::new_from_previous(
-                current_manifest,
-                schema,
-                Arc::new(final_fragments),
-                new_blob_version,
-            );
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -2215,7 +2179,6 @@ impl Transaction {
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
-                new_blob_version,
                 reference_paths,
             )
         };
@@ -3046,51 +3009,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                 });
             }
         };
-        let blobs_op = message
-            .blob_operation
-            .map(|blob_op| match blob_op {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments,
-                }) => Result::Ok(Operation::Append {
-                    fragments: fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                }),
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments,
-                    schema,
-                    schema_metadata: _schema_metadata, // TODO: handle metadata
-                    config_upsert_values,
-                    initial_bases,
-                }) => {
-                    let config_upsert_option = if config_upsert_values.is_empty() {
-                        Some(config_upsert_values)
-                    } else {
-                        None
-                    };
-
-                    Ok(Operation::Overwrite {
-                        fragments: fragments
-                            .into_iter()
-                            .map(Fragment::try_from)
-                            .collect::<Result<Vec<_>>>()?,
-                        schema: Schema::from(&Fields(schema)),
-                        config_upsert_values: config_upsert_option,
-                        initial_bases: if initial_bases.is_empty() {
-                            None
-                        } else {
-                            Some(initial_bases.into_iter().map(BasePath::from).collect())
-                        },
-                    })
-                }
-            })
-            .transpose()?;
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
-            blobs_op,
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -3359,40 +3281,6 @@ impl From<&Transaction> for pb::Transaction {
             }
         };
 
-        let blob_operation = value.blobs_op.as_ref().map(|op| match op {
-            Operation::Append { fragments } => {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                })
-            }
-            Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values,
-                initial_bases,
-            } => {
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                    config_upsert_values: config_upsert_values
-                        .clone()
-                        .unwrap_or(Default::default()),
-                    initial_bases: initial_bases
-                        .as_ref()
-                        .map(|paths| {
-                            paths
-                                .iter()
-                                .cloned()
-                                .map(|bp: BasePath| -> pb::BasePath { bp.into() })
-                                .collect::<Vec<pb::BasePath>>()
-                        })
-                        .unwrap_or_default(),
-                })
-            }
-            _ => panic!("Invalid blob operation: {:?}", value),
-        });
-
         let transaction_properties = value
             .transaction_properties
             .as_ref()
@@ -3402,7 +3290,6 @@ impl From<&Transaction> for pb::Transaction {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
-            blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
         }
@@ -3686,7 +3573,6 @@ mod tests {
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(original_fragments),
             DataStorageFormat::new(LanceFileVersion::V2_0),
-            None,
             HashMap::new(),
         );
 

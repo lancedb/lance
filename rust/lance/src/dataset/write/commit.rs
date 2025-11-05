@@ -436,21 +436,6 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
-        let blob_new_frags = transactions
-            .iter()
-            .flat_map(|t| &t.blobs_op)
-            .flat_map(|b| match b {
-                Operation::Append { fragments } => fragments.clone(),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        let blobs_op = if blob_new_frags.is_empty() {
-            None
-        } else {
-            Some(Operation::Append {
-                fragments: blob_new_frags,
-            })
-        };
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -464,7 +449,6 @@ impl<'a> CommitBuilder<'a> {
                     .collect(),
             },
             read_version,
-            blobs_op,
             tag: None,
             //TODO: handle batch transaction merges in the future
             transaction_properties: None,
@@ -529,7 +513,6 @@ mod tests {
                 fragments: vec![sample_fragment()],
             },
             read_version,
-            blobs_op: None,
             tag: None,
             transaction_properties: None,
         }
@@ -794,7 +777,6 @@ mod tests {
                 update_mode: None,
             },
             read_version: 1,
-            blobs_op: None,
             tag: None,
             transaction_properties: None,
         };
@@ -822,6 +804,5 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
-        assert!(transaction.blobs_op.is_none());
     }
 }

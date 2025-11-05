@@ -58,7 +58,33 @@ message Manifest {
     // that the library is semantically versioned, this is a string. However, if it
     // is semantically versioned, it should be a valid semver string without any 'v'
     // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    //
+    // For forward compatibility with older readers, when writing new manifests this
+    // field should contain only the core version (major.minor.patch) without any
+    // prerelease or build metadata. The prerelease/build info should be stored in
+    // the separate prerelease and build_metadata fields instead.
     string version = 2;
+    // Optional semver prerelease identifier.
+    //
+    // This field stores the prerelease portion of a semantic version separately
+    // from the core version number. For example, if the full version is "2.0.0-rc.1",
+    // the version field would contain "2.0.0" and prerelease would contain "rc.1".
+    //
+    // This separation ensures forward compatibility: older readers can parse the
+    // clean version field without errors, while newer readers can reconstruct the
+    // full semantic version by combining version, prerelease, and build_metadata.
+    //
+    // If absent, the version field is used as-is.
+    optional string prerelease = 3;
+    // Optional semver build metadata.
+    //
+    // This field stores the build metadata portion of a semantic version separately
+    // from the core version number. For example, if the full version is
+    // "2.0.0-rc.1+build.123", the version field would contain "2.0.0", prerelease
+    // would contain "rc.1", and build_metadata would contain "build.123".
+    //
+    // If absent, no build metadata is present.
+    optional string build_metadata = 4;
   }
 
   // The version of the writer that created this file.
@@ -157,12 +183,9 @@ message Manifest {
   // data itself and is attached to the output schema of scans.
   map<string, string> table_metadata = 19;
 
-  // The version of the blob dataset associated with this table.  Changes to
-  // blob fields will modify the blob dataset and update this version in the parent
-  // table.
-  //
-  // If this value is 0 then there are no blob fields.
-  uint64 blob_dataset_version = 17;
+  // Field number 17 (`blob_dataset_version`) was used for a secondary blob dataset.
+  reserved 17;
+  reserved "blob_dataset_version";
 
   // The base paths of data files.
   //

@@ -11,9 +11,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance.schema;
+package com.lancedb.lance.cleanup;
 
-public enum StorageType {
-  DEFAULT,
-  BLOB
+/** Statistics returned by dataset cleanup. */
+public class RemovalStats {
+  private final long bytesRemoved;
+  private final long oldVersions;
+
+  public RemovalStats(long bytesRemoved, long oldVersions) {
+    this.bytesRemoved = bytesRemoved;
+    this.oldVersions = oldVersions;
+  }
+
+  public long getBytesRemoved() {
+    return bytesRemoved;
+  }
+
+  public long getOldVersions() {
+    return oldVersions;
+  }
 }
