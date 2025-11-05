@@ -157,7 +157,7 @@ pub struct Dataset {
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
-    pub index_cache: Arc<DSIndexCache>,
+    pub(crate) index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.

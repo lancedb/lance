@@ -4028,7 +4028,6 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "bytes",
- "deepsize",
  "fsst",
  "futures",
  "hex",

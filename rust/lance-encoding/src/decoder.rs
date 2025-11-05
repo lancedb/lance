@@ -224,7 +224,7 @@ use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::{DeepSizeOf, LanceCache};
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use log::{debug, trace, warn};
 use snafu::location;
@@ -262,35 +262,10 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 /// A file should only use one or the other and never both.
 /// 2.0 decoders can always assume this is pb::ArrayEncoding
 /// and 2.1+ decoders can always assume this is pb::PageLayout
-#[derive(Debug, DeepSizeOf)]
+#[derive(Debug)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
     Structural(pb21::PageLayout),
-}
-
-// Implement these manually because there isn't yet an implementation for bytes::Bytes
-impl DeepSizeOf for pb::Fsst {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.symbol_table.len()
-    }
-}
-
-impl DeepSizeOf for pb::Constant {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.value.len()
-    }
-}
-
-impl DeepSizeOf for pb21::Fsst {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.symbol_table.len()
-    }
-}
-
-impl DeepSizeOf for pb21::Constant {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.value.as_ref().map(|v| v.len()).unwrap_or(0)
-    }
 }
 
 impl PageEncoding {
@@ -316,7 +291,7 @@ impl PageEncoding {
 /// Metadata describing a page in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
-#[derive(Debug, DeepSizeOf)]
+#[derive(Debug)]
 pub struct PageInfo {
     /// The number of rows in the page
     pub num_rows: u64,
@@ -333,7 +308,7 @@ pub struct PageInfo {
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone)]
 pub struct ColumnInfo {
     /// The index of the column in the file
     pub index: u32,

@@ -59,7 +59,7 @@ const BITMAP_INDEX_VERSION: u32 = 0;
 // bitmaps are cached we don't open it. If we do open it we should only open it once.
 #[derive(Clone)]
 struct LazyIndexReader {
-    index_reader: Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>,
+    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
     store: Arc<dyn IndexStore>,
 }
 
@@ -71,31 +71,21 @@ impl std::fmt::Debug for LazyIndexReader {
     }
 }
 
-impl DeepSizeOf for LazyIndexReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        let mut total_size = 0;
-        if let Some(reader) = self.index_reader.get() {
-            total_size += reader.deep_size_of_children(context);
-        }
-        total_size += self.index_reader.get().deep_size_of_children(context);
-        total_size
-    }
-}
-
 impl LazyIndexReader {
     fn new(store: Arc<dyn IndexStore>) -> Self {
         Self {
-            index_reader: Arc::new(tokio::sync::OnceCell::new()),
+            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
             store,
         }
     }
 
     async fn get(&self) -> Result<Arc<dyn IndexReader>> {
-        Ok(self
-            .index_reader
-            .get_or_try_init(|| async { self.store.open_index_file(BITMAP_LOOKUP_NAME).await })
-            .await?
-            .clone())
+        let mut reader = self.index_reader.lock().await;
+        if reader.is_none() {
+            let index_reader = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+            *reader = Some(index_reader);
+        }
+        Ok(reader.as_ref().unwrap().clone())
     }
 }
 
@@ -114,19 +104,13 @@ pub struct BitmapIndex {
 
     value_type: DataType,
 
-    // store: Arc<dyn IndexStore>,
+    store: Arc<dyn IndexStore>,
+
     index_cache: WeakLanceCache,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 
     lazy_reader: LazyIndexReader,
-}
-
-impl Drop for BitmapIndex {
-    fn drop(&mut self) {
-        println!("Dropping BitmapIndex");
-        dbg!(DeepSizeOf::deep_size_of(self));
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +140,7 @@ impl BitmapIndex {
             index_map,
             null_map,
             value_type,
-            // store,
+            store,
             index_cache,
             frag_reuse_index,
             lazy_reader,
@@ -313,9 +297,7 @@ impl DeepSizeOf for BitmapIndex {
         let mut total_size = 0;
 
         total_size += self.index_map.deep_size_of_children(context);
-        total_size += self.null_map.deep_size_of_children(context);
-        total_size += self.lazy_reader.deep_size_of_children(context);
-        // total_size += self.store.deep_size_of_children(context);
+        total_size += self.store.deep_size_of_children(context);
 
         total_size
     }

@@ -766,9 +766,7 @@ impl DeepSizeOf for BTreeIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
         // sub_index and fri.
-        self.page_lookup.deep_size_of_children(context)
-            + self.store.deep_size_of_children(context)
-            + self.sub_index.deep_size_of_children(context)
+        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 

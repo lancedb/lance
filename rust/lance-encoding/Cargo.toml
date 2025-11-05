@@ -23,7 +23,6 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 lance-bitpacking = { workspace = true, optional = true }
 bytes.workspace = true
-deepsize.workspace = true
 futures.workspace = true
 fsst.workspace = true
 hex = "0.4.3"

@@ -178,7 +178,7 @@ pub trait IndexWriter: Send {
 
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
-pub trait IndexReader: Send + Sync + DeepSizeOf {
+pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read the range of rows from the file.
