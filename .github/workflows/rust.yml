@@ -147,6 +147,9 @@ jobs:
   query-integration-tests:
     runs-on: ubuntu-2404-8x-arm64
     timeout-minutes: 75
+    env:
+      # We use opt-level 1 which makes some tests 5x faster to run.
+      RUSTFLAGS: "-C debuginfo=1 -C opt-level 1"
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
@@ -162,12 +165,12 @@ jobs:
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      # - name: Build query integration tests
-      #   run: |
-      #     cargo build --locked -p lance --profile release-with-debug --features fp16kernels --tests --test integration_tests
+      - name: Build query integration tests
+        run: |
+          cargo build --locked -p lance --no-default-features --features fp16kernels,slow_tests --tests --test integration_tests
       - name: Run query integration tests
         run: |
-          cargo test --locked -p lance --profile release-with-debug --features fp16kernels,slow_tests --test integration_tests
+          cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
     runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
