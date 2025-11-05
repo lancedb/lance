@@ -21,7 +21,7 @@ fn create_datafusion_context() -> SessionContext {
 mod primitives;
 mod vectors;
 
-/// Scanning an ordering by id should give same result as original.
+/// Scanning and ordering by id should give same result as original.
 async fn test_scan(original: &RecordBatch, ds: &Dataset) {
     let mut scanner = ds.scan();
     scanner
