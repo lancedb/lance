@@ -26,6 +26,7 @@ use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
+use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -38,11 +39,13 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::StorageOptionsProvider;
 use std::collections::HashMap;
+use std::future::IntoFuture;
 use std::iter::empty;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -154,21 +157,6 @@ impl BlockingDataset {
             false, // TODO: support enable_v2_manifest_paths
         ))?;
         Ok(Self { inner })
-    }
-
-    pub fn create_index(
-        &mut self,
-        columns: &[&str],
-        index_type: IndexType,
-        name: Option<String>,
-        params: &dyn IndexParams,
-        replace: bool,
-    ) -> Result<()> {
-        RT.block_on(
-            self.inner
-                .create_index(columns, index_type, name, params, replace),
-        )?;
-        Ok(())
     }
 
     pub fn latest_version(&self) -> Result<u64> {
@@ -680,9 +668,12 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,   // Optional<String>
-    params_jobj: JObject, // IndexParams
-    replace_jobj: jboolean,
+    name_jobj: JObject,       // Optional<String>
+    params_jobj: JObject,     // IndexParams
+    replace_jobj: jboolean,   // replace
+    train_jobj: jboolean,     // train
+    fragments_jobj: JObject,  // List<Integer>
+    index_uuid_jobj: JObject, // String
 ) {
     ok_or_throw_without_return!(
         env,
@@ -693,25 +684,37 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
             index_type_code_jobj,
             name_jobj,
             params_jobj,
-            replace_jobj
+            replace_jobj,
+            train_jobj,
+            fragments_jobj,
+            index_uuid_jobj
         )
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_index(
     env: &mut JNIEnv,
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,   // Optional<String>
-    params_jobj: JObject, // IndexParams
-    replace_jobj: jboolean,
+    name_jobj: JObject,       // Optional<String>
+    params_jobj: JObject,     // IndexParams
+    replace_jobj: jboolean,   // replace
+    train_jobj: jboolean,     // train
+    fragments_jobj: JObject,  // Optional<List<String>>
+    index_uuid_jobj: JObject, // Optional<String>
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
-    let replace = replace_jobj != 0;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+    let replace = replace_jobj != 0;
+    let train = train_jobj != 0;
+    let fragment_ids = env
+        .get_ints_opt(&fragments_jobj)?
+        .map(|vec| vec.into_iter().map(|i| i as u32).collect());
+    let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -754,9 +757,111 @@ fn inner_create_index(
     let params = params_result?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+
+    let mut index_builder = dataset_guard
+        .inner
+        .create_index_builder(&columns_slice, index_type, params.as_ref())
+        .replace(replace)
+        .train(train);
+
+    if let Some(name) = name {
+        index_builder = index_builder.name(name);
+    }
+
+    let has_fragment_ids = fragment_ids.is_some();
+
+    if let Some(fragment_ids) = fragment_ids {
+        index_builder = index_builder.fragments(fragment_ids);
+    }
+
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
+    }
+
+    if has_fragment_ids {
+        RT.block_on(index_builder.execute_uncommitted())?;
+    } else {
+        RT.block_on(index_builder.into_future())?
+    }
 
     Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_innerMergeIndexMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject, // Optional<Integer>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_merge_index_metadata(
+            &mut env,
+            java_dataset,
+            index_uuid,
+            index_type_code_jobj,
+            batch_readhead_jobj
+        )
+    );
+}
+
+fn inner_merge_index_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject, // Optional<Integer>
+) -> Result<()> {
+    let index_uuid = index_uuid.extract(env)?;
+    let index_type = IndexType::try_from(index_type_code_jobj)?;
+    let batch_readhead = env
+        .get_int_opt(&batch_readhead_jobj)?
+        .map(|val| val as usize);
+
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(async {
+        let index_store = LanceIndexStore::from_dataset_for_new(&dataset_guard.inner, &index_uuid)?;
+        let object_store = dataset_guard.inner.object_store();
+        let index_dir = dataset_guard.inner.indices_dir().child(index_uuid);
+
+        match index_type {
+            IndexType::Inverted => lance_index::scalar::inverted::builder::merge_index_files(
+                object_store,
+                &index_dir,
+                Arc::new(index_store),
+            )
+            .await
+            .map_err(|e| {
+                Error::runtime_error(format!(
+                    "Cannot create index of type: {:?}. Caused by: {:?}",
+                    index_type,
+                    e.to_string()
+                ))
+            }),
+            IndexType::BTree => lance_index::scalar::btree::merge_index_files(
+                object_store,
+                &index_dir,
+                Arc::new(index_store),
+                batch_readhead,
+            )
+            .await
+            .map_err(|e| {
+                Error::runtime_error(format!(
+                    "Cannot create index of type: {:?}. Caused by: {:?}",
+                    index_type,
+                    e.to_string()
+                ))
+            }),
+            _ => Err(Error::input_error(format!(
+                "Cannot merge index type: {:?}. Only supports BTREE and INVERTED now.",
+                index_type
+            ))),
+        }
+    })
 }
 
 //////////////////

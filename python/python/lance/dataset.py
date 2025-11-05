@@ -2245,7 +2245,7 @@ class LanceDataset(pa.dataset.Dataset):
         replace: bool = True,
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
-        fragment_uuid: Optional[str] = None,
+        index_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2340,7 +2340,7 @@ class LanceDataset(pa.dataset.Dataset):
             method returns an IndexMetadata object but does not commit the index
             to the dataset. The index can be committed later using the commit API.
             This parameter is passed via kwargs internally.
-        fragment_uuid : str, optional
+        index_uuid : str, optional
             A UUID to use for fragment-level distributed indexing
             multiple fragment-level indices need to share UUID for later merging.
             If not provided, a new UUID will be generated. This parameter is passed via
@@ -2506,11 +2506,11 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
-        # Add fragment_ids and fragment_uuid to kwargs if provided
+        # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
-        if fragment_uuid is not None:
-            kwargs["fragment_uuid"] = fragment_uuid
+        if index_uuid is not None:
+            kwargs["index_uuid"] = index_uuid
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
