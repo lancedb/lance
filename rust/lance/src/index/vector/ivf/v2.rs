@@ -632,7 +632,10 @@ mod tests {
         dataset::optimize::{compact_files, CompactionOptions},
         index::vector::IndexFileVersion,
     };
-    use crate::{index::vector::VectorIndexParams, Dataset};
+    use crate::{
+        index::vector::{VectorIndex, VectorIndexParams},
+        Dataset,
+    };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
@@ -782,6 +785,144 @@ mod tests {
         let schema: Arc<_> = Schema::new(fields).into();
         let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
         (batch, schema)
+    }
+
+    struct VectorIndexTestContext {
+        stats_json: String,
+        stats: serde_json::Value,
+        index: Arc<dyn VectorIndex>,
+    }
+
+    impl VectorIndexTestContext {
+        fn stats(&self) -> &serde_json::Value {
+            &self.stats
+        }
+
+        fn stats_json(&self) -> &str {
+            &self.stats_json
+        }
+
+        fn num_partitions(&self) -> usize {
+            self.stats()["indices"][0]["num_partitions"]
+                .as_u64()
+                .expect("num_partitions should be present") as usize
+        }
+
+        fn ivf(&self) -> &IvfPq {
+            self.index
+                .as_any()
+                .downcast_ref::<IvfPq>()
+                .expect("expected IvfPq index")
+        }
+    }
+
+    async fn load_vector_index_context(
+        dataset: &Dataset,
+        column: &str,
+        index_name: &str,
+    ) -> VectorIndexTestContext {
+        let stats_json = dataset.index_statistics(index_name).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let uuid = stats["indices"][0]["uuid"]
+            .as_str()
+            .expect("Index uuid should be present");
+        let index = dataset
+            .open_vector_index(column, uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        VectorIndexTestContext {
+            stats_json,
+            stats,
+            index,
+        }
+    }
+
+    async fn verify_partition_split_after_append(
+        mut dataset: Dataset,
+        test_uri: &str,
+        params: VectorIndexParams,
+        description: &str,
+    ) {
+        const INDEX_NAME: &str = "vector_idx";
+        const APPEND_ROWS: usize = 50_000;
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let initial_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            initial_ctx.num_partitions(),
+            2,
+            "Expected {} initial partitions to be 2 before append, got stats: {}",
+            description,
+            initial_ctx.stats_json()
+        );
+
+        // Append tightly clustered vectors so data flows into the same partition.
+        append_dataset::<Float32Type>(&mut dataset, APPEND_ROWS, 0.0..0.05).await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            final_ctx.num_partitions(),
+            3,
+            "Expected partition split to increase partitions from 2 to 3 for {}, got stats: {}",
+            description,
+            final_ctx.stats_json()
+        );
+    }
+
+    async fn load_partition_row_ids(index: &IvfPq, partition_idx: usize) -> Vec<u64> {
+        index
+            .storage
+            .load_partition(partition_idx)
+            .await
+            .unwrap()
+            .row_ids()
+            .copied()
+            .collect()
+    }
+
+    async fn delete_ids(dataset: &mut Dataset, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let predicate = ids
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        dataset
+            .delete(&format!("id in ({})", predicate))
+            .await
+            .unwrap();
+    }
+
+    async fn compact_after_deletions(dataset: &mut Dataset) {
+        compact_files(
+            dataset,
+            CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[allow(dead_code)]
@@ -2029,55 +2170,13 @@ mod tests {
 
         // Create initial dataset with just enough rows for 2 partitions
         // Using a small initial dataset to avoid long test times
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         // Create an IVF-PQ index with 2 partitions
         // For IvfPq, target_partition_size = 8192
         // Split triggers when partition_size > 4 * 8192 = 32,768
-        let nlist = 2;
-        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::L2, 50);
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector_idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify we start with 2 partitions using index statistics
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(initial_num_partitions, 2);
-
-        // Append enough data to trigger a split
-        // We need to add more than 32,768 rows to one partition
-        // To ensure they mostly go to one partition, we'll generate vectors
-        // that are very similar to each other (tight range) to cluster together
-        let append_rows = 50000;
-        append_dataset::<Float32Type>(&mut dataset, append_rows, 0.0..0.05).await;
-
-        // Optimize indices - this should trigger the split check and perform the split
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        // Reload the dataset to get the latest index information
-        let dataset = Dataset::open(test_uri).await.unwrap();
-
-        // Verify that we now have 3 partitions (one partition was split)
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(
-            final_num_partitions, 3,
-            "Expected partition split to increase partitions from 2 to 3, got stats: {}",
-            stats_json
-        );
+        let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::L2, 50);
+        verify_partition_split_after_append(dataset, test_uri, params, "scalar vector data").await;
     }
 
     #[tokio::test]
@@ -2191,13 +2290,13 @@ mod tests {
             .unwrap();
 
         // Verify initial partition count
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(num_partitions as usize, nlist);
+        let index_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
+        assert_eq!(index_ctx.num_partitions(), nlist);
 
         // Verify partition sizes match expected (approximately, due to potential edge cases)
-        let partitions = stats["indices"][0]["partitions"].as_array().unwrap();
+        let partitions = index_ctx.stats()["indices"][0]["partitions"]
+            .as_array()
+            .unwrap();
         let partition_0_size = partitions[0]["size"].as_u64().unwrap();
         assert!(
             (50..=150).contains(&partition_0_size),
@@ -2207,14 +2306,7 @@ mod tests {
 
         // Delete most rows from partition 0, keeping only 1 row
         // This should bring it well below the 2048 threshold
-        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
-        let index = dataset
-            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
-        let part = index.storage.load_partition(0).await.unwrap();
-        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+        let row_ids = load_partition_row_ids(index_ctx.ivf(), 0).await;
 
         assert!(!row_ids.is_empty(), "Partition 0 should not be empty");
 
@@ -2227,43 +2319,21 @@ mod tests {
         let first_vector = res["vector"].as_fixed_size_list().value(0);
 
         // Delete all but the first row in partition 0
-        if ids.len() > 1 {
-            dataset
-                .delete(&format!(
-                    "id in ({})",
-                    ids.iter()
-                        .skip(1)
-                        .map(|x| x.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))
-                .await
-                .unwrap();
-        }
+        delete_ids(&mut dataset, &ids[1..]).await;
 
         // Compact to trigger partition join
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                materialize_deletions_threshold: 0.0,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        compact_after_deletions(&mut dataset).await;
 
         // Verify partition was joined (should have nlist-1 partitions now)
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
+        let final_num_partitions = final_ctx.num_partitions();
         assert_eq!(
-            final_num_partitions as usize,
+            final_num_partitions,
             nlist - 1,
             "Expected partition join to decrease partitions from {} to {}, got stats: {}",
             nlist,
             nlist - 1,
-            stats_json
+            final_ctx.stats_json()
         );
 
         // Verify that vector search still works after partition join
@@ -2348,56 +2418,13 @@ mod tests {
         let test_uri = test_dir.as_str();
 
         // Create initial dataset with multivector data
-        let (mut dataset, _) =
-            generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         // Create an IVF-PQ index with 2 partitions
         // For IvfPq, target_partition_size = 8192
         // Split triggers when partition_size > 4 * 8192 = 32,768
-        let nlist = 2;
-        let params = VectorIndexParams::ivf_pq(nlist, 8, DIM / 8, DistanceType::Cosine, 50);
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector_idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify we start with 2 partitions using index statistics
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(initial_num_partitions, 2);
-
-        // Append enough multivector data to trigger a split
-        // We need to add more than 32,768 vectors to one partition
-        // To ensure they mostly go to one partition, we'll generate vectors
-        // that are very similar to each other (tight range) to cluster together
-        let append_rows = 50000;
-        append_dataset::<Float32Type>(&mut dataset, append_rows, 0.0..0.05).await;
-
-        // Optimize indices - this should trigger the split check and perform the split
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        // Reload the dataset to get the latest index information
-        let dataset = Dataset::open(test_uri).await.unwrap();
-
-        // Verify that we now have 3 partitions (one partition was split)
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(
-            final_num_partitions, 3,
-            "Expected partition split to increase partitions from 2 to 3 for multivector, got stats: {}",
-            stats_json
-        );
+        let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::Cosine, 50);
+        verify_partition_split_after_append(dataset, test_uri, params, "multivector data").await;
     }
 
     #[tokio::test]
@@ -2444,36 +2471,29 @@ mod tests {
             .unwrap();
 
         // Verify initial partition count
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let initial_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
-        assert_eq!(initial_num_partitions as usize, nlist);
+        let index_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
+        assert_eq!(index_ctx.num_partitions(), nlist);
 
         // Find the smallest partition and delete most of its rows
-        let uuid = stats["indices"][0]["uuid"].as_str().unwrap();
-        let index = dataset
-            .open_vector_index("vector", uuid, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+        let row_ids = {
+            let ivf = index_ctx.ivf();
+            let mut smallest: Option<Vec<u64>> = None;
+            for i in 0..ivf.ivf.num_partitions() {
+                let partition_row_ids = load_partition_row_ids(ivf, i).await;
+                if partition_row_ids.is_empty() {
+                    continue;
+                }
 
-        let mut smallest_partition_idx = 0;
-        let mut smallest_partition_size = usize::MAX;
-        for i in 0..index.ivf.num_partitions() {
-            let part = index.storage.load_partition(i).await.unwrap();
-            let size = part.row_ids().count();
-            if size > 0 && size < smallest_partition_size {
-                smallest_partition_size = size;
-                smallest_partition_idx = i;
+                let is_better = smallest
+                    .as_ref()
+                    .map(|existing| partition_row_ids.len() < existing.len())
+                    .unwrap_or(true);
+                if is_better {
+                    smallest = Some(partition_row_ids);
+                }
             }
-        }
-
-        let part = index
-            .storage
-            .load_partition(smallest_partition_idx)
-            .await
-            .unwrap();
-        let row_ids = part.row_ids().copied().collect::<Vec<_>>();
+            smallest.unwrap_or_default()
+        };
 
         if row_ids.is_empty() {
             // All partitions might be large - just verify basic functionality
@@ -2495,39 +2515,16 @@ mod tests {
         let retained_ids: Vec<u64> = row_ids.iter().take(keep_count).copied().collect();
 
         // Delete all rows except the first keep_count rows
-        if row_ids.len() > keep_count {
-            dataset
-                .delete(&format!(
-                    "id in ({})",
-                    row_ids
-                        .iter()
-                        .skip(keep_count)
-                        .map(|x| x.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))
-                .await
-                .unwrap();
-        }
+        delete_ids(&mut dataset, &row_ids[keep_count..]).await;
 
         // Compact to potentially trigger partition join
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                materialize_deletions_threshold: 0.0,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        compact_after_deletions(&mut dataset).await;
 
         // Verify partition count (may or may not have joined depending on sizes)
-        let stats_json = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let final_num_partitions = stats["indices"][0]["num_partitions"].as_u64().unwrap();
+        let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
+        let final_num_partitions = final_ctx.num_partitions();
         assert!(
-            final_num_partitions as usize <= nlist,
+            final_num_partitions <= nlist,
             "Partition count should not increase after deletions, was {}, now {}",
             nlist,
             final_num_partitions
