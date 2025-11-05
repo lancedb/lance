@@ -103,7 +103,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 20;
+const DEFAULT_NPROBES: usize = 20;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -981,7 +981,7 @@ impl Dataset {
                 10
             };
 
-            let mut minimum_nprobes = DEFAULT_NPROBS;
+            let mut minimum_nprobes = DEFAULT_NPROBES;
             let mut maximum_nprobes = None;
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
