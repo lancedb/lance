@@ -34,6 +34,7 @@ from typing import (
 
 import pyarrow as pa
 import pyarrow.dataset
+from lance_namespace import DescribeTableRequest, LanceNamespace
 from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
@@ -5096,8 +5097,8 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
-    namespace: Optional[any] = None,
-    table_id: Optional[list] = None,
+    namespace: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5190,13 +5191,13 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
-    namespace : optional, any
+    namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table(). Storage options will be automatically refreshed
         before they expire.
-    table_id : optional, list of str
+    table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
 
@@ -5230,22 +5231,21 @@ def write_dataset(
                 "Both 'namespace' and 'table_id' must be provided together."
             )
 
-        # Call describe_table to get location and storage options
-        table_info = namespace.describe_table(table_id=table_id, version=None)
-
-        # Extract location from namespace response
-        uri = table_info.get("location")
+        request = DescribeTableRequest(id=table_id, version=None)
+        response = namespace.describe_table(request)
+        uri = response.location
         if not uri:
             raise ValueError("Namespace did not return a table location")
 
-        # Merge initial storage options from describe_table with user-provided options
-        namespace_storage_options = table_info.get("storage_options", {})
-        if storage_options:
-            # User-provided options take precedence
-            merged_storage_options = {**namespace_storage_options, **storage_options}
-        else:
-            merged_storage_options = namespace_storage_options
-        storage_options = merged_storage_options
+        namespace_storage_options = response.storage_options
+        if namespace_storage_options:
+            # TODO: support dynamic storage options provider
+            if storage_options is None:
+                storage_options = namespace_storage_options
+            else:
+                merged_options = dict(storage_options)
+                merged_options.update(namespace_storage_options)
+                storage_options = merged_options
     elif table_id is not None:
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
 

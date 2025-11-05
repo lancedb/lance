@@ -7,7 +7,9 @@ This module provides storage options integration with LanceNamespace,
 enabling automatic storage options refresh for namespace-managed tables.
 """
 
-from typing import Dict
+from typing import Dict, List
+
+from lance_namespace import DescribeTableRequest, LanceNamespace
 
 from .io import StorageOptionsProvider
 
@@ -25,10 +27,8 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
 
     Parameters
     ----------
-    namespace : any
-        The namespace instance to fetch storage options from. This can be any
-        object with a describe_table(table_id, version) method that returns a
-        dict with 'location' and 'storage_options' keys. For example, use
+    namespace : LanceNamespace
+        The namespace instance to fetch storage options from. Use
         lance_namespace.connect() from the lance_namespace PyPI package.
     table_id : List[str]
         The table identifier (e.g., ["workspace", "table_name"])
@@ -61,12 +61,12 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         )
     """
 
-    def __init__(self, namespace, table_id: list):
+    def __init__(self, namespace: LanceNamespace, table_id: List[str]):
         """Initialize with namespace and table ID.
 
         Parameters
         ----------
-        namespace : any
+        namespace : LanceNamespace
             The namespace instance with a describe_table() method
         table_id : List[str]
             The table identifier
@@ -91,13 +91,9 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         RuntimeError
             If the namespace doesn't return storage options or expiration time
         """
-        # Call namespace to describe the table and get storage options
-        table_info = self._namespace.describe_table(
-            table_id=self._table_id, version=None
-        )
-
-        # Extract storage options - should already be a flat dict of strings
-        storage_options = table_info.get("storage_options")
+        request = DescribeTableRequest(id=self._table_id, version=None)
+        response = self._namespace.describe_table(request)
+        storage_options = response.storage_options
         if storage_options is None:
             raise RuntimeError(
                 "Namespace did not return storage_options. "
