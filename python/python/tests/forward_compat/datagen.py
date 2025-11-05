@@ -66,7 +66,7 @@ def write_dataset_json():
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("json"))
+    dataset = lance.write_dataset(data, get_path("json"), max_rows_per_file=100)
     dataset.create_scalar_index(
         "json",
         IndexConfig(
@@ -75,25 +75,53 @@ def write_dataset_json():
     )
 
 
-def write_dataset_scalar_index():
-    shutil.rmtree(get_path("scalar_index"), ignore_errors=True)
+def write_dataset_btree_index():
+    shutil.rmtree(get_path("btree_index"), ignore_errors=True)
 
     data = pa.table(
         {
             "idx": pa.array(range(1000)),
             "btree": pa.array(range(1000)),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("btree_index"), max_rows_per_file=100)
+    dataset.create_scalar_index("btree", "BTREE")
+
+
+def write_dataset_bitmap_labellist_index():
+    shutil.rmtree(get_path("bitmap_labellist_index"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
             "bitmap": pa.array(range(1000)),
             "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
+        }
+    )
+
+    dataset = lance.write_dataset(
+        data, get_path("bitmap_labellist_index"), max_rows_per_file=100
+    )
+    dataset.create_scalar_index("bitmap", "BITMAP")
+    dataset.create_scalar_index("label_list", "LABEL_LIST")
+
+
+def write_dataset_ngram_zonemap_bloomfilter_index():
+    shutil.rmtree(get_path("ngram_zonemap_bloomfilter_index"), ignore_errors=True)
+
+    data = pa.table(
+        {
+            "idx": pa.array(range(1000)),
             "ngram": pa.array([f"word{i}" for i in range(1000)]),
             "zonemap": pa.array(range(1000)),
             "bloomfilter": pa.array(range(1000)),
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("scalar_index"))
-    dataset.create_scalar_index("btree", "BTREE")
-    dataset.create_scalar_index("bitmap", "BITMAP")
-    dataset.create_scalar_index("label_list", "LABEL_LIST")
+    dataset = lance.write_dataset(
+        data, get_path("ngram_zonemap_bloomfilter_index"), max_rows_per_file=100
+    )
     dataset.create_scalar_index("ngram", "NGRAM")
     dataset.create_scalar_index("zonemap", "ZONEMAP")
     dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
@@ -111,7 +139,7 @@ def write_dataset_fts_index():
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("fts_index"))
+    dataset = lance.write_dataset(data, get_path("fts_index"), max_rows_per_file=100)
     dataset.create_scalar_index("text", "INVERTED")
 
 
@@ -119,6 +147,8 @@ if __name__ == "__main__":
     write_basic_types()
     write_large()
     write_dataset_pq_buffer()
-    write_dataset_scalar_index()
+    write_dataset_btree_index()
+    write_dataset_bitmap_labellist_index()
+    write_dataset_ngram_zonemap_bloomfilter_index()
     write_dataset_json()
     write_dataset_fts_index()
