@@ -53,11 +53,6 @@ async fn test_take(original: &RecordBatch, ds: &Dataset) {
         // Convert to u64 for Lance take
         let indices_u64: Vec<u64> = indices.iter().map(|&i| i as u64).collect();
 
-        if indices_u64.is_empty() {
-            // Skip empty case as Lance may not handle it the same way
-            continue;
-        }
-
         let taken_ds = ds.take(&indices_u64, ds.schema().clone()).await.unwrap();
 
         // Take from RecordBatch using arrow::compute
