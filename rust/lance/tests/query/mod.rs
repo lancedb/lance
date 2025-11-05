@@ -50,11 +50,6 @@ async fn test_take(original: &RecordBatch, ds: &Dataset) {
     ];
 
     for indices in cases {
-        // Skip cases with invalid indices
-        if indices.iter().any(|&i| i >= num_rows) {
-            continue;
-        }
-
         // Convert to u64 for Lance take
         let indices_u64: Vec<u64> = indices.iter().map(|&i| i as u64).collect();
 
