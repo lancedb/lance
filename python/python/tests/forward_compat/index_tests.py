@@ -2,6 +2,7 @@ import inspect
 import sys
 from pathlib import Path
 
+import lance
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -210,8 +211,11 @@ class BasicTypes(UpgradeDowngradeTest):
         self.file_version = file_version
 
     def create(self):
-        with LanceFileWriter(str(self.path), version=self.file_version) as writer:
-            writer.write_batch(build_basic_types())
+        batch = build_basic_types()
+        with LanceFileWriter(
+            str(self.path), version=self.file_version, schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
 
     def check_read(self):
         reader = LanceFileReader(str(self.path))
@@ -221,6 +225,27 @@ class BasicTypes(UpgradeDowngradeTest):
     def check_write(self):
         with LanceFileWriter(str(self.path), version=self.file_version) as writer:
             writer.write_batch(build_basic_types())
+
+
+@compat_test()
+class BasicTypesLegacy(UpgradeDowngradeTest):
+    def __init__(self, path: Path, file_version: str):
+        self.path = path
+        self.file_version = file_version
+
+    def create(self):
+        batch = build_basic_types()
+        lance.write_dataset(batch, self.path, data_storage_version="0.1")
+
+    def check_read(self):
+        ds = lance.dataset(self.path)
+        table = ds.to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        ds = lance.dataset(self.path)
+        ds.delete("true")
+        ds.insert(build_basic_types())
 
 
 class IndexTest:
