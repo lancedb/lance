@@ -335,8 +335,7 @@ async fn test_query_binary(#[case] data_type: DataType) {
 
 #[tokio::test]
 #[rstest::rstest]
-#[case::decimal32(DataType::Decimal32(38, 10))]
-#[case::decimal64(DataType::Decimal64(38, 10))]
+// TODO: Add Decimal32 and Decimal64 once lance_datagen supports them
 #[case::decimal128(DataType::Decimal128(38, 10))]
 #[case::decimal256(DataType::Decimal256(76, 20))]
 async fn test_query_decimal(#[case] data_type: DataType) {
@@ -349,7 +348,6 @@ async fn test_query_decimal(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: fix bugs with bitmap, btree, and zone map for decimals
             // NOTE: BloomFilter not supported for decimals
             [None, Some(IndexType::Bitmap), Some(IndexType::BTree)],
         )
