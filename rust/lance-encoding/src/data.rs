@@ -399,8 +399,14 @@ pub struct FixedSizeListBlock {
 }
 
 impl FixedSizeListBlock {
-    pub fn num_values(&self) -> u64 {
-        self.child.num_values() / self.dimension
+    pub fn num_values(&self) -> Result<u64> {
+        let child_values = self.child.num_values()?;
+        child_values
+            .checked_div(self.dimension)
+            .ok_or(Error::InvalidInput {
+                source: "Division by zero: dimension cannot be zero".into(),
+                location: location!(),
+            })
     }
 
     /// Try to flatten a FixedSizeListBlock into a FixedWidthDataBlock
@@ -455,7 +461,7 @@ impl FixedSizeListBlock {
     }
 
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
-        let num_values = self.num_values();
+        let num_values = self.num_values()?;
         let builder = match &data_type {
             DataType::FixedSizeList(child_field, _) => {
                 let child_data = self
@@ -713,9 +719,11 @@ impl DictionaryDataBlock {
         }
 
         // assume the indices are uniformly distributed.
-        let estimated_size_bytes = self.dictionary.data_size()
-            * (self.indices.num_values + self.dictionary.num_values() - 1)
-            / self.dictionary.num_values();
+        let estimated_size_bytes = {
+            let dict_num_values = self.dictionary.num_values()?;
+            self.dictionary.data_size() * (self.indices.num_values + dict_num_values - 1)
+                / dict_num_values
+        };
         let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
@@ -935,18 +943,18 @@ impl DataBlock {
     ///
     /// This function does not recurse into child blocks.  If this is a FSL then it will
     /// be the number of lists and not the number of items.
-    pub fn num_values(&self) -> u64 {
+    pub fn num_values(&self) -> Result<u64> {
         match self {
-            Self::Empty() => 0,
-            Self::Constant(inner) => inner.num_values,
-            Self::AllNull(inner) => inner.num_values,
+            Self::Empty() => Ok(0),
+            Self::Constant(inner) => Ok(inner.num_values),
+            Self::AllNull(inner) => Ok(inner.num_values),
             Self::Nullable(inner) => inner.data.num_values(),
-            Self::FixedWidth(inner) => inner.num_values,
+            Self::FixedWidth(inner) => Ok(inner.num_values),
             Self::FixedSizeList(inner) => inner.num_values(),
-            Self::VariableWidth(inner) => inner.num_values,
+            Self::VariableWidth(inner) => Ok(inner.num_values),
             Self::Struct(inner) => inner.children[0].num_values(),
-            Self::Dictionary(inner) => inner.indices.num_values,
-            Self::Opaque(inner) => inner.num_values,
+            Self::Dictionary(inner) => Ok(inner.indices.num_values),
+            Self::Opaque(inner) => Ok(inner.num_values),
         }
     }
 
@@ -1633,6 +1641,10 @@ impl DataBlockBuilder {
 
 #[cfg(test)]
 mod tests {
+    use crate::data::BlockInfo;
+    use crate::data::Error;
+    use crate::data::FixedSizeListBlock;
+    use crate::data::FixedWidthDataBlock;
     use std::sync::Arc;
 
     use arrow_array::{
@@ -1686,7 +1698,7 @@ mod tests {
 
         let block = DataBlock::from_arrays(arrays, 7);
 
-        assert_eq!(block.num_values(), 7);
+        assert_eq!(block.num_values().unwrap(), 7);
         let block = block.as_nullable().unwrap();
 
         assert_eq!(block.nulls, LanceBuffer::from(vec![0b00011101]));
@@ -1710,7 +1722,7 @@ mod tests {
 
         let block = DataBlock::from_arrays(arrays, 3);
 
-        assert_eq!(block.num_values(), 3);
+        assert_eq!(block.num_values().unwrap(), 3);
         // Should be no nullable wrapper
         let data = block.as_variable_width().unwrap();
         assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(vec![0, 1, 3, 6]));
@@ -1727,7 +1739,7 @@ mod tests {
             let num_rows = arrs.iter().map(|a| a.len()).sum::<usize>() as u64;
             let data = DataBlock::from_arrays(&arrs, num_rows);
 
-            assert_eq!(data.num_values(), num_rows);
+            assert_eq!(data.num_values().unwrap(), num_rows);
 
             let data = data.as_variable_width().unwrap();
             assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(expected_off));
@@ -1756,7 +1768,7 @@ mod tests {
         let arr = LargeBinaryArray::from_vec(vec![b"hello", b"world"]);
         let data = DataBlock::from_array(arr);
 
-        assert_eq!(data.num_values(), 2);
+        assert_eq!(data.num_values().unwrap(), 2);
         let data = data.as_variable_width().unwrap();
         assert_eq!(data.bits_per_offset, 64);
         assert_eq!(data.num_values, 2);
@@ -1774,7 +1786,7 @@ mod tests {
 
         let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
 
-        assert_eq!(data.num_values(), 5);
+        assert_eq!(data.num_values().unwrap(), 5);
         let data = data.as_dictionary().unwrap();
         let indices = data.indices;
         assert_eq!(indices.bits_per_value, 8);
@@ -1808,12 +1820,12 @@ mod tests {
         let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
 
         let check_common = |data: DataBlock| {
-            assert_eq!(data.num_values(), 5);
+            assert_eq!(data.num_values().unwrap(), 5);
             let dict = data.as_dictionary().unwrap();
 
             let nullable_items = dict.dictionary.as_nullable().unwrap();
             assert_eq!(nullable_items.nulls, LanceBuffer::from(vec![0b00000111]));
-            assert_eq!(nullable_items.data.num_values(), 4);
+            assert_eq!(nullable_items.data.num_values().unwrap(), 4);
 
             let items = nullable_items.data.as_variable_width().unwrap();
             assert_eq!(items.bits_per_offset, 32);
@@ -1863,7 +1875,7 @@ mod tests {
         let dict = DictionaryArray::new(indices, Arc::new(items));
         let data = DataBlock::from_array(dict);
 
-        assert_eq!(data.num_values(), 257);
+        assert_eq!(data.num_values().unwrap(), 257);
 
         let dict = data.as_dictionary().unwrap();
 
@@ -1924,7 +1936,7 @@ mod tests {
         let dict1 = DictionaryArray::new(indices.clone(), Arc::new(items));
         let dict2 = DictionaryArray::new(indices, Arc::new(other_items));
         let data = DataBlock::from_arrays(&[Arc::new(dict1), Arc::new(dict2)], 512);
-        assert_eq!(data.num_values(), 512);
+        assert_eq!(data.num_values().unwrap(), 512);
 
         let dict = data.as_dictionary().unwrap();
 
@@ -2011,5 +2023,44 @@ mod tests {
 
         let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
+    }
+
+    fn create_fsl_block(child: DataBlock, dimension: u64) -> FixedSizeListBlock {
+        FixedSizeListBlock {
+            child: Box::new(child),
+            dimension,
+        }
+    }
+
+    fn create_fixed_width_block(num_values: u64) -> DataBlock {
+        let bytes_needed = (num_values * 4) as usize;
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0u8; bytes_needed]),
+            bits_per_value: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+
+    #[test]
+    fn test_num_values_basic_division() {
+        let child_block = create_fixed_width_block(12);
+        let fsl_block = create_fsl_block(child_block, 3);
+        assert_eq!(fsl_block.num_values().unwrap(), 4); // 12 / 3 = 4
+    }
+
+    #[test]
+    fn test_num_values_division_by_zero() {
+        let child_block = create_fixed_width_block(10);
+        let fsl_block = create_fsl_block(child_block, 0);
+
+        let result = fsl_block.num_values();
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidInput { source, .. }) = result {
+            assert!(source.to_string().contains("Division by zero"));
+        } else {
+            panic!("Expected InvalidInput error, got {:?}", result);
+        }
     }
 }

@@ -602,7 +602,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
         let mut data = data_builder.finish();
 
         let unraveler =
-            RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
+            RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values()?);
 
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
@@ -3780,7 +3780,7 @@ impl PrimitiveStructuralEncoder {
             unreachable!()
         }
 
-        let num_items = data.num_values();
+        let num_items = data.num_values()?;
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
@@ -3839,7 +3839,7 @@ impl PrimitiveStructuralEncoder {
         data.push(serialized.data);
 
         if let Some(dictionary_data) = dictionary_data {
-            let num_dictionary_items = dictionary_data.num_values();
+            let num_dictionary_items = dictionary_data.num_values()?;
             // field in `create_block_compressor` is not used currently.
             let dummy_dictionary_field = Field::new_arrow("", DataType::UInt16, false)?;
 
@@ -4113,10 +4113,11 @@ impl PrimitiveStructuralEncoder {
             if let Some(rep_levels) = repdef.repetition_levels.as_ref() {
                 // If there are rep levels there may be "invisible" items and we need to encode
                 // rep_levels.len() things which might be larger than data.num_values()
-                (rep_levels.len() as u64, data.num_values())
+                (rep_levels.len() as u64, data.num_values()?)
             } else {
                 // If there are no rep levels then we encode data.num_values() things
-                (data.num_values(), data.num_values())
+                let num_values = data.num_values()?;
+                (num_values, num_values)
             };
 
         let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
@@ -4194,7 +4195,7 @@ impl PrimitiveStructuralEncoder {
             return None;
         };
 
-        let num_values = data_block.num_values();
+        let num_values = data_block.num_values().ok()?;
 
         match data_block {
             DataBlock::FixedWidth(_) => {
@@ -4227,14 +4228,14 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
+    fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> Result<bool> {
         // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
         // estimating the size
         if !matches!(
             data_block,
             DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_)
         ) {
-            return false;
+            return Ok(false);
         }
 
         // Don't dictionary encode tiny arrays
@@ -4242,8 +4243,8 @@ impl PrimitiveStructuralEncoder {
             .ok()
             .and_then(|val| val.parse().ok())
             .unwrap_or(100);
-        if data_block.num_values() < too_small {
-            return false;
+        if data_block.num_values()? < too_small {
+            return Ok(false);
         }
 
         // Get size ratio from metadata or env var, default to 0.8
@@ -4271,15 +4272,15 @@ impl PrimitiveStructuralEncoder {
 
         // Estimate dictionary-encoded size
         let Some(encoded_size) = Self::estimate_dict_size(data_block) else {
-            return false;
+            return Ok(false);
         };
 
         let size_ratio_actual = if data_size > 0 {
             encoded_size as f64 / data_size as f64
         } else {
-            return false;
+            return Ok(false);
         };
-        size_ratio_actual < threshold_ratio
+        Ok(size_ratio_actual < threshold_ratio)
     }
 
     // Creates an encode task, consuming all buffered data
@@ -4386,7 +4387,7 @@ impl PrimitiveStructuralEncoder {
                     Some(dictionary_data_block),
                     num_rows
                 )
-            } else if Self::should_dictionary_encode(&data_block, &field) {
+            } else if Self::should_dictionary_encode(&data_block, &field)? {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,
@@ -5677,7 +5678,10 @@ mod tests {
 
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
 
-        assert!(result, "Should use dictionary encode based on size");
+        assert!(
+            result.unwrap(),
+            "Should use dictionary encode based on size"
+        );
     }
 
     #[test]
@@ -5695,6 +5699,9 @@ mod tests {
 
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
 
-        assert!(!result, "Should not use dictionary encode based on size");
+        assert!(
+            !result.unwrap(),
+            "Should not use dictionary encode based on size"
+        );
     }
 }

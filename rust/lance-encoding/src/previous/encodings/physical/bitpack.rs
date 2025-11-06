@@ -705,7 +705,7 @@ impl ArrayEncoder for BitpackedArrayEncoder {
     ) -> Result<EncodedArray> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
-        let dst_bytes_total = ceil(data.num_values() as usize * self.num_bits as usize, 8);
+        let dst_bytes_total = ceil(data.num_values()? as usize * self.num_bits as usize, 8);
 
         let mut dst_buffer = vec![0u8; dst_bytes_total];
         let mut dst_idx = 0;

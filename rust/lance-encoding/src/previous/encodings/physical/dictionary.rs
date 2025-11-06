@@ -260,7 +260,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
             }
             _ => panic!("Expected dictionary data"),
         };
-        let num_dictionary_items = dict_data.dictionary.num_values() as u32;
+        let num_dictionary_items = dict_data.dictionary.num_values()? as u32;
 
         let encoded_indices = self.indices_encoder.encode(
             DataBlock::FixedWidth(dict_data.indices),
