@@ -7,7 +7,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
-    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -40,6 +40,14 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
+
+fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+    if storage_version >= LanceFileVersion::V2_2 {
+        BlobVersion::V2
+    } else {
+        BlobVersion::V1
+    }
+}
 
 mod commit;
 pub mod delete;
@@ -580,7 +588,9 @@ pub async fn write_fragments_internal(
         (data, schema)
     };
 
-    let (schema, storage_version) = if let Some(dataset) = dataset {
+    let allow_blob_version_change =
+        dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
+    let (mut schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
@@ -626,6 +636,9 @@ pub async fn write_fragments_internal(
         // from the user or the default.
         (converted_schema, params.storage_version_or_default())
     };
+
+    let target_blob_version = blob_version_for(storage_version);
+    schema.apply_blob_version(target_blob_version, allow_blob_version_change)?;
 
     let fragments = do_write_fragments(
         object_store,
