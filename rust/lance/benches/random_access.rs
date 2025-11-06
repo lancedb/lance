@@ -21,17 +21,19 @@ const ROW_IDS: [u64; 5] = [1, 40, 100, 130, 200];
 fn bench_random_access(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to build tokio runtime");
 
-    let dataset_v2_0 = runtime.block_on(prepare_dataset(LanceFileVersion::V2_0));
-    let dataset_v2_1 = runtime.block_on(prepare_dataset(LanceFileVersion::V2_1));
+    let dataset_v2_0 = runtime.block_on(prepare_dataset(LanceFileVersion::V2_0, true));
+    let dataset_v2_1_fsst = runtime.block_on(prepare_dataset(LanceFileVersion::V2_1, true));
+    let dataset_v2_1_no_fsst = runtime.block_on(prepare_dataset(LanceFileVersion::V2_1, false));
 
-    // benchmark_dataset(&runtime, c, dataset_v2_0, "V2_0");
-    benchmark_dataset(&runtime, c, dataset_v2_1, "V2_1");
+    benchmark_dataset(&runtime, c, dataset_v2_0, "V2_0");
+    benchmark_dataset(&runtime, c, dataset_v2_1_fsst, "V2_1 (FSST)");
+    benchmark_dataset(&runtime, c, dataset_v2_1_no_fsst, "V2_1 (FSST disabled)");
 }
 
 fn benchmark_dataset(rt: &Runtime, c: &mut Criterion, dataset: Dataset, label: &str) {
     let dataset = Arc::new(dataset);
     bench_filtered_scan(rt, c, dataset.clone(), label);
-    // bench_random_take(rt, c, dataset, label);
+    bench_random_take(rt, c, dataset, label);
 }
 
 fn bench_filtered_scan(rt: &Runtime, c: &mut Criterion, dataset: Arc<Dataset>, label: &str) {
@@ -82,14 +84,20 @@ fn utf8_field_without_fsst(name: &str) -> Field {
     Field::new(name, DataType::Utf8, false).with_metadata(metadata)
 }
 
-async fn prepare_dataset(version: LanceFileVersion) -> Dataset {
+fn utf8_field_for(version: LanceFileVersion, enable_fsst: bool, name: &str) -> Field {
+    if enable_fsst && version >= LanceFileVersion::V2_1 {
+        Field::new(name, DataType::Utf8, false)
+    } else {
+        utf8_field_without_fsst(name)
+    }
+}
+
+async fn prepare_dataset(version: LanceFileVersion, enable_fsst: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("l_orderkey", DataType::Int64, false),
-        // Field::new("l_shipmode", DataType::Utf8, false),
-        utf8_field_without_fsst("l_shipmode"),
+        utf8_field_for(version, enable_fsst, "l_shipmode"),
         Field::new("l_extendedprice", DataType::Float64, false),
-        // Field::new("l_comment", DataType::Utf8, false),
-        utf8_field_without_fsst("l_comment"),
+        utf8_field_for(version, enable_fsst, "l_comment"),
     ]));
 
     let batches = generate_batches(schema.clone());
@@ -112,7 +120,7 @@ async fn prepare_dataset(version: LanceFileVersion) -> Dataset {
 }
 
 fn generate_batches(schema: Arc<ArrowSchema>) -> Vec<RecordBatch> {
-    let mut batches = Vec::with_capacity((TOTAL_ROWS + BATCH_SIZE - 1) / BATCH_SIZE);
+    let mut batches = Vec::with_capacity(TOTAL_ROWS.div_ceil(BATCH_SIZE));
     let mut start = 0usize;
 
     while start < TOTAL_ROWS {
