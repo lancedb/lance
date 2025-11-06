@@ -21,7 +21,9 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::utils::{
+    build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, MetricsMode,
+};
 use super::PreFilterSource;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 use lance_index::metrics::MetricsCollector;
@@ -437,6 +439,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         })
         .try_flatten_unordered(None)
         .map(move |batch| {
+            let _timer = metrics_clone.baseline_metrics.elapsed_compute().timer();
             if let Ok(batch) = &batch {
                 metrics_clone
                     .baseline_metrics
@@ -449,6 +452,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             stream.stream_in_current_span().boxed(),
             partition,
             &self.metrics,
+            MetricsMode::SkipElapsedCompute,
         )))
     }
 

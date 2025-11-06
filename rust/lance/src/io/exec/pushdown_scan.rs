@@ -48,7 +48,7 @@ use crate::{
     Dataset,
 };
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
+use super::utils::{InstrumentedRecordBatchStreamAdapter, MetricsMode};
 use super::Planner;
 
 #[derive(Debug, Clone)]
@@ -237,6 +237,7 @@ impl ExecutionPlan for LancePushdownScanExec {
             batch_stream,
             partition,
             &self.metrics,
+            MetricsMode::MeasureElapsedCompute,
         )))
     }
 
