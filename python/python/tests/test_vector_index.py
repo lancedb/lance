@@ -1092,7 +1092,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
-                    "minimum_nprobes": 1,
+                    "minimum_nprobes": 20,
                 },
             )
 
