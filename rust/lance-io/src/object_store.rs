@@ -750,7 +750,7 @@ impl ObjectStore {
         let store = match wrapper {
             Some(wrapper) => {
                 let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
-                    .calculate_object_store_prefix(&location.to_string(), storage_options)
+                    .calculate_object_store_prefix(location.as_ref(), storage_options)
                     .unwrap();
                 wrapper.wrap(&store_prefix, store)
             }

@@ -149,7 +149,7 @@ impl ObjectStoreRegistry {
             let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
             message.push_str(&format!("\nValid schemes: {}", valid_schemes));
         }
-        return Error::invalid_input(message, location!());
+        Error::invalid_input(message, location!())
     }
 
     /// Get an object store for a given base path and parameters.
@@ -249,14 +249,14 @@ impl ObjectStoreRegistry {
                     // On Windows, drive letters such as C:/ can sometimes be confused for schemes.
                     // So if there is no known object store for this single-letter scheme, treat it
                     // as the local store.
-                    return Ok("file".to_string());
+                    Ok("file".to_string())
                 } else {
-                    return Err(self.scheme_not_found_error(scheme));
+                    Err(self.scheme_not_found_error(scheme))
                 }
-            }
+            },
             Some(provider) => {
                 provider.calculate_object_store_prefix(scheme, authority, storage_options)
-            }
+            },
         }
     }
 }
