@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::{Arc, LazyLock}, time::Duration};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
@@ -15,8 +15,7 @@ use object_store::{
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    storage_options, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE
 };
 use lance_core::error::{Error, Result};
 
@@ -141,36 +140,47 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             None => {
                 // The URI looks like 'az://container/path-part/file'.
                 // We must look at the storage options to find the account.
-                let opts = storage_options.ok_or(Error::invalid_input(
-                    "Unable to find object store prefix: no Azure "
-                        + "account name in URI, and no storage options configured.",
+                let mut account = match storage_options {
+                    Some(opts) => StorageOptions::find_configured_storage_account(&opts),
+                    None => None,
+                };
+                if let None = account {
+                    account = StorageOptions::find_configured_storage_account(&ENV_OPTIONS.0);
+                }
+                let account = account.ok_or(Error::invalid_input(
+                    "Unable to find object store prefix: no Azure ".to_owned()
+                        + "account name in URI, and no storage account configured.",
                     location!(),
                 ))?;
-                let account = opts
-                    .get("azure_storage_account_name")
-                    .ok_or(Error::invalid_input(
-                    "Unable to find object store prefix: no Azure "
-                        + "account name in URI, and no azure_storage_account_name storage option.",
-                    location!(),
-                ))?;
-                (authority, account.to_string())
+                (authority, account)
             }
         };
         Ok(format!("{}${}@{}", scheme, container, account))
     }
 }
 
+static ENV_OPTIONS: LazyLock<StorageOptions> = LazyLock::new(StorageOptions::from_env);
+
 impl StorageOptions {
-    /// Add values from the environment to storage options
-    pub fn with_env_azure(&mut self) {
+    /// Iterate over all environment variables, looking for anything related to Azure.
+    fn from_env() -> Self {
+        let mut opts = HashMap::<String, String>::new();
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
                 if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
+                    opts.insert(config_key.as_ref().to_string(), value.to_string());
                 }
+            }
+        }
+        StorageOptions(opts)
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_azure(&mut self) {
+        for (os_key, os_value) in &ENV_OPTIONS.0 {
+            if !self.0.contains_key(os_key) {
+                self.0
+                    .insert(os_key.clone(), os_value.clone());
             }
         }
     }
@@ -184,6 +194,16 @@ impl StorageOptions {
                 Some((az_key, value.clone()))
             })
             .collect()
+    }
+
+    fn find_configured_storage_account(map: &HashMap<String, String>) -> Option<String> {
+        if let Some(account) = map.get("azure_storage_account_name") {
+            Some(account.to_string())
+        } else if let Some(account) = map.get("account_name") {
+            Some(account.to_string())
+        } else {
+            None
+        }
     }
 }
 

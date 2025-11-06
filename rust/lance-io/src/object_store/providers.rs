@@ -59,12 +59,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
         authority: &str,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        match scheme {
-            "file" => Ok("file".to_string()),
-            "file-object-store" => Ok("file-object-store".to_string()),
-            "memory" => Ok("memory".to_string()),
-            _ => Ok(format!("{}${}", scheme, authority)),
-        }
+        Ok(format!("{}${}", scheme, authority))
     }
 }
 
@@ -316,8 +311,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cache_url() {
-        // Test the default cache_url implementation using a dummy provider
+    fn test_calculcate_object_store_prefix() {
+        // Test the default calculcate_object_store_prefix implementation using a dummy provider
         #[derive(Debug)]
         struct DummyProvider;
 
@@ -333,21 +328,6 @@ mod tests {
         }
 
         let provider = DummyProvider;
-        let cases = [
-            ("s3://bucket/path?param=value", "s3://bucket?param=value"),
-            ("file:///path/to/file", "file://"),
-            ("file-object-store:///path/to/file", "file-object-store://"),
-            ("memory:///", "memory://"),
-            (
-                "http://example.com/path?param=value",
-                "http://example.com/?param=value",
-            ),
-        ];
-
-        for (url, expected_cache_url) in cases {
-            let url = Url::parse(url).unwrap();
-            let cache_url = provider.cache_url(&url);
-            assert_eq!(cache_url, expected_cache_url);
-        }
+        assert_eq!("dummy$blah", provider.calculcate_object_store_prefix("dummy", "blah", None).unwrap());
     }
 }
