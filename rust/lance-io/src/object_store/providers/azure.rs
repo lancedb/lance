@@ -125,7 +125,6 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         })
     }
 
-    //.parse_url("az://container@account.dfs.core.windows.net/path-part/file")
     fn calculcate_object_store_prefix(
         &self,
         scheme: &str,
@@ -267,5 +266,48 @@ mod tests {
                 .into_iter()
             ))
         );
+    }
+
+    #[test]
+    fn test_calculcate_object_store_prefix_from_url_and_options() {
+        let provider = AzureBlobStoreProvider;
+        let options =
+            HashMap::from_iter([("account_name".to_string(), "bob".to_string())].into_iter());
+        assert_eq!(
+            "az$container@bob",
+            provider
+                .calculcate_object_store_prefix("az", "container", Some(&options))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calculcate_object_store_prefix_from_url_and_ignored_options() {
+        let provider = AzureBlobStoreProvider;
+        let options =
+            HashMap::from_iter([("account_name".to_string(), "bob".to_string())].into_iter());
+        assert_eq!(
+            "az$container@account",
+            provider
+                .calculcate_object_store_prefix(
+                    "az",
+                    "container@account.dfs.core.windows.net",
+                    Some(&options)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_fail_to_calculcate_object_store_prefix_from_url() {
+        let provider = AzureBlobStoreProvider;
+        let options =
+            HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())].into_iter());
+        let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
+        let result = provider
+            .calculcate_object_store_prefix("az", "container", Some(&options))
+            .expect_err("expected error")
+            .to_string();
+        assert_eq!(expected, &result[..expected.len()]);
     }
 }
