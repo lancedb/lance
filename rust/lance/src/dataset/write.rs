@@ -564,7 +564,7 @@ pub async fn write_fragments_internal(
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
-    mut params: WriteParams,
+    params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let adapter = SchemaAdapter::new(data.schema());
