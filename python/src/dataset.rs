@@ -103,7 +103,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 20;
+const DEFAULT_NPROBES: usize = 20;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -981,7 +981,7 @@ impl Dataset {
                 10
             };
 
-            let mut minimum_nprobes = DEFAULT_NPROBS;
+            let mut minimum_nprobes = DEFAULT_NPROBES;
             let mut maximum_nprobes = None;
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
@@ -1894,7 +1894,7 @@ impl Dataset {
             builder = builder.name(name);
         }
 
-        // Extract fragment_ids and fragment_uuid from kwargs
+        // Extract fragment_ids and index_uuid from kwargs
         let fragment_ids: Option<Vec<u32>> = if let Some(kwargs) = kwargs {
             kwargs
                 .get_item("fragment_ids")?
@@ -1904,22 +1904,22 @@ impl Dataset {
             None
         };
 
-        let fragment_uuid: Option<String> = if let Some(kwargs) = kwargs {
+        let index_uuid: Option<String> = if let Some(kwargs) = kwargs {
             kwargs
-                .get_item("fragment_uuid")?
+                .get_item("index_uuid")?
                 .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
                 .transpose()?
         } else {
             None
         };
 
-        // Add fragment_ids and fragment_uuid support
+        // Add fragment_ids and index_uuid support
         let has_fragment_ids = fragment_ids.is_some();
         if let Some(fragment_ids) = fragment_ids {
             builder = builder.fragments(fragment_ids);
         }
-        if let Some(fragment_uuid) = fragment_uuid {
-            builder = builder.fragment_uuid(fragment_uuid);
+        if let Some(index_uuid) = index_uuid {
+            builder = builder.index_uuid(index_uuid);
         }
 
         use std::future::IntoFuture;

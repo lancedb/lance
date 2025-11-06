@@ -194,13 +194,6 @@ impl<'a> CommitBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
-                let (object_store, base_path) = ObjectStore::from_uri_and_params(
-                    session.store_registry(),
-                    uri,
-                    &self.store_params.clone().unwrap_or_default(),
-                )
-                .await?;
-                let mut object_store = object_store;
                 let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
                 {
                     self.commit_handler.as_ref().unwrap().clone()
@@ -208,9 +201,19 @@ impl<'a> CommitBuilder<'a> {
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
                         .await?
                 };
-                if let Some(passed_store) = self.object_store {
-                    object_store = passed_store;
-                }
+                let (object_store, base_path) = if let Some(passed_store) = self.object_store {
+                    (
+                        passed_store,
+                        ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
+                    )
+                } else {
+                    ObjectStore::from_uri_and_params(
+                        session.store_registry(),
+                        uri,
+                        &self.store_params.clone().unwrap_or_default(),
+                    )
+                    .await?
+                };
                 (object_store, base_path, commit_handler)
             }
         };
