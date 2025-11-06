@@ -34,9 +34,11 @@ case "$RELEASE_TYPE" in
         ;;
 esac
 
-# Calculate vote end time
+# Calculate vote end time in both UTC and Pacific
 if [ "$VOTE_DURATION_DAYS" -gt 0 ]; then
-    VOTE_END_TIME=$(date -u -v+${VOTE_DURATION_DAYS}d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "+${VOTE_DURATION_DAYS} days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+    # Try macOS date format first, then GNU date format
+    VOTE_END_TIME_UTC=$(date -u -v+${VOTE_DURATION_DAYS}d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "+${VOTE_DURATION_DAYS} days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+    VOTE_END_TIME_PT=$(TZ='America/Los_Angeles' date -v+${VOTE_DURATION_DAYS}d '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || TZ='America/Los_Angeles' date -d "+${VOTE_DURATION_DAYS} days" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "")
 fi
 
 # Build discussion body with testing instructions
@@ -85,10 +87,16 @@ Please test the RC artifacts and vote by commenting:
 - **0** to abstain or neutral
 - **-1** if issues found (please include details)"
 
-if [ "$VOTE_DURATION_DAYS" -gt 0 ] && [ -n "$VOTE_END_TIME" ]; then
+if [ "$VOTE_DURATION_DAYS" -gt 0 ] && [ -n "$VOTE_END_TIME_UTC" ]; then
     DISCUSSION_BODY="${DISCUSSION_BODY}
 
-**Vote Duration**: If there are enough binding votes and no vetoes, the vote will end at **${VOTE_END_TIME} UTC** (Pacific time: $(TZ='America/Los_Angeles' date -d \"$VOTE_END_TIME UTC\" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'see UTC time'))."
+**Vote Duration**: If there are enough binding votes and no vetoes, the vote will end at **${VOTE_END_TIME_UTC} UTC**"
+
+    if [ -n "$VOTE_END_TIME_PT" ]; then
+        DISCUSSION_BODY="${DISCUSSION_BODY} (Pacific time: ${VOTE_END_TIME_PT})."
+    else
+        DISCUSSION_BODY="${DISCUSSION_BODY}."
+    fi
 else
     DISCUSSION_BODY="${DISCUSSION_BODY}
 
