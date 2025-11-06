@@ -41,7 +41,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
         })
     }
 
-    /// Calculcate the unique prefix that should be used for this object store.
+    /// Calculate the unique prefix that should be used for this object store.
     ///
     /// For object stores that don't have the concept of buckets, this will just be something like
     /// 'file' or 'memory'.
@@ -53,7 +53,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// this will be something like 'az$account_name@container'
     ///
     /// Providers should override this if they have special requirements like Azure's.
-    fn calculcate_object_store_prefix(
+    fn calculate_object_store_prefix(
         &self,
         scheme: &str,
         authority: &str,
@@ -167,7 +167,7 @@ impl ObjectStoreRegistry {
             return Err(self.scheme_not_found_error(scheme));
         };
 
-        let cache_path = provider.calculcate_object_store_prefix(
+        let cache_path = provider.calculate_object_store_prefix(
             base_path.scheme(),
             base_path.authority(),
             params.storage_options.as_ref(),
@@ -255,7 +255,7 @@ impl ObjectStoreRegistry {
                 }
             }
             Some(provider) => {
-                provider.calculcate_object_store_prefix(scheme, authority, storage_options)
+                provider.calculate_object_store_prefix(scheme, authority, storage_options)
             }
         }
     }
@@ -326,18 +326,18 @@ mod tests {
     }
 
     #[test]
-    fn test_calculcate_object_store_prefix() {
+    fn test_calculate_object_store_prefix() {
         let provider = DummyProvider;
         assert_eq!(
             "dummy$blah",
             provider
-                .calculcate_object_store_prefix("dummy", "blah", None)
+                .calculate_object_store_prefix("dummy", "blah", None)
                 .unwrap()
         );
     }
 
     #[test]
-    fn test_calculcate_object_store_scheme_not_found() {
+    fn test_calculate_object_store_scheme_not_found() {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
         let s = "Invalid user input: No object store provider found for scheme: 'dummy2'\nValid schemes: dummy";
@@ -350,7 +350,7 @@ mod tests {
 
     // Test that paths without a scheme get treated as local paths.
     #[test]
-    fn test_calculcate_object_store_prefix_for_local() {
+    fn test_calculate_object_store_prefix_for_local() {
         let registry = ObjectStoreRegistry::empty();
         assert_eq!(
             "file",
@@ -362,7 +362,7 @@ mod tests {
 
     // Test that paths with a single-letter scheme that is not registered for anything get treated as local paths.
     #[test]
-    fn test_calculcate_object_store_prefix_for_local_windows_path() {
+    fn test_calculate_object_store_prefix_for_local_windows_path() {
         let registry = ObjectStoreRegistry::empty();
         assert_eq!(
             "file",
@@ -374,7 +374,7 @@ mod tests {
 
     // Test that paths with a given scheme get mapped to that storage provider.
     #[test]
-    fn test_calculcate_object_store_prefix_for_dummy_path() {
+    fn test_calculate_object_store_prefix_for_dummy_path() {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
         assert_eq!(

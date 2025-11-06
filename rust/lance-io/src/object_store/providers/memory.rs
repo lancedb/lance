@@ -42,7 +42,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         Ok(Path::from(output))
     }
 
-    fn calculcate_object_store_prefix(
+    fn calculate_object_store_prefix(
         &self,
         _scheme: &str,
         _authority: &str,
@@ -67,12 +67,12 @@ mod tests {
     }
 
     #[test]
-    fn test_calculcate_object_store_prefix() {
+    fn test_calculate_object_store_prefix() {
         let provider = MemoryStoreProvider;
         assert_eq!(
             "memory",
             provider
-                .calculcate_object_store_prefix("memory", "etc", None)
+                .calculate_object_store_prefix("memory", "etc", None)
                 .unwrap()
         );
     }
