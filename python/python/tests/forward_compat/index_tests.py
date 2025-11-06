@@ -1,5 +1,8 @@
 import inspect
+import json
+import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import lance
@@ -24,6 +27,92 @@ from .util import build_basic_types
 #   c. test_optimize
 
 
+@lru_cache(maxsize=1)
+def last_stable_release():
+    """Returns the latest stable version available on PyPI.
+
+    Queries the PyPI JSON API to get the latest stable release of pylance.
+    Results are cached to avoid repeated network calls.
+    """
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/pylance/json", timeout=5
+        ) as response:
+            data = json.loads(response.read())
+            version = data["info"]["version"]
+            return version
+    except Exception as e:
+        # If we can't fetch, return None which will be filtered out
+        print(
+            f"Warning: Could not fetch latest stable release from PyPI: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+@lru_cache(maxsize=1)
+def last_beta_release():
+    """Returns the latest beta version available on fury.io.
+
+    Uses pip to query the fury.io index for pre-release versions of pylance.
+    Results are cached to avoid repeated network calls.
+    """
+    try:
+        # Use pip index to get versions from fury.io
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "index",
+                "versions",
+                "pylance",
+                "--pre",
+                "--extra-index-url",
+                "https://pypi.fury.io/lancedb/",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        if result.returncode == 0:
+            # Parse output to find available versions
+            # Output format: "pylance (x.y.z)"
+            # Available versions: x.y.z.betaN, x.y.z, ...
+            for line in result.stdout.splitlines():
+                if "Available versions:" in line:
+                    versions_str = line.split("Available versions:")[1].strip()
+                    versions = [v.strip() for v in versions_str.split(",")]
+                    # Return the first beta/pre-release version
+                    for v in versions:
+                        if "beta" in v or "rc" in v or "a" in v or "b" in v:
+                            return v
+                    # If no pre-release found, return the first version
+                    if versions:
+                        return versions[0]
+
+        print(
+            "Warning: Could not fetch latest beta release from fury.io",
+            file=sys.stderr,
+        )
+        return None
+
+    except Exception as e:
+        print(
+            f"Warning: Could not fetch latest beta release from fury.io: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+# Fetch versions (cached)
+LAST_STABLE_RELEASE = last_stable_release()
+LAST_BETA_RELEASE = last_beta_release()
+
+
 class UpgradeDowngradeTest:
     def create(self):
         pass
@@ -35,7 +124,12 @@ class UpgradeDowngradeTest:
         pass
 
 
-VERSIONS = ["0.16.0", "0.30.0", "0.36.0"]
+# Default versions to test, filtering out any that couldn't be fetched
+VERSIONS = [
+    v
+    for v in ["0.16.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
+    if v is not None
+]
 
 
 def compat_test(versions=None):
@@ -83,6 +177,17 @@ def compat_test(versions=None):
     """
     if versions is None:
         versions = VERSIONS
+
+    # Filter out None values (in case some versions couldn't be fetched)
+    versions = [v for v in versions if v is not None]
+
+    # Skip if no valid versions
+    if not versions:
+
+        def decorator(cls):
+            return cls
+
+        return decorator
 
     def decorator(cls):
         # Extract existing parametrize marks from the class
@@ -203,17 +308,17 @@ def test_func({sig_params}):
     return namespace["test_func"]
 
 
-@compat_test()
-@pytest.mark.parametrize("file_version", ["2.0"])  # Only test stable file versions
-class BasicTypes(UpgradeDowngradeTest):
-    def __init__(self, path: Path, file_version: str):
+# We start testing against the first release where 2.1 was stable. Before that
+# the format was unstable to the readers will panic.
+@compat_test(versions=["0.38.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class BasicTypes2_1(UpgradeDowngradeTest):
+    def __init__(self, path: Path):
         self.path = path
-        self.file_version = file_version
 
     def create(self):
         batch = build_basic_types()
         with LanceFileWriter(
-            str(self.path), version=self.file_version, schema=batch.schema
+            str(self.path), version="2.1", schema=batch.schema
         ) as writer:
             writer.write_batch(batch)
 
@@ -223,7 +328,31 @@ class BasicTypes(UpgradeDowngradeTest):
         assert table == build_basic_types()
 
     def check_write(self):
-        with LanceFileWriter(str(self.path), version=self.file_version) as writer:
+        # Test with overwrite
+        with LanceFileWriter(str(self.path), version="2.1") as writer:
+            writer.write_batch(build_basic_types())
+
+
+@compat_test()
+class BasicTypes2_0(UpgradeDowngradeTest):
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        batch = build_basic_types()
+        with LanceFileWriter(
+            str(self.path), version="2.0", schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
+
+    def check_read(self):
+        reader = LanceFileReader(str(self.path))
+        table = reader.read_all().to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        # Test with overwrite
+        with LanceFileWriter(str(self.path), version="2.0") as writer:
             writer.write_batch(build_basic_types())
 
 
