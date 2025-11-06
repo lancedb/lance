@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, str::FromStr, sync::{Arc, LazyLock}, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
@@ -15,7 +20,8 @@ use object_store::{
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
+    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::{Error, Result};
 
@@ -179,8 +185,7 @@ impl StorageOptions {
     pub fn with_env_azure(&mut self) {
         for (os_key, os_value) in &ENV_OPTIONS.0 {
             if !self.0.contains_key(os_key) {
-                self.0
-                    .insert(os_key.clone(), os_value.clone());
+                self.0.insert(os_key.clone(), os_value.clone());
             }
         }
     }
@@ -245,5 +250,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "az");
+    }
+
+    #[test]
+    fn test_find_configured_storage_account() {
+        assert_eq!(
+            Some("myaccount".to_string()),
+            StorageOptions::find_configured_storage_account(&HashMap::from_iter(
+                [
+                    ("access_key".to_string(), "myaccesskey".to_string()),
+                    (
+                        "azure_storage_account_name".to_string(),
+                        "myaccount".to_string()
+                    )
+                ]
+                .into_iter()
+            ))
+        );
     }
 }

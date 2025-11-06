@@ -328,7 +328,12 @@ mod tests {
     #[test]
     fn test_calculcate_object_store_prefix() {
         let provider = DummyProvider;
-        assert_eq!("dummy$blah", provider.calculcate_object_store_prefix("dummy", "blah", None).unwrap());
+        assert_eq!(
+            "dummy$blah",
+            provider
+                .calculcate_object_store_prefix("dummy", "blah", None)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -336,7 +341,10 @@ mod tests {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
         let s = "Invalid user input: No object store provider found for scheme: 'dummy2'\nValid schemes: dummy";
-        let result = registry.calculate_object_store_prefix("dummy2://mybucket/my/long/path", None).expect_err("expected error").to_string();
+        let result = registry
+            .calculate_object_store_prefix("dummy2://mybucket/my/long/path", None)
+            .expect_err("expected error")
+            .to_string();
         assert_eq!(s, &result[..s.len()]);
     }
 
@@ -344,14 +352,24 @@ mod tests {
     #[test]
     fn test_calculcate_object_store_prefix_for_local() {
         let registry = ObjectStoreRegistry::empty();
-        assert_eq!("file", registry.calculate_object_store_prefix("/tmp/foobar", None).unwrap());
+        assert_eq!(
+            "file",
+            registry
+                .calculate_object_store_prefix("/tmp/foobar", None)
+                .unwrap()
+        );
     }
 
     // Test that paths with a single-letter scheme that is not registered for anything get treated as local paths.
     #[test]
     fn test_calculcate_object_store_prefix_for_local_windows_path() {
         let registry = ObjectStoreRegistry::empty();
-        assert_eq!("file", registry.calculate_object_store_prefix("c://dos/path", None).unwrap());
+        assert_eq!(
+            "file",
+            registry
+                .calculate_object_store_prefix("c://dos/path", None)
+                .unwrap()
+        );
     }
 
     // Test that paths with a given scheme get mapped to that storage provider.
@@ -359,6 +377,11 @@ mod tests {
     fn test_calculcate_object_store_prefix_for_dummy_path() {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
-        assert_eq!("dummy$mybucket", registry.calculate_object_store_prefix("dummy://mybucket/my/long/path", None).unwrap());
+        assert_eq!(
+            "dummy$mybucket",
+            registry
+                .calculate_object_store_prefix("dummy://mybucket/my/long/path", None)
+                .unwrap()
+        );
     }
 }

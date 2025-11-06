@@ -86,13 +86,23 @@ mod tests {
     #[test]
     fn test_calculcate_object_store_prefix() {
         let provider = FileStoreProvider;
-        assert_eq!("file", provider.calculcate_object_store_prefix("file", "etc", None).unwrap());
+        assert_eq!(
+            "file",
+            provider
+                .calculcate_object_store_prefix("file", "etc", None)
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_calculcate_object_store_prefix_for_file_object_store() {
         let provider = FileStoreProvider;
-        assert_eq!("file-object-store", provider.calculcate_object_store_prefix("file-object-store", "etc", None).unwrap());
+        assert_eq!(
+            "file-object-store",
+            provider
+                .calculcate_object_store_prefix("file-object-store", "etc", None)
+                .unwrap()
+        );
     }
 
     #[test]

@@ -69,6 +69,11 @@ mod tests {
     #[test]
     fn test_calculcate_object_store_prefix() {
         let provider = MemoryStoreProvider;
-        assert_eq!("memory", provider.calculcate_object_store_prefix("memory", "etc", None).unwrap());
+        assert_eq!(
+            "memory",
+            provider
+                .calculcate_object_store_prefix("memory", "etc", None)
+                .unwrap()
+        );
     }
 }
