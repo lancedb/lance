@@ -227,6 +227,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::tokio::spawn_cpu;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -1437,7 +1438,7 @@ impl BatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    next_task.into_batch(emitted_batch_size_warning)
+                    spawn_cpu(move || next_task.into_batch(emitted_batch_size_warning)).await
                 };
                 (task, num_rows)
             });
@@ -1760,7 +1761,7 @@ impl StructuralBatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    next_task.into_batch(emitted_batch_size_warning)
+                    spawn_cpu(move || next_task.into_batch(emitted_batch_size_warning)).await
                 };
                 (task, num_rows)
             });

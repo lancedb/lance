@@ -25,9 +25,7 @@ use arrow_array::{
     types::{ArrowDictionaryKeyType, UInt16Type, UInt32Type, UInt64Type, UInt8Type},
     Array, ArrayRef, OffsetSizeTrait, UInt64Array,
 };
-use arrow_buffer::{
-    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
-};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
@@ -233,25 +231,57 @@ impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<
         let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
 
-        let offsets: ScalarBuffer<T> = block.offsets.clone().borrow_to_typed_slice();
+        let selection_start = selection.start as usize;
+        let selection_end = selection.end as usize;
+        if selection_start == selection_end {
+            return;
+        }
 
-        let start_offset = offsets[selection.start as usize];
-        let end_offset = offsets[selection.end as usize];
-        let mut previous_len = self.bytes.len();
+        let offsets_bytes = block.offsets.as_ref();
+        let offset_size = std::mem::size_of::<T>();
 
+        // TODO: refactor this into a better public API for buffer.
+        fn read_offset(bytes: &[u8], stride: usize, index: usize) -> usize {
+            let start = index * stride;
+            let end = start + stride;
+            let chunk = &bytes[start..end];
+            match stride {
+                4 => {
+                    let arr: [u8; 4] = chunk
+                        .try_into()
+                        .expect("invalid 32-bit offset slice length");
+                    u32::from_le_bytes(arr) as usize
+                }
+                8 => {
+                    let arr: [u8; 8] = chunk
+                        .try_into()
+                        .expect("invalid 64-bit offset slice length");
+                    u64::from_le_bytes(arr) as usize
+                }
+                _ => unreachable!("unsupported offset width"),
+            }
+        }
+
+        let start_offset = read_offset(offsets_bytes, offset_size, selection_start);
+        let end_offset = read_offset(offsets_bytes, offset_size, selection_end);
+
+        let bytes_to_copy = end_offset - start_offset;
+        self.bytes.reserve(bytes_to_copy);
+        self.offsets.reserve(selection_end - selection_start);
+
+        let previous_len = self.bytes.len();
         self.bytes
-            .extend_from_slice(&block.data[start_offset.as_usize()..end_offset.as_usize()]);
+            .extend_from_slice(&block.data[start_offset..end_offset]);
 
-        self.offsets.extend(
-            offsets[selection.start as usize..selection.end as usize]
-                .iter()
-                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
-                .map(|(&current, &next)| {
-                    let this_value_len = next - current;
-                    previous_len += this_value_len.as_usize();
-                    T::from_usize(previous_len).unwrap()
-                }),
-        );
+        let mut running_len = previous_len;
+        let mut prev_offset = start_offset;
+        for idx in selection_start + 1..=selection_end {
+            let next_offset = read_offset(offsets_bytes, offset_size, idx);
+            running_len += next_offset - prev_offset;
+            self.offsets
+                .push(T::from_usize(running_len).expect("offset overflow"));
+            prev_offset = next_offset;
+        }
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
