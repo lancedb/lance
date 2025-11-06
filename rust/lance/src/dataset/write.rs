@@ -371,7 +371,7 @@ pub async fn do_write_fragments(
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
-    params: WriteParams,
+    mut params: WriteParams,
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
@@ -379,6 +379,8 @@ pub async fn do_write_fragments(
     let data = adapter.to_physical_stream(data);
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
+        // Make sure the max rows per group is not larger than the max rows per file
+        params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
     } else {
