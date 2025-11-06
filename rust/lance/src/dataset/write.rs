@@ -380,7 +380,8 @@ pub async fn do_write_fragments(
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // Make sure the max rows per group is not larger than the max rows per file
-        params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+        params.max_rows_per_group =
+            std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
     } else {
