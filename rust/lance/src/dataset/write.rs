@@ -20,7 +20,9 @@ use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, ManifestProvider};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{
+    storage_options::StorageOptionsProvider, ObjectStore, ObjectStoreParams, ObjectStoreRegistry,
+};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
@@ -242,6 +244,9 @@ pub struct WriteParams {
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// Storage options provider for dynamic credential refresh.
+    pub storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
 }
 
 impl Default for WriteParams {
@@ -266,6 +271,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            storage_options_provider: None,
         }
     }
 }
@@ -343,6 +349,21 @@ impl WriteParams {
             target_base_names_or_paths: Some(references),
             ..self
         }
+    }
+
+    /// Set storage options provider for dynamic credential refresh.
+    pub fn with_storage_options_provider(
+        mut self,
+        provider: Arc<dyn StorageOptionsProvider>,
+    ) -> Self {
+        if self.store_params.is_none() {
+            self.store_params = Some(ObjectStoreParams::default());
+        }
+
+        self.store_params.as_mut().unwrap().storage_options_provider = Some(provider.clone());
+        self.storage_options_provider = Some(provider);
+
+        self
     }
 }
 

@@ -31,7 +31,11 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{
+    storage_options::LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+};
+use lance_namespace::models::DescribeTableRequest;
+use lance_namespace::LanceNamespace;
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -770,6 +774,57 @@ impl Dataset {
         }
         Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
+    }
+
+    /// Write to or Create a [Dataset] using a LanceNamespace for storage options.
+    ///
+    /// Automatically fetches storage options from the namespace and sets up
+    /// auto-refresh for temporary credentials.
+    pub async fn write_with_namespace(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        mut params: Option<WriteParams>,
+    ) -> Result<Self> {
+        let request = DescribeTableRequest {
+            id: Some(table_id.clone()),
+            version: None,
+        };
+        let response = namespace
+            .describe_table(request)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: Box::new(e),
+                location: location!(),
+            })?;
+
+        let uri = response.location.ok_or_else(|| Error::Namespace {
+            source: Box::new(std::io::Error::other(
+                "Table location not found in namespace response",
+            )),
+            location: location!(),
+        })?;
+
+        let mut write_params = params.take().unwrap_or_default();
+
+        if let Some(namespace_storage_options) = response.storage_options {
+            if write_params.store_params.is_none() {
+                write_params.store_params = Some(ObjectStoreParams::default());
+            }
+            write_params
+                .store_params
+                .as_mut()
+                .unwrap()
+                .storage_options = Some(namespace_storage_options);
+
+            let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                namespace,
+                table_id,
+            ));
+            write_params = write_params.with_storage_options_provider(provider);
+        }
+
+        Self::write(batches, uri.as_str(), Some(write_params)).await
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
