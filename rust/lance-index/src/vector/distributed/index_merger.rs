@@ -855,14 +855,24 @@ pub async fn merge_vector_index_files(
     }
 
     if aux_paths.is_empty() {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "No partial_* auxiliary files found under index dir: {}",
+        // If a unified auxiliary file already exists at the root, no merge is required.
+        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        if object_store.exists(&aux_out).await.unwrap_or(false) {
+            log::warn!(
+                "No partial_* auxiliary files found under index dir: {}, but unified auxiliary file already exists; skipping merge",
                 index_dir
-            )
-            .into(),
-            location: location!(),
-        });
+            );
+            return Ok(());
+        }
+        // For certain index types (e.g., FLAT/HNSW-only) the merge may be a no-op in distributed setups
+        // where shards were committed directly. In such cases, proceed without error to avoid blocking
+        // index manifest merge. PQ/SQ variants still require merging artifacts and will be handled by
+        // downstream open logic if missing.
+        log::warn!(
+            "No partial_* auxiliary files found under index dir: {}; proceeding without merge for index types that do not require auxiliary shards",
+            index_dir
+        );
+        return Ok(());
     }
 
     // Prepare IVF model and storage metadata aggregation

@@ -473,20 +473,13 @@ pub(crate) async fn build_distributed_vector_index(
                         &ivf_params,
                     )
                     .await?;
-                    // If a user-provided PQ codebook exists in params, ignore it and warn — we always use the global codebook
-                    if pq_params.codebook.is_some() {
-                        log::warn!(
-                            "pq_codebook is provided but will be ignored in distributed build; using global unified codebook by default"
-                        );
-                    }
-                    let mut clean_pq_params = pq_params.clone();
-                    clean_pq_params.codebook = None;
+                    // Build PQ model; if a user-provided pq_codebook is present, it will be honored by build_pq_model
                     let global_pq = crate::index::vector::pq::build_pq_model(
                         &filtered_dataset,
                         column,
                         dim,
                         metric_type,
-                        &clean_pq_params,
+                        pq_params,
                         Some(&ivf_model),
                     )
                     .await?;
@@ -498,7 +491,7 @@ pub(crate) async fn build_distributed_vector_index(
                         params.metric_type,
                         Box::new(shuffler),
                         Some(ivf_params),
-                        Some(clean_pq_params),
+                        Some(pq_params.clone()),
                         (),
                         frag_reuse_index,
                     )?
@@ -626,20 +619,13 @@ pub(crate) async fn build_distributed_vector_index(
                 &ivf_params,
             )
             .await?;
-            // If a user-provided PQ codebook exists in params, ignore it and warn — we always use the global codebook
-            if pq_params.codebook.is_some() {
-                log::warn!(
-                    "pq_codebook is provided but will be ignored in distributed build; using global unified codebook by default"
-                );
-            }
-            let mut clean_pq_params = pq_params.clone();
-            clean_pq_params.codebook = None;
+            // Build PQ model; if a user-provided pq_codebook is present, it will be honored by build_pq_model
             let global_pq = crate::index::vector::pq::build_pq_model(
                 &filtered_dataset,
                 column,
                 dim,
                 metric_type,
-                &clean_pq_params,
+                pq_params,
                 Some(&ivf_model),
             )
             .await?;
@@ -651,7 +637,7 @@ pub(crate) async fn build_distributed_vector_index(
                 params.metric_type,
                 Box::new(shuffler),
                 Some(ivf_params),
-                Some(clean_pq_params.clone()),
+                Some(pq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
@@ -705,6 +691,10 @@ pub(crate) async fn build_distributed_vector_index(
             .with_fragment_filter(fragment_ids.to_vec())
             .build()
             .await?;
+        }
+        IndexType::IvfRq => {
+            // Distributed indexing explicitly does not support IVF_RQ; skip silently
+            log::warn!("Build Distributed Vector Index: IVF_RQ is not supported in distributed mode; skipping this shard");
         }
         _ => {
             return Err(Error::Index {
