@@ -5,7 +5,9 @@ Manages creation and execution of test code in isolated virtual environments
 with specific Lance versions installed.
 """
 
+import os
 import pickle
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +32,7 @@ class VenvExecutor:
         self.venv_path = Path(venv_path)
         self.python_path: Optional[Path] = None
         self._created = False
+        self._subprocess: Optional[subprocess.Popen] = None
 
     def create(self):
         """Create the virtual environment and install the specified Lance version."""
@@ -72,9 +75,60 @@ class VenvExecutor:
 
         self._created = True
 
+    def _ensure_subprocess(self):
+        """Ensure the persistent subprocess is running."""
+        if self._subprocess is not None and self._subprocess.poll() is None:
+            # Subprocess is already running
+            return
+
+        # Start persistent subprocess
+        runner_script = Path(__file__).parent / "venv_runner.py"
+
+        # Set PYTHONPATH to include the tests directory
+        env = os.environ.copy()
+        tests_dir = Path(__file__).parent.parent
+        env["PYTHONPATH"] = str(tests_dir)
+
+        self._subprocess = subprocess.Popen(
+            [str(self.python_path), "-u", str(runner_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+
+    def _send_message(self, obj: Any):
+        """Send a length-prefixed pickled message to subprocess."""
+        data = pickle.dumps(obj)
+        length = struct.pack(">I", len(data))
+        self._subprocess.stdin.write(length)
+        self._subprocess.stdin.write(data)
+        self._subprocess.stdin.flush()
+
+    def _receive_message(self) -> Any:
+        """Receive a length-prefixed pickled message from subprocess."""
+        # Read 4-byte length header
+        length_bytes = self._subprocess.stdout.read(4)
+        if len(length_bytes) < 4:
+            raise RuntimeError("Failed to read message length from subprocess")
+
+        length = struct.unpack(">I", length_bytes)[0]
+
+        # Read message data
+        data = self._subprocess.stdout.read(length)
+        if len(data) < length:
+            raise RuntimeError(
+                f"Incomplete message: expected {length} bytes, got {len(data)}"
+            )
+
+        return pickle.loads(data)
+
     def execute_method(self, obj: Any, method_name: str) -> Any:
         """
         Execute a method on a pickled object in the virtual environment.
+
+        Uses a persistent subprocess to avoid repeatedly importing Lance and
+        its dependencies.
 
         Parameters
         ----------
@@ -96,58 +150,56 @@ class VenvExecutor:
         if not self._created:
             raise RuntimeError("Virtual environment not created. Call create() first.")
 
-        # Get path to venv_runner.py
-        runner_script = Path(__file__).parent / "venv_runner.py"
+        # Ensure subprocess is running
+        self._ensure_subprocess()
 
-        # Pickle the object
-        pickled_obj = pickle.dumps(obj)
+        try:
+            # Send request: (obj, method_name)
+            self._send_message((obj, method_name))
 
-        # Set PYTHONPATH to include the tests directory so the venv can import
-        # test modules. This allows unpickling test classes (they're pickled as
-        # forward_compat.*)
-        import os
+            # Receive response
+            response = self._receive_message()
 
-        env = os.environ.copy()
-        tests_dir = Path(__file__).parent.parent
-        env["PYTHONPATH"] = str(tests_dir)
-
-        # Run the venv_runner.py script
-        result = subprocess.run(
-            [str(self.python_path), str(runner_script), method_name],
-            input=pickled_obj,
-            capture_output=True,
-            env=env,
-        )
-
-        # Parse the result
-        if result.returncode == 0:
-            response = pickle.loads(result.stdout)
             if response["success"]:
                 return response["result"]
             else:
-                # This shouldn't happen if returncode is 0, but handle it
-                raise RuntimeError(f"Unexpected error: {response}")
-        else:
-            # Execution failed, unpickle error info
-            try:
-                error_info = pickle.loads(result.stdout)
-                # Re-create the exception with traceback info
+                # Error occurred in subprocess
                 error_msg = (
                     f"Error in venv (Lance {self.version}) calling {method_name}:\n"
-                    f"{error_info['exception_type']}: {error_info['exception_msg']}\n"
-                    f"\nTraceback from venv:\n{error_info['traceback']}"
+                    f"{response['exception_type']}: {response['exception_msg']}\n"
+                    f"\nTraceback from venv:\n{response['traceback']}"
                 )
                 raise RuntimeError(error_msg)
-            except (pickle.UnpicklingError, KeyError, EOFError):
-                # If we can't unpickle the error, show raw output
-                raise RuntimeError(
-                    f"Failed to execute {method_name} in venv (Lance {self.version}):\n"
-                    f"stdout: {result.stdout.decode('utf-8', errors='replace')}\n"
-                    f"stderr: {result.stderr.decode('utf-8', errors='replace')}"
+
+        except (BrokenPipeError, EOFError, struct.error) as e:
+            # Subprocess died or communication failed
+            stderr_output = ""
+            if self._subprocess and self._subprocess.stderr:
+                stderr_output = self._subprocess.stderr.read().decode(
+                    "utf-8", errors="replace"
                 )
 
+            raise RuntimeError(
+                f"Communication with venv subprocess failed (Lance {self.version}):\n"
+                f"Error: {e}\n"
+                f"stderr: {stderr_output}"
+            )
+
     def cleanup(self):
-        """Remove the virtual environment directory."""
+        """Remove the virtual environment directory and terminate subprocess."""
+        # Terminate the persistent subprocess
+        if self._subprocess is not None:
+            try:
+                self._subprocess.stdin.close()
+                self._subprocess.terminate()
+                self._subprocess.wait(timeout=5)
+            except Exception:
+                # Force kill if graceful termination fails
+                self._subprocess.kill()
+            finally:
+                self._subprocess = None
+
+        # Remove venv directory
         if self.venv_path.exists():
             import shutil
 

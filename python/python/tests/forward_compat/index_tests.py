@@ -229,9 +229,8 @@ class BasicTypes(UpgradeDowngradeTest):
 
 @compat_test()
 class BasicTypesLegacy(UpgradeDowngradeTest):
-    def __init__(self, path: Path, file_version: str):
+    def __init__(self, path: Path):
         self.path = path
-        self.file_version = file_version
 
     def create(self):
         batch = build_basic_types()
