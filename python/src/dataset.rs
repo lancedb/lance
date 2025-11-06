@@ -103,7 +103,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBES: usize = 20;
+const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -981,22 +981,20 @@ impl Dataset {
                 10
             };
 
-            let mut minimum_nprobes = Some(DEFAULT_NPROBES);
+            let mut minimum_nprobes = DEFAULT_NPROBES;
             let mut maximum_nprobes = None;
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
                 if !nprobes.is_none() {
                     let extracted: usize = nprobes.extract()?;
-                    minimum_nprobes = Some(extracted);
+                    minimum_nprobes = extracted;
                     maximum_nprobes = Some(extracted);
                 }
             }
 
             if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
-                if min_nprobes.is_none() {
-                    minimum_nprobes = None;
-                } else {
-                    minimum_nprobes = Some(min_nprobes.extract()?);
+                if !min_nprobes.is_none() {
+                    minimum_nprobes = min_nprobes.extract()?;
                 }
             }
 
@@ -1006,9 +1004,7 @@ impl Dataset {
                 }
             }
 
-            if let (Some(minimum_nprobes), Some(maximum_nprobes)) =
-                (minimum_nprobes, maximum_nprobes)
-            {
+            if let Some(maximum_nprobes) = maximum_nprobes {
                 if minimum_nprobes > maximum_nprobes {
                     return Err(PyValueError::new_err(
                         "minimum_nprobes must be <= maximum_nprobes",
@@ -1016,10 +1012,8 @@ impl Dataset {
                 }
             }
 
-            if let Some(minimum_nprobes) = minimum_nprobes {
-                if minimum_nprobes < 1 {
-                    return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
-                }
+            if minimum_nprobes < 1 {
+                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
             }
 
             if let Some(maximum_nprobes) = maximum_nprobes {

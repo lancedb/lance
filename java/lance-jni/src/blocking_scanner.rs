@@ -179,7 +179,7 @@ fn inner_create_scanner<'local>(
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
         let _ = scanner.nearest(&column, &key, k);
 
-        let minimum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMinimumNprobes")?;
+        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
 
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;

@@ -255,7 +255,7 @@ mod test {
                 k: 1,
                 lower_bound: None,
                 upper_bound: None,
-                minimum_nprobes: Some(1),
+                minimum_nprobes: 1,
                 maximum_nprobes: None,
                 ef: None,
                 refine_factor: None,

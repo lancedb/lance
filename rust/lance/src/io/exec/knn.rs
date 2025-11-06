@@ -403,31 +403,21 @@ impl DisplayAs for ANNIvfPartitionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let min_display = self
-                    .query
-                    .minimum_nprobes
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "None".to_string());
                 write!(
                     f,
                     "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}, deltas={}",
                     self.index_uuids[0],
-                    min_display,
+                    self.query.minimum_nprobes,
                     self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
             }
             DisplayFormatType::TreeRender => {
-                let min_display = self
-                    .query
-                    .minimum_nprobes
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "None".to_string());
                 write!(
                     f,
                     "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
                     self.index_uuids[0],
-                    min_display,
+                    self.query.minimum_nprobes,
                     self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
@@ -451,7 +441,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         Ok(Statistics {
-            num_rows: Precision::Exact(self.query.minimum_nprobes.unwrap_or(0)),
+            num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -735,7 +725,7 @@ impl ANNIvfSubIndexExec {
                 .maximum_nprobes
                 .unwrap_or(partitions.len())
                 .min(partitions.len());
-            let min_nprobes = query.minimum_nprobes.unwrap_or(0).min(max_nprobes);
+            let min_nprobes = query.minimum_nprobes.min(max_nprobes);
             if max_nprobes <= min_nprobes {
                 // We've already searched all partitions, no late search needed
                 return futures::stream::empty().boxed();
@@ -853,7 +843,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        let minimum_nprobes = query.minimum_nprobes.unwrap_or(0).min(partitions.len());
+        let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
 
         futures::stream::iter(0..minimum_nprobes)
@@ -1116,19 +1106,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 }
 
 fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
-    let minimum = query
-        .minimum_nprobes
-        .map(|current| current.max(pruned_nprobes))
-        .unwrap_or(pruned_nprobes);
-    let mut maximum = query
-        .maximum_nprobes
-        .map(|current| current.min(pruned_nprobes))
-        .unwrap_or(pruned_nprobes);
-    if minimum > maximum {
-        maximum = minimum;
+    query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
+    if let Some(maximum) = query.maximum_nprobes {
+        if query.minimum_nprobes > maximum {
+            query.minimum_nprobes = maximum;
+        }
     }
-    query.minimum_nprobes = Some(minimum);
-    query.maximum_nprobes = Some(maximum);
 }
 
 fn early_pruning(dists: &[f32], k: usize) -> usize {
@@ -1373,7 +1356,7 @@ mod tests {
             k: 10,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: None,
+            minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -1387,27 +1370,33 @@ mod tests {
     fn test_adjust_probes_rules() {
         let mut query = base_query();
         adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, Some(10));
-        assert_eq!(query.maximum_nprobes, Some(10));
+        assert_eq!(query.minimum_nprobes, 10);
+        assert_eq!(query.maximum_nprobes, None);
 
         let mut query = base_query();
-        query.minimum_nprobes = Some(20);
+        query.minimum_nprobes = 20;
         adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, Some(20));
-        assert_eq!(query.maximum_nprobes, Some(20));
+        assert_eq!(query.minimum_nprobes, 20);
+        assert_eq!(query.maximum_nprobes, None);
 
         let mut query = base_query();
         query.maximum_nprobes = Some(25);
         adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, Some(10));
-        assert_eq!(query.maximum_nprobes, Some(10));
+        assert_eq!(query.minimum_nprobes, 10);
+        assert_eq!(query.maximum_nprobes, Some(25));
 
         let mut query = base_query();
-        query.minimum_nprobes = Some(30);
+        query.maximum_nprobes = Some(5);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 5);
+        assert_eq!(query.maximum_nprobes, Some(5));
+
+        let mut query = base_query();
+        query.minimum_nprobes = 30;
         query.maximum_nprobes = Some(50);
         adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, Some(30));
-        assert_eq!(query.maximum_nprobes, Some(30));
+        assert_eq!(query.minimum_nprobes, 30);
+        assert_eq!(query.maximum_nprobes, Some(50));
     }
 
     #[tokio::test]
@@ -1544,7 +1533,7 @@ mod tests {
             k: 10,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: Some(1),
+            minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -1739,7 +1728,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(Some(10))
+            .minimum_nprobes(10)
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17")
@@ -1776,7 +1765,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(Some(10))
+            .minimum_nprobes(10)
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17 AND label = 18")
@@ -1812,7 +1801,7 @@ mod tests {
                 .scan()
                 .nearest("vector", q.as_ref(), 50)
                 .unwrap()
-                .minimum_nprobes(Some(10))
+                .minimum_nprobes(max_nprobes)
                 .maximum_nprobes(max_nprobes)
                 .prefilter(true)
                 .filter("label = 17")
@@ -1851,7 +1840,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(Some(10))
+            .minimum_nprobes(10)
             .prefilter(true)
             .filter("userid < 20")
             .unwrap()
@@ -1890,7 +1879,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(Some(10))
+            .minimum_nprobes(10)
             .prefilter(true)
             .refine(1)
             .filter("userid < 20")
@@ -1927,7 +1916,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 40000)
             .unwrap()
-            .minimum_nprobes(Some(10))
+            .minimum_nprobes(10)
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
