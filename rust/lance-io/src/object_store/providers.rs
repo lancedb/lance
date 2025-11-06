@@ -231,13 +231,14 @@ impl ObjectStoreRegistry {
         let (scheme, authority) = match uri.find("://") {
             None => {
                 // If there is no scheme, this is a file:// URI.
-                return Ok("file/".to_string());
+                return Ok("file".to_string());
             }
             Some(index) => {
                 let scheme = &uri[..index];
-                let authority = match uri[index + 1..].find("/") {
-                    None => &uri[index + 1..],
-                    Some(sindex) => &uri[index + 1..sindex],
+                let remainder = &uri[index + 3..];
+                let authority = match remainder.find("/") {
+                    None => remainder,
+                    Some(sindex) => &remainder[..sindex],
                 };
                 (scheme, authority)
             }
@@ -248,7 +249,7 @@ impl ObjectStoreRegistry {
                     // On Windows, drive letters such as C:/ can sometimes be confused for schemes.
                     // So if there is no known object store for this single-letter scheme, treat it
                     // as the local store.
-                    return Ok("file/".to_string());
+                    return Ok("file".to_string());
                 } else {
                     return Err(self.scheme_not_found_error(scheme));
                 }
@@ -310,24 +311,54 @@ impl ObjectStoreRegistry {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for DummyProvider {
+        async fn new_store(
+            &self,
+            _base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            unreachable!("This test doesn't create stores")
+        }
+    }
+
     #[test]
     fn test_calculcate_object_store_prefix() {
-        // Test the default calculcate_object_store_prefix implementation using a dummy provider
-        #[derive(Debug)]
-        struct DummyProvider;
-
-        #[async_trait::async_trait]
-        impl ObjectStoreProvider for DummyProvider {
-            async fn new_store(
-                &self,
-                _base_path: Url,
-                _params: &ObjectStoreParams,
-            ) -> Result<ObjectStore> {
-                unreachable!("This test doesn't create stores")
-            }
-        }
-
         let provider = DummyProvider;
         assert_eq!("dummy$blah", provider.calculcate_object_store_prefix("dummy", "blah", None).unwrap());
+    }
+
+    #[test]
+    fn test_calculcate_object_store_scheme_not_found() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("dummy", Arc::new(DummyProvider));
+        let s = "Invalid user input: No object store provider found for scheme: 'dummy2'\nValid schemes: dummy";
+        let result = registry.calculate_object_store_prefix("dummy2://mybucket/my/long/path", None).expect_err("expected error").to_string();
+        assert_eq!(s, &result[..s.len()]);
+    }
+
+    // Test that paths without a scheme get treated as local paths.
+    #[test]
+    fn test_calculcate_object_store_prefix_for_local() {
+        let registry = ObjectStoreRegistry::empty();
+        assert_eq!("file", registry.calculate_object_store_prefix("/tmp/foobar", None).unwrap());
+    }
+
+    // Test that paths with a single-letter scheme that is not registered for anything get treated as local paths.
+    #[test]
+    fn test_calculcate_object_store_prefix_for_local_windows_path() {
+        let registry = ObjectStoreRegistry::empty();
+        assert_eq!("file", registry.calculate_object_store_prefix("c://dos/path", None).unwrap());
+    }
+
+    // Test that paths with a given scheme get mapped to that storage provider.
+    #[test]
+    fn test_calculcate_object_store_prefix_for_dummy_path() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("dummy", Arc::new(DummyProvider));
+        assert_eq!("dummy$mybucket", registry.calculate_object_store_prefix("dummy://mybucket/my/long/path", None).unwrap());
     }
 }
