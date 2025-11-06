@@ -45,10 +45,10 @@ use super::value::{ValueDecompressor, ValueEncoder};
 fn struct_data_block_to_fixed_width_data_block(
     struct_data_block: StructDataBlock,
     bits_per_values: &[u64],
-) -> DataBlock {
+) -> Result<DataBlock> {
     let data_size = struct_data_block.expect_single_stat::<UInt64Type>(Stat::DataSize);
     let mut output = Vec::with_capacity(data_size as usize);
-    let num_values = struct_data_block.children[0].num_values();
+    let num_values = struct_data_block.children[0].num_values()?;
 
     for i in 0..num_values as usize {
         for (j, child) in struct_data_block.children.iter().enumerate() {
@@ -62,12 +62,12 @@ fn struct_data_block_to_fixed_width_data_block(
         }
     }
 
-    DataBlock::FixedWidth(FixedWidthDataBlock {
+    Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
         bits_per_value: bits_per_values.iter().copied().sum(),
         data: LanceBuffer::from(output),
         num_values,
         block_info: BlockInfo::default(),
-    })
+    }))
 }
 
 #[derive(Debug, Default)]
@@ -80,7 +80,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                 let bits_per_values = struct_data_block.children.iter().map(|data_block| data_block.as_fixed_width_ref().unwrap().bits_per_value).collect::<Vec<_>>();
 
                 // transform struct datablock to fixed-width data block.
-                let data_block = struct_data_block_to_fixed_width_data_block(struct_data_block, &bits_per_values);
+                let data_block = struct_data_block_to_fixed_width_data_block(struct_data_block, &bits_per_values)?;
 
                 // store and transformed fixed-width data block.
                 let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
@@ -318,9 +318,9 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             ));
         }
 
-        let num_values = struct_block.children[0].num_values();
+        let num_values = struct_block.children[0].num_values()?;
         for child in struct_block.children.iter() {
-            if child.num_values() != num_values {
+            if child.num_values()? != num_values {
                 return Err(Error::invalid_input(
                     "Packed struct children must have matching value counts",
                     location!(),

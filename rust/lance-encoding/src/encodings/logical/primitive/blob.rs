@@ -136,7 +136,7 @@ impl BlobDescriptionDecodePageTask {
 impl DecodePageTask for BlobDescriptionDecodePageTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let decoded = self.inner.decode()?;
-        let num_values = decoded.data.num_values();
+        let num_values = decoded.data.num_values()?;
 
         // Need to extract out the repdef information
         let DataBlock::Struct(descriptions) = &decoded.data else {
