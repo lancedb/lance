@@ -403,21 +403,31 @@ impl DisplayAs for ANNIvfPartitionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let min_display = self
+                    .query
+                    .minimum_nprobes
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "None".to_string());
                 write!(
                     f,
                     "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}, deltas={}",
                     self.index_uuids[0],
-                    self.query.minimum_nprobes,
+                    min_display,
                     self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
             }
             DisplayFormatType::TreeRender => {
+                let min_display = self
+                    .query
+                    .minimum_nprobes
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "None".to_string());
                 write!(
                     f,
                     "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
                     self.index_uuids[0],
-                    self.query.minimum_nprobes,
+                    min_display,
                     self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
@@ -441,7 +451,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         Ok(Statistics {
-            num_rows: Precision::Exact(self.query.minimum_nprobes),
+            num_rows: Precision::Exact(self.query.minimum_nprobes.unwrap_or(0)),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -721,8 +731,12 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
-            let max_nprobes = query.maximum_nprobes.unwrap_or(partitions.len());
-            if max_nprobes == query.minimum_nprobes {
+            let max_nprobes = query
+                .maximum_nprobes
+                .unwrap_or(partitions.len())
+                .min(partitions.len());
+            let min_nprobes = query.minimum_nprobes.unwrap_or(0).min(max_nprobes);
+            if max_nprobes <= min_nprobes {
                 // We've already searched all partitions, no late search needed
                 return futures::stream::empty().boxed();
             }
@@ -784,7 +798,7 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            futures::stream::iter(query.minimum_nprobes..max_nprobes)
+            futures::stream::iter(min_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -839,7 +853,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
+        let minimum_nprobes = query.minimum_nprobes.unwrap_or(0).min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
 
         futures::stream::iter(0..minimum_nprobes)
@@ -1026,10 +1040,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let pre_filter = pre_filter.clone();
                     let state = state.clone();
                     let mut query = query.clone();
-                    query.minimum_nprobes = std::cmp::min(
-                        query.minimum_nprobes,
-                        early_pruning(q_c_dists.values(), query.k),
-                    );
+                    let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
+                    adjust_probes(&mut query, pruned_nprobes);
                     async move {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
@@ -1101,6 +1113,22 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
+    let minimum = query
+        .minimum_nprobes
+        .map(|current| current.max(pruned_nprobes))
+        .unwrap_or(pruned_nprobes);
+    let mut maximum = query
+        .maximum_nprobes
+        .map(|current| current.min(pruned_nprobes))
+        .unwrap_or(pruned_nprobes);
+    if minimum > maximum {
+        maximum = minimum;
+    }
+    query.minimum_nprobes = Some(minimum);
+    query.maximum_nprobes = Some(maximum);
 }
 
 fn early_pruning(dists: &[f32], k: usize) -> usize {
@@ -1319,7 +1347,9 @@ mod tests {
 
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
-    use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1332,9 +1362,53 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
 
-    use crate::dataset::{ProjectionRequest, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::io::exec::testing::TestingExec;
+
+    fn base_query() -> Query {
+        Query {
+            column: "vec".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: None,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: DistanceType::L2,
+            use_index: true,
+            dist_q_c: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_adjust_probes_rules() {
+        let mut query = base_query();
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, Some(10));
+        assert_eq!(query.maximum_nprobes, Some(10));
+
+        let mut query = base_query();
+        query.minimum_nprobes = Some(20);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, Some(20));
+        assert_eq!(query.maximum_nprobes, Some(20));
+
+        let mut query = base_query();
+        query.maximum_nprobes = Some(25);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, Some(10));
+        assert_eq!(query.maximum_nprobes, Some(10));
+
+        let mut query = base_query();
+        query.minimum_nprobes = Some(30);
+        query.maximum_nprobes = Some(50);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, Some(30));
+        assert_eq!(query.maximum_nprobes, Some(30));
+    }
 
     #[tokio::test]
     async fn knn_flat_search() {
@@ -1470,7 +1544,7 @@ mod tests {
             k: 10,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: 1,
+            minimum_nprobes: Some(1),
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -1665,7 +1739,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(Some(10))
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17")
@@ -1694,17 +1768,7 @@ mod tests {
     async fn test_no_prefilter_results(#[values(1, 20)] num_deltas: usize) {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
-        let q = fixture
-            .dataset
-            .take(
-                &[0],
-                ProjectionRequest::from_schema(fixture.dataset.schema().clone()),
-            )
-            .await
-            .unwrap()
-            .column_by_name("vector")
-            .unwrap()
-            .clone();
+        let q = fixture.get_centroid(0);
         let stats_holder = StatsHolder::default();
 
         let results = fixture
@@ -1712,7 +1776,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(Some(10))
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17 AND label = 18")
@@ -1748,7 +1812,7 @@ mod tests {
                 .scan()
                 .nearest("vector", q.as_ref(), 50)
                 .unwrap()
-                .minimum_nprobes(10)
+                .minimum_nprobes(Some(10))
                 .maximum_nprobes(max_nprobes)
                 .prefilter(true)
                 .filter("label = 17")
@@ -1787,7 +1851,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(Some(10))
             .prefilter(true)
             .filter("userid < 20")
             .unwrap()
@@ -1826,7 +1890,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(Some(10))
             .prefilter(true)
             .refine(1)
             .filter("userid < 20")
@@ -1863,7 +1927,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 40000)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(Some(10))
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()

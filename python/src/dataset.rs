@@ -981,19 +981,22 @@ impl Dataset {
                 10
             };
 
-            let mut minimum_nprobes = DEFAULT_NPROBES;
+            let mut minimum_nprobes = Some(DEFAULT_NPROBES);
             let mut maximum_nprobes = None;
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
                 if !nprobes.is_none() {
-                    minimum_nprobes = nprobes.extract()?;
-                    maximum_nprobes = Some(minimum_nprobes);
+                    let extracted: usize = nprobes.extract()?;
+                    minimum_nprobes = Some(extracted);
+                    maximum_nprobes = Some(extracted);
                 }
             }
 
             if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
-                if !min_nprobes.is_none() {
-                    minimum_nprobes = min_nprobes.extract()?;
+                if min_nprobes.is_none() {
+                    minimum_nprobes = None;
+                } else {
+                    minimum_nprobes = Some(min_nprobes.extract()?);
                 }
             }
 
@@ -1003,18 +1006,26 @@ impl Dataset {
                 }
             }
 
-            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
-                return Err(PyValueError::new_err(
-                    "minimum_nprobes must be <= maximum_nprobes",
-                ));
+            if let (Some(minimum_nprobes), Some(maximum_nprobes)) =
+                (minimum_nprobes, maximum_nprobes)
+            {
+                if minimum_nprobes > maximum_nprobes {
+                    return Err(PyValueError::new_err(
+                        "minimum_nprobes must be <= maximum_nprobes",
+                    ));
+                }
             }
 
-            if minimum_nprobes < 1 {
-                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+            if let Some(minimum_nprobes) = minimum_nprobes {
+                if minimum_nprobes < 1 {
+                    return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+                }
             }
 
-            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
-                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                if maximum_nprobes < 1 {
+                    return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+                }
             }
 
             let metric_type: Option<MetricType> =

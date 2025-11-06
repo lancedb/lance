@@ -87,7 +87,9 @@ pub struct Query {
 
     /// The minimum number of probes to load and search.  More partitions
     /// will only be loaded if we have not found k results.
-    pub minimum_nprobes: usize,
+    ///
+    /// If None, the planner will decide how many partitions to search first.
+    pub minimum_nprobes: Option<usize>,
 
     /// The maximum number of probes to load and search.  If not set then
     /// ALL partitions will be searched, if needed, to satisfy k results.

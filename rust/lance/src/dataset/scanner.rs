@@ -1047,7 +1047,7 @@ impl Scanner {
             k,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: 20,
+            minimum_nprobes: Some(20),
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -1082,7 +1082,7 @@ impl Scanner {
     /// [Self::maximum_nprobes] to the same value.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
+            q.minimum_nprobes = Some(n);
             q.maximum_nprobes = Some(n);
         } else {
             log::warn!("nprobes is not set because nearest has not been called yet");
@@ -1097,7 +1097,7 @@ impl Scanner {
     #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
+            q.minimum_nprobes = Some(n);
             q.maximum_nprobes = Some(n);
         } else {
             log::warn!("nprobes is not set because nearest has not been called yet");
@@ -1110,7 +1110,10 @@ impl Scanner {
     /// If we have found k matching results after searching this many partitions then
     /// the search will stop.  Increasing this number can increase recall but will increase
     /// latency on all queries.
-    pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
+    ///
+    /// Passing [`None`] clears any previously configured minimum which allows the planner to
+    /// determine an appropriate value dynamically.
+    pub fn minimum_nprobes(&mut self, n: Option<usize>) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
         } else {
@@ -3979,6 +3982,38 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_minimum_nprobes_can_be_cleared() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+
+        let vector_field = test_ds
+            .schema
+            .field_with_name("vec")
+            .expect("vector field must exist");
+        let dimension = match vector_field.data_type() {
+            DataType::FixedSizeList(_, size) => *size as usize,
+            _ => panic!("expected fixed size list for vector field"),
+        };
+
+        let query = std::sync::Arc::new(arrow_array::Float32Array::from(vec![0.0f32; dimension]));
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", query.as_ref(), 5).unwrap();
+        scanner.minimum_nprobes(Some(3));
+        scanner.minimum_nprobes(None);
+
+        assert!(scanner
+            .nearest_mut()
+            .expect("nearest query should be configured")
+            .minimum_nprobes
+            .is_none());
+
+        scanner.try_into_stream().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_strict_batch_size() {
         let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
@@ -5167,7 +5202,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
-        scan.minimum_nprobes(100);
+        scan.minimum_nprobes(Some(100));
         scan.with_row_id();
 
         let batches = scan
@@ -5471,7 +5506,7 @@ mod test {
             let key: Float32Array = (0..32).map(|_v| 1.0_f32).collect();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.minimum_nprobes(100);
+            scan.minimum_nprobes(Some(100));
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
@@ -5507,7 +5542,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.minimum_nprobes(100);
+            scan.minimum_nprobes(Some(100));
 
             let results = scan
                 .try_into_stream()
@@ -5569,7 +5604,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.minimum_nprobes(100);
+            scan.minimum_nprobes(Some(100));
 
             let results = scan
                 .try_into_stream()

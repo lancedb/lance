@@ -25,7 +25,7 @@ public class Query {
   private final String column;
   private final float[] key;
   private final int k;
-  private final int minimumNprobes;
+  private final Optional<Integer> minimumNprobes;
   private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
@@ -38,10 +38,13 @@ public class Query {
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
     Preconditions.checkArgument(
-        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
+        builder.minimumNprobes.map(n -> n > 0).orElse(true),
+        "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
         !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+            || builder.minimumNprobes
+                .map(min -> builder.maximumNprobes.get() >= min)
+                .orElse(true),
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
     this.minimumNprobes = builder.minimumNprobes;
@@ -64,7 +67,7 @@ public class Query {
     return k;
   }
 
-  public int getMinimumNprobes() {
+  public Optional<Integer> getMinimumNprobes() {
     return minimumNprobes;
   }
 
@@ -94,7 +97,7 @@ public class Query {
         .add("column", column)
         .add("key", key)
         .add("k", k)
-        .add("minimumNprobes", minimumNprobes)
+        .add("minimumNprobes", minimumNprobes.orElse(null))
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
@@ -107,7 +110,7 @@ public class Query {
     private String column;
     private float[] key;
     private int k = 10;
-    private int minimumNprobes = 20;
+    private Optional<Integer> minimumNprobes = Optional.of(20);
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
@@ -157,7 +160,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.minimumNprobes = nprobes;
+      this.minimumNprobes = Optional.of(nprobes);
       this.maximumNprobes = Optional.of(nprobes);
       return this;
     }
@@ -172,7 +175,29 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setMinimumNprobes(int minimumNprobes) {
-      this.minimumNprobes = minimumNprobes;
+      this.minimumNprobes = Optional.of(minimumNprobes);
+      return this;
+    }
+
+    /**
+     * Sets the minimum number of partitions to search.
+     *
+     * @param minimumNprobes The optional number of partitions to search.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setMinimumNprobes(Optional<Integer> minimumNprobes) {
+      this.minimumNprobes =
+          Preconditions.checkNotNull(minimumNprobes, "minimumNprobes must not be null");
+      return this;
+    }
+
+    /**
+     * Clears any previously configured minimum number of partitions to search.
+     *
+     * @return The Builder instance for method chaining.
+     */
+    public Builder clearMinimumNprobes() {
+      this.minimumNprobes = Optional.empty();
       return this;
     }
 

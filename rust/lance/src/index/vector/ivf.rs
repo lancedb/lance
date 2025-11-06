@@ -2153,7 +2153,7 @@ mod tests {
                     k: 5,
                     lower_bound: None,
                     upper_bound: None,
-                    minimum_nprobes: 1,
+                    minimum_nprobes: Some(1),
                     maximum_nprobes: None,
                     ef: None,
                     refine_factor: None,
@@ -2658,7 +2658,7 @@ mod tests {
             .nearest("vec", &query, 2_000)
             .unwrap()
             .ef(100_000)
-            .minimum_nprobes(2)
+            .minimum_nprobes(Some(2))
             .try_into_batch()
             .await
             .unwrap();
@@ -2703,7 +2703,7 @@ mod tests {
                 .scan()
                 .nearest("vec", &query, 2_000)
                 .unwrap()
-                .minimum_nprobes(2)
+                .minimum_nprobes(Some(2))
                 .try_into_batch()
                 .await
                 .unwrap();
@@ -3125,7 +3125,7 @@ mod tests {
             .with_row_id()
             .nearest("vector", query, k)
             .unwrap()
-            .minimum_nprobes(nlist)
+            .minimum_nprobes(Some(nlist))
             .try_into_stream()
             .await
             .unwrap()
@@ -3207,7 +3207,7 @@ mod tests {
             .with_row_id()
             .nearest("vector", query, k)
             .unwrap()
-            .minimum_nprobes(nlist)
+            .minimum_nprobes(Some(nlist))
             .try_into_stream()
             .await
             .unwrap()
