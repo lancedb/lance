@@ -39,8 +39,8 @@ impl AllocationTracker for MemoryTracker {
     fn allocated(
         &self,
         _addr: usize,
-        _object_size: usize,
-        wrapped_size: usize,
+        object_size: usize,
+        _wrapped_size: usize,
         group_id: AllocationGroupId,
     ) {
         if group_id == AllocationGroupId::ROOT {
@@ -49,7 +49,7 @@ impl AllocationTracker for MemoryTracker {
         }
         let mut guard = GLOBAL_STATS.lock().unwrap();
         let stats = guard.entry(group_id).or_default();
-        stats.total_bytes_allocated += wrapped_size as isize;
+        stats.total_bytes_allocated += object_size as isize;
         stats.total_allocations += 1;
         stats.max_bytes_allocated = stats.max_bytes_allocated.max(stats.net_bytes_allocated());
     }
@@ -57,8 +57,8 @@ impl AllocationTracker for MemoryTracker {
     fn deallocated(
         &self,
         _addr: usize,
-        _object_size: usize,
-        wrapped_size: usize,
+        object_size: usize,
+        _wrapped_size: usize,
         source_group_id: AllocationGroupId,
         current_group_id: AllocationGroupId,
     ) {
@@ -73,10 +73,7 @@ impl AllocationTracker for MemoryTracker {
         }
         let mut guard = GLOBAL_STATS.lock().unwrap();
         let stats = guard.entry(group_id).or_default();
-        // Track size of wrapped allocation and not total allocation size. The
-        // tracking_allocator keeps some bookkeeping data in addition to the requested
-        // allocation, which we don't want to count here.
-        stats.total_bytes_deallocated += wrapped_size as isize;
+        stats.total_bytes_deallocated += object_size as isize;
         stats.total_deallocations += 1;
     }
 }
@@ -163,11 +160,11 @@ fn check_memory_leak() {
         drop(v);
     }
     let stats = tracker.stats();
-    assert_eq!(stats.max_bytes_allocated, (1024 * 1024) + 1024 + 16);
-    assert_eq!(stats.total_bytes_allocated, (1024 * 1024) + 1024 + 16);
-    assert_eq!(stats.total_bytes_deallocated, (1024 * 1024) + 8);
+    assert_eq!(stats.max_bytes_allocated, (1024 * 1024) + 1024);
+    assert_eq!(stats.total_bytes_allocated, (1024 * 1024) + 1024);
+    assert_eq!(stats.total_bytes_deallocated, (1024 * 1024));
     assert_eq!(stats.total_allocations, 2);
-    assert_eq!(stats.net_bytes_allocated(), 1024 + 8);
+    assert_eq!(stats.net_bytes_allocated(), 1024);
 }
 
 #[tokio::test]
