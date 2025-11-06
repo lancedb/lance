@@ -579,9 +579,6 @@ pub async fn write_fragments_internal(
         (data, schema)
     };
 
-    // Make sure the max rows per group is not larger than the max rows per file
-    params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
-
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
