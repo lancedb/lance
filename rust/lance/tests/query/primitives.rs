@@ -335,7 +335,7 @@ async fn test_query_binary(#[case] data_type: DataType) {
 
 #[tokio::test]
 #[rstest::rstest]
-// TODO: Add Decimal32 and Decimal64 once lance_datagen supports them
+// TODO: Add Decimal32 and Decimal64 https://github.com/lancedb/lance/issues/5174
 #[case::decimal128(DataType::Decimal128(38, 10))]
 #[case::decimal256(DataType::Decimal256(76, 20))]
 async fn test_query_decimal(#[case] data_type: DataType) {
