@@ -271,8 +271,7 @@ mod tests {
     #[test]
     fn test_calculate_object_store_prefix_from_url_and_options() {
         let provider = AzureBlobStoreProvider;
-        let options =
-            HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@bob",
             provider
@@ -284,8 +283,7 @@ mod tests {
     #[test]
     fn test_calculate_object_store_prefix_from_url_and_ignored_options() {
         let provider = AzureBlobStoreProvider;
-        let options =
-            HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@account",
             provider
@@ -301,8 +299,7 @@ mod tests {
     #[test]
     fn test_fail_to_calculate_object_store_prefix_from_url() {
         let provider = AzureBlobStoreProvider;
-        let options =
-            HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
+        let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
         let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
         let result = provider
             .calculate_object_store_prefix("az", "container", Some(&options))

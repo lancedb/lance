@@ -253,10 +253,10 @@ impl ObjectStoreRegistry {
                 } else {
                     Err(self.scheme_not_found_error(scheme))
                 }
-            },
+            }
             Some(provider) => {
                 provider.calculate_object_store_prefix(scheme, authority, storage_options)
-            },
+            }
         }
     }
 }
