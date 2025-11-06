@@ -22,14 +22,15 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone)]
 pub struct SizedRecord {
-    record: ArcAny,
-    size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    pub record: ArcAny,
+    pub size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    pub type_name: &'static str,
 }
 
 impl std::fmt::Debug for SizedRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SizedRecord")
-            .field("record", &self.record)
+            .field("type", &self.type_name)
             .finish()
     }
 }
@@ -42,12 +43,14 @@ impl DeepSizeOf for SizedRecord {
 
 impl SizedRecord {
     fn new<T: DeepSizeOf + Send + Sync + 'static>(record: Arc<T>) -> Self {
+        // Calculate size once and store it
         // +8 for the size of the Arc pointer itself
         let size_accessor =
             |record: &ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() + 8 };
         Self {
             record,
             size_accessor: Arc::new(size_accessor),
+            type_name: std::any::type_name::<T>(),
         }
     }
 }
@@ -277,6 +280,13 @@ impl LanceCache {
         self.misses.store(0, Ordering::Relaxed);
     }
 
+    // For testing: get all entries in the cache
+    #[doc(hidden)]
+    pub async fn entries(&self) -> Vec<((String, TypeId), SizedRecord)> {
+        self.cache.run_pending_tasks().await;
+        self.cache.iter().map(|(k, v)| ((*k).clone(), v)).collect()
+    }
+
     // CacheKey-based methods
     pub async fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
@@ -340,14 +350,38 @@ pub struct WeakLanceCache {
     misses: Arc<AtomicU64>,
 }
 
-impl WeakLanceCache {
-    /// Create a weak reference from a strong LanceCache
-    pub fn from(cache: &LanceCache) -> Self {
+impl From<&LanceCache> for WeakLanceCache {
+    fn from(cache: &LanceCache) -> Self {
         Self {
             inner: Arc::downgrade(&cache.cache),
             prefix: cache.prefix.clone(),
             hits: cache.hits.clone(),
             misses: cache.misses.clone(),
+        }
+    }
+}
+
+impl From<LanceCache> for WeakLanceCache {
+    fn from(cache: LanceCache) -> Self {
+        Self {
+            inner: Arc::downgrade(&cache.cache),
+            prefix: cache.prefix,
+            hits: cache.hits,
+            misses: cache.misses,
+        }
+    }
+}
+
+impl WeakLanceCache {
+    pub fn upgrade(self) -> LanceCache {
+        let Some(cache) = self.inner.upgrade() else {
+            return LanceCache::no_cache();
+        };
+        LanceCache {
+            cache,
+            prefix: self.prefix,
+            hits: self.hits,
+            misses: self.misses,
         }
     }
 

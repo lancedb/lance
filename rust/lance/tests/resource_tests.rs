@@ -1,0 +1,1 @@
+mod resource_test;
