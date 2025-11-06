@@ -3,5 +3,5 @@
 
 // The memory tests don't work currently on MacOS because they rely on thread
 // local storage in the allocator, which seems to have some issues on MacOS.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod resource_test;
