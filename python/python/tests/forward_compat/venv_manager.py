@@ -21,7 +21,7 @@ DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 class VenvExecutor:
     """Manages a virtual environment with a specific Lance version."""
 
-    def __init__(self, version: str, venv_path: Path):
+    def __init__(self, version: str, venv_path: Path, persistent: bool = False):
         """
         Initialize a VenvExecutor.
 
@@ -31,16 +31,67 @@ class VenvExecutor:
             Lance version to install (e.g., "0.30.0")
         venv_path : Path
             Directory where virtual environment will be created
+        persistent : bool
+            If True, venv is persistent and validated before use
         """
         self.version = version
         self.venv_path = Path(venv_path)
+        self.persistent = persistent
         self.python_path: Optional[Path] = None
         self._created = False
         self._subprocess: Optional[subprocess.Popen] = None
 
+    def _validate_venv(self) -> bool:
+        """Check if existing venv is valid and has correct Lance version."""
+        if not self.venv_path.exists():
+            return False
+
+        # Determine python path
+        if sys.platform == "win32":
+            python_path = self.venv_path / "Scripts" / "python.exe"
+        else:
+            python_path = self.venv_path / "bin" / "python"
+
+        if not python_path.exists():
+            return False
+
+        # Check if pylance is installed with correct version
+        try:
+            result = subprocess.run(
+                [str(python_path), "-m", "pip", "show", "pylance"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+
+            # Parse version from output
+            for line in result.stdout.splitlines():
+                if line.startswith("Version:"):
+                    installed_version = line.split(":", 1)[1].strip()
+                    return installed_version == self.version
+
+        except Exception:
+            return False
+
+        return False
+
     def create(self):
         """Create the virtual environment and install the specified Lance version."""
         if self._created:
+            return
+
+        # Check if persistent venv already exists and is valid
+        if self.persistent and self._validate_venv():
+            if DEBUG:
+                print(f"[TIMING] Reusing existing venv for {self.version}", flush=True)
+            # Set python path
+            if sys.platform == "win32":
+                self.python_path = self.venv_path / "Scripts" / "python.exe"
+            else:
+                self.python_path = self.venv_path / "bin" / "python"
+            self._created = True
             return
 
         start_time = time.time()
@@ -256,7 +307,7 @@ class VenvExecutor:
 class VenvFactory:
     """Factory for creating and managing VenvExecutor instances."""
 
-    def __init__(self, base_path: Path):
+    def __init__(self, base_path: Path, persistent: bool = False):
         """
         Initialize the factory.
 
@@ -264,8 +315,11 @@ class VenvFactory:
         ----------
         base_path : Path
             Base directory for creating virtual environments
+        persistent : bool
+            If True, venvs are not cleaned up and can be reused across sessions
         """
         self.base_path = Path(base_path)
+        self.persistent = persistent
         self.venvs: dict[str, VenvExecutor] = {}
 
     def get_venv(self, version: str) -> VenvExecutor:
@@ -284,13 +338,14 @@ class VenvFactory:
         """
         if version not in self.venvs:
             venv_path = self.base_path / f"venv_{version}"
-            executor = VenvExecutor(version, venv_path)
+            executor = VenvExecutor(version, venv_path, persistent=self.persistent)
             executor.create()
             self.venvs[version] = executor
         return self.venvs[version]
 
     def cleanup_all(self):
-        """Clean up all created virtual environments."""
-        for venv in self.venvs.values():
-            venv.cleanup()
+        """Clean up all created virtual environments (skips persistent venvs)."""
+        if not self.persistent:
+            for venv in self.venvs.values():
+                venv.cleanup()
         self.venvs.clear()
