@@ -45,12 +45,19 @@ def test_blob_compaction_requires_flag(tmp_path: Path):
     schema = pa.schema([pa.field("id", pa.int32()), blob_field])
     blobs = [b"\x01\x02", b"\x03\x04\x05"]
     table = pa.table(
-        {"id": pa.array([0, 1], type=pa.int32()), "blob": pa.array(blobs, type=pa.large_binary())},
+        {
+            "id": pa.array([0, 1], type=pa.int32()),
+            "blob": pa.array(blobs, type=pa.large_binary()),
+        },
         schema=schema,
     )
 
     dataset = lance.write_dataset(
-        table, base_dir, schema=schema, max_rows_per_file=1, data_storage_version="stable"
+        table,
+        base_dir,
+        schema=schema,
+        max_rows_per_file=1,
+        data_storage_version="stable",
     )
     assert len(dataset.get_fragments()) == 2
 
