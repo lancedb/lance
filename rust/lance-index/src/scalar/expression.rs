@@ -712,10 +712,15 @@ impl IndexedExpression {
     fn maybe_not(self) -> Option<Self> {
         match (self.scalar_query, self.refine_expr) {
             (Some(_), Some(_)) => None,
-            (Some(scalar_query), None) => Some(Self {
-                scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
-                refine_expr: None,
-            }),
+            (Some(scalar_query), None) => {
+                if scalar_query.needs_recheck() {
+                    return None;
+                }
+                Some(Self {
+                    scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
+                    refine_expr: None,
+                })
+            }
             (None, Some(refine_expr)) => Some(Self {
                 scalar_query: None,
                 refine_expr: Some(Expr::Not(Box::new(refine_expr))),
