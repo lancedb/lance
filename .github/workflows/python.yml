@@ -126,6 +126,36 @@ jobs:
           name: linux-wheels
           path: python/target/wheels/pylance-*.whl
 
+  compat:
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    name: Compatibility Tests
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+      - name: Run compatibility tests
+        run: |
+          pytest python/tests/forward_compat/ --run-compat -v
+        env:
+          COMPAT_TEMP_VENV: 1
+
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
