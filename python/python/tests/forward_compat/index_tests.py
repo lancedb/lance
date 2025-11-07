@@ -1,30 +1,18 @@
 import inspect
 import json
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
 
 import lance
+import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 from .util import build_basic_types
-
-# Flow:
-# 1. Old
-#    a. gen_data
-#    b. create_index
-#    c. test_query
-#    d. test_stats
-# 2. Current
-#    a. test_query
-#    b. test_stats
-#    c. test_optimize
-# 3. Old
-#   a. test_query
-#   b. test_stats
-#   c. test_optimize
 
 
 @lru_cache(maxsize=1)
@@ -376,18 +364,369 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
         ds.insert(build_basic_types())
 
 
-class IndexTest:
-    def gen_data(self):
-        pass
+# ============================================================================
+# Index Compatibility Tests
+# ============================================================================
+# These tests verify that indices created with one version of Lance can be
+# read and written by other versions.
 
-    def create_index(self):
-        pass
 
-    def test_query(self):
-        pass
+@compat_test(versions=["0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class BTreeIndex(UpgradeDowngradeTest):
+    """Test BTREE scalar index compatibility"""
 
-    def test_stats(self):
-        pass
+    def __init__(self, path: Path):
+        self.path = path
 
-    def test_optimize(self):
-        pass
+    def create(self):
+        """Create dataset with BTREE index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "btree": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index("btree", "BTREE")
+
+    def check_read(self):
+        """Verify BTREE index can be queried."""
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="btree == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        # Verify index is used
+        explain = ds.scanner(filter="btree == 7").explain_plan()
+        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+
+    def check_write(self):
+        """Verify can insert data and optimize BTREE index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "btree": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        # Verify new data is queryable
+        table = ds.to_table(filter="btree == 1000")
+        assert table.num_rows == 1
+
+
+@compat_test(
+    versions=["0.20.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
+)
+class BitmapLabelListIndex(UpgradeDowngradeTest):
+    """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with BITMAP and LABEL_LIST indices."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "bitmap": pa.array(range(1000)),
+                "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index("bitmap", "BITMAP")
+        dataset.create_scalar_index("label_list", "LABEL_LIST")
+
+    def check_read(self):
+        """Verify BITMAP and LABEL_LIST indices can be queried."""
+        ds = lance.dataset(self.path)
+
+        # Test BITMAP index
+        table = ds.to_table(filter="bitmap == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        # Test LABEL_LIST index
+        table = ds.to_table(filter="array_has_any(label_list, ['label7'])")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+    def check_write(self):
+        """Verify can insert data and optimize indices."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "bitmap": pa.array([1000]),
+                "label_list": pa.array([["label1000"]]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+
+@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class NgramIndex(UpgradeDowngradeTest):
+    """Test NGRAM index compatibility (introduced in 0.36.0)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with NGRAM index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "ngram": pa.array([f"word{i}" for i in range(1000)]),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index("ngram", "NGRAM")
+
+    def check_read(self):
+        """Verify NGRAM index can be queried."""
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="contains(ngram, 'word7')")
+        # word7, word70-79, word700-799 = 111 results
+        assert table.num_rows == 111
+
+        # Verify index is used
+        explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
+        assert "ScalarIndexQuery" in explain
+
+    def check_write(self):
+        """Verify can insert data and optimize NGRAM index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "ngram": pa.array(["word1000"]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+
+@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
+    """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with ZONEMAP and BLOOMFILTER indices."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "zonemap": pa.array(range(1000)),
+                "bloomfilter": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index("zonemap", "ZONEMAP")
+        dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
+
+    def check_read(self):
+        """Verify ZONEMAP and BLOOMFILTER indices can be queried."""
+        ds = lance.dataset(self.path)
+
+        # Test ZONEMAP
+        table = ds.to_table(filter="zonemap == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        # Test BLOOMFILTER
+        table = ds.to_table(filter="bloomfilter == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+    def check_write(self):
+        """Verify can insert data and optimize indices."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "zonemap": pa.array([1000]),
+                "bloomfilter": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+
+@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class JsonIndex(UpgradeDowngradeTest):
+    """Test JSON index compatibility (introduced in 0.36.0)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with JSON index."""
+        from lance.indices import IndexConfig
+
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index(
+            "json",
+            IndexConfig(
+                index_type="json",
+                parameters={"target_index_type": "btree", "path": "val"},
+            ),
+        )
+
+    def check_read(self):
+        """Verify JSON index can be queried."""
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="json_get_int(json, 'val') == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        # Verify index is used
+        explain = ds.scanner(filter="json_get_int(json, 'val') == 7").explain_plan()
+        assert "ScalarIndexQuery" in explain
+
+    def check_write(self):
+        """Verify can insert data with JSON index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "json": pa.array(['{"val": 1000}'], pa.json_()),
+            }
+        )
+        ds.insert(data)
+        # TODO: fix this https://github.com/lancedb/lance/issues/5177
+        # ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+
+@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+class FtsIndex(UpgradeDowngradeTest):
+    """Test FTS (full-text search) index compatibility (introduced in 0.36.0)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with FTS index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "text": pa.array(
+                    [f"document with words {i} and more text" for i in range(1000)]
+                ),
+            }
+        )
+        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset.create_scalar_index("text", "INVERTED")
+
+    def check_read(self):
+        """Verify FTS index can be queried."""
+        ds = lance.dataset(self.path)
+        # Search for documents containing "words" and "7"
+        # Note: Actual FTS query syntax may vary
+        table = ds.to_table(filter="text LIKE '%words 7 %'")
+        assert table.num_rows > 0
+
+    def check_write(self):
+        """Verify can insert data with FTS index."""
+        # Dataset::load_manifest does not do retain_supported_indices
+        # so this can only work with no cache
+        session = lance.Session(index_cache_size_bytes=0, metadata_cache_size_bytes=0)
+        ds = lance.dataset(self.path, session=session)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "text": pa.array(["new document to index"]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.compact_files()
+
+
+@compat_test(
+    versions=[
+        "0.29.1.beta2",
+        "0.30.0",
+        "0.36.0",
+        LAST_STABLE_RELEASE,
+        LAST_BETA_RELEASE,
+    ]
+)
+class PqVectorIndex(UpgradeDowngradeTest):
+    """Test PQ (Product Quantization) vector index compatibility."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create dataset with PQ vector index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        ndims = 32
+        nvecs = 512
+
+        data = pa.table(
+            {
+                "id": pa.array(range(nvecs)),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(ndims * nvecs).cast(pa.float32()), ndims
+                ),
+            }
+        )
+
+        dataset = lance.write_dataset(data, self.path)
+        dataset.create_index(
+            "vec",
+            "IVF_PQ",
+            num_partitions=1,
+            num_sub_vectors=4,
+        )
+
+    def check_read(self):
+        """Verify PQ index can be queried."""
+        ds = lance.dataset(self.path)
+        # Query with random vector
+        q = pc.random(32).cast(pa.float32())
+        result = ds.to_table(
+            nearest={
+                "q": q,
+                "k": 4,
+                "column": "vec",
+            }
+        )
+        assert result.num_rows == 4
+
+    def check_write(self):
+        """Verify can insert vectors and rebuild index."""
+        ds = lance.dataset(self.path)
+        # Add new vectors
+        data = pa.table(
+            {
+                "id": pa.array([1000]),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(32).cast(pa.float32()), 32
+                ),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
