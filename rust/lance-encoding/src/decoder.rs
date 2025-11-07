@@ -227,7 +227,6 @@ use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tokio::spawn_cpu;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -1438,7 +1437,15 @@ impl BatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    spawn_cpu(move || next_task.into_batch(emitted_batch_size_warning)).await
+                    // Real decode work happens inside into_batch, which can block the current
+                    // thread for a long time. By spawning it as a new task, we allow Tokio's
+                    // worker threads to keep making progress.
+                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                        .await
+                        .map_err(|err| Error::Wrapped {
+                            error: err.into(),
+                            location: location!(),
+                        })?
                 };
                 (task, num_rows)
             });
@@ -1761,7 +1768,15 @@ impl StructuralBatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    spawn_cpu(move || next_task.into_batch(emitted_batch_size_warning)).await
+                    // Real decode work happens inside into_batch, which can block the current
+                    // thread for a long time. By spawning it as a new task, we allow Tokio's
+                    // worker threads to keep making progress.
+                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                        .await
+                        .map_err(|err| Error::Wrapped {
+                            error: err.into(),
+                            location: location!(),
+                        })?
                 };
                 (task, num_rows)
             });
