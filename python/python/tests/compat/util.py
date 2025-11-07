@@ -5,19 +5,8 @@
 #
 # Everything here must be runnable by older versions of Lance.
 
-from pathlib import Path
 
 import pyarrow as pa
-
-
-def get_path(name: str):
-    dataset_dir = (
-        Path(__file__).parent.parent.parent.parent.parent
-        / "test_data"
-        / "forward_compat"
-        / name
-    )
-    return dataset_dir
 
 
 def build_basic_types():
