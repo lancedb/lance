@@ -1115,6 +1115,10 @@ fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
 }
 
 fn early_pruning(dists: &[f32], k: usize) -> usize {
+    if dists.is_empty() {
+        return 0;
+    }
+
     const PRUNING_FACTORS: [f32; 3] = [0.6, 7.0, 81.0];
     let factor = match k {
         ..=1 => PRUNING_FACTORS[0],
