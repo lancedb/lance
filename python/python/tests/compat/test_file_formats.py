@@ -111,4 +111,6 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
     def check_write(self):
         ds = lance.dataset(self.path)
         ds.delete("true")
-        ds.insert(build_basic_types())
+        lance.write_dataset(
+            build_basic_types(), self.path, data_storage_version="0.1", mode="append"
+        )

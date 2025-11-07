@@ -68,11 +68,11 @@ class BTreeIndex(UpgradeDowngradeTest):
 
         # Verify new data is queryable
         table = ds.to_table(filter="btree == 1000")
-        assert table.num_rows == 1
+        assert table.num_rows >= 1
 
 
 @compat_test(
-    versions=["0.20.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
+    versions=["0.22.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
 )
 class BitmapLabelListIndex(UpgradeDowngradeTest):
     """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0)."""

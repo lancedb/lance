@@ -283,6 +283,7 @@ def test_func({sig_params}):
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
     venv.execute_method(obj, "check_read")
+    venv.execute_method(obj, "check_write")
 '''
     else:  # upgrade_downgrade
         func_body = f'''
@@ -298,6 +299,7 @@ def test_func({sig_params}):
     obj.check_write()
     # Old version: verify can still read
     venv.execute_method(obj, "check_read")
+    venv.execute_method(obj, "check_write")
 '''
 
     # Execute to create the function
