@@ -61,9 +61,9 @@ jobs:
     - name: Handle tag
       id: handle_tag
       run: |
-        # If the tag ends with -beta.N, we need to call setup_version.py 
+        # If the tag ends with -beta.N or -rc.N, we need to call setup_version.py
         # and export repo as "fury" instead of "pypi"
-        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
+        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]] || [[ ${{ github.ref }} == refs/tags/*-rc.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
           pip install packaging
           python ci/setup_version.py $TAG
@@ -116,9 +116,9 @@ jobs:
     - name: Handle tag
       id: handle_tag
       run: |
-        # If the tag ends with -beta.N, we need to call setup_version.py 
+        # If the tag ends with -beta.N or -rc.N, we need to call setup_version.py
         # and export repo as "fury" instead of "pypi"
-        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
+        if [[ ${{ github.ref }} == refs/tags/*-beta.* ]] || [[ ${{ github.ref }} == refs/tags/*-rc.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
           pip install packaging
           python ci/setup_version.py $TAG
