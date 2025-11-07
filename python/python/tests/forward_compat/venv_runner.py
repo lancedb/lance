@@ -13,10 +13,15 @@ Protocol:
 - Writes pickled response dict
 """
 
+import os
 import pickle
 import struct
 import sys
+import time
 import traceback
+
+# Enable detailed timing output with DEBUG=1
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 
 
 def read_message(stream):
@@ -59,9 +64,25 @@ def main():
 
             obj, method_name = request
 
-            # Execute method
+            # Execute method with timing
+            start_time = time.time()
+            if DEBUG:
+                print(
+                    f"[VENV TIMING] Executing {method_name}...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
             method = getattr(obj, method_name)
             result = method()
+
+            if DEBUG:
+                exec_time = time.time() - start_time
+                print(
+                    f"[VENV TIMING] {method_name} completed in {exec_time:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             # Send success response
             response = {"success": True, "result": result}
