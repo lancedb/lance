@@ -3,10 +3,9 @@
 
 from typing import Optional
 
-from lance.dependencies import torch
+import torch
 
-
-def preferred_device(device: Optional[str] = None):
+def preferred_device(device: Optional[str] = None) -> torch.device:
     """Get the preferred device for computation.
 
     Parameters
