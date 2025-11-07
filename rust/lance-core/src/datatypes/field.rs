@@ -29,7 +29,10 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    Error, Result,
+};
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
 /// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
@@ -68,6 +71,32 @@ pub struct SchemaCompareOptions {
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
+}
+
+/// Blob column format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobVersion {
+    /// Legacy blob format (position / size only).
+    #[default]
+    V1,
+    /// Blob v2 struct format.
+    V2,
+}
+
+impl BlobVersion {
+    pub fn from_metadata_value(value: Option<&str>) -> Self {
+        match value {
+            Some("2") => Self::V2,
+            _ => Self::V1,
+        }
+    }
+
+    pub fn metadata_value(self) -> Option<&'static str> {
+        match self {
+            Self::V1 => None,
+            Self::V2 => Some("2"),
+        }
+    }
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -457,14 +486,45 @@ impl Field {
         self.metadata.contains_key(BLOB_META_KEY)
     }
 
+    pub fn blob_version(&self) -> BlobVersion {
+        if !self.is_blob() {
+            return BlobVersion::V1;
+        }
+        let value = self.metadata.get(BLOB_VERSION_META_KEY).map(|s| s.as_str());
+        BlobVersion::from_metadata_value(value)
+    }
+
+    pub fn set_blob_version(&mut self, version: BlobVersion) {
+        if !self.is_blob() {
+            return;
+        }
+        match version.metadata_value() {
+            Some(value) => {
+                self.metadata
+                    .insert(BLOB_VERSION_META_KEY.to_string(), value.to_string());
+            }
+            None => {
+                self.metadata.remove(BLOB_VERSION_META_KEY);
+            }
+        }
+    }
+
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
     pub fn into_unloaded(mut self) -> Self {
         if self.data_type().is_binary_like() && self.is_blob() {
-            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            match self.blob_version() {
+                BlobVersion::V2 => {
+                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+                }
+                BlobVersion::V1 => {
+                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+                }
+            }
         }
         self
     }
@@ -1465,5 +1525,41 @@ mod tests {
         // Finally, ignore will ignore
         assert!(f1.compare_with_options(&f2, &ignore_nullability));
         assert!(f2.compare_with_options(&f1, &ignore_nullability));
+    }
+
+    #[test]
+    fn blob_version_detection_and_setting() {
+        let mut metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let field_v1: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata.clone())
+            .try_into()
+            .unwrap();
+        assert_eq!(field_v1.blob_version(), BlobVersion::V1);
+
+        metadata.insert(BLOB_VERSION_META_KEY.to_string(), "2".to_string());
+        let mut field_v2: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        assert_eq!(field_v2.blob_version(), BlobVersion::V2);
+
+        field_v2.set_blob_version(BlobVersion::V1);
+        assert_eq!(field_v2.blob_version(), BlobVersion::V1);
+        assert!(!field_v2.metadata.contains_key(BLOB_VERSION_META_KEY));
+    }
+
+    #[test]
+    fn blob_into_unloaded_selects_v2_layout() {
+        let metadata = HashMap::from([
+            (BLOB_META_KEY.to_string(), "true".to_string()),
+            (BLOB_VERSION_META_KEY.to_string(), "2".to_string()),
+        ]);
+        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        let unloaded = field.into_unloaded();
+        assert_eq!(unloaded.children.len(), 5);
+        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }
 }

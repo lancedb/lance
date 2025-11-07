@@ -1,0 +1,26 @@
+name: 'Setup Release Environment'
+description: 'Sets up Python, Rust, and dependencies for release workflows (assumes repo is already checked out)'
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install bump-my-version packaging PyGithub
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Configure git identity
+      shell: bash
+      run: |
+        git config user.name 'Lance Release Bot'
+        git config user.email 'lance-dev@lancedb.com'
