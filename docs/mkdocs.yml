@@ -1,5 +1,5 @@
 site_name: Lance
-site_description: Modern columnar data format for ML and LLMs
+site_description: Open Lakehouse Format for Multimodal AI
 site_url: https://lancedb.github.io/lance/
 docs_dir: src
 
@@ -8,6 +8,7 @@ repo_url: https://github.com/lancedb/lance
 
 theme:
   name: material
+  custom_dir: overrides
   logo: logo/white.png
   favicon: logo/logo.png
   palette:
@@ -40,7 +41,11 @@ theme:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -69,4 +74,11 @@ extra:
       link: https://discord.gg/zMM32dvNtd
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/lancedb
+
+extra_css:
+  - assets/stylesheets/termynal.css
+  - assets/stylesheets/home.css
+
+extra_javascript:
+  - assets/javascript/termynal.js
 

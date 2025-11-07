@@ -1,0 +1,235 @@
+{% extends "main.html" %}
+
+{% block tabs %}
+  {{ super() }}
+
+  <style>
+    /* Hide main content for home page */
+    .md-content {
+      display: none;
+    }
+
+    /* Hide table of contents */
+    @media screen and (min-width: 60em) {
+      .md-sidebar--secondary {
+        display: none;
+      }
+    }
+
+    /* Hide navigation */
+    @media screen and (min-width: 76.25em) {
+      .md-sidebar--primary {
+        display: none;
+      }
+    }
+
+    /* Make header static */
+    .md-header {
+      position: initial;
+    }
+
+    .md-main__inner {
+      margin: 0;
+    }
+  </style>
+
+  <!-- Hero Section -->
+  <section class="mdx-container">
+    <div class="container">
+      <div class="intro-message">
+        <div class="hero-logo">
+          <img src="logo/white.png" alt="Lance Logo">
+          <h1>Lance<sup>™</sup></h1>
+        </div>
+        <h3>The Open Lakehouse Format for Multimodal AI</h3>
+        <hr class="intro-divider" />
+        <ul class="list-inline">
+          <li>
+            <a href="quickstart" class="md-button md-button--primary">Get Started</a>
+          </li>
+          <li>
+            <a href="format" class="md-button">Read the Spec</a>
+          </li>
+          <li>
+            <a href="examples/python/llm_training" class="md-button">Train an LLM</a>
+          </li>
+          <li>
+            <a href="https://discord.gg/msY9kdwSYw" class="md-button" target="_blank" rel="noopener">Join Discord</a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- What is Lance Section -->
+  <section class="lance-intro-section">
+    <div class="container">
+      <div class="lance-intro-content">
+        <h2>What is Lance<sup>™</sup>?</h2>
+        <p>
+          Lance contains a file format, table format, and catalog spec for multimodal AI,
+          allowing you to build a complete open lakehouse on top of object storage to power your AI workflows.
+          Lance brings high-performance vector search, full-text search, random access, and feature
+          engineering capabilities to the lakehouse, while you can still get all the existing lakehouse benefits
+          like SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, Trino, DuckDB, etc.)
+          and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore, etc.)
+        </p>
+        <a href="quickstart" class="md-button md-button--primary">Learn More</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 1: Expressive Hybrid Search -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>Expressive Hybrid Search</h2>
+          <p>
+            Lance enables powerful hybrid search combining vector similarity, full-text search,
+            and SQL analytics on the same dataset. All query types are accelerated by corresponding
+            secondary indices as part of the Lance specification.
+          </p>
+          <p>
+            Run semantic search on embeddings, filter by keywords, and apply complex SQL predicates -
+            all using a sinle table with a unified interface.
+          </p>
+          <a href="quickstart/vector-search" class="md-button">Learn More</a>
+        </div>
+        <div class="lance-feature-demo">
+          <div id="termynal-hybrid-search"
+            data-termynal=""
+            data-ty-startdelay="500"
+            data-ty-typedelay="40"
+            data-ty-linedelay="700"
+            style="width: 500px;">
+            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
+            <span data-ty="input" data-ty-prompt=">>>">ds = lance.dataset("s3://my-bucket/docs")</span>
+            <span data-ty="input" data-ty-prompt=">>>">ds.to_table(full_text_query="machine learning")</span>
+            <span data-ty="input" data-ty-prompt=">>>">ds.to_table(</span>
+            <span data-ty="input" data-ty-prompt="...">  nearest={"column": "embedding", "q": query_vec, "k": 10},</span>
+            <span data-ty="input" data-ty-prompt="...">  filter="year > 2020")</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 2: Lightning-fast Random Access -->
+  <section class="lance-feature-section reverse">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>Lightning-fast Random Access</h2>
+          <p>
+            Lance delivers 100x faster random access compared to Parquet or Iceberg. With efficient
+            row-addressing, you can access individual records across multiple files instantly,
+            making it perfect for real-time ML serving, random sampling, and interactive applications.
+          </p>
+          <p>
+            Unlike traditional columnar formats, Lance maintains high performance even when
+            randomly accessing scattered rows across your entire dataset.
+          </p>
+          <a href="guide/read_and_write#random-access" class="md-button">Learn More</a>
+        </div>
+        <div class="lance-feature-demo">
+          <div id="termynal-random-access"
+            data-termynal=""
+            data-ty-startdelay="1500"
+            data-ty-typedelay="40"
+            data-ty-linedelay="700"
+            style="width: 500px;">
+            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
+            <span data-ty="input" data-ty-prompt=">>>">dataset = lance.dataset("s3://my-bucket/embeddings")</span>
+            <span data-ty="input" data-ty-prompt=">>>">table = dataset.take([100, 5000, 1000000])</span>
+            <span data-ty="input" data-ty-prompt=">>>">dataset.take([0, 1], columns=["id", "vector"])</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 3: Native Multimodal Data Support -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>Native Multimodal Data Support</h2>
+          <p>
+            Store images, videos, audio, text, and embeddings in a single unified format.
+            Lance's blob encoding efficiently handles large binary objects with lazy loading,
+            while optimized vector storage accelerates similarity search.
+          </p>
+          <p>
+            Perfect for AI/ML workloads where you need to store raw data alongside embeddings
+            for multimodal retrieval and generation workflows.
+          </p>
+          <a href="guide/blob" class="md-button">Learn More</a>
+        </div>
+        <div class="lance-feature-demo">
+          <div id="termynal-multimodal"
+            data-termynal=""
+            data-ty-startdelay="2500"
+            data-ty-typedelay="40"
+            data-ty-linedelay="700"
+            style="width: 500px;">
+            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
+            <span data-ty="input" data-ty-prompt=">>>">import pyarrow as pa</span>
+            <span data-ty="input" data-ty-prompt=">>>">schema = pa.schema([</span>
+            <span data-ty="input" data-ty-prompt="...">  pa.field("video", pa.large_binary(),</span>
+            <span data-ty="input" data-ty-prompt="...">    metadata={"lance-encoding:blob": "true"}),</span>
+            <span data-ty="input" data-ty-prompt="...">  pa.field("embedding", pa.list_(pa.float32(), 128))])</span>
+            <span data-ty="input" data-ty-prompt=">>>">lance.write_dataset(table, "multimodal.lance", schema=schema)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 4: Data Evolution -->
+  <section class="lance-feature-section reverse">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>Data Evolution > Schema Evolution</h2>
+          <p>
+            Schema evolution in most open table formats are metadata only and fast.
+            But when trying to backfill column values in existing rows, a full table rewrite is typically required.
+            Lance supports efficient schema evolution with backfill, making it perfect for ML
+            feature engineering, embedding and media content management.
+          </p>
+          <p>
+            Adding a new column with data is as simple as writing new Lance files to the Lance table -
+            no need to rewrite your entire dataset.
+          </p>
+          <a href="guide/data_evolution" class="md-button">Learn More</a>
+        </div>
+        <div class="lance-feature-demo">
+          <div id="termynal-evolution"
+            data-termynal=""
+            data-ty-startdelay="3500"
+            data-ty-typedelay="40"
+            data-ty-linedelay="700"
+            style="width: 500px;">
+            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
+            <span data-ty="input" data-ty-prompt=">>>">dataset = lance.dataset("my_data.lance")</span>
+            <span data-ty="input" data-ty-prompt=">>>">@lance.batch_udf()</span>
+            <span data-ty="input" data-ty-prompt="...">def add_embeddings(batch):</span>
+            <span data-ty="input" data-ty-prompt="...">  vectors = model.encode(batch["text"])</span>
+            <span data-ty="input" data-ty-prompt="...">  return {"embedding": vectors}</span>
+            <span data-ty="input" data-ty-prompt=">>>">dataset.add_columns(add_embeddings)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <script
+    src="assets/javascript/termynal.js"
+    data-termynal-container="#termynal-hybrid-search|#termynal-random-access|#termynal-multimodal|#termynal-evolution">
+  </script>
+
+{% endblock %}
+
+{% block content %}{% endblock %}
+{% block footer %}{% endblock %}
