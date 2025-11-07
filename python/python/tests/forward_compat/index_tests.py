@@ -12,7 +12,7 @@ import pyarrow.compute as pc
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
-from .util import build_basic_types
+from .util import build_basic_types, build_large
 
 
 @lru_cache(maxsize=1)
@@ -322,26 +322,45 @@ class BasicTypes2_1(UpgradeDowngradeTest):
 
 
 @compat_test()
-class BasicTypes2_0(UpgradeDowngradeTest):
-    def __init__(self, path: Path):
+@pytest.mark.parametrize(
+    "data_factory,name",
+    [
+        (build_basic_types, "basic_types"),
+        (build_large, "large"),
+    ],
+    ids=["basic_types", "large"],
+)
+class FileCompat(UpgradeDowngradeTest):
+    """Test file format compatibility with different data types.
+
+    Tests both basic types (scalars, strings, etc.) and large data (vectors, binary).
+    """
+
+    def __init__(self, path: Path, data_factory, name: str):
         self.path = path
+        self.data_factory = data_factory
+        self.name = name
 
     def create(self):
-        batch = build_basic_types()
+        """Create Lance file with test data."""
+        batch = self.data_factory()
         with LanceFileWriter(
             str(self.path), version="2.0", schema=batch.schema
         ) as writer:
             writer.write_batch(batch)
 
     def check_read(self):
+        """Verify file can be read and data matches."""
         reader = LanceFileReader(str(self.path))
         table = reader.read_all().to_table()
-        assert table == build_basic_types()
+        expected = self.data_factory()
+        assert table.equals(expected), f"Data mismatch for {self.name}"
 
     def check_write(self):
-        # Test with overwrite
+        """Verify can overwrite the file."""
+        batch = self.data_factory()
         with LanceFileWriter(str(self.path), version="2.0") as writer:
-            writer.write_batch(build_basic_types())
+            writer.write_batch(batch)
 
 
 @compat_test()
