@@ -1804,7 +1804,7 @@ fn select_reassign_candidates_impl(
         .filter(|&idx| idx as usize != part_idx)
         .take(selection_len)
         .collect::<Vec<_>>();
-    let reassign_candidate_ids = UInt32Array::from_iter_values(filtered_ids.into_iter());
+    let reassign_candidate_ids = UInt32Array::from(filtered_ids);
     let reassign_candidate_centroids =
         arrow::compute::take(centroids, &reassign_candidate_ids, None)?;
     Ok((
