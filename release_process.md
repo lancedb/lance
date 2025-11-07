@@ -55,7 +55,7 @@ Lance uses semantic versioning with prerelease identifiers:
 ### Publishing Channels
 
 | Language     | Stable release      | RC release                  | Beta release                |
-|--------------|---------------------|-----------------------------|------------------------------|
+|--------------|---------------------|-----------------------------|-----------------------------|
 | **Rust**     | crates.io           | Not published (use git tag) | Not published (use git tag) |
 | **Python**   | PyPI                | fury.io                     | fury.io                     |
 | **Java**     | Maven Central       | Maven Central               | Maven Central               |
@@ -94,9 +94,9 @@ Lance uses semantic versioning with prerelease identifiers:
 flowchart LR
     subgraph main["Main Branch"]
         direction LR
-        M0["1.3.0-beta.2<br/>📍 release-root/1.3.0-beta.N"] --> M1["1.4.0-beta.0<br/>📍 release-root/1.4.0-beta.N"]
-        M1 --> M2["1.4.0-beta.1<br/>🏷️ v1.4.0-beta.1"]
-        M2 --> M3["1.5.0-beta.0<br/>📍 release-root/1.5.0-beta.N"]
+        M0["1.3.0-beta.2<br/>📍 release-root/1.3.0-beta.N<br/>📍 release-root/1.4.0-beta.N"] --> M1["1.4.0-beta.0"]
+        M1 --> M2["1.4.0-beta.1<br/>🏷️ v1.4.0-beta.1<br/>📍 release-root/1.5.0-beta.N"]
+        M2 --> M3["1.5.0-beta.0"]
     end
 
     subgraph release["Release Branch: release/v1.3"]
@@ -112,10 +112,10 @@ flowchart LR
 ```
 
 **Flow explanation:**
-- **Main branch** at `1.3.0-beta.2` (has release-root tag) → create RC checks for breaking changes → if none, RC is `1.3.0-rc.1`, main bumps to `1.4.0-beta.0` with new release-root tag → `1.4.0-beta.1` (preview, tagged) → create RC for v1.4.0 → main bumps to `1.5.0-beta.0`
-- **Release branch** `release/v1.3` created from main at `1.3.0-beta.2`, starts at `1.3.0-rc.1` (tagged) → `1.3.0` (stable, tagged) → `1.3.1-beta.0` → `1.3.1-rc.1` (tagged) → `1.3.1` (stable, tagged) → `1.3.2-beta.0`
-- **Tags**: 🏷️ = version tag, 📍 = release-root tag (for breaking change detection)
-- **Breaking changes**: If breaking changes detected when cutting RC from `1.3.0-beta.2`, the RC would be `2.0.0-rc.1` and main would bump to `2.1.0-beta.0`
+- **Main branch**: Commit M0 at `1.3.0-beta.2` has two release-root tags: `release-root/1.3.0-beta.N` (from previous RC) and `release-root/1.4.0-beta.N` (created when cutting v1.3.0-rc.1) → M1 bumps to `1.4.0-beta.0` (unreleased) → M2 publishes `1.4.0-beta.1` (preview, tagged) and gets `release-root/1.5.0-beta.N` tag when cutting v1.4.0-rc.1 → M3 bumps to `1.5.0-beta.0`
+- **Release branch** `release/v1.3` created from M0, starts at `1.3.0-rc.1` (tagged) → `1.3.0` (stable, tagged) → `1.3.1-beta.0` → `1.3.1-rc.1` (tagged) → `1.3.1` (stable, tagged) → `1.3.2-beta.0`
+- **Tags**: 🏷️ = version tag (points to tagged commit), 📍 = release-root tag (points to commit before RC was created, used for breaking change detection)
+- **Breaking changes**: If breaking changes detected when cutting RC from M0, the RC would be `2.0.0-rc.1` and main would bump to `2.1.0-beta.0`. M0 would then have `release-root/2.0.0-beta.N` instead of `release-root/1.4.0-beta.N`
 
 **Note**: All commits are linear on their respective branches. `beta.0` = unreleased, `beta.1+` = published previews.
 
@@ -187,7 +187,7 @@ Release root tags mark the base commits for breaking change detection. The tag n
    - Example: When bumping 1.4.0-beta.5 → 2.0.0-beta.1, create `release-root/2.0.0-beta.N` pointing to the SAME commit with the SAME base RC version
 
 **Key properties**:
-- **Multiple tags, same commit**: `release-root/1.4.0-beta.N` and `release-root/2.0.0-beta.N` point to the same RC commit
+- **Multiple tags, same commit**: `release-root/1.4.0-beta.N` and `release-root/2.0.0-beta.N` point to the same commit on main (the commit before the RC branch was created)
 - **Major version bumped once**: Both tags store same base RC version (1.3.0-rc.1), so we know 2.x is already a major bump from 1.3.0
 - **No additional bumps**: When at 2.0.0-beta.1, we detect breaking changes but see major already bumped (2 > 1), so just increment beta
 - **Beta reset on major bump**: When bumping major version, beta number resets to 1 (e.g., 1.4.0-beta.5 → 2.0.0-beta.1)
