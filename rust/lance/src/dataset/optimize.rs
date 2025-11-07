@@ -1389,8 +1389,10 @@ mod tests {
         dataset.validate().await.unwrap();
         assert!(dataset.get_fragments().len() > 1);
 
-        let mut options = CompactionOptions::default();
-        options.compact_blobs = true;
+        let options = CompactionOptions {
+            compact_blobs: true,
+            ..Default::default()
+        };
         compact_files(&mut dataset, options, None).await.unwrap();
         dataset.validate().await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
