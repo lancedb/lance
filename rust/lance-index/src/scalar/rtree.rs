@@ -8,9 +8,6 @@ use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-pub use crate::scalar::rtree::bbox::{
-    bounding_box, bounding_box_single_scalar, total_bounds, update_total_bounds, BoundingBox,
-};
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexReaderStream, IndexStore,
@@ -40,6 +37,7 @@ use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_concat_stream;
+pub use lance_geo::bbox::{bounding_box, bounding_box_single_scalar, total_bounds, BoundingBox};
 use lance_io::object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -50,7 +48,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-pub mod bbox;
 mod sort;
 
 pub const DEFAULT_RTREE_PAGE_SIZE: u32 = 4096;
@@ -695,10 +692,7 @@ impl RTreeIndexPlugin {
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
 
-            update_total_bounds(&mut total_bbox, &bbox_array).map_err(|e| Error::Index {
-                message: format!("Construct GeoArrowArray from an Arrow Array failed: {}", e),
-                location: location!(),
-            })?;
+            total_bbox.add_geo_arrow_array(&bbox_array)?;
 
             let num_rows = bbox_array.len();
 

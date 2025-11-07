@@ -8,6 +8,7 @@ members = [
     "rust/lance-encoding",
     "rust/lance-file",
     "rust/lance-index",
+    "rust/lance-geo",
     "rust/lance-io",
     "rust/lance-linalg",
     "rust/lance-namespace",
@@ -23,9 +24,8 @@ exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
-
 [workspace.package]
-version = "0.40.0-beta.2"
+version = "0.40.0-beta.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -56,6 +56,7 @@ lance-datafusion = { version = "=0.40.0-beta.2", path = "./rust/lance-datafusion
 lance-datagen = { version = "=0.40.0-beta.2", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=0.40.0-beta.2", path = "./rust/lance-encoding" }
 lance-file = { version = "=0.40.0-beta.2", path = "./rust/lance-file" }
+lance-geo = { version = "=0.40.0-beta.2", path = "./rust/lance-geo" }
 lance-index = { version = "=0.40.0-beta.2", path = "./rust/lance-index" }
 lance-io = { version = "=0.40.0-beta.2", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=0.40.0-beta.2", path = "./rust/lance-linalg" }
@@ -131,7 +132,7 @@ fsst = { version = "=0.40.0-beta.2", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.6"
 geoarrow-schema = "0.6"
-geodatafusion = "0.1.0"
+geodatafusion = "0.1.1"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 http = "1.1.0"

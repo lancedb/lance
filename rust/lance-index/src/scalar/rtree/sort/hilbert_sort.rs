@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::scalar::rtree::bbox::{bounding_box, BoundingBox};
 use crate::scalar::rtree::sort::Sorter;
 use crate::Result;
 use arrow_array::{ArrayRef, UInt32Array};
@@ -21,6 +20,7 @@ use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use geoarrow_array::array::from_arrow_array;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions, OneShotExec};
+use lance_geo::bbox::{bounding_box, BoundingBox};
 use std::any::Any;
 use std::sync::Arc;
 

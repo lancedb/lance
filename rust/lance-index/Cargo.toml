@@ -32,7 +32,6 @@ fst.workspace = true
 futures.workspace = true
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
-geo-traits = { workspace = true }
 geo-types = { workspace = true }
 half.workspace = true
 itertools.workspace = true
@@ -43,6 +42,7 @@ lance-core.workspace = true
 lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
+lance-geo.workspace = true
 lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true

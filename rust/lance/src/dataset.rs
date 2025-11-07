@@ -9849,9 +9849,7 @@ mod tests {
     async fn test_geo_rtree_index() {
         use geo_types::line_string;
         use geoarrow_array::{builder::LineStringBuilder, GeoArrowArray};
-        use geoarrow_schema::CoordType;
         use geoarrow_schema::{Dimension, LineStringType};
-        use geodatafusion::udf::{geo::relationships::Intersects, native::io::GeomFromText};
 
         // 1. Creates arrow table linestring spatial data
         let line_string_type = LineStringType::new(Dimension::XY, Default::default());
@@ -9882,28 +9880,13 @@ mod tests {
             .await
             .unwrap();
 
-        async fn assert_intersects_sql(dataset: &Dataset, has_index: bool) {
-            let ctx = SessionContext::new();
-            ctx.register_table(
-                "dataset",
-                Arc::new(LanceTableProvider::new(
-                    Arc::new(dataset.clone()),
-                    false,
-                    false,
-                )),
-            )
-            .unwrap();
-            // register GEO functions
-            ctx.register_udf(GeomFromText::new(CoordType::Separated).into());
-            ctx.register_udf(Intersects::new().into());
-
+        async fn assert_intersects_sql(dataset: &mut Dataset, has_index: bool) {
             // Executes a SQL query with St_Distance function
-            let df = ctx.sql("SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))").await.unwrap();
-            let batches = df
-                .execute_stream()
+            let batches = dataset.sql("SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))")
+                .build()
                 .await
                 .unwrap()
-                .try_collect::<Vec<_>>()
+                .into_batch_records()
                 .await
                 .unwrap();
 
@@ -9914,12 +9897,11 @@ mod tests {
             assert_eq!(2, num_rows);
 
             if has_index {
-                let df = ctx.sql("EXPLAIN SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))").await.unwrap();
-                let batches = df
-                    .execute_stream()
+                let batches = dataset.sql("SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))")
+                    .build()
                     .await
                     .unwrap()
-                    .try_collect::<Vec<_>>()
+                    .into_batch_records()
                     .await
                     .unwrap();
                 let plan = format!("{:?}", batches);
@@ -9927,7 +9909,7 @@ mod tests {
             }
         }
 
-        assert_intersects_sql(&dataset, false).await;
+        assert_intersects_sql(&mut dataset, false).await;
 
         dataset
             .create_index(
@@ -9940,6 +9922,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_intersects_sql(&dataset, true).await;
+        assert_intersects_sql(&mut dataset, true).await;
     }
 }

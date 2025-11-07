@@ -161,6 +161,13 @@ impl BoundingBox {
         self.add_coord(&rect.max());
     }
 
+    pub fn add_geo_arrow_array(&mut self, arr: &dyn GeoArrowArray) -> ArrowResult<()> {
+        let bbox = total_bounds(arr)?;
+        self.add_geometry(&bbox);
+
+        Ok(())
+    }
+
     pub fn rect_intersects(&self, other: &impl RectTrait<T = f64>) -> bool {
         if self.maxx() < other.min().x() {
             return false;
@@ -311,16 +318,6 @@ fn impl_total_bounds<'a>(arr: &'a impl GeoArrowArrayAccessor<'a>) -> ArrowResult
     }
 
     Ok(bbox)
-}
-
-pub fn update_total_bounds(
-    total_bbox: &mut BoundingBox,
-    arr: &dyn GeoArrowArray,
-) -> ArrowResult<()> {
-    let bbox = downcast_geoarrow_array!(arr, impl_total_bounds)?;
-    total_bbox.add_geometry(&bbox);
-
-    Ok(())
 }
 
 /// Convert a length-1 GeoArrowArray to a geo::Geometry scalar.
