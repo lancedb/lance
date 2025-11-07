@@ -23,6 +23,7 @@ exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
+
 [workspace.package]
 version = "0.40.0-beta.1"
 edition = "2021"
