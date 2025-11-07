@@ -65,12 +65,12 @@ Lance uses semantic versioning with prerelease identifiers:
 
 | Release Type              | GitHub Release Type | Start Commit (exclusive)    | End Commit (inclusive) | Explanation                                                          |
 |---------------------------|---------------------|-----------------------------|------------------------|----------------------------------------------------------------------|
+| **Stable (Major/Minor)**  | Release             | `release-root/X.Y.0-beta.N` | `vX.Y.0`               | All changes from main + RC fixes                                     |
+| **Stable (Patch)**        | Release             | `vX.Y.(Z-1)`                | `vX.Y.Z`               | Only changes in this patch release                                   |
 | **RC (Major/Minor)**      | Pre-Release         | `release-root/X.Y.0-beta.N` | `vX.Y.0-rc.N`          | All changes for the release                                          |
 | **RC (Patch)**            | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-rc.N`          | Only changes in this patch release                                   |
 | **RC (Iterations)**       | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-rc.N`          | Only changes in this patch release (not changes against previous RC) |
-| **Stable (Major/Minor)**  | Release             | `release-root/X.Y.0-beta.N` | `vX.Y.0`               | All changes from main + RC fixes                                     |
-| **Stable (Patch)**        | Release             | `vX.Y.(Z-1)`                | `vX.Y.Z`               | Only changes in this patch release                                   |
-| **Beta (Main branch)**    | Pre-Release         | `release-root/X.Y.Z-beta.N` | `vX.Y.Z-beta.N`        | Changes since RC cut                                                 |
+| **Beta (Main branch)**    | Pre-Release         | `release-root/X.Y.Z-beta.N` | `vX.Y.Z-beta.N`        | Changes since last stable release RC cut in main branch              |
 | **Beta (Release branch)** | Pre-Release         | `vX.Y.(Z-1)`                | `vX.Y.Z-beta.N`        | Changes since last stable release                                    |
 
 ## Branching Strategy
