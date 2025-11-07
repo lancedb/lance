@@ -154,7 +154,7 @@ jobs:
           pip install $(ls wheels/pylance-*.whl)[tests,ray]
       - name: Run compatibility tests
         run: |
-          pytest python/tests/forward_compat/ --run-compat -v
+          make compattest
         env:
           COMPAT_TEMP_VENV: 1
 
