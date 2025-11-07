@@ -486,9 +486,9 @@ impl FilteredReadStream {
     // We need to figure out which ranges to read from each fragment.
     //
     // If the scan range is ignoring the filters we can push it down here.
-        // If the scan range is not ignoring the filters we can only push it down if:
-        // 1. The index result is an exact match (we know exactly which rows will be in the result)
-        // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
+    // If the scan range is not ignoring the filters we can only push it down if:
+    // 1. The index result is an exact match (we know exactly which rows will be in the result)
+    // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
     // Returns: (fragment reads, whether limit was pushed down to fragment ranges)
     #[instrument(name = "plan_scan", skip_all)]
     async fn plan_scan(
@@ -1846,8 +1846,7 @@ mod tests {
         datatypes::{Float32Type, UInt32Type, UInt64Type},
     };
     use arrow_array::{
-        cast::AsArray, Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator,
-        UInt32Array,
+        cast::AsArray, Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
@@ -2090,10 +2089,11 @@ mod tests {
         let planner = Planner::new(arrow_schema);
         let expr = planner.parse_filter("value IS NOT NULL").unwrap();
         let index_info = dataset.scalar_index_info().await.unwrap();
-        let filter_plan = planner
-            .create_filter_plan(expr, &index_info, true)
-            .unwrap();
-        assert!(filter_plan.index_query.is_none(), "bloom filter IS NOT NULL should not use an index query");
+        let filter_plan = planner.create_filter_plan(expr, &index_info, true).unwrap();
+        assert!(
+            filter_plan.index_query.is_none(),
+            "bloom filter IS NOT NULL should not use an index query"
+        );
 
         let options = FilteredReadOptions::basic_full_read(&dataset).with_filter_plan(filter_plan);
         let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
