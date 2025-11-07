@@ -94,9 +94,9 @@ Lance uses semantic versioning with prerelease identifiers:
 flowchart LR
     subgraph main["Main Branch"]
         direction LR
-        M0["1.3.0-beta.2<br/>📍 release-root/1.3.0-beta.N<br/>📍 release-root/1.4.0-beta.N"] --> M1["1.4.0-beta.0"]
-        M1 --> M2["1.4.0-beta.1<br/>🏷️ v1.4.0-beta.1<br/>📍 release-root/1.5.0-beta.N"]
-        M2 --> M3["1.5.0-beta.0"]
+        M0["1.3.0-beta.2<br/>📍 release-root/1.4.0-beta.N<br/>📍 release-root/2.0.0-beta.N"] --> M1["1.4.0-beta.0"]
+        M1 --> M2["1.4.0-beta.1<br/>🏷️ v1.4.0-beta.1"]
+        M2 --> M3["2.0.0-beta.1<br/>🏷️ v2.0.0-beta.1"]
     end
 
     subgraph release["Release Branch: release/v1.3"]
@@ -112,10 +112,10 @@ flowchart LR
 ```
 
 **Flow explanation:**
-- **Main branch**: Commit M0 at `1.3.0-beta.2` has two release-root tags: `release-root/1.3.0-beta.N` (from previous RC) and `release-root/1.4.0-beta.N` (created when cutting v1.3.0-rc.1) → M1 bumps to `1.4.0-beta.0` (unreleased) → M2 publishes `1.4.0-beta.1` (preview, tagged) and gets `release-root/1.5.0-beta.N` tag when cutting v1.4.0-rc.1 → M3 bumps to `1.5.0-beta.0`
+- **Main branch**: Commit M0 at `1.3.0-beta.2` has `release-root/1.4.0-beta.N` (created when cutting v1.3.0-rc.1, pointing to this commit) and `release-root/2.0.0-beta.N` (created when breaking changes bumped major version, pointing to same commit) → M1 bumps to `1.4.0-beta.0` (unreleased) → M2 publishes `1.4.0-beta.1` (preview, tagged) → M3 publishes `2.0.0-beta.1` after detecting breaking changes (tagged)
 - **Release branch** `release/v1.3` created from M0, starts at `1.3.0-rc.1` (tagged) → `1.3.0` (stable, tagged) → `1.3.1-beta.0` → `1.3.1-rc.1` (tagged) → `1.3.1` (stable, tagged) → `1.3.2-beta.0`
 - **Tags**: 🏷️ = version tag (points to tagged commit), 📍 = release-root tag (points to commit before RC was created, used for breaking change detection)
-- **Breaking changes**: If breaking changes detected when cutting RC from M0, the RC would be `2.0.0-rc.1` and main would bump to `2.1.0-beta.0`. M0 would then have `release-root/2.0.0-beta.N` instead of `release-root/1.4.0-beta.N`
+- **Breaking changes**: Both `release-root/1.4.0-beta.N` and `release-root/2.0.0-beta.N` point to M0 (same commit), showing that 2.0.0 is a major version bump from the 1.3.0-rc.1 baseline
 
 **Note**: All commits are linear on their respective branches. `beta.0` = unreleased, `beta.1+` = published previews.
 
