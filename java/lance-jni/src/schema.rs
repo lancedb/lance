@@ -9,7 +9,7 @@ use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
 use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
-use lance_core::datatypes::{Field, Schema, StorageClass};
+use lance_core::datatypes::{Field, Schema};
 
 impl IntoJava for Schema {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
@@ -40,11 +40,8 @@ pub fn convert_to_java_field<'local>(
     let children = convert_children_fields(env, lance_field)?;
     let metadata = to_java_map(env, &lance_field.metadata)?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
-    let storage_type = convert_storage_type(env, &lance_field.storage_class)?;
-
     let ctor_sig = "(IILjava/lang/String;".to_owned()
         + "ZLorg/apache/arrow/vector/types/pojo/ArrowType;"
-        + "Lcom/lancedb/lance/schema/StorageType;"
         + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
         + "Ljava/util/Map;"
         + "Ljava/util/List;Z)V";
@@ -57,7 +54,6 @@ pub fn convert_to_java_field<'local>(
             JValue::Object(&JObject::from(name)),
             JValue::Bool(lance_field.nullable as jboolean),
             JValue::Object(&arrow_type),
-            JValue::Object(&storage_type),
             JValue::Object(&JObject::null()),
             JValue::Object(&metadata),
             JValue::Object(&children),
@@ -66,25 +62,6 @@ pub fn convert_to_java_field<'local>(
     )?;
 
     Ok(field_obj)
-}
-
-fn convert_storage_type<'local>(
-    env: &mut JNIEnv<'local>,
-    storage_class: &StorageClass,
-) -> Result<JObject<'local>> {
-    let jname = match storage_class {
-        StorageClass::Blob => env.new_string("BLOB")?,
-        _ => env.new_string("DEFAULT")?,
-    };
-
-    Ok(env
-        .call_static_method(
-            "com/lancedb/lance/schema/StorageType",
-            "valueOf",
-            "(Ljava/lang/String;)Lcom/lancedb/lance/schema/StorageType;",
-            &[JValue::Object(&JObject::from(jname))],
-        )?
-        .l()?)
 }
 
 fn convert_children_fields<'local>(

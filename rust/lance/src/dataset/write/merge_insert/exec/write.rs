@@ -826,7 +826,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
-            let write_result = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
@@ -836,8 +836,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
-
-            let mut new_fragments = write_result.default.0;
 
             if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
                 let fragment_sizes = new_fragments
@@ -894,12 +892,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             // Step 5: Create and store the transaction
-            let transaction = Transaction::new(
-                dataset.manifest.version,
-                operation,
-                /*blobs_op=*/ None,
-                None,
-            );
+            let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {

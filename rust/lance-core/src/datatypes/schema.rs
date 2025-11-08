@@ -15,7 +15,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
+use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
@@ -146,45 +146,11 @@ impl Schema {
         }
     }
 
-    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
-        let fields = self
-            .fields
-            .iter()
-            .filter(|f| f.storage_class() == storage_class)
-            .cloned()
-            .collect();
-        Self {
-            fields,
-            metadata: self.metadata.clone(),
+    pub fn apply_blob_version(&mut self, version: BlobVersion, allow_change: bool) -> Result<()> {
+        for field in self.fields.iter_mut() {
+            apply_blob_version_to_field(field, version, allow_change)?;
         }
-    }
-
-    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
-    /// If there are no blob storage class fields, the second schema will be `None`.
-    /// The order of fields is preserved.
-    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
-        let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut sibling_fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields.iter() {
-            match field.storage_class() {
-                StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => sibling_fields.push(field.clone()),
-            }
-        }
-        (
-            Self {
-                fields: local_fields,
-                metadata: self.metadata.clone(),
-            },
-            if sibling_fields.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    fields: sibling_fields,
-                    metadata: self.metadata.clone(),
-                })
-            },
-        )
+        Ok(())
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -921,6 +887,31 @@ fn explain_metadata_difference(
     }
 }
 
+fn apply_blob_version_to_field(
+    field: &mut Field,
+    version: BlobVersion,
+    allow_change: bool,
+) -> Result<()> {
+    if field.is_blob() {
+        let current = field.blob_version();
+        if current != version && !allow_change {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Blob column '{}' uses version {:?}, expected {:?}",
+                    field.name, current, version
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+        field.set_blob_version(version);
+    }
+    for child in field.children.iter_mut() {
+        apply_blob_version_to_field(child, version, allow_change)?;
+    }
+    Ok(())
+}
+
 /// What to do when a column is missing in the schema
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnMissing {
@@ -1519,6 +1510,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::datatypes::BlobVersion;
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -2538,5 +2530,24 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
+    }
+
+    #[test]
+    fn apply_blob_version_requires_consistent_metadata() {
+        let arrow_field = ArrowField::new("blob", ArrowDataType::LargeBinary, true).with_metadata(
+            HashMap::from([
+                (BLOB_META_KEY.to_string(), "true".to_string()),
+                (BLOB_VERSION_META_KEY.to_string(), "2".to_string()),
+            ]),
+        );
+        let mut schema =
+            Schema::try_from(&ArrowSchema::new(vec![arrow_field])).expect("schema creation");
+
+        assert!(schema.apply_blob_version(BlobVersion::V1, false).is_err());
+
+        schema
+            .apply_blob_version(BlobVersion::V1, true)
+            .expect("allow metadata change when permitted");
+        assert_eq!(schema.fields[0].blob_version(), BlobVersion::V1);
     }
 }

@@ -11,6 +11,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -365,6 +366,13 @@ impl FilteredReadStream {
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
 
+        log::debug!(
+            "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
+            fragments.len(),
+            fragment_readahead,
+            io_parallelism
+        );
+
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
         let frag_futs = fragments
@@ -386,7 +394,13 @@ impl FilteredReadStream {
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
-        let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
+            SchedulerConfig {
+                io_buffer_size_bytes,
+            }
+        } else {
+            SchedulerConfig::max_bandwidth(obj_store.as_ref())
+        };
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
         let (scoped_fragments, scan_planned_with_limit_pushed_down) = Self::plan_scan(
@@ -412,7 +426,7 @@ impl FilteredReadStream {
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    tokio::task::spawn(
+                    SpawnedTask::spawn(
                         Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
@@ -1197,6 +1211,8 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// The size of the I/O buffer to use for the scan
+    pub io_buffer_size_bytes: Option<u64>,
 }
 
 impl FilteredReadOptions {
@@ -1223,6 +1239,7 @@ impl FilteredReadOptions {
             projection,
             refine_filter: None,
             full_filter: None,
+            io_buffer_size_bytes: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1363,6 +1380,14 @@ impl FilteredReadOptions {
     /// the row address.
     pub fn with_projection(mut self, projection: Projection) -> Self {
         self.projection = projection;
+        self
+    }
+
+    /// Specify the size of the I/O buffer (in bytes) to use for the scan
+    ///
+    /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
+    pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
+        self.io_buffer_size_bytes = Some(io_buffer_size);
         self
     }
 }
@@ -1820,7 +1845,9 @@ mod tests {
         compute::concat_batches,
         datatypes::{Float32Type, UInt32Type, UInt64Type},
     };
-    use arrow_array::{cast::AsArray, Array, UInt32Array};
+    use arrow_array::{
+        cast::AsArray, Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
+    };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
@@ -2017,10 +2044,64 @@ mod tests {
         }
     }
 
+    async fn dataset_with_bloom_filter_nulls() -> (TempStrDir, Arc<Dataset>) {
+        let tmp_path = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int32,
+            true,
+        )]));
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(3),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let mut dataset = Dataset::write(reader, tmp_path.as_str(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BloomFilter,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        (tmp_path, Arc::new(dataset))
+    }
+
     fn u32s(ranges: Vec<Range<u32>>) -> Arc<dyn Array> {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bloom_filter_is_not_null_prefilter() {
+        let (_tmp_path, dataset) = dataset_with_bloom_filter_nulls().await;
+        let arrow_schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let planner = Planner::new(arrow_schema);
+        let expr = planner.parse_filter("value IS NOT NULL").unwrap();
+        let index_info = dataset.scalar_index_info().await.unwrap();
+        let filter_plan = planner.create_filter_plan(expr, &index_info, true).unwrap();
+        assert!(
+            filter_plan.index_query.is_none(),
+            "bloom filter IS NOT NULL should not use an index query"
+        );
+
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_filter_plan(filter_plan);
+        let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+        assert_eq!(row_count, 3);
     }
 
     #[test_log::test(tokio::test)]

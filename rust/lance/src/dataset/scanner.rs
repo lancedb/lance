@@ -75,7 +75,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::utils::wrap_json_stream_for_reading;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -1080,6 +1080,21 @@ impl Scanner {
     ///
     /// This method is a convenience method that sets both [Self::minimum_nprobes] and
     /// [Self::maximum_nprobes] to the same value.
+    pub fn nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.minimum_nprobes = n;
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures how many partititions will be searched in the vector index.
+    ///
+    /// This method is a convenience method that sets both [Self::minimum_nprobes] and
+    /// [Self::maximum_nprobes] to the same value.
+    #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
@@ -1606,12 +1621,6 @@ impl Scanner {
             .empty_projection()
             .union_columns(filter_columns, OnMissing::Error)?
             .into_schema();
-        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "non-default storage columns cannot be used as filters".into(),
-                location: location!(),
-            });
-        }
 
         // Start with the desired fields
         Ok(desired_projection
@@ -2054,6 +2063,10 @@ impl Scanner {
 
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
         let index_input = filter_plan.index_query.clone().map(|index_query| {
@@ -3647,10 +3660,13 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        // Convert lance.json (JSONB) back to arrow.json (strings) for reading
-        //
-        // This is so bad, we need to find a way to remove this.
-        let exec_node = wrap_json_stream_for_reading(exec_node);
+        let schema = exec_node.schema();
+        let adapter = SchemaAdapter::new(schema.clone());
+        let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
+            adapter.to_logical_stream(exec_node)
+        } else {
+            exec_node
+        };
 
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
@@ -7345,7 +7361,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#;
+      MatchQuery: column=s, query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7361,7 +7377,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#;
+      PhraseQuery: column=s, query=hello world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7379,8 +7395,8 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: query=hello
-        MatchQuery: query=world"#;
+        MatchQuery: column=s, query=hello
+        MatchQuery: column=s, query=world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7402,7 +7418,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx
@@ -7413,7 +7429,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx"#
         };
@@ -7437,8 +7453,8 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
-            FlatMatchQuery: query=hello
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
@@ -7460,14 +7476,14 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
@@ -7477,10 +7493,10 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         };
@@ -8379,5 +8395,54 @@ mod test {
                 "All rows created at version 1"
             );
         }
+    }
+
+    #[test_log::test(test)]
+    fn test_scan_finishes_all_tasks() {
+        // Need to use multi-threaded runtime otherwise tasks don't run unless someone is polling somewhere
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let ds = lance_datagen::gen_batch()
+                .col("id", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1000), FragmentRowCount::from(10))
+                .await
+                .unwrap();
+
+            // This scan with has a small I/O buffer size and batch size to mimic a real-world situation
+            // that required a lot of data.  Many fragments will be scheduled at low priority and the data
+            // buffer will fill up with data reads.  When the scan is abandoned, the tasks to read the fragment
+            // metadata were left behind and would never finish because the data was never decoded to drain the
+            // backpressure queue.
+            //
+            // The fix (that this test verifies) is to ensure we close the I/O scheduler when the scan is abandoned.
+            let mut stream = ds
+                .scan()
+                .fragment_readahead(1000)
+                .batch_size(1)
+                .io_buffer_size(1)
+                .batch_readahead(1)
+                .try_into_stream()
+                .await
+                .unwrap();
+            stream.next().await.unwrap().unwrap();
+        });
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if runtime.handle().metrics().num_alive_tasks() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            runtime.handle().metrics().num_alive_tasks() == 0,
+            "Tasks should have finished within 10 seconds but there are still {} tasks running",
+            runtime.handle().metrics().num_alive_tasks()
+        );
     }
 }

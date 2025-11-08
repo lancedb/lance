@@ -133,7 +133,7 @@ def btree_comparison_datasets(tmp_path):
             index_type="BTREE",
             name=fragment_index_name,
             replace=False,
-            fragment_uuid=fragment_index_id,
+            index_uuid=fragment_index_id,
             fragment_ids=[fragment_id],
         )
 
@@ -2222,7 +2222,7 @@ def build_distributed_fts_index(
             index_type="INVERTED",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
             **index_params,
         )
@@ -3083,13 +3083,13 @@ def test_distribute_fts_index_build(tmp_path):
     for fragment in ds.get_fragments():
         fragment_id = fragment.fragment_id
 
-        # Use the new fragment_ids and fragment_uuid parameters
+        # Use the new fragment_ids and index_uuid parameters
         ds.create_scalar_index(
             column="text",
             index_type="INVERTED",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
             remove_stop_words=False,
         )
@@ -3274,7 +3274,7 @@ def test_distribute_btree_index_build(tmp_path):
             index_type="BTREE",
             name=index_name,
             replace=False,
-            fragment_uuid=index_id,
+            index_uuid=index_id,
             fragment_ids=[fragment_id],
         )
 

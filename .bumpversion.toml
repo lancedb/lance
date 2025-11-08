@@ -1,8 +1,8 @@
 [tool.bumpversion]
-current_version = "0.32.1"
-parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>.+))?"
+current_version = "0.40.0-beta.2"
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>(beta|rc))\\.(?P<prerelease_num>\\d+))?"
 serialize = [
-    "{major}.{minor}.{patch}-{prerelease}",
+    "{major}.{minor}.{patch}-{prerelease}.{prerelease_num}",
     "{major}.{minor}.{patch}"
 ]
 search = "{current_version}"
@@ -17,6 +17,13 @@ tag_message = "Release version {new_version}"
 allow_dirty = false
 commit = false
 message = "chore: bump version {current_version} → {new_version}"
+
+[tool.bumpversion.parts.prerelease]
+optional_value = "stable"
+values = ["beta", "rc", "stable"]
+
+[tool.bumpversion.parts.prerelease_num]
+first_value = "0"
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
@@ -108,96 +115,8 @@ filename = "Cargo.toml"
 search = 'lance-bitpacking = {{ version = "={current_version}"'
 replace = 'lance-bitpacking = {{ version = "={new_version}"'
 
-# Update all rust crate Cargo.toml files
-[[tool.bumpversion.files]]
-filename = "rust/lance/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-arrow/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-core/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-datafusion/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-datagen/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-encoding/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-file/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-index/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-io/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-linalg/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-namespace/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-namespace-impls/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-table/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/compression/bitpacking/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/compression/fsst/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-test-macros/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/lance-testing/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "rust/examples/Cargo.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
+# Note: Individual rust crate Cargo.toml files use workspace = true,
+# so we don't need to update them individually
 
 # Python Cargo.toml
 [[tool.bumpversion.files]]

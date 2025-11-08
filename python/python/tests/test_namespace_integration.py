@@ -14,11 +14,12 @@ import copy
 import time
 import uuid
 from threading import Lock
-from typing import Dict, Optional
+from typing import Dict
 
 import lance
 import pyarrow as pa
 import pytest
+from lance_namespace import DescribeTableResponse, LanceNamespace
 
 # These are all keys that are accepted by storage_options
 CONFIG = {
@@ -67,7 +68,7 @@ def delete_bucket(s3, bucket_name):
         pass
 
 
-class MockLanceNamespace:
+class MockLanceNamespace(LanceNamespace):
     """
     Mock namespace implementation that tracks credential refresh calls.
 
@@ -116,9 +117,7 @@ class MockLanceNamespace:
         """Return a unique identifier for this namespace instance."""
         return "MockLanceNamespace { }"
 
-    def describe_table(
-        self, table_id: list, version: Optional[int] = None
-    ) -> Dict[str, any]:
+    def describe_table(self, request) -> DescribeTableResponse:
         """
         Describe a table and return storage options with incrementing credentials.
 
@@ -127,18 +126,16 @@ class MockLanceNamespace:
 
         Parameters
         ----------
-        table_id : list
-            The table identifier (e.g., ["my_table"])
-        version : Optional[int]
-            The table version (not used in this mock)
+        request : DescribeTableRequest
+            The describe table request.
 
         Returns
         -------
-        Dict[str, any]
-            A dictionary with:
-            - location: The S3 URI of the table
-            - storage_options: Dict with AWS credentials and expires_at_millis
+        DescribeTableResponse
+            Response with location and storage_options
         """
+        table_id = request.id
+
         with self.lock:
             self.call_count += 1
             count = self.call_count
@@ -163,10 +160,10 @@ class MockLanceNamespace:
         )
         storage_options["expires_at_millis"] = str(expires_at_millis)
 
-        return {
-            "location": location,
-            "storage_options": storage_options,
-        }
+        return DescribeTableResponse(
+            location=location,
+            storage_options=storage_options,
+        )
 
 
 @pytest.mark.integration

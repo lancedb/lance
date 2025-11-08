@@ -1190,7 +1190,6 @@ pub async fn initialize_vector_index(
             removed_indices: vec![],
         },
         None,
-        None,
     );
 
     target_dataset

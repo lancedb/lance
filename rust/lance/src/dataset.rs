@@ -127,7 +127,6 @@ pub use write::{
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
-pub const BLOB_DIR: &str = "_blobs";
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -514,7 +513,7 @@ impl Dataset {
             ref_path: String::from(self.uri()),
             branch_name: Some(branch.to_string()),
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             .with_store_params(store_params.unwrap_or_default())
@@ -846,36 +845,6 @@ impl Dataset {
     }
 
     // TODO: Cache this
-    pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
-        if let Some(blobs_version) = self.manifest.blob_dataset_version {
-            let blobs_path = self.base.child(BLOB_DIR);
-            let blob_manifest_location = self
-                .commit_handler
-                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
-                .await?;
-            let manifest = read_manifest(
-                &self.object_store,
-                &blob_manifest_location.path,
-                blob_manifest_location.size,
-            )
-            .await?;
-            let blobs_dataset = Self::checkout_manifest(
-                self.object_store.clone(),
-                blobs_path,
-                format!("{}/{}", self.uri, BLOB_DIR),
-                Arc::new(manifest),
-                blob_manifest_location,
-                self.session.clone(),
-                self.commit_handler.clone(),
-                self.file_reader_options.clone(),
-                self.store_params.as_deref().cloned(),
-            )?;
-            Ok(Some(Arc::new(blobs_dataset)))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn is_legacy_storage(&self) -> bool {
         self.manifest
             .data_storage_format
@@ -992,7 +961,6 @@ impl Dataset {
             Operation::Restore {
                 version: self.manifest.version,
             },
-            /*blobs_op=*/ None,
             None,
         );
 
@@ -1069,7 +1037,6 @@ impl Dataset {
     async fn do_commit(
         base_uri: WriteDestination<'_>,
         operation: Operation,
-        blobs_op: Option<Operation>,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -1088,7 +1055,7 @@ impl Dataset {
             Ok,
         )?;
 
-        let transaction = Transaction::new(read_version, operation, blobs_op, None);
+        let transaction = Transaction::new(read_version, operation, None);
 
         let mut builder = CommitBuilder::new(base_uri)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
@@ -1152,9 +1119,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1185,9 +1149,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1592,11 +1553,7 @@ impl Dataset {
         &self.manifest.schema
     }
 
-    /// Similar to [Self::schema], but only returns fields with the default storage class
-    pub fn local_schema(&self) -> &Schema {
-        &self.manifest.local_schema
-    }
-
+    /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())
@@ -1954,7 +1911,7 @@ impl Dataset {
             ref_path: self.uri.clone(),
             branch_name: None,
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.unwrap_or_default())
@@ -2273,9 +2230,6 @@ impl Dataset {
                 fragments: updated_fragments,
                 schema: new_schema,
             },
-            // It is not possible to add blob columns using merge
-            /*blobs_op=*/
-            None,
             None,
         );
 
@@ -2625,15 +2579,14 @@ mod tests {
     };
     use arrow_array::{
         Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
-        StructArray, UInt64Array,
+        LargeBinaryArray, StructArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
-    use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
@@ -4308,7 +4261,7 @@ mod tests {
             initial_bases: None,
         };
         let test_uri = TempStrDir::default();
-        let read_version_0_transaction = Transaction::new(0, operation, None, None);
+        let read_version_0_transaction = Transaction::new(0, operation, None);
         let strict_builder = CommitBuilder::new(&test_uri).with_max_retries(0);
         let unstrict_builder = CommitBuilder::new(&test_uri).with_max_retries(1);
         strict_builder
@@ -5293,7 +5246,7 @@ mod tests {
         // let scan_fut = scan
         //     .nearest("vector", &query_vec, 2000)
         //     .unwrap()
-        //     .nprobs(4)
+        //     .nprobes(4)
         //     .prefilter(true)
         //     .try_into_stream()
         //     .await
@@ -5354,7 +5307,7 @@ mod tests {
         let batches = scan
             .nearest("vector", &query_vec, 2000)
             .unwrap()
-            .nprobs(4)
+            .nprobes(4)
             .prefilter(true)
             .try_into_stream()
             .await
@@ -6846,6 +6799,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
         // Looking at the fragments, there is no data file with the missing field
         let fragments = dataset.get_fragments();
@@ -6877,6 +6831,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
 
         // When reading back, only missing data is null, otherwise is filled in
         let data = dataset.scan().try_into_batch().await.unwrap();
@@ -7054,20 +7009,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_balanced_subschemas() {
-        // TODO: support this.
         let test_uri = TempStrDir::default();
 
         let field_a = ArrowField::new("a", DataType::Int32, true);
-        let field_b = ArrowField::new("b", DataType::Int64, true);
+        let field_b = ArrowField::new("b", DataType::LargeBinary, true);
         let schema = Arc::new(ArrowSchema::new(vec![
             field_a.clone(),
-            field_b.clone().with_metadata(
-                [(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                )]
-                .into(),
-            ),
+            field_b
+                .clone()
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
         ]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
@@ -7085,18 +7035,52 @@ mod tests {
         let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
 
         // Insert right side
         let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
-        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            just_b.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter(vec![Some(vec![2u8])]))],
+        )
+        .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].metadata.files.len(), 1);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+
+        let data = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["a"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.num_rows(), 2);
+        let a_column = data.column(0).as_primitive::<Int32Type>();
+        assert_eq!(a_column.value(0), 1);
+        assert!(a_column.is_null(1));
+
+        let blob_batch = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["b"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        let blob_descriptions = blob_batch.column(0).as_struct();
+        assert!(blob_descriptions.is_null(0));
+        assert!(blob_descriptions.is_valid(1));
     }
 
     #[tokio::test]
@@ -8209,6 +8193,130 @@ mod tests {
             .unwrap();
 
         (dataset, json_col)
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_fuzziness_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().lance_tokenizer("json".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query with fuzziness
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Dursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Dontent,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
     }
 
     #[tokio::test]

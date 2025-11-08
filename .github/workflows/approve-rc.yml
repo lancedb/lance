@@ -1,0 +1,113 @@
+name: Approve RC
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: 'RC tag to approve (e.g., v1.3.0-rc.2 or v1.3.1-rc.1)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (simulate without pushing)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  approve-rc:
+    runs-on: ubuntu-latest
+    outputs:
+      stable_version: ${{ steps.approve.outputs.STABLE_VERSION }}
+      stable_tag: ${{ steps.approve.outputs.STABLE_TAG }}
+      release_branch: ${{ steps.approve.outputs.RELEASE_BRANCH }}
+      is_major_minor: ${{ steps.approve.outputs.IS_MAJOR_MINOR }}
+      previous_tag: ${{ steps.approve.outputs.PREVIOUS_TAG }}
+    steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
+
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        fetch-depth: 0
+        lfs: true
+
+    - name: Setup release environment
+      uses: ./.github/actions/setup-release-env
+
+    - name: Approve RC
+      id: approve
+      run: |
+        bash ci/approve_rc.sh "${{ inputs.rc_tag }}"
+
+    - name: Push changes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      run: |
+        git push origin "${{ steps.approve.outputs.RELEASE_BRANCH }}"
+        git push origin "${{ steps.approve.outputs.STABLE_TAG }}"
+
+    - name: Generate Release Notes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      id: release_notes
+      env:
+        GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+      run: |
+        PREVIOUS_TAG="${{ steps.approve.outputs.PREVIOUS_TAG }}"
+        STABLE_TAG="${{ steps.approve.outputs.STABLE_TAG }}"
+
+        if [ -n "${PREVIOUS_TAG}" ]; then
+          echo "Generating release notes from ${PREVIOUS_TAG} to ${STABLE_TAG}"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${STABLE_TAG}" \
+            -f previous_tag_name="${PREVIOUS_TAG}" \
+            --jq .body)
+        else
+          echo "No previous tag found, using automatic generation"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${STABLE_TAG}" \
+            --jq .body)
+        fi
+
+        # Save to output
+        echo "notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$NOTES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.approve.outputs.STABLE_TAG }}
+        name: ${{ steps.approve.outputs.STABLE_TAG }}
+        draft: false
+        prerelease: false
+        body: ${{ steps.release_notes.outputs.notes }}
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+
+    - name: Summary
+      run: |
+        echo "## Stable Release Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **RC Tag:** ${{ inputs.rc_tag }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Stable Version:** ${{ steps.approve.outputs.STABLE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Stable Tag:** ${{ steps.approve.outputs.STABLE_TAG }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Branch:** ${{ steps.approve.outputs.RELEASE_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Next Version:** ${{ steps.approve.outputs.NEXT_BETA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Type:** $( [ "${{ steps.approve.outputs.IS_MAJOR_MINOR }}" == "true" ] && echo "Major/Minor" || echo "Patch" )" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ steps.approve.outputs.PREVIOUS_TAG }}" ]; then
+          echo "- **Release Notes From:** ${{ steps.approve.outputs.PREVIOUS_TAG }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This was a dry run. No changes were pushed." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Stable release ${{ steps.approve.outputs.STABLE_TAG }} complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Publishing:** Stable artifacts will be published to PyPI, crates.io, Maven Central" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-bumped:** Release branch bumped to ${{ steps.approve.outputs.NEXT_BETA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        fi

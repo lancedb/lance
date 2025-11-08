@@ -89,7 +89,6 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
             removed_indices: vec![frag_reuse_index_meta.clone()],
         },
         None,
-        None,
     );
 
     dataset
