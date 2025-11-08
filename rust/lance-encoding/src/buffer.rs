@@ -5,7 +5,7 @@
 
 use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
-use arrow_buffer::{ArrowNativeType, Buffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 use snafu::location;
 use std::borrow::Cow;
@@ -109,13 +109,6 @@ impl LanceBuffer {
         }
     }
 
-    /// Convert a buffer into a bytes::Bytes object
-    ///
-    /// This convert is zero cost.
-    pub fn into_bytes(self) -> bytes::Bytes {
-        self.0.into_vec::<u8>().unwrap().into()
-    }
-
     /// Make an owned copy of the buffer (always does a copy of the data)
     pub fn deep_copy(&self) -> Self {
         Self(Buffer::from_vec(self.0.to_vec()))
@@ -167,7 +160,11 @@ impl LanceBuffer {
         if is_aligned {
             ScalarBuffer::<T>::from(self.clone().into_buffer())
         } else {
-            ScalarBuffer::<T>::from(self.deep_copy().into_buffer())
+            let num_values = self.len() / std::mem::size_of::<T>();
+            let vec = Vec::<T>::with_capacity(num_values);
+            let mut bytes = MutableBuffer::from(vec);
+            bytes.extend_from_slice(self);
+            ScalarBuffer::<T>::from(Buffer::from(bytes))
         }
     }
 
@@ -194,7 +191,7 @@ impl LanceBuffer {
         if self.as_ptr().align_offset(align) == 0 {
             Cow::Borrowed(bytemuck::cast_slice(&self.0))
         } else {
-            Cow::Owned(bytemuck::cast_vec(self.0.to_vec()))
+            Cow::Owned(bytemuck::pod_collect_to_vec(self.0.as_slice()))
         }
     }
 
