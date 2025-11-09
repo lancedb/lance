@@ -239,7 +239,10 @@ mod tests {
                     "endpoint".to_string(),
                     "https://test_account.blob.core.windows.net".to_string(),
                 ),
-                ("account_key".to_string(), "12345=".to_string()),
+                (
+                    "account_key".to_string(),
+                    "dGVzdF9hY2NvdW50X2tleQ==".to_string(),
+                ),
             ])),
             ..Default::default()
         };
