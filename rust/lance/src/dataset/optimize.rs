@@ -108,6 +108,8 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use tracing::info;
 
+use crate::dataset::blob_stream::wrap_blob_stream_if_needed;
+
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
@@ -691,6 +693,10 @@ async fn rewrite_files(
     let (row_ids_rx, reader) = if needs_remapping {
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+
+        let dataset_arc = Arc::new(dataset.clone().into_owned());
+        let data = wrap_blob_stream_if_needed(data, dataset_arc);
+
         let (data_no_row_ids, row_id_rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         (Some(row_id_rx), data_no_row_ids)

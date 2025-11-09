@@ -82,6 +82,7 @@ pub mod udtf;
 pub mod updater;
 mod utils;
 mod write;
+mod blob_stream;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;

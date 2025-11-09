@@ -4339,6 +4339,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "datafusion",
+ "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-physical-expr",

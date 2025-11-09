@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-
+use std::{sync::Arc};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::Dataset;
@@ -150,12 +150,48 @@ fn is_index_remap_caught_up(
 mod tests {
     use super::*;
     use crate::dataset::optimize::{compact_files, remapping, CompactionOptions};
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, TestDatasetGenerator};
     use all_asserts::{assert_false, assert_true};
-    use arrow_array::types::{Float32Type, Int32Type};
-    use lance_datagen::Dimension;
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
+    use lance_core::Result;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, BatchCount, Dimension, RowCount};
+    use lance_encoding::version::LanceFileVersion;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::{DatasetIndexExt, IndexType};
+
+    #[tokio::test]
+    async fn test_compact_blob_files(){
+        let test_dir = TempStrDir::default();
+
+        let data = lance_datagen::gen_batch()
+            .col("filterme", array::step::<UInt64Type>())
+            .col("blobs", array::blob())
+            .into_reader_rows(RowCount::from(5), BatchCount::from(5))
+            .map(|batch| Ok(batch?))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        let dataset = Arc::new(
+            TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
+                .make_hostile(&test_dir)
+                .await,
+        );
+        let mut exclusive_dataset = Arc::try_unwrap(dataset).expect("This should be the only Arc pointing to the dataset");
+
+        // Compact and check index not caught up
+        compact_files(
+            &mut exclusive_dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
