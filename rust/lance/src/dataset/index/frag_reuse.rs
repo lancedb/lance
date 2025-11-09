@@ -153,12 +153,15 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, TestDatasetGenerator};
     use all_asserts::{assert_false, assert_true};
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
+    use chrono::TimeDelta;
     use lance_core::Result;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_encoding::version::LanceFileVersion;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::{DatasetIndexExt, IndexType};
+    use crate::dataset::cleanup::{cleanup_old_versions, CleanupPolicyBuilder};
+    use crate::utils::temporal::utc_now;
 
     #[tokio::test]
     async fn test_compact_blob_files(){
@@ -188,6 +191,17 @@ mod tests {
                 ..Default::default()
             },
             None,
+        )
+            .await
+            .unwrap();
+
+        cleanup_old_versions(
+            &exclusive_dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .delete_unverified(true)
+                .error_if_tagged_old_versions(true)
+                .build(),
         )
             .await
             .unwrap();
