@@ -15,12 +15,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::collections::HashSet;
+use datafusion::common::HashMap;
 
 use crate::dataset::Dataset;
 use lance_core::utils::address::RowAddress;
-
-// 🔧 注意：理想情况下应通过 field name 动态获取 ID，此处暂保留硬编码
-const BLOB_STORAGE_FIELD_ID: u32 = 1;
 
 pub fn wrap_blob_stream_if_needed(
     inner: SendableRecordBatchStream,
@@ -34,7 +32,7 @@ pub fn wrap_blob_stream_if_needed(
         .collect();
 
     if blob_fields.is_empty() {
-        // 🟢 No blob fields → return original stream
+        // No blob fields → return original stream
         inner
     } else {
         Box::pin(ResolvedBlobStream::new(inner, dataset))
@@ -46,6 +44,7 @@ pub fn resolve_blob_column(
     batch: &RecordBatch,
     dataset: &Dataset,
     blob_field_name: &str,
+    blob_field_id: u32,
     row_id_col: &UInt64Array,
 ) -> DFResult<ArrayRef> {
     let blob_struct = batch
@@ -82,7 +81,7 @@ pub fn resolve_blob_column(
             .ok_or_else(|| DataFusionError::Execution("fragment not found".to_string()))?;
 
         let data_file = frag
-            .data_file_for_field(BLOB_STORAGE_FIELD_ID)
+            .data_file_for_field(blob_field_id)
             .ok_or_else(|| DataFusionError::Execution("blob data file not found".to_string()))?;
 
         let path_str = dataset.data_dir().child(data_file.path.as_str()).to_string();
@@ -113,7 +112,7 @@ pub struct ResolvedBlobStream {
     inner: SendableRecordBatchStream,
     dataset: Arc<Dataset>,
     output_schema: SchemaRef,
-    blob_field_names: Vec<String>, // 支持多个
+    blob_field_name_to_id: Vec<(String, u32)>,
 }
 
 impl ResolvedBlobStream {
@@ -129,29 +128,28 @@ impl ResolvedBlobStream {
         dataset: Arc<Dataset>,
     ) -> Self {
         // 🔍 自动查找所有 blob 字段
-        let blob_fields: Vec<&lance_core::datatypes::Field> = dataset
+        let blob_field_name_to_id: Vec<(String, u32)> = dataset
             .schema()
             .fields
             .iter()
             .filter(|field| field.is_blob())
+            .map(|f| (f.name.clone(), f.id as u32))
             .collect();
 
-        let blob_field_names: Vec<String> = blob_fields.iter().map(|f| f.name.clone()).collect();
-
         let input_schema = inner.schema();
-        // 检查所有 blob 字段是否都在输入流中
-        for name in &blob_field_names {
+        let blob_names: HashSet<&String> = blob_field_name_to_id.iter().map(|(n, _)| n).collect();
+
+        for (name, _) in &blob_field_name_to_id {
             if input_schema.column_with_name(name).is_none() {
                 panic!("Input schema missing blob field: {}", name);
             }
         }
-        // 构建输出 schema：将每个 blob struct 替换为 LargeBinary
-        let blob_set: HashSet<&String> = blob_field_names.iter().collect();
+
         let fields: Vec<Field> = input_schema
             .fields()
             .iter()
             .map(|f| {
-                if blob_set.contains(f.name()) {
+                if blob_names.contains(f.name()) {
                     Field::new(f.name(), DataType::LargeBinary, f.is_nullable())
                 } else {
                     f.as_ref().clone()
@@ -164,7 +162,7 @@ impl ResolvedBlobStream {
             inner,
             dataset,
             output_schema,
-            blob_field_names,
+            blob_field_name_to_id,
         }
     }
 }
@@ -182,18 +180,22 @@ impl Stream for ResolvedBlobStream {
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| DataFusionError::Execution("_rowid is not UInt64".to_string()))?;
 
-                // Step 1: 预先解析所有 blob 列
-                let mut resolved_blobs = std::collections::HashMap::new();
-                for name in &self.blob_field_names {
-                    let resolved = resolve_blob_column(&batch, &self.dataset, name, row_ids)?;
-                    resolved_blobs.insert(name.as_str(), resolved);
+                let mut resolved_blobs: HashMap<String, ArrayRef> = HashMap::new();
+                for (name, field_id) in &self.blob_field_name_to_id {
+                    let resolved = resolve_blob_column(
+                        &batch,
+                        &self.dataset,
+                        name,
+                        *field_id,
+                        row_ids,
+                    )?;
+                    resolved_blobs.insert(name.clone(), resolved);
                 }
 
-                // Step 2: 构建新列
                 let mut new_columns = Vec::with_capacity(batch.num_columns());
                 for (i, col) in batch.columns().iter().enumerate() {
                     let field_name = batch.schema_ref().field(i).name();
-                    if let Some(resolved) = resolved_blobs.get(field_name.as_str()) {
+                    if let Some(resolved) = resolved_blobs.get(field_name) {
                         new_columns.push(resolved.clone());
                     } else {
                         new_columns.push(col.clone());
