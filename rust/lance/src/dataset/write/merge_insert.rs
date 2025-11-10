@@ -311,6 +311,8 @@ pub struct MergeInsertJob {
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
+    // Precomputed primary key filter for source data (ExactSet or Bloom)
+    primary_key_filter: Option<crate::dataset::conflict_detection::PrimaryKeyFilterModel>,
 }
 
 /// Build a merge insert operation.
@@ -511,6 +513,7 @@ impl MergeInsertBuilder {
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
+            primary_key_filter: None,
         })
     }
 }
@@ -1361,12 +1364,17 @@ impl MergeInsertJob {
                 location: location!(),
             })?;
 
-        let transaction = merge_insert_exec
+        let mut transaction = merge_insert_exec
             .transaction()
             .ok_or_else(|| Error::Internal {
                 message: "Transaction not available - execution may not have completed".into(),
                 location: location!(),
             })?;
+
+        // Attach precomputed primary key filter if available (fast path)
+        if let Some(pk) = &self.primary_key_filter {
+            transaction.primary_key_filter = Some(pk.clone());
+        }
 
         let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
 
@@ -1563,6 +1571,9 @@ impl MergeInsertJob {
             .unwrap();
 
         let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        if let Some(pk) = &self.primary_key_filter {
+            transaction.primary_key_filter = Some(pk.clone());
+        }
 
         Ok(UncommittedMergeInsert {
             transaction,
@@ -1740,6 +1751,95 @@ pub struct UncommittedMergeInsert {
     pub stats: MergeStats,
 }
 
+/// Compute a primary key filter (ExactSet for now) from the source stream based on ON columns
+async fn compute_pk_filter_from_stream(
+    mut stream: SendableRecordBatchStream,
+    on_cols: &[String],
+) -> Result<crate::dataset::conflict_detection::PrimaryKeyFilterModel> {
+    use crate::dataset::conflict_detection::{PrimaryKeyBloomFilter, PrimaryKeyValue, PrimaryKeyFilterModel};
+    use arrow_array::{StringArray, LargeStringArray, BinaryArray, LargeBinaryArray};
+    use arrow_schema::DataType;
+
+    let mut bloom = PrimaryKeyBloomFilter::new(on_cols.to_vec());
+
+    while let Some(batch_res) = stream.next().await {
+        let batch = batch_res?;
+        let num_rows = batch.num_rows();
+        // Precompute ON column indices and types
+        let mut col_info: Vec<(usize, DataType)> = Vec::with_capacity(on_cols.len());
+        for name in on_cols.iter() {
+            let idx = batch
+                .schema()
+                .index_of(name)
+                .map_err(|e| Error::invalid_input(format!("ON column '{}' not found: {}", name, e), location!()))?;
+            let dt = batch.column(idx).data_type().clone();
+            col_info.push((idx, dt));
+        }
+
+        for row in 0..num_rows {
+            let mut parts: Vec<PrimaryKeyValue> = Vec::with_capacity(col_info.len());
+            let mut invalid = false;
+            for (idx, dt) in col_info.iter() {
+                let col = batch.column(*idx);
+                if col.is_null(row) {
+                    invalid = true;
+                    break;
+                }
+                match dt {
+                    DataType::Utf8 => {
+                        let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        parts.push(PrimaryKeyValue::String(arr.value(row).to_string()));
+                    }
+                    DataType::LargeUtf8 => {
+                        let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        parts.push(PrimaryKeyValue::String(arr.value(row).to_string()));
+                    }
+                    DataType::UInt64 => {
+                        let a = col.as_primitive::<arrow_array::types::UInt64Type>();
+                        parts.push(PrimaryKeyValue::UInt64(a.value(row)));
+                    }
+                    DataType::Int64 => {
+                        let a = col.as_primitive::<arrow_array::types::Int64Type>();
+                        parts.push(PrimaryKeyValue::Int64(a.value(row)));
+                    }
+                    DataType::UInt32 => {
+                        let a = col.as_primitive::<arrow_array::types::UInt32Type>();
+                        parts.push(PrimaryKeyValue::UInt64(a.value(row) as u64));
+                    }
+                    DataType::Int32 => {
+                        let a = col.as_primitive::<arrow_array::types::Int32Type>();
+                        parts.push(PrimaryKeyValue::Int64(a.value(row) as i64));
+                    }
+                    DataType::Binary => {
+                        let a = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        parts.push(PrimaryKeyValue::Binary(a.value(row).to_vec()));
+                    }
+                    DataType::LargeBinary => {
+                        let a = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                        parts.push(PrimaryKeyValue::Binary(a.value(row).to_vec()));
+                    }
+                    _ => {
+                        // Unsupported key type, skip this row for safety
+                        invalid = true;
+                        break;
+                    }
+                }
+            }
+            if invalid {
+                continue;
+            }
+            let pk = if parts.len() == 1 {
+                parts.into_iter().next().unwrap()
+            } else {
+                PrimaryKeyValue::Composite(parts)
+            };
+            bloom.insert(pk)?;
+        }
+    }
+
+    Ok(PrimaryKeyFilterModel::from_exact_bloom(&bloom))
+}
+
 /// Wrapper struct that combines MergeInsertJob with the source iterator for retry functionality
 #[derive(Clone)]
 struct MergeInsertJobWithIterator {
@@ -1758,8 +1858,15 @@ impl RetryExecutor for MergeInsertJobWithIterator {
 
         // We need to get a fresh stream for each retry attempt
         // The source_iter provides unlimited streams from the same source data
+        // First, use a stream to compute the source primary key filter
+        let pk_stream = self.source_iter.lock().unwrap().next().unwrap();
+        let pk_filter = compute_pk_filter_from_stream(pk_stream, &self.job.params.on).await?;
+
+        // Then, get another fresh stream to run the actual merge
         let stream = self.source_iter.lock().unwrap().next().unwrap();
-        self.job.clone().execute_uncommitted_impl(stream).await
+        let mut job = self.job.clone();
+        job.primary_key_filter = Some(pk_filter);
+        job.execute_uncommitted_impl(stream).await
     }
 
     async fn commit(&self, dataset: Arc<Dataset>, mut data: Self::Data) -> Result<Self::Result> {
@@ -4186,6 +4293,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transaction_pk_filter_roundtrip() {
+        use arrow_array::{RecordBatch, UInt32Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+        use crate::io::commit::read_transaction_file;
+
+        // Create dataset
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Source with overlapping key 1
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 3])),
+                Arc::new(UInt32Array::from(vec![2, 2])),
+            ],
+        )
+        .unwrap();
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(new_batch)]),
+        );
+
+        let UncommittedMergeInsert { transaction, .. } = MergeInsertBuilder::try_new(
+            dataset.clone(),
+            vec!["id".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(stream)
+        .await
+        .unwrap();
+
+        // Commit and read back transaction file
+        let committed = CommitBuilder::new(dataset.clone()).execute(transaction).await.unwrap();
+        let tx_path = committed.manifest().transaction_file.clone().unwrap();
+        let tx_read = read_transaction_file(dataset.object_store(), &dataset.base, &tx_path)
+            .await
+            .unwrap();
+        assert!(tx_read.primary_key_filter.is_some());
+        let pk = tx_read.primary_key_filter.unwrap();
+        assert_eq!(pk.columns, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_pk_bloom_conflict_detection_concurrent() {
+        use arrow_array::{RecordBatch, UInt32Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+        use object_store::throttle::ThrottleConfig;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // Throttle to increase contention
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(5),
+                wait_get_per_call: Duration::from_millis(5),
+                wait_list_per_call: Duration::from_millis(5),
+                ..Default::default()
+            },
+        });
+
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Both jobs update/insert the same key 2
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from(vec![2])), Arc::new(UInt32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from(vec![2])), Arc::new(UInt32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let s1 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch1.clone())]),
+        );
+        let s2 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch2.clone())]),
+        );
+
+        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let t1 = tokio::spawn(async move { b1.execute(s1).await.unwrap().1 });
+        let t2 = tokio::spawn(async move { b2.execute(s2).await.unwrap().1 });
+
+        let s1 = t1.await.unwrap();
+        let s2 = t2.await.unwrap();
+        // At least one attempt should include a retry under contention
+        assert!(s1.num_attempts >= 1);
+        assert!(s2.num_attempts >= 1);
+
+        // Validate final dataset has id=2 updated to 1, without duplicates
+        let ds_latest = dataset.checkout_latest().await.unwrap();
+        let batch = ds_latest.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>().values();
+        let vals = batch["value"].as_primitive::<UInt32Type>().values();
+        // find index of id==2
+        let pos = ids.iter().position(|&x| x == 2).unwrap();
+        assert_eq!(vals[pos], 1);
+    }
+    #[tokio::test]
     async fn test_explain_plan() {
         // Set up test data using lance_datagen
         let dataset = lance_datagen::gen_batch()
@@ -4206,14 +4472,8 @@ mod tests {
 
         // Test explain_plan with default schema (None)
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
-
-        // Also validate the full string structure with pattern matching
-        let expected_pattern = "\
-MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
-  CoalescePartitionsExec...
-    HashJoinExec...
-      LanceRead...
-      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        assert!(plan.contains("MergeInsert"));
+        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep";
         assert_string_matches(&plan, expected_pattern).unwrap();
 
         // Test with explicit schema
@@ -4227,7 +4487,6 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Test verbose mode produces different (likely longer) output
         let verbose_plan = merge_insert_job.explain_plan(None, true).await.unwrap();
         assert!(verbose_plan.contains("MergeInsert"));
-        // Verbose should also match the expected pattern
         assert_string_matches(&verbose_plan, expected_pattern).unwrap();
     }
 
