@@ -20,11 +20,13 @@ import com.lancedb.lance.util.Range;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.Test;
@@ -253,5 +255,88 @@ public class FileReaderWriterTest {
       fail("Expected LanceException to be thrown");
     } catch (IOException e) {
     }
+  }
+
+  @Test
+  void testBlobEncodingReturnsDescriptors(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("test_blob.lance").toString();
+    BufferAllocator allocator = new RootAllocator();
+
+    // Step 1: Write blob-encoded data
+    Map<String, String> blobMetadata = new HashMap<>();
+    blobMetadata.put("lance-encoding:blob", "true");
+
+    Field blobField =
+        new Field(
+            "blob_data",
+            new FieldType(true, ArrowType.LargeBinary.INSTANCE, null, blobMetadata),
+            Collections.emptyList());
+
+    Schema schema = new Schema(Collections.singletonList(blobField), null);
+
+    try (LanceFileWriter writer =
+        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap())) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+
+        LargeVarBinaryVector blobVector = (LargeVarBinaryVector) root.getVector("blob_data");
+
+        // Write 5 blobs
+        for (int i = 0; i < 5; i++) {
+          byte[] data = new byte[100 * (i + 1)]; // Different sizes
+          Arrays.fill(data, (byte) i);
+          blobVector.setSafe(i, data);
+        }
+
+        root.setRowCount(5);
+        writer.write(root);
+      }
+    }
+
+    // Step 2: Read back and verify
+    try (LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
+      // Check schema
+      Schema readSchema = reader.schema();
+      Field readField = readSchema.getFields().get(0);
+
+      // Check if blob metadata is preserved
+      assertTrue(
+          readField.getMetadata().containsKey("lance-encoding:blob"),
+          "Blob metadata should be preserved in schema");
+
+      // Read batch - must pass column names to trigger schema usage for blob encoding
+      try (ArrowReader batch = reader.readAll(Collections.singletonList("blob_data"), null, 10)) {
+        batch.loadNextBatch(); // Actually load the data
+        VectorSchemaRoot root = batch.getVectorSchemaRoot();
+
+        // Get the blob column
+        org.apache.arrow.vector.FieldVector column = root.getVector("blob_data");
+        // Check if it's a struct with position and size (means the blob encoding happened)
+        if (column.getField().getType() instanceof ArrowType.Struct) {
+          // The struct should have 'position' and 'size' fields
+          assertEquals(
+              2,
+              column.getField().getChildren().size(),
+              "Struct should have 2 fields (position and size)");
+
+        } else if (column.getField().getType() instanceof ArrowType.LargeBinary) {
+          // This is what currently happens - Java materializes
+          LargeVarBinaryVector binaryVector = (LargeVarBinaryVector) column;
+
+          for (int i = 0; i < Math.min(5, root.getRowCount()); i++) {
+            byte[] data = binaryVector.get(i);
+            System.out.println("Row " + i + ": " + data.length + " bytes");
+          }
+          // Fail the test to demonstrate the issue
+          fail(
+              "Java LanceFileReader materializes blobs instead of returning descriptors. "
+                  + "Expected struct<position: uint64, size: uint64> but got "
+                  + column.getField().getType());
+        } else {
+          fail("Unexpected type: " + column.getField().getType());
+        }
+      }
+    }
+    allocator.close();
   }
 }

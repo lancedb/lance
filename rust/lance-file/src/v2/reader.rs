@@ -311,14 +311,7 @@ impl ReaderProjection {
             .enumerate()
             .map(|(idx, field)| (field.id as u32, idx as u32))
             .collect::<BTreeMap<_, _>>();
-        // Create a Projection with default BlobHandling::BlobsDescriptions
-        // This will transform blob fields from Binary to Struct<position, size>
-        // Using the builder pattern like Scanner does
-        let mut projection = Projection::empty(Arc::new(schema.clone()));
-        for column_name in column_names {
-            projection = projection.union_column(column_name, OnMissing::Error)?;
-        }
-        let projected = projection.to_bare_schema();
+        let projected = schema.project(column_names)?;
         let mut column_indices = Vec::new();
         Self::from_field_ids_helper(
             file_version,
