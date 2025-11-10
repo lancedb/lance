@@ -220,8 +220,6 @@ pub(super) async fn take_blobs(
 mod tests {
     use std::sync::Arc;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
     use futures::TryStreamExt;
@@ -239,16 +237,10 @@ mod tests {
         data: Vec<RecordBatch>,
     }
 
-    fn next_memory_uri() -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("memory://blob-tests/{id}")
-    }
+    const MEMORY_URI: &str = "memory://blob-tests";
 
     impl BlobTestFixture {
         async fn new() -> Self {
-            let uri = next_memory_uri();
-
             let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
                 .col("blobs", array::blob())
@@ -259,7 +251,7 @@ mod tests {
 
             let dataset = Arc::new(
                 TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
-                    .make_hostile(&uri)
+                    .make_hostile(MEMORY_URI)
                     .await,
             );
 
