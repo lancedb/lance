@@ -1546,7 +1546,7 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone, nlist, recall_requirement).await;
+            test_index_multivec(params, nlist, recall_requirement).await;
         }
     }
 
