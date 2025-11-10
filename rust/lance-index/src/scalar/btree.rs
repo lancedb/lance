@@ -3659,11 +3659,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            false,
-            updated_index.ranges_to_files.is_some(),
+        assert!(
+            updated_index.ranges_to_files.is_none(),
             "Updated ranged-btree-index should fall back to non-ranged"
         );
+
         let updated_value = (DEFAULT_BTREE_BATCH_SIZE * 2 + (DEFAULT_BTREE_BATCH_SIZE / 2)) as i32;
         let updated_query = SargableQuery::Equals(ScalarValue::Int32(Some(updated_value)));
 
