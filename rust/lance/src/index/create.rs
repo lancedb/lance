@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use futures::future::BoxFuture;
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
-use lance_table::format::IndexMetadata;
-use snafu::location;
-use std::{future::IntoFuture, sync::Arc};
-use tracing::instrument;
-use uuid::Uuid;
-
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -23,10 +15,19 @@ use crate::{
     },
     Error, Result,
 };
+use futures::future::BoxFuture;
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
+use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
+use lance_table::format::IndexMetadata;
+use snafu::location;
+use std::{future::IntoFuture, sync::Arc};
+use tracing::instrument;
+use uuid::Uuid;
+
+use arrow_array::RecordBatchReader;
 
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
@@ -38,6 +39,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     index_uuid: Option<String>,
+    preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -57,6 +59,7 @@ impl<'a> CreateIndexBuilder<'a> {
             train: true,
             fragments: None,
             index_uuid: None,
+            preprocessed_data: None,
         }
     }
 
@@ -82,6 +85,14 @@ impl<'a> CreateIndexBuilder<'a> {
 
     pub fn index_uuid(mut self, uuid: String) -> Self {
         self.index_uuid = Some(uuid);
+        self
+    }
+
+    pub fn preprocessed_data(
+        mut self,
+        stream: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Self {
+        self.preprocessed_data = Some(stream);
         self
     }
 
@@ -154,6 +165,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
+                assert!(
+                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
+                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
+                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -176,6 +191,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     base_params
                 };
 
+                let preprocesssed_data = self
+                    .preprocessed_data
+                    .take()
+                    .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
                 build_scalar_index(
                     self.dataset,
                     column,
@@ -183,6 +202,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     &params,
                     train,
                     self.fragments.clone(),
+                    preprocesssed_data,
                 )
                 .await?
             }
@@ -203,6 +223,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     params,
                     train,
                     self.fragments.clone(),
+                    None,
                 )
                 .await?
             }
@@ -226,6 +247,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     &params,
                     train,
                     self.fragments.clone(),
+                    None,
                 )
                 .await?
             }
