@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_table::format::pb;
 
@@ -137,7 +138,7 @@ impl PrimaryKeyBloomFilter {
 }
 
 /// Typed PrimaryKeyFilter model used to bridge protobuf field and in-memory logic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub enum FilterType {
     ExactSet(HashSet<u64>),
     Bloom {
@@ -147,7 +148,7 @@ pub enum FilterType {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct PrimaryKeyFilterModel {
     pub columns: Vec<String>,
     pub filter: FilterType,

@@ -3050,7 +3050,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             primary_key_filter: message
                 .primary_key_filter
                 .as_ref()
-                .map(|f| PrimaryKeyFilterModel::from_pb(f))
+                .map(PrimaryKeyFilterModel::from_pb)
                 .transpose()?,
         })
     }

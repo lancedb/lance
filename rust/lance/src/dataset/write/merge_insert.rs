@@ -1313,7 +1313,8 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
-        let plan = self.create_plan(source).await?;
+        let cloned_job = self.clone();
+        let plan = cloned_job.create_plan(source).await?;
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
@@ -1570,7 +1571,7 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let mut transaction = Transaction::new(self.dataset.manifest.version, operation, None);
         if let Some(pk) = &self.primary_key_filter {
             transaction.primary_key_filter = Some(pk.clone());
         }
@@ -4343,7 +4344,7 @@ mod tests {
                 .when_not_matched(WhenNotMatched::InsertAll)
                 .try_build()
                 .unwrap()
-                .execute_uncommitted(stream)
+                .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
                 .await
                 .unwrap();
 
@@ -4444,8 +4445,18 @@ mod tests {
             .try_build()
             .unwrap();
 
-        let t1 = tokio::spawn(async move { b1.execute(s1).await.unwrap().1 });
-        let t2 = tokio::spawn(async move { b2.execute(s2).await.unwrap().1 });
+        let t1 = tokio::spawn(async move {
+            b1.execute(Box::pin(s1) as SendableRecordBatchStream)
+                .await
+                .unwrap()
+                .1
+        });
+        let t2 = tokio::spawn(async move {
+            b2.execute(Box::pin(s2) as SendableRecordBatchStream)
+                .await
+                .unwrap()
+                .1
+        });
 
         let s1 = t1.await.unwrap();
         let s2 = t2.await.unwrap();
@@ -4454,7 +4465,8 @@ mod tests {
         assert!(s2.num_attempts >= 1);
 
         // Validate final dataset has id=2 updated to 1, without duplicates
-        let ds_latest = dataset.checkout_latest().await.unwrap();
+        let mut ds_latest = dataset.as_ref().clone();
+        ds_latest.checkout_latest().await.unwrap();
         let batch = ds_latest.scan().try_into_batch().await.unwrap();
         let ids = batch["id"].as_primitive::<UInt32Type>().values();
         let vals = batch["value"].as_primitive::<UInt32Type>().values();

@@ -978,6 +978,7 @@ impl<'a> TransactionRebase<'a> {
                         other_version,
                         location!(),
                     )),
+                    _ => Ok(()),
                 }
             }
         }
