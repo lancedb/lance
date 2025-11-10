@@ -22,7 +22,7 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, Transaction, MAGIC};
 
 use super::commit::ManifestLocation;
 
@@ -141,6 +141,7 @@ async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
+    mut transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
@@ -151,6 +152,14 @@ async fn do_write_manifest(
         manifest.index_section = Some(pos);
     }
 
+    // Write inline transaction if presented.
+    if let Some(tx) = transaction.take() {
+        // Convert to protobuf at the write boundary to persist inline
+        let pb_tx: pb::Transaction = tx.into();
+        let pos = writer.write_protobuf(&pb_tx).await?;
+        manifest.transaction_section = Some(pos);
+    }
+
     writer.write_struct(manifest).await
 }
 
@@ -159,6 +168,7 @@ pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
+    transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
@@ -209,7 +219,7 @@ pub async fn write_manifest(
         }
     }
 
-    do_write_manifest(writer, manifest, indices).await
+    do_write_manifest(writer, manifest, indices, transaction).await
 }
 
 /// Implementation of ManifestProvider that describes a Lance file by writing
@@ -228,7 +238,7 @@ impl ManifestProvider for ManifestDescribing {
             DataStorageFormat::new(LanceFileVersion::Legacy),
             HashMap::new(),
         );
-        let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
+        let pos = do_write_manifest(object_writer, &mut manifest, None, None).await?;
         Ok(Some(pos))
     }
 }
@@ -279,7 +289,7 @@ mod test {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        let pos = write_manifest(&mut writer, &mut manifest, None)
+        let pos = write_manifest(&mut writer, &mut manifest, None, None)
             .await
             .unwrap();
         writer
