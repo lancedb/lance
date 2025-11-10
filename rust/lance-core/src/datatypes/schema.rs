@@ -15,7 +15,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
+use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
@@ -144,6 +144,13 @@ impl Schema {
         } else {
             Some(differences.join(", "))
         }
+    }
+
+    pub fn apply_blob_version(&mut self, version: BlobVersion, allow_change: bool) -> Result<()> {
+        for field in self.fields.iter_mut() {
+            apply_blob_version_to_field(field, version, allow_change)?;
+        }
+        Ok(())
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -880,6 +887,31 @@ fn explain_metadata_difference(
     }
 }
 
+fn apply_blob_version_to_field(
+    field: &mut Field,
+    version: BlobVersion,
+    allow_change: bool,
+) -> Result<()> {
+    if field.is_blob() {
+        let current = field.blob_version();
+        if current != version && !allow_change {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Blob column '{}' uses version {:?}, expected {:?}",
+                    field.name, current, version
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+        field.set_blob_version(version);
+    }
+    for child in field.children.iter_mut() {
+        apply_blob_version_to_field(child, version, allow_change)?;
+    }
+    Ok(())
+}
+
 /// What to do when a column is missing in the schema
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnMissing {
@@ -1478,6 +1510,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::datatypes::BlobVersion;
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -2497,5 +2530,24 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
+    }
+
+    #[test]
+    fn apply_blob_version_requires_consistent_metadata() {
+        let arrow_field = ArrowField::new("blob", ArrowDataType::LargeBinary, true).with_metadata(
+            HashMap::from([
+                (BLOB_META_KEY.to_string(), "true".to_string()),
+                (BLOB_VERSION_META_KEY.to_string(), "2".to_string()),
+            ]),
+        );
+        let mut schema =
+            Schema::try_from(&ArrowSchema::new(vec![arrow_field])).expect("schema creation");
+
+        assert!(schema.apply_blob_version(BlobVersion::V1, false).is_err());
+
+        schema
+            .apply_blob_version(BlobVersion::V1, true)
+            .expect("allow metadata change when permitted");
+        assert_eq!(schema.fields[0].blob_version(), BlobVersion::V1);
     }
 }

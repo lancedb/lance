@@ -103,7 +103,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBES: usize = 20;
+const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -986,8 +986,9 @@ impl Dataset {
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
                 if !nprobes.is_none() {
-                    minimum_nprobes = nprobes.extract()?;
-                    maximum_nprobes = Some(minimum_nprobes);
+                    let extracted: usize = nprobes.extract()?;
+                    minimum_nprobes = extracted;
+                    maximum_nprobes = Some(extracted);
                 }
             }
 
@@ -1003,18 +1004,22 @@ impl Dataset {
                 }
             }
 
-            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
-                return Err(PyValueError::new_err(
-                    "minimum_nprobes must be <= maximum_nprobes",
-                ));
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                if minimum_nprobes > maximum_nprobes {
+                    return Err(PyValueError::new_err(
+                        "minimum_nprobes must be <= maximum_nprobes",
+                    ));
+                }
             }
 
             if minimum_nprobes < 1 {
                 return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
             }
 
-            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
-                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                if maximum_nprobes < 1 {
+                    return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+                }
             }
 
             let metric_type: Option<MetricType> =

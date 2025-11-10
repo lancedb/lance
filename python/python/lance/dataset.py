@@ -717,7 +717,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "column": <embedding col name>,
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
@@ -980,7 +980,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
                     "metric": "cosine",
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }

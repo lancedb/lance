@@ -721,8 +721,12 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
-            let max_nprobes = query.maximum_nprobes.unwrap_or(partitions.len());
-            if max_nprobes == query.minimum_nprobes {
+            let max_nprobes = query
+                .maximum_nprobes
+                .unwrap_or(partitions.len())
+                .min(partitions.len());
+            let min_nprobes = query.minimum_nprobes.min(max_nprobes);
+            if max_nprobes <= min_nprobes {
                 // We've already searched all partitions, no late search needed
                 return futures::stream::empty().boxed();
             }
@@ -784,7 +788,7 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            futures::stream::iter(query.minimum_nprobes..max_nprobes)
+            futures::stream::iter(min_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -1025,8 +1029,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let metrics = metrics.clone();
                     let pre_filter = pre_filter.clone();
                     let state = state.clone();
-                    let query = query.clone();
-
+                    let mut query = query.clone();
+                    let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
+                    adjust_probes(&mut query, pruned_nprobes);
                     async move {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
@@ -1098,6 +1103,30 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
+    query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
+    if let Some(maximum) = query.maximum_nprobes {
+        if query.minimum_nprobes > maximum {
+            query.minimum_nprobes = maximum;
+        }
+    }
+}
+
+fn early_pruning(dists: &[f32], k: usize) -> usize {
+    if dists.is_empty() {
+        return 0;
+    }
+
+    const PRUNING_FACTORS: [f32; 3] = [0.6, 7.0, 81.0];
+    let factor = match k {
+        ..=1 => PRUNING_FACTORS[0],
+        2..=10 => PRUNING_FACTORS[1],
+        11.. => PRUNING_FACTORS[2],
+    };
+    let dist_threshold = dists[0] * factor;
+    dists.partition_point(|dist| *dist <= dist_threshold)
 }
 
 #[derive(Debug)]
@@ -1305,7 +1334,9 @@ mod tests {
 
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
-    use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1321,6 +1352,56 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::io::exec::testing::TestingExec;
+
+    fn base_query() -> Query {
+        Query {
+            column: "vec".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: DistanceType::L2,
+            use_index: true,
+            dist_q_c: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_adjust_probes_rules() {
+        let mut query = base_query();
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 10);
+        assert_eq!(query.maximum_nprobes, None);
+
+        let mut query = base_query();
+        query.minimum_nprobes = 20;
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 20);
+        assert_eq!(query.maximum_nprobes, None);
+
+        let mut query = base_query();
+        query.maximum_nprobes = Some(25);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 10);
+        assert_eq!(query.maximum_nprobes, Some(25));
+
+        let mut query = base_query();
+        query.maximum_nprobes = Some(5);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 5);
+        assert_eq!(query.maximum_nprobes, Some(5));
+
+        let mut query = base_query();
+        query.minimum_nprobes = 30;
+        query.maximum_nprobes = Some(50);
+        adjust_probes(&mut query, 10);
+        assert_eq!(query.minimum_nprobes, 30);
+        assert_eq!(query.maximum_nprobes, Some(50));
+    }
 
     #[tokio::test]
     async fn knn_flat_search() {
@@ -1724,7 +1805,7 @@ mod tests {
                 .scan()
                 .nearest("vector", q.as_ref(), 50)
                 .unwrap()
-                .minimum_nprobes(10)
+                .minimum_nprobes(max_nprobes)
                 .maximum_nprobes(max_nprobes)
                 .prefilter(true)
                 .filter("label = 17")

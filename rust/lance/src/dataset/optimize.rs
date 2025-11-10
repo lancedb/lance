@@ -471,14 +471,12 @@ pub async fn plan_compaction(
 ) -> Result<CompactionPlan> {
     // get_fragments should be returning fragments in sorted order (by id)
     // and fragment ids should be unique
+    let fragments = dataset.get_fragments();
     debug_assert!(
-        dataset
-            .get_fragments()
-            .windows(2)
-            .all(|w| w[0].id() < w[1].id()),
+        fragments.windows(2).all(|w| w[0].id() < w[1].id()),
         "fragments in manifest are not sorted"
     );
-    let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
+    let mut fragment_metrics = futures::stream::iter(fragments)
         .map(|fragment| async move {
             match collect_metrics(&fragment).await {
                 Ok(metrics) => Ok((fragment.metadata, metrics)),
