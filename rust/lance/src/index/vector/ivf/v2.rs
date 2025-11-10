@@ -1520,7 +1520,9 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params, nlist, recall_requirement).await;
+        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
+        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
+        test_remap(params, nlist, recall_requirement * 0.9).await;
     }
 
     #[rstest]
@@ -1544,7 +1546,7 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+            test_index_multivec(params.clone, nlist, recall_requirement).await;
         }
     }
 
