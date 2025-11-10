@@ -97,10 +97,16 @@ def vec_to_table(
     if isinstance(data, dict):
         if names is None:
             names = ["id", "vector"]
-        elif not isinstance(names, (list, tuple)) and len(names) == 2:
-            raise ValueError(
-                "If data is a dict, names must be a list or tuple of 2 strings"
-            )
+        else:
+            if isinstance(names, str):
+                raise ValueError(
+                    "If data is a dict, names must be a list or tuple of 2 strings"
+                )
+            if len(names) != 2:
+                raise ValueError(
+                    "If data is a dict, names must be a list or tuple of 2 strings"
+                )
+            names = list(names)
         values = list(data.values())
         if check_ndim:
             ndim = _validate_ndim(values, ndim)
@@ -114,8 +120,10 @@ def vec_to_table(
             names = ["vector"]
         elif isinstance(names, str):
             names = [names]
-        elif not isinstance(names, (list, tuple)) and len(names) == 1:
-            raise ValueError(f"names cannot be more than 1 got {len(names)}")
+        else:
+            if len(names) != 1:
+                raise ValueError(f"names must contain exactly 1 entry, got {len(names)}")
+            names = list(names)
         if check_ndim:
             ndim = _validate_ndim(data, ndim)
         vectors = _normalize_vectors(data, ndim)
