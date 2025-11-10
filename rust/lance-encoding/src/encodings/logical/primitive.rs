@@ -65,9 +65,8 @@ use crate::{
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::constants::DICT_SIZE_RATIO_META_KEY;
-use crate::encodings::logical::primitive::dict::{
-    DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-};
+use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
+use crate::version::LanceFileVersion;
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
@@ -1261,14 +1260,19 @@ impl MiniBlockScheduler {
                     dictionary_data_alignment: 4,
                     num_dictionary_items,
                 }),
-                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
-                    dictionary_decompressor: decompressors
-                        .create_block_decompressor(dictionary_encoding)?
-                        .into(),
-                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                    dictionary_data_alignment: 16,
-                    num_dictionary_items,
-                }),
+                Compression::Flat(flat) => {
+                    let bits_per_value = flat.bits_per_value;
+                    let alignment = bits_per_value / 8;
+
+                    Some(MiniBlockSchedulerDictionary {
+                        dictionary_decompressor: decompressors
+                            .create_block_decompressor(dictionary_encoding)?
+                            .into(),
+                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                        dictionary_data_alignment: alignment,
+                        num_dictionary_items,
+                    })
+                }
                 Compression::General(_) => Some(MiniBlockSchedulerDictionary {
                     dictionary_decompressor: decompressors
                         .create_block_decompressor(dictionary_encoding)?
@@ -4197,9 +4201,9 @@ impl PrimitiveStructuralEncoder {
         let num_values = data_block.num_values();
 
         match data_block {
-            DataBlock::FixedWidth(_) => {
+            DataBlock::FixedWidth(fix_width) => {
                 // Dictionary: cardinality unique values at 128 bits each
-                let dict_size = cardinality * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+                let dict_size = cardinality * (fix_width.bits_per_value / 8);
                 // Indices: num_values indices at 32 bits each
                 let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
                 Some(dict_size + indices_size)
@@ -4227,7 +4231,11 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
+    fn should_dictionary_encode(
+        data_block: &DataBlock,
+        field: &Field,
+        version: LanceFileVersion,
+    ) -> bool {
         // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
         // estimating the size
         if !matches!(
@@ -4235,6 +4243,14 @@ impl PrimitiveStructuralEncoder {
             DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_)
         ) {
             return false;
+        }
+
+        // For fixed-width data, only allow 64-bit dictionary encoding in version 2.2+
+        // to prevent forward compatibility issues with older readers
+        if let DataBlock::FixedWidth(fix_width) = data_block {
+            if fix_width.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
+                return false;
+            }
         }
 
         // Don't dictionary encode tiny arrays
@@ -4386,7 +4402,7 @@ impl PrimitiveStructuralEncoder {
                     Some(dictionary_data_block),
                     num_rows
                 )
-            } else if Self::should_dictionary_encode(&data_block, &field) {
+            } else if Self::should_dictionary_encode(&data_block, &field, compression_strategy.version()) {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,
@@ -5594,7 +5610,7 @@ mod tests {
             .insert(Stat::Cardinality, cardinality_array);
 
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 32,
+            bits_per_value: 128,
             data: crate::buffer::LanceBuffer::from(vec![0u8; (num_values * 4) as usize]),
             num_values,
             block_info,
@@ -5631,16 +5647,14 @@ mod tests {
 
     #[test]
     fn test_estimate_dict_size_fixed_width() {
-        use crate::encodings::logical::primitive::dict::{
-            DICT_FIXED_WIDTH_BITS_PER_VALUE, DICT_INDICES_BITS_PER_VALUE,
-        };
+        use crate::encodings::logical::primitive::dict::DICT_INDICES_BITS_PER_VALUE;
 
         let block = create_test_fixed_data_block(1000, 400);
         let estimated_size = PrimitiveStructuralEncoder::estimate_dict_size(&block).unwrap();
 
         // Dictionary: 400 * 16 bytes (128-bit values)
         // Indices: 1000 * 4 bytes (32-bit i32)
-        let expected_dict_size = 400 * (DICT_FIXED_WIDTH_BITS_PER_VALUE / 8);
+        let expected_dict_size = 400 * (128 / 8);
         let expected_indices_size = 1000 * (DICT_INDICES_BITS_PER_VALUE / 8);
         let expected_total = expected_dict_size + expected_indices_size;
 
@@ -5675,7 +5689,11 @@ mod tests {
             arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
         let field = LanceField::try_from(&arrow_field).unwrap();
 
-        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_0,
+        );
 
         assert!(result, "Should use dictionary encode based on size");
     }
@@ -5693,8 +5711,63 @@ mod tests {
             arrow_schema::Field::new("test", DataType::Int32, false).with_metadata(metadata);
         let field = LanceField::try_from(&arrow_field).unwrap();
 
-        let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field);
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_0,
+        );
 
         assert!(!result, "Should not use dictionary encode based on size");
+    }
+
+    #[test]
+    fn test_64bit_dict_encoding_requires_v2_2() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use crate::statistics::Stat;
+        use lance_core::datatypes::Field as LanceField;
+
+        // Create a 64-bit fixed width block with low cardinality
+        let block_info = BlockInfo::default();
+        let cardinality_array = Arc::new(UInt64Array::from(vec![10u64]));
+        block_info
+            .0
+            .write()
+            .unwrap()
+            .insert(Stat::Cardinality, cardinality_array);
+
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: crate::buffer::LanceBuffer::from(vec![0u8; 1000 * 8]),
+            num_values: 1000,
+            block_info,
+        });
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::UInt64, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        // Should NOT use dict encoding with version < 2.2
+        let result_v2_1 = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_1,
+        );
+        assert!(
+            !result_v2_1,
+            "Should not use dictionary encode for 64-bit data with version 2.1"
+        );
+
+        // Should use dict encoding with version >= 2.2
+        let result_v2_2 = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_2,
+        );
+        assert!(
+            result_v2_2,
+            "Should use dictionary encode for 64-bit data with version 2.2"
+        );
     }
 }
