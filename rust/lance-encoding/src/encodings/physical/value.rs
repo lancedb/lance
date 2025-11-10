@@ -891,7 +891,7 @@ pub(crate) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_u64_dictionary_encoding() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         let values: Vec<u64> = (0..100).collect();
         let repeated_values: Vec<_> = values
             .iter()

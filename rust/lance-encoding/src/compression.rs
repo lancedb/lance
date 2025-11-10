@@ -129,6 +129,9 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>>;
+
+    /// Get the file version used for compression decisions
+    fn version(&self) -> LanceFileVersion;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -604,6 +607,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn version(&self) -> LanceFileVersion {
+        self.version
     }
 }
 
