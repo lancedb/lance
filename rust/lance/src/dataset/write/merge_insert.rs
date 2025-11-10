@@ -1862,16 +1862,37 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         self.attempt_count.fetch_add(1, Ordering::SeqCst);
 
         // We need to get a fresh stream for each retry attempt
-        // The source_iter provides unlimited streams from the same source data
-        // First, use a stream to compute the source primary key filter
-        let pk_stream = self.source_iter.lock().unwrap().next().unwrap();
-        let pk_filter = compute_pk_filter_from_stream(pk_stream, &self.job.params.on).await?;
-
-        // Then, get another fresh stream to run the actual merge
-        let stream = self.source_iter.lock().unwrap().next().unwrap();
+        // The source_iter provides unlimited streams from the same source data when retries are enabled.
+        // If conflict_retries == 0 then only a single stream is available; skip PK filter precompute.
         let mut job = self.job.clone();
-        job.primary_key_filter = Some(pk_filter);
-        job.execute_uncommitted_impl(stream).await
+        if job.params.conflict_retries > 0 {
+            // First, use a stream to compute the source primary key filter
+            let pk_stream = self
+                .source_iter
+                .lock()
+                .unwrap()
+                .next()
+                .expect("source stream exhausted while computing PK filter");
+            let pk_filter = compute_pk_filter_from_stream(pk_stream, &job.params.on).await?;
+            job.primary_key_filter = Some(pk_filter);
+            // Then, get another fresh stream to run the actual merge
+            let stream = self
+                .source_iter
+                .lock()
+                .unwrap()
+                .next()
+                .expect("source stream exhausted while executing merge");
+            job.execute_uncommitted_impl(stream).await
+        } else {
+            // No retries requested: consume the single stream and execute without PK filter pre-check
+            let stream = self
+                .source_iter
+                .lock()
+                .unwrap()
+                .next()
+                .expect("source stream exhausted");
+            job.execute_uncommitted_impl(stream).await
+        }
     }
 
     async fn commit(&self, dataset: Arc<Dataset>, mut data: Self::Data) -> Result<Self::Result> {
