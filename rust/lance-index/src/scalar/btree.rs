@@ -29,6 +29,7 @@ use arrow_arith::numeric::add;
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
@@ -58,6 +59,7 @@ use lance_datafusion::{
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
 use object_store::path::Path;
+use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
@@ -694,23 +696,121 @@ impl BTreeLookup {
 struct LazyIndexReader {
     index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
     store: Arc<dyn IndexStore>,
+    ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
 }
 
 impl LazyIndexReader {
-    fn new(store: Arc<dyn IndexStore>) -> Self {
+    fn new(
+        store: Arc<dyn IndexStore>,
+        ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
+    ) -> Self {
         Self {
             index_reader: Arc::new(tokio::sync::Mutex::new(None)),
             store,
+            ranges_to_files,
         }
     }
 
     async fn get(&self) -> Result<Arc<dyn IndexReader>> {
         let mut reader = self.index_reader.lock().await;
         if reader.is_none() {
-            let index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+            let index_reader = if let Some(ranges_to_files) = &self.ranges_to_files {
+                Arc::new(LazyRangedIndexReader::new(
+                    self.store.clone(),
+                    ranges_to_files.clone(),
+                ))
+            } else {
+                self.store.open_index_file(BTREE_PAGES_NAME).await?
+            };
             *reader = Some(index_reader);
         }
         Ok(reader.as_ref().unwrap().clone())
+    }
+}
+
+/// Index reader to dispatch page query to corresponding ranged page-files.
+struct LazyRangedIndexReader {
+    #[allow(clippy::type_complexity)]
+    readers: Arc<DashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>,
+    store: Arc<dyn IndexStore>,
+    // for each range, we store the corresponding file name and start offset
+    ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
+}
+
+impl LazyRangedIndexReader {
+    fn new(
+        store: Arc<dyn IndexStore>,
+        ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
+    ) -> Self {
+        Self {
+            readers: Arc::new(DashMap::new()),
+            store,
+            ranges_to_files,
+        }
+    }
+
+    async fn get_reader(&self, file_name: &str) -> Result<Arc<dyn IndexReader>> {
+        let reader_cell = {
+            let guard = self
+                .readers
+                .entry(file_name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
+
+            Arc::clone(&*guard)
+        };
+        let reader = reader_cell
+            .get_or_try_init(|| async { self.store.open_index_file(file_name).await })
+            .await?;
+        Ok(reader.clone())
+    }
+
+    async fn get_reader_and_inner_offset(
+        &self,
+        page_idx: u32,
+    ) -> Result<(Arc<dyn IndexReader>, u32)> {
+        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).unwrap_or_else(|| {
+            panic!("Unexpected page index, index {} is out of range.", page_idx)
+        });
+        let reader = self.get_reader(page_file_name).await?;
+        Ok((reader.clone(), page_idx - *offset))
+    }
+}
+
+#[async_trait]
+impl IndexReader for LazyRangedIndexReader {
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+        let (reader, inner_offset) = self.get_reader_and_inner_offset(n as u32).await?;
+        reader
+            .read_record_batch(inner_offset as u64, batch_size)
+            .await
+    }
+
+    async fn read_range(
+        &self,
+        _range: std::ops::Range<usize>,
+        _projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("Read range is not implemented for lazy page file reader.");
+    }
+
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        let mut total_batches = 0;
+        for (_, (file_name, _)) in self.ranges_to_files.iter() {
+            let reader = self
+                .get_reader(file_name)
+                .await
+                .unwrap_or_else(|_| panic!("Cannot open page file {}.", file_name));
+            total_batches += reader.as_ref().num_batches(batch_size).await;
+        }
+        total_batches
+    }
+
+    fn num_rows(&self) -> usize {
+        unimplemented!("only async functions are available for lazy page index reader.");
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        unimplemented!("only async functions are available for lazy page index reader.");
     }
 }
 
@@ -763,6 +863,7 @@ pub struct BTreeIndex {
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
+    ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
@@ -783,6 +884,7 @@ impl BTreeIndex {
         index_cache: WeakLanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
+        ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
@@ -792,6 +894,7 @@ impl BTreeIndex {
             index_cache,
             sub_index,
             batch_size,
+            ranges_to_files,
             frag_reuse_index,
         }
     }
@@ -857,6 +960,7 @@ impl BTreeIndex {
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
         batch_size: u64,
+        ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
@@ -872,6 +976,7 @@ impl BTreeIndex {
                 WeakLanceCache::from(index_cache),
                 sub_index,
                 batch_size,
+                ranges_to_files,
                 frag_reuse_index,
             ));
         }
@@ -922,6 +1027,7 @@ impl BTreeIndex {
             WeakLanceCache::from(index_cache),
             sub_index,
             batch_size,
+            ranges_to_files,
             frag_reuse_index,
         ))
     }
@@ -942,18 +1048,49 @@ impl BTreeIndex {
             .get(BATCH_SIZE_META_KEY)
             .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
             .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+
+        let range_partitioned = file_schema
+            .metadata
+            .get(RANGE_PARTITIONED_META_KEY)
+            .map(|bs| bs.parse().unwrap_or(DEFAULT_RANGE_PARTITIONED))
+            .unwrap_or(DEFAULT_RANGE_PARTITIONED);
+        let ranges_to_files = if range_partitioned {
+            let part_sizes_str = file_schema
+            .metadata
+            .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
+            .expect("Range-partitioned Btree lookup file must have page-number-per-range-file metadata!");
+            let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
+            let mut offset: u32 = 0;
+
+            let range_map = part_sizes_vec
+                .into_iter()
+                .map(|(id, size)| {
+                    let range = offset..=(offset + size - 1);
+                    let file_with_size = (format!("part_{}_page_data.lance", id), offset);
+                    offset += size;
+                    (range, file_with_size)
+                })
+                .collect();
+
+            Some(Arc::new(range_map))
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
             store,
             index_cache,
             batch_size,
+            ranges_to_files,
             frag_reuse_index,
         )?))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
-        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let reader = lazy_reader.get().await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
         let row_id_field = schema.field(1).clone().with_name(ROW_ID);
@@ -1071,15 +1208,12 @@ impl Index for BTreeIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let index_reader = LazyIndexReader::new(self.store.clone());
+        let index_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = index_reader.get().await?;
-        let num_rows = reader.num_rows();
-        let batch_size = self.batch_size as usize;
-        let num_pages = num_rows.div_ceil(batch_size);
+        let num_pages = reader.num_batches(self.batch_size).await;
         let mut pages = stream::iter(0..num_pages)
             .map(|page_idx| {
                 let index_reader = index_reader.clone();
-                let page_idx = page_idx as u32;
                 async move {
                     let page = self
                         .read_page(page_idx, index_reader, &NoOpMetricsCollector)
@@ -1137,7 +1271,8 @@ impl Index for BTreeIndex {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = RoaringBitmap::default();
 
-        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let sub_index_reader = lazy_reader.get().await?;
         let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
             .await
             .buffered(self.store.io_parallelism());
@@ -1174,7 +1309,9 @@ impl ScalarIndex for BTreeIndex {
             )),
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
-        let lazy_index_reader = LazyIndexReader::new(self.store.clone());
+
+        let lazy_index_reader =
+            LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
@@ -1206,7 +1343,8 @@ impl ScalarIndex for BTreeIndex {
             .new_index_file(BTREE_PAGES_NAME, self.sub_index.schema().clone())
             .await?;
 
-        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let sub_index_reader = lazy_reader.get().await?;
         let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
             .await
             .buffered(self.store.io_parallelism());
@@ -1217,10 +1355,31 @@ impl ScalarIndex for BTreeIndex {
 
         sub_index_file.finish().await?;
 
-        // Copy the lookup file as-is
-        self.store
-            .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
-            .await?;
+        // Copy the lookup file as-is if not range-partitioned
+        if self.ranges_to_files.is_none() {
+            self.store
+                .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
+                .await?;
+        } else {
+            // else we should remove range-partition configuration options
+            let lookup_file = self.store.open_index_file(BTREE_LOOKUP_NAME).await?;
+            let mut lookup_schema = lookup_file.schema().clone();
+            lookup_schema
+                .metadata
+                .retain(|key, _| key == BATCH_SIZE_META_KEY);
+
+            let mut target_lookup_file = dest_store
+                .new_index_file(BTREE_LOOKUP_NAME, Arc::new(Schema::from(&lookup_schema)))
+                .await?;
+            let mut reader_stream = IndexReaderStream::new(lookup_file, self.batch_size)
+                .await
+                .buffered(self.store.io_parallelism());
+            while let Some(batch) = reader_stream.try_next().await? {
+                target_lookup_file.write_record_batch(batch).await?;
+            }
+
+            target_lookup_file.finish().await?;
+        }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1647,10 +1806,11 @@ async fn merge_range_partitioned_lookups(
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
 
-    let mut rows_per_file: Vec<u32> = Vec::with_capacity(sorted_part_lookup_files.len());
+    // stores partition id and page num
+    let mut rows_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
     let mut num_rows_written = 0u32;
 
-    for part_lookup_file in sorted_part_lookup_files {
+    for (part_id, part_lookup_file) in sorted_part_lookup_files {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
         let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
         let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
@@ -1659,7 +1819,7 @@ async fn merge_range_partitioned_lookups(
             let modified_batch = add_offset_to_page_idx(&original_batch, num_rows_written)?;
             lookup_file.write_record_batch(modified_batch).await?;
         }
-        rows_per_file.push(lookup_reader.num_rows() as u32);
+        rows_per_file.push((part_id, lookup_reader.num_rows() as u32));
         num_rows_written += lookup_reader.num_rows() as u32;
     }
 
@@ -1867,8 +2027,8 @@ async fn merge_pages(
     Ok(lookup_entries)
 }
 
-// Sorts file paths by partition ID extracted from file name.
-fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<String>> {
+// Sorts file paths by the partition ID extracted from file name.
+fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<(u64, String)>> {
     let mut files_with_ids: Vec<(u64, &String)> = part_files
         .iter()
         .map(|file| extract_partition_id(file).map(|id| (id, file)))
@@ -1878,7 +2038,7 @@ fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<String>> {
 
     let sorted_files = files_with_ids
         .into_iter()
-        .map(|(_, file)| file.clone())
+        .map(|(id, file)| (id, file.clone()))
         .collect();
 
     Ok(sorted_files)
@@ -2190,7 +2350,6 @@ mod tests {
     use lance_io::object_store::ObjectStore;
 
     use crate::metrics::LocalMetricsCollector;
-    use crate::scalar::btree::BTREE_LOOKUP_NAME;
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
@@ -3115,12 +3274,14 @@ mod tests {
         .unwrap();
 
         // Method 2: Build range-based index using the same data split into ranges
-        // Create range 1 index - first half of the data (0 to 2 * DEFAULT_BTREE_BATCH_SIZE - 1)
-        let half_count = 2 * DEFAULT_BTREE_BATCH_SIZE;
+        // Create range 1 index, intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
         let range1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_stream(RowCount::from(half_count / 2), BatchCount::from(2));
+            .into_df_stream(
+                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
+                BatchCount::from(5),
+            );
         let range1_data_source = Box::pin(RecordBatchStreamAdapter::new(
             range1_gen.schema(),
             range1_gen,
@@ -3137,15 +3298,18 @@ mod tests {
         .await
         .unwrap();
 
-        // Create range 2 index - second half of the data (2 * DEFAULT_BTREE_BATCH_SIZE to 4 * DEFAULT_BTREE_BATCH_SIZE - 1)
-        let start_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        // Create range 2 index, also intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        let start_val = (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
         let end_val = (4 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let values_second_half: Vec<i32> = (start_val..end_val).collect();
         let row_ids_second_half: Vec<u64> = (start_val as u64..end_val as u64).collect();
         let range2_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_second_half))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
-            .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
+            .into_df_stream(
+                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
+                BatchCount::from(3),
+            );
         let range2_data_source = Box::pin(RecordBatchStreamAdapter::new(
             range2_gen.schema(),
             range2_gen,
@@ -3182,23 +3346,345 @@ mod tests {
         .await
         .unwrap();
 
-        let full_lookup_reader = full_store.open_index_file(BTREE_LOOKUP_NAME).await.unwrap();
-        let range_lookup_reader = range_store
-            .open_index_file(BTREE_LOOKUP_NAME)
+        let full_index = BTreeIndex::load(full_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let ranged_index = BTreeIndex::load(range_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Equality Tests
+
+        // Test 1: Query for value 0
+        let query_0 = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
+        let full_result_0 = full_index
+            .search(&query_0, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_0 = ranged_index
+            .search(&query_0, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(full_result_0, ranged_result_0, "Query for value 0 failed");
+
+        // Test 2: Query for value in middle of first batch (should be in first page)
+        let mid_first_batch = (DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let query_mid_first = SargableQuery::Equals(ScalarValue::Int32(Some(mid_first_batch)));
+        let full_result_mid_first = full_index
+            .search(&query_mid_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_mid_first = ranged_index
+            .search(&query_mid_first, &NoOpMetricsCollector)
             .await
             .unwrap();
         assert_eq!(
-            full_lookup_reader.num_rows(),
-            range_lookup_reader.num_rows()
+            full_result_mid_first, ranged_result_mid_first,
+            "Query for value {} failed",
+            mid_first_batch
         );
-        let full_lookup_batch = range_lookup_reader
-            .read_record_batch(0, DEFAULT_BTREE_BATCH_SIZE)
+
+        // Test 3: Query for value in the last batch (should be in the second range file)
+        let mid_last_batch = (DEFAULT_BTREE_BATCH_SIZE * 3 + (DEFAULT_BTREE_BATCH_SIZE / 2)) as i32;
+        let query_mid_last = SargableQuery::Equals(ScalarValue::Int32(Some(mid_last_batch)));
+        let full_result_mid_last = full_index
+            .search(&query_mid_last, &NoOpMetricsCollector)
             .await
             .unwrap();
-        let range_lookup_batch = range_lookup_reader
-            .read_record_batch(0, DEFAULT_BTREE_BATCH_SIZE)
+        let ranged_result_mid_last = ranged_index
+            .search(&query_mid_last, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(full_lookup_batch, range_lookup_batch);
+        assert_eq!(
+            full_result_mid_last, ranged_result_mid_last,
+            "Query for value {} failed",
+            mid_last_batch
+        );
+
+        // Test 4: Query upper bound.
+        let max_val = (4 * DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
+        let query_max = SargableQuery::Equals(ScalarValue::Int32(Some(max_val)));
+        let full_result_max = full_index
+            .search(&query_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_max = ranged_index
+            .search(&query_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_max, ranged_result_max,
+            "Query for maximum value {} failed",
+            max_val
+        );
+
+        // Test 5: Query first value of the second page file.
+        let second_first_val = (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let query_second_first = SargableQuery::Equals(ScalarValue::Int32(Some(second_first_val)));
+        let full_result_second_first = full_index
+            .search(&query_second_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_second_first = ranged_index
+            .search(&query_second_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_second_first, ranged_result_second_first,
+            "Query for first value of the second page file {} failed",
+            second_first_val
+        );
+
+        // Test 6: Query value below the minimum
+        let query_below_min = SargableQuery::Equals(ScalarValue::Int32(Some(-1)));
+        let full_result_below = full_index
+            .search(&query_below_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_below = ranged_index
+            .search(&query_below_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_below, ranged_result_below,
+            "Query for value below minimum (-1) failed"
+        );
+
+        // Test 7: Query value above the maximum
+        let query_above_max = SargableQuery::Equals(ScalarValue::Int32(Some(max_val + 1)));
+        let full_result_above = full_index
+            .search(&query_above_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_above = ranged_index
+            .search(&query_above_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_above,
+            ranged_result_above,
+            "Query for value above maximum ({}) failed",
+            max_val + 1
+        );
+
+        // Range Tests
+
+        // Test 8: Cross-range query: One range including different values from adjacent range files.
+        let range_start =
+            (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2 - 100) as i32;
+        let range_end = range_start + 200;
+        let query_cross_range = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(range_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(range_end))),
+        );
+        let full_result_cross = full_index
+            .search(&query_cross_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_cross = ranged_index
+            .search(&query_cross_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_cross, ranged_result_cross,
+            "Cross-range range query [{}, {}] failed",
+            range_start, range_end
+        );
+
+        // Test 9 Test simple range within a single page file
+        let single_range_start = (DEFAULT_BTREE_BATCH_SIZE * 4 - 300) as i32;
+        let single_range_end = single_range_start + 200;
+        let query_single_range = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(single_range_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(single_range_end))),
+        );
+        let full_result_single = full_index
+            .search(&query_single_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_single = ranged_index
+            .search(&query_single_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_single, ranged_result_single,
+            "Single range query [{}, {}] failed",
+            single_range_start, single_range_end
+        );
+
+        // Test 10: Large range query spanning almost all values
+        let large_range_start = 100_i32;
+        let large_range_end = (DEFAULT_BTREE_BATCH_SIZE * 4 - 100) as i32;
+        let query_large_range = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(large_range_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(large_range_end))),
+        );
+        let full_result_single = full_index
+            .search(&query_large_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ranged_result_single = ranged_index
+            .search(&query_large_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_single, ranged_result_single,
+            "Single fragment range query [{}, {}] failed",
+            large_range_start, large_range_end
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_ranged_index() {
+        // Setup stores for both indexes
+        let old_tmpdir = TempObjDir::default();
+        let old_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            old_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let new_tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
+
+        // Create range 1 index, intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        let range1_gen = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(
+                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
+                BatchCount::from(5),
+            );
+        let range1_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            range1_gen.schema(),
+            range1_gen,
+        ));
+
+        train_btree_index(
+            range1_data_source,
+            &sub_index_trainer,
+            old_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            Option::from(1u32),
+        )
+        .await
+        .unwrap();
+
+        // Create range 2 index, also intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        let start_val = (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let end_val = (4 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let values_second_half: Vec<i32> = (start_val..end_val).collect();
+        let row_ids_second_half: Vec<u64> = (start_val as u64..end_val as u64).collect();
+        let range2_gen = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values_second_half))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
+            .into_df_stream(
+                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
+                BatchCount::from(3),
+            );
+        let range2_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            range2_gen.schema(),
+            range2_gen,
+        ));
+
+        train_btree_index(
+            range2_data_source,
+            &sub_index_trainer,
+            old_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            Option::from(2u32),
+        )
+        .await
+        .unwrap();
+
+        // Merge the fragment files
+        let part_page_files = vec![
+            part_page_data_file_path(1 << 32),
+            part_page_data_file_path(2 << 32),
+        ];
+
+        let part_lookup_files = vec![
+            part_lookup_file_path(1 << 32),
+            part_lookup_file_path(2 << 32),
+        ];
+
+        super::merge_metadata_files(
+            old_store.clone(),
+            &part_page_files,
+            &part_lookup_files,
+            Option::from(1usize),
+        )
+        .await
+        .unwrap();
+
+        // create some update data
+        let start_val = (DEFAULT_BTREE_BATCH_SIZE * 2) as i32;
+        let end_val = (DEFAULT_BTREE_BATCH_SIZE * 3) as i32;
+        let row_id_delta = (DEFAULT_BTREE_BATCH_SIZE * 3) as i32;
+        let values: Vec<i32> = (start_val..end_val).collect();
+        let row_ids: Vec<u64> =
+            ((start_val + row_id_delta) as u64..(end_val + row_id_delta) as u64).collect();
+        let update_data = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids))
+            .into_df_stream(
+                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
+                BatchCount::from(2),
+            );
+        let update_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            update_data.schema(),
+            update_data,
+        ));
+
+        let ranged_index = BTreeIndex::load(old_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // update the ranged index
+        ranged_index
+            .update(update_data_source, new_store.as_ref())
+            .await
+            .expect("Error in updating ranged index");
+
+        let updated_index = BTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            false,
+            updated_index.ranges_to_files.is_some(),
+            "Updated ranged-btree-index should fall back to non-ranged"
+        );
+        let updated_value = (DEFAULT_BTREE_BATCH_SIZE * 2 + (DEFAULT_BTREE_BATCH_SIZE / 2)) as i32;
+        let updated_query = SargableQuery::Equals(ScalarValue::Int32(Some(updated_value)));
+
+        let query_result = updated_index
+            .search(&updated_query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        match query_result {
+            SearchResult::Exact(row_id_map) => {
+                assert!(
+                    row_id_map.contains(updated_value as u64),
+                    "Updated index should contain original rowids."
+                );
+                assert!(
+                    row_id_map.contains((updated_value + row_id_delta) as u64),
+                    "Updated index should contain new rowids"
+                );
+            }
+            _ => {
+                panic!("Btree search result should always be Exact.");
+            }
+        }
     }
 }
