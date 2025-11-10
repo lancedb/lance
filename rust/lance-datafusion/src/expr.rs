@@ -117,34 +117,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             // See above warning about lossy float conversion
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
-            // Convert integer to decimal by multiplying by 10^scale
-            DataType::Decimal128(precision, scale) => val.map(|v| {
-                let scaled_value = (v as i128) * 10_i128.pow(*scale as u32);
-                ScalarValue::Decimal128(Some(scaled_value), *precision, *scale)
-            }),
-            DataType::Decimal256(precision, scale) => val.and_then(|v| {
-                // Convert i64 to i256 and scale
-                // First compute the scale factor as i128, then build i256
-                let scale_factor = 10_i128.pow(*scale as u32);
-                // Convert the integer value to i256 and multiply by scale factor
-                let v_i256 = i256::from(v);
-                // Convert i128 to i256 by converting to/from bytes
-                let scale_bytes = scale_factor.to_le_bytes();
-                let mut i256_bytes = [0u8; 32];
-                // Copy the i128 bytes into the lower 16 bytes of i256
-                i256_bytes[..16].copy_from_slice(&scale_bytes);
-                // Sign extend if negative
-                if scale_factor < 0 {
-                    i256_bytes[16..].fill(0xFF);
-                }
-                let scale_i256 = i256::from_le_bytes(i256_bytes);
-                let scaled_value = v_i256 * scale_i256;
-                Some(ScalarValue::Decimal256(
-                    Some(scaled_value),
-                    *precision,
-                    *scale,
-                ))
-            }),
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
             _ => None,
         },
         ScalarValue::UInt8(val) => match ty {
