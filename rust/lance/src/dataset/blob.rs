@@ -226,6 +226,7 @@ mod tests {
     use arrow_array::RecordBatch;
     use futures::TryStreamExt;
     use lance_arrow::DataTypeExt;
+    use lance_io::stream::RecordBatchStream;
 
     use lance_core::{Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
