@@ -220,27 +220,33 @@ pub(super) async fn take_blobs(
 mod tests {
     use std::sync::Arc;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
     use futures::TryStreamExt;
     use lance_arrow::DataTypeExt;
-    use lance_io::stream::RecordBatchStream;
 
-    use lance_core::{utils::tempfile::TempStrDir, Error, Result};
+    use lance_core::{Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
 
     use crate::{utils::test::TestDatasetGenerator, Dataset};
 
     struct BlobTestFixture {
-        _test_dir: TempStrDir,
         dataset: Arc<Dataset>,
         data: Vec<RecordBatch>,
     }
 
+    fn next_memory_uri() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("memory://blob-tests/{id}")
+    }
+
     impl BlobTestFixture {
         async fn new() -> Self {
-            let test_dir = TempStrDir::default();
+            let uri = next_memory_uri();
 
             let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
@@ -252,12 +258,11 @@ mod tests {
 
             let dataset = Arc::new(
                 TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
-                    .make_hostile(&test_dir)
+                    .make_hostile(&uri)
                     .await,
             );
 
             Self {
-                _test_dir: test_dir,
                 dataset,
                 data,
             }
