@@ -262,10 +262,7 @@ mod tests {
                     .await,
             );
 
-            Self {
-                dataset,
-                data,
-            }
+            Self { dataset, data }
         }
     }
 
