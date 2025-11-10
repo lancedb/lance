@@ -1756,8 +1756,10 @@ async fn compute_pk_filter_from_stream(
     mut stream: SendableRecordBatchStream,
     on_cols: &[String],
 ) -> Result<crate::dataset::conflict_detection::PrimaryKeyFilterModel> {
-    use crate::dataset::conflict_detection::{PrimaryKeyBloomFilter, PrimaryKeyValue, PrimaryKeyFilterModel};
-    use arrow_array::{StringArray, LargeStringArray, BinaryArray, LargeBinaryArray};
+    use crate::dataset::conflict_detection::{
+        PrimaryKeyBloomFilter, PrimaryKeyFilterModel, PrimaryKeyValue,
+    };
+    use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
     use arrow_schema::DataType;
 
     let mut bloom = PrimaryKeyBloomFilter::new(on_cols.to_vec());
@@ -1768,10 +1770,12 @@ async fn compute_pk_filter_from_stream(
         // Precompute ON column indices and types
         let mut col_info: Vec<(usize, DataType)> = Vec::with_capacity(on_cols.len());
         for name in on_cols.iter() {
-            let idx = batch
-                .schema()
-                .index_of(name)
-                .map_err(|e| Error::invalid_input(format!("ON column '{}' not found: {}", name, e), location!()))?;
+            let idx = batch.schema().index_of(name).map_err(|e| {
+                Error::invalid_input(
+                    format!("ON column '{}' not found: {}", name, e),
+                    location!(),
+                )
+            })?;
             let dt = batch.column(idx).data_type().clone();
             col_info.push((idx, dt));
         }
@@ -4294,10 +4298,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_pk_filter_roundtrip() {
+        use crate::io::commit::read_transaction_file;
         use arrow_array::{RecordBatch, UInt32Array};
         use arrow_schema::{DataType, Field, Schema};
         use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-        use crate::io::commit::read_transaction_file;
 
         // Create dataset
         let schema = Arc::new(Schema::new(vec![
@@ -4332,21 +4336,22 @@ mod tests {
             futures::stream::iter(vec![Ok(new_batch)]),
         );
 
-        let UncommittedMergeInsert { transaction, .. } = MergeInsertBuilder::try_new(
-            dataset.clone(),
-            vec!["id".to_string()],
-        )
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .try_build()
-        .unwrap()
-        .execute_uncommitted(stream)
-        .await
-        .unwrap();
+        let UncommittedMergeInsert { transaction, .. } =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(stream)
+                .await
+                .unwrap();
 
         // Commit and read back transaction file
-        let committed = CommitBuilder::new(dataset.clone()).execute(transaction).await.unwrap();
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .unwrap();
         let tx_path = committed.manifest().transaction_file.clone().unwrap();
         let tx_read = read_transaction_file(dataset.object_store(), &dataset.base, &tx_path)
             .await
@@ -4402,12 +4407,18 @@ mod tests {
         // Both jobs update/insert the same key 2
         let batch1 = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt32Array::from(vec![2])), Arc::new(UInt32Array::from(vec![1]))],
+            vec![
+                Arc::new(UInt32Array::from(vec![2])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
         )
         .unwrap();
         let batch2 = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt32Array::from(vec![2])), Arc::new(UInt32Array::from(vec![1]))],
+            vec![
+                Arc::new(UInt32Array::from(vec![2])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
         )
         .unwrap();
 

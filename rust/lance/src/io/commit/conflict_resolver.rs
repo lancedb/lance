@@ -965,15 +965,19 @@ impl<'a> TransactionRebase<'a> {
                     | Operation::Delete { .. }
                     | Operation::Rewrite { .. }
                     | Operation::Merge { .. }
-                    | Operation::DataReplacement { .. } => {
-                        Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
-                    }
+                    | Operation::DataReplacement { .. } => Err(self.retryable_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    )),
                     Operation::Overwrite { .. }
                     | Operation::Restore { .. }
                     | Operation::Project { .. }
-                    | Operation::UpdateMemWalState { .. } => {
-                        Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
-                    }
+                    | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    )),
                 }
             }
         }

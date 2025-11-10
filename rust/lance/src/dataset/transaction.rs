@@ -46,6 +46,7 @@
 //!
 
 use super::ManifestWriteConfig;
+use crate::dataset::conflict_detection::PrimaryKeyFilterModel;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -76,7 +77,6 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
-use crate::dataset::conflict_detection::PrimaryKeyFilterModel;
 
 /// A change to a dataset that can be retried
 ///
@@ -3321,10 +3321,7 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-            primary_key_filter: value
-                .primary_key_filter
-                .as_ref()
-                .map(|m| m.to_pb()),
+            primary_key_filter: value.primary_key_filter.as_ref().map(|m| m.to_pb()),
         }
     }
 }
