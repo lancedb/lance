@@ -1099,13 +1099,25 @@ mod tests {
         }
     }
 
-    async fn test_remap(params: VectorIndexParams, nlist: usize) {
+    async fn test_remap(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         match params.metric_type {
             DistanceType::Hamming => {
-                Box::pin(test_remap_impl::<UInt8Type>(params, nlist, 0..4)).await;
+                Box::pin(test_remap_impl::<UInt8Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0..4,
+                ))
+                .await;
             }
             _ => {
-                Box::pin(test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0)).await;
+                Box::pin(test_remap_impl::<Float32Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                ))
+                .await;
             }
         }
     }
@@ -1113,10 +1125,12 @@ mod tests {
     async fn test_remap_impl<T: ArrowPrimitiveType>(
         params: VectorIndexParams,
         nlist: usize,
+        recall_requirement: f32,
         range: Range<T::Native>,
     ) where
         T::Native: SampleUniform,
     {
+        // let recall_requirement = recall_requirement * 0.99;
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
@@ -1179,7 +1193,8 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
-        assert_ge!(recall, 0.7, "{}", recall);
+        // 100 can't be exactly expressed as a float, so we need to use a tolerance
+        assert_ge!(recall, recall_requirement - f32::EPSILON, "{}", recall);
 
         // delete so that only one row left, to trigger remap and there must be some empty partitions
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
@@ -1302,7 +1317,7 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_remap(params.clone(), nlist).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
         test_delete_all_rows(params).await;
     }
 
@@ -1326,7 +1341,7 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -1350,7 +1365,7 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_remap(params.clone(), nlist).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
         test_delete_all_rows(params).await;
     }
 
@@ -1371,7 +1386,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -1391,7 +1406,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     // RQ doesn't perform well for random data
@@ -1418,7 +1433,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params.clone(), nlist).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -1438,7 +1453,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -1466,7 +1481,7 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_delete_all_rows(params.clone()).await;
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -1492,7 +1507,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params, nlist).await;
+        test_remap(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
