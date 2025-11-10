@@ -41,7 +41,6 @@ from lance.log import LOGGER
 
 from .blob import BlobFile
 from .dependencies import (
-    _check_for_hugging_face,
     _check_for_numpy,
     torch,
 )
@@ -5258,15 +5257,6 @@ def write_dataset(
             data_storage_version = "legacy"
         else:
             data_storage_version = "stable"
-
-    if _check_for_hugging_face(data_obj):
-        # Huggingface datasets
-        from .dependencies import datasets
-
-        if isinstance(data_obj, datasets.Dataset):
-            if schema is None:
-                schema = data_obj.features.arrow_schema
-            data_obj = data_obj.data.to_batches()
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
