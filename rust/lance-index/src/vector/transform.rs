@@ -135,8 +135,11 @@ impl Transformer for KeepFiniteVectors {
         data.iter().enumerate().for_each(|(idx, arr)| {
             if let Some(data) = arr {
                 let is_valid = match data.data_type() {
+                    // f16 vectors are computed in f32 space, so they will not overflow.
                     DataType::Float16 => is_all_finite::<Float16Type>(&data),
+                    // f32 vectors must be bounded to avoid overflow in distance computation.
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
+                    // f32 vectors are computed in f32 space, so they have the same limit as f64.
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
                     DataType::UInt8 => data.null_count() == 0,
                     DataType::Int8 => data.null_count() == 0,
@@ -240,6 +243,7 @@ mod tests {
     use arrow_schema::Schema;
     use half::f16;
     use lance_arrow::*;
+    use lance_linalg::distance::L2;
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {
@@ -349,5 +353,45 @@ mod tests {
 
         let dup_drop_result = transformer.transform(&output);
         assert!(dup_drop_result.is_ok());
+    }
+
+    #[test]
+    fn test_is_all_finite() {
+        let array = Float32Array::from(vec![1.0, 2.0]);
+        assert!(is_all_finite::<Float32Type>(&array));
+
+        let failure_values = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        for &v in &failure_values {
+            let array = Float32Array::from(vec![1.0, v]);
+            assert!(
+                !is_all_finite::<Float32Type>(&array),
+                "value {} should fail is_all_finite",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_finite_f16() {
+        let v1 = vec![f16::MAX; 10_000];
+        let v2 = vec![f16::MAX - f16::from_f32_const(1.0); 10_000];
+        let distance = f16::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f32() {
+        let v1 = vec![f32::MAX; 10_000];
+        let v2 = vec![f32::MAX - 1.0; 10_000];
+        let distance = f32::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f64() {
+        let v1 = vec![f64::MAX; 10_000];
+        let v2 = vec![f64::MAX - 1.0; 10_000];
+        let distance = f64::l2(&v1, &v2);
+        assert!(distance.is_finite());
     }
 }

@@ -20,7 +20,7 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::cache::LanceCache;
+    use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
@@ -109,7 +109,7 @@ mod test {
             Ok(self.ret_val.clone())
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!("only for IVF")
         }
 
@@ -189,9 +189,9 @@ mod test {
         }
 
         let make_idx = move |assert_query: Vec<f32>, metric: MetricType| async move {
-            let f = tempfile::NamedTempFile::new().unwrap();
+            let f = TempStdFile::default();
 
-            let reader = LocalObjectReader::open_local_path(f.path(), 64, None)
+            let reader = LocalObjectReader::open_local_path(f, 64, None)
                 .await
                 .unwrap();
 
@@ -247,7 +247,7 @@ mod test {
         ] {
             let mut key = Arc::new(Float32Array::from(query)) as Arc<dyn Array>;
             if metric == MetricType::Cosine {
-                key = normalize_arrow(&key).unwrap();
+                key = normalize_arrow(&key).unwrap().0;
             };
             let q = Query {
                 column: "test".to_string(),
@@ -261,9 +261,10 @@ mod test {
                 refine_factor: None,
                 metric_type: metric,
                 use_index: true,
+                dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
-            let partition_ids = idx.find_partitions(&q).unwrap();
+            let (partition_ids, _) = idx.find_partitions(&q).unwrap();
             assert_eq!(partition_ids.len(), 4);
             let nearest_partition_id = partition_ids.value(0);
             idx.search_in_partition(

@@ -124,7 +124,7 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list().await?;
+        let tags = self.dataset.tags().list().await?;
         let tagged_versions: HashSet<u64> = tags
             .values()
             .map(|tag_content| tag_content.version)
@@ -295,7 +295,7 @@ impl<'a> CleanupTask<'a> {
 
         let old_manifests_stream = stream::iter(old_manifests)
             .map(|path| {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.as_ref());
                 Ok(path)
             })
             .boxed();
@@ -615,7 +615,7 @@ fn tagged_old_versions_cleanup_error(
 ) -> Error {
     let unreferenced_tags: HashMap<String, u64> = tags
         .iter()
-        .filter_map(|(k, &v)| {
+        .filter_map(|(k, v)| {
             if tagged_old_versions.contains(&v.version) {
                 Some((k.clone(), v.version))
             } else {
@@ -639,7 +639,7 @@ mod tests {
 
     use arrow_array::RecordBatchReader;
     use datafusion::common::assert_contains;
-    use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
@@ -647,6 +647,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
+    use mock_instant::thread_local::MockClock;
     use snafu::location;
 
     use super::*;
@@ -655,7 +656,7 @@ mod tests {
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
-    use tempfile::{tempdir, TempDir};
+    use lance_core::utils::tempfile::TempStrDir;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -666,8 +667,8 @@ mod tests {
     impl WrappingObjectStore for MockObjectStore {
         fn wrap(
             &self,
+            _storage_prefix: &str,
             original: Arc<dyn object_store::ObjectStore>,
-            _storage_options: Option<&std::collections::HashMap<String, String>>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }
@@ -718,25 +719,23 @@ mod tests {
         num_bytes: u64,
     }
 
-    struct MockDatasetFixture<'a> {
+    struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempDir,
+        _tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
-        pub clock: MockClock<'a>,
     }
 
-    impl MockDatasetFixture<'_> {
+    impl MockDatasetFixture {
         fn try_new() -> Result<Self> {
-            let tmpdir = tempdir()?;
-            // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
-            let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
+            let tmpdir = TempStrDir::default();
+            let tmpdir_path = tmpdir.as_str();
+            let dataset_path = format!("{}/my_db", tmpdir_path);
             Ok(Self {
                 _tmpdir: tmpdir,
-                dataset_path: format!("{}/my_db", tmpdir_path),
+                dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
-                clock: MockClock::new(),
             })
         }
 
@@ -948,9 +947,7 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
 
@@ -987,9 +984,7 @@ mod tests {
         // remain if they are still referenced by newer manifests
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.append_some_data().await.unwrap();
         fixture.append_some_data().await.unwrap();
 
@@ -1029,14 +1024,12 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
 
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
         let removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(20).unwrap())
@@ -1051,7 +1044,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         cleanup_error = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1060,7 +1053,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         let removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1080,15 +1073,13 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
-        dataset.tags.create("tag-latest", 3).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("tag-latest", 3).await.unwrap();
 
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
         let mut removed = fixture
             .run_cleanup_with_override(
@@ -1101,7 +1092,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1113,7 +1104,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed.old_versions, 1);
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1154,10 +1145,7 @@ mod tests {
         .unwrap();
 
         // Helper function to check that the number of files is correct.
-        async fn check_num_files<'a>(
-            fixture: &'a MockDatasetFixture<'a>,
-            num_expected_files: usize,
-        ) {
+        async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
             let file_count = fixture.count_files().await.unwrap();
 
             assert_eq!(file_count.num_data_files, num_expected_files);
@@ -1173,9 +1161,11 @@ mod tests {
         }
 
         // Fast forward so we are outside of the "older_than" window.
-        fixture
-            .clock
-            .set_system_time(cleanup_older_than + TimeDelta::minutes(1));
+        MockClock::set_system_time(
+            (cleanup_older_than + TimeDelta::minutes(1))
+                .to_std()
+                .unwrap(),
+        );
 
         // Write more files and check that those outside of the "older_than" window
         // are cleaned up.
@@ -1210,9 +1200,11 @@ mod tests {
         dataset.update_config(config_updates).await.unwrap();
 
         // Fast forward so we are outside of the new "older_than" window.
-        fixture
-            .clock
-            .set_system_time(cleanup_older_than + new_cleanup_older_than + TimeDelta::minutes(2));
+        MockClock::set_system_time(
+            (cleanup_older_than + new_cleanup_older_than + TimeDelta::minutes(2))
+                .to_std()
+                .unwrap(),
+        );
 
         fixture.overwrite_some_data().await.unwrap();
 
@@ -1226,9 +1218,7 @@ mod tests {
     async fn cleanup_recent_verified_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_seconds(1).unwrap());
+        MockClock::set_system_time(TimeDelta::try_seconds(1).unwrap().to_std().unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
@@ -1259,6 +1249,7 @@ mod tests {
             (None, true),         // Default, files are old - delete
             (None, false),        // Default, files are new - do not delete
         ] {
+            MockClock::set_system_time(std::time::Duration::from_secs(0));
             let mut fixture = MockDatasetFixture::try_new().unwrap();
             fixture.create_some_data().await.unwrap();
             fixture.block_commits();
@@ -1269,7 +1260,7 @@ mod tests {
             } else {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS - 1).unwrap()
             };
-            fixture.clock.set_system_time(age);
+            MockClock::set_system_time(age.to_std().unwrap());
 
             // The above created some unreferenced data files but, since they
             // are not referenced in any manifest, and 7 days has not passed, we
@@ -1307,9 +1298,7 @@ mod tests {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
@@ -1348,9 +1337,7 @@ mod tests {
         // This will keep some data from the appended file and should
         // completely remove the first file
         fixture.delete_data("filter_me < 20").await.unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.overwrite_data(data_gen.batch(16)).await.unwrap();
         // This will delete half of the last fragment
         fixture.delete_data("filter_me >= 40").await.unwrap();
@@ -1386,9 +1373,7 @@ mod tests {
         // by any fragment.  We need to make sure the cleanup routine
         // doesn't over-zealously delete these
         let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
 
@@ -1412,9 +1397,7 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
         // This append will fail since the commit is blocked but it should have
@@ -1451,9 +1434,7 @@ mod tests {
         // but the cleanup routine has no way of detecting this.  They should look
         // just like an in-progress write.
         let mut fixture = MockDatasetFixture::try_new().unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.create_some_data().await.unwrap();
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
@@ -1478,9 +1459,7 @@ mod tests {
         // prevent us from running cleanup again later.
         let mut fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture
-            .clock
-            .set_system_time(TimeDelta::try_days(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         // The delete operation should delete the first version and its
@@ -1530,9 +1509,7 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         let mut time = 10i64;
         for _ in 0..4 {
-            fixture
-                .clock
-                .set_system_time(TimeDelta::try_seconds(time).unwrap());
+            MockClock::set_system_time(TimeDelta::try_seconds(time).unwrap().to_std().unwrap());
             time += 10i64;
             fixture.overwrite_some_data().await.unwrap();
         }
@@ -1566,9 +1543,7 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         let mut time = 1i64;
         for _ in 0..4 {
-            fixture
-                .clock
-                .set_system_time(TimeDelta::try_days(time).unwrap());
+            MockClock::set_system_time(TimeDelta::try_days(time).unwrap().to_std().unwrap());
             time += 1i64;
             fixture.overwrite_some_data().await.unwrap();
         }

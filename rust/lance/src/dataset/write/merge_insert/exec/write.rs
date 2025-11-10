@@ -23,7 +23,9 @@ use roaring::RoaringTreemap;
 
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
-use crate::dataset::write::merge_insert::create_duplicate_row_error;
+use crate::dataset::write::merge_insert::{
+    create_duplicate_row_error, format_key_values_on_columns,
+};
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -119,6 +121,13 @@ impl MergeState {
             Action::Nothing => {
                 // Do nothing action - keep the row but don't count it
                 Ok(None)
+            }
+            Action::Fail => {
+                // Fail action - return an error to fail the operation
+                Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Merge insert failed: found matching row with key values: {}",
+                    format_key_values_on_columns(batch, row_idx, &self.on_columns)
+                )))
             }
         }
     }
@@ -484,7 +493,7 @@ impl FullSchemaMergeInsertExec {
 
         enum FragmentChange {
             Unchanged,
-            Modified(Fragment),
+            Modified(Box<Fragment>),
             Removed(u64),
         }
 
@@ -499,7 +508,7 @@ impl FullSchemaMergeInsertExec {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -514,7 +523,7 @@ impl FullSchemaMergeInsertExec {
         while let Some(res) = stream.next().await.transpose()? {
             match res {
                 FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
                 FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
             }
         }
@@ -691,6 +700,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     crate::dataset::WhenMatched::UpdateIf(condition) => {
                         format!("UpdateIf({})", condition)
                     }
+                    crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
@@ -765,6 +775,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         &self.properties
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+
     fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
         // We require a single partition for the merge operation to ensure all data is processed
         vec![datafusion_physical_expr::Distribution::SinglePartition]
@@ -812,17 +826,16 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
-            let write_result = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),
+                None, // Merge insert doesn't use target_bases
             )
             .await?;
-
-            let mut new_fragments = write_result.default.0;
 
             if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
                 let fragment_sizes = new_fragments
@@ -879,12 +892,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             // Step 5: Create and store the transaction
-            let transaction = Transaction::new(
-                dataset.manifest.version,
-                operation,
-                /*blobs_op=*/ None,
-                None,
-            );
+            let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {

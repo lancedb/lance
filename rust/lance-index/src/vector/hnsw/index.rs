@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -186,7 +186,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )
     }
 
-    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 

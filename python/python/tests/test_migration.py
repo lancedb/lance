@@ -7,6 +7,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
+from lance.file import stable_version
 
 
 def prep_dataset(tmp_path: Path, version, name: str):
@@ -35,7 +36,7 @@ def test_add_data_storage_version(tmp_path: Path):
         assert ds.data_storage_version == expected_version
 
     check_dataset("v1_no_files.lance", "0.1")
-    check_dataset("v2_no_files.lance", "2.0")
+    check_dataset("v2_no_files.lance", stable_version())
     check_dataset("v1_with_files.lance", "0.1")
     check_dataset("v2_with_files.lance", "2.0")
 
@@ -72,12 +73,15 @@ def test_old_btree_bitmap_indices(tmp_path: Path):
     """
     ds = prep_dataset(tmp_path, "v0.20.0", "old_btree_bitmap_indices.lance")
 
-    assert ds.to_table(filter="bitmap > 2") == pa.table(
-        {"bitmap": [3, 4], "btree": [3, 4]}
-    )
-    assert ds.to_table(filter="btree > 2") == pa.table(
-        {"bitmap": [3, 4], "btree": [3, 4]}
-    )
+    def query(filt: str):
+        table = ds.to_table(filter=filt)
+        assert table == pa.table({"bitmap": [3, 4], "btree": [3, 4]})
+
+        explain = ds.scanner(filter=filt).explain_plan()
+        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+
+    query("bitmap > 2")
+    query("btree > 2")
 
 
 def test_index_no_details(tmp_path: Path):

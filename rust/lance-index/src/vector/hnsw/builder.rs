@@ -171,7 +171,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let nodes = &self.nodes();
         for level in (0..self.max_level()).rev() {
@@ -256,7 +256,7 @@ impl HNSW {
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
         for i in 0..node_ids.len() {
             if let Some(ahead) = self.inner.params.prefetch_distance {
@@ -479,6 +479,7 @@ impl HnswBuilder {
                 ef: self.params.ef_construction,
                 lower_bound: None,
                 upper_bound: None,
+                dist_q_c: 0.0,
             },
             dist_calc,
             None,
@@ -556,6 +557,7 @@ pub struct HnswQueryParams {
     pub ef: usize,
     pub lower_bound: Option<f32>,
     pub upper_bound: Option<f32>,
+    pub dist_q_c: f32,
 }
 
 impl From<&Query> for HnswQueryParams {
@@ -565,6 +567,7 @@ impl From<&Query> for HnswQueryParams {
             ef: query.ef.unwrap_or(k + k / 2),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
+            dist_q_c: query.dist_q_c,
         }
     }
 }
@@ -745,7 +748,7 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::info!(
+        log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
@@ -753,6 +756,10 @@ impl IvfSubIndex for HNSW {
             hnsw.inner.params.ef_construction,
             storage.distance_type(),
         );
+
+        if storage.is_empty() {
+            return Ok(hnsw);
+        }
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
@@ -767,8 +774,14 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
-    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        unimplemented!("HNSW remap is not supported yet");
+    fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>, // we don't need the mapping here because we rebuild the graph from remapped storage
+        store: &impl VectorStore,
+    ) -> Result<Self> {
+        // We can't simply remap the row ids in the graph because the vectors are changed,
+        // so the graph needs to be rebuilt.
+        Self::index_vectors(store, self.inner.params.clone())
     }
 
     /// Encode the sub index into a record batch
@@ -900,6 +913,7 @@ mod tests {
             ef: 50,
             lower_bound: None,
             upper_bound: None,
+            dist_q_c: 0.0,
         };
         let builder_results = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())

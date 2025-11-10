@@ -7,7 +7,7 @@
     <groupId>com.lancedb</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>0.36.0</version>
+    <version>0.40.0-beta.2</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -98,12 +98,30 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
-            <version>3.14.0</version>
+            <version>3.18.0</version>
         </dependency>
         <dependency>
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>
             <version>33.3.1-jre</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lancedb</groupId>
+            <artifactId>lance-namespace-core</artifactId>
+            <version>0.0.20</version>
+        </dependency>
+        <!-- AWS SDK for S3 integration testing -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>2.20.26</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>auth</artifactId>
+            <version>2.20.26</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

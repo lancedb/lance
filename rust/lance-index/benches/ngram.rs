@@ -13,7 +13,7 @@ use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::pb;
+use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
 use lance_index::scalar::{registry::ScalarIndexPlugin, TextQuery};
@@ -89,7 +89,7 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let details = prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap();
+    let details = prost_types::Any::from_msg(&pbold::NGramIndexDetails::default()).unwrap();
     let index = rt
         .block_on(NGramIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
         .unwrap();

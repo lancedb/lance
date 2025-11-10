@@ -197,6 +197,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
+        let version = params.data_storage_version.unwrap_or_default();
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -209,7 +210,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             &schema,
             stream,
             params.into_owned(),
-            LanceFileVersion::Stable,
+            version,
+            None, // Fragment creation doesn't use target_bases
         )
         .await
     }
@@ -330,6 +332,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
+    use lance_core::utils::tempfile::{TempDir, TempStrDir};
     use rstest::rstest;
 
     use super::*;
@@ -354,8 +357,8 @@ mod tests {
         // Writing with empty schema produces an error
         let empty_schema = Arc::new(ArrowSchema::empty());
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], empty_schema));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempDir::default();
+        let result = FragmentCreateBuilder::new(&tmp_dir.path_str())
             .write(empty_reader, None)
             .await;
         assert!(result.is_err());
@@ -369,7 +372,7 @@ mod tests {
         // Writing empty reader produces an error
         let arrow_schema = test_data().schema();
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], arrow_schema.clone()));
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .write(empty_reader, None)
             .await;
         assert!(result.is_err());
@@ -386,7 +389,7 @@ mod tests {
             .try_with_column(ArrowField::new("c", DataType::Utf8, false))
             .unwrap();
         let wrong_schema = Schema::try_from(&wrong_schema).unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .schema(&wrong_schema)
             .write(test_data(), None)
             .await;
@@ -403,8 +406,8 @@ mod tests {
     async fn test_fragment_write_default_schema() {
         // Infers schema and uses 0 as default field id
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .write(data, None)
             .await
             .unwrap();
@@ -426,8 +429,8 @@ mod tests {
         custom_schema.mut_field_by_id(0).unwrap().id = 3;
         custom_schema.mut_field_by_id(1).unwrap().id = 1;
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .schema(&custom_schema)
             .write(data, Some(42))
             .await
@@ -445,8 +448,8 @@ mod tests {
         // Writing with empty schema produces an error
         let empty_schema = Arc::new(ArrowSchema::empty());
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], empty_schema));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempDir::default();
+        let result = FragmentCreateBuilder::new(&tmp_dir.path_str())
             .write_fragments(empty_reader)
             .await;
         assert!(result.is_err());
@@ -460,7 +463,7 @@ mod tests {
         // Writing empty reader produces an error
         let arrow_schema = test_data().schema();
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], arrow_schema.clone()));
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .write_fragments(empty_reader)
             .await;
         assert!(result.is_ok());
@@ -472,7 +475,7 @@ mod tests {
             .try_with_column(ArrowField::new("c", DataType::Utf8, false))
             .unwrap();
         let wrong_schema = Schema::try_from(&wrong_schema).unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .schema(&wrong_schema)
             .write_fragments(test_data())
             .await;
@@ -489,8 +492,8 @@ mod tests {
     async fn test_write_fragments_default_schema() {
         // Infers schema and uses 0 as default field id
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragments = FragmentCreateBuilder::new(&tmp_dir)
             .write_fragments(data)
             .await
             .unwrap();
@@ -506,12 +509,12 @@ mod tests {
     async fn test_write_fragments_with_options() {
         // Uses provided schema. Field ids are correct in fragment metadata.
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
         let writer_params = WriteParams {
             max_rows_per_file: 1,
             ..Default::default()
         };
-        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let fragments = FragmentCreateBuilder::new(&tmp_dir)
             .write_params(&writer_params)
             .write_fragments(data)
             .await
@@ -531,6 +534,37 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
+    async fn test_write_with_format_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable
+        )]
+        file_version: LanceFileVersion,
+    ) {
+        let data = test_data();
+        let tmp_dir = TempStrDir::default();
+        let writer_params = WriteParams {
+            data_storage_version: Some(file_version),
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write_params(&writer_params)
+            .write(data, None)
+            .await
+            .unwrap();
+
+        assert!(!fragment.files.is_empty());
+        fragment.files.iter().for_each(|f| {
+            let (major_version, minor_version) = file_version.to_numbers();
+            assert_eq!(f.file_major_version, major_version);
+            assert_eq!(f.file_minor_version, minor_version);
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_write_fragments_with_format_version(
         #[values(
             LanceFileVersion::V2_0,
@@ -541,19 +575,19 @@ mod tests {
         file_version: LanceFileVersion,
     ) {
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
         let writer_params = WriteParams {
             data_storage_version: Some(file_version),
             ..Default::default()
         };
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .write_params(&writer_params)
-            .write(data, None)
+            .write_fragments(data)
             .await
             .unwrap();
 
-        assert!(!fragment.files.is_empty());
-        fragment.files.iter().for_each(|f| {
+        assert!(!fragment.is_empty());
+        fragment[0].files.iter().for_each(|f| {
             let (major_version, minor_version) = file_version.to_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);

@@ -10,6 +10,8 @@ members = [
     "rust/lance-index",
     "rust/lance-io",
     "rust/lance-linalg",
+    "rust/lance-namespace",
+    "rust/lance-namespace-impls",
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
@@ -21,8 +23,9 @@ exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
+
 [workspace.package]
-version = "0.36.0"
+version = "0.40.0-beta.2"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -45,32 +48,36 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
-lance = { version = "=0.36.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.36.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.36.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.36.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.36.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.36.0", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.36.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.36.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.36.0", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=0.36.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.36.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.36.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.36.0", path = "./rust/lance-testing" }
+libc = "0.2.176"
+lance = { version = "=0.40.0-beta.2", path = "./rust/lance" }
+lance-arrow = { version = "=0.40.0-beta.2", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.40.0-beta.2", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.40.0-beta.2", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.40.0-beta.2", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.40.0-beta.2", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.40.0-beta.2", path = "./rust/lance-file" }
+lance-index = { version = "=0.40.0-beta.2", path = "./rust/lance-index" }
+lance-io = { version = "=0.40.0-beta.2", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=0.40.0-beta.2", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=0.40.0-beta.2", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=0.40.0-beta.2", path = "./rust/lance-namespace-impls" }
+lance-namespace-reqwest-client = "0.0.18"
+lance-table = { version = "=0.40.0-beta.2", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.40.0-beta.2", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.40.0-beta.2", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "55.2", optional = false, features = ["prettyprint"] }
-arrow-arith = "55.2"
-arrow-array = "55.2"
-arrow-buffer = "55.2"
-arrow-cast = "55.2"
-arrow-data = "55.2"
-arrow-ipc = { version = "55.2", features = ["zstd"] }
-arrow-ord = "55.2"
-arrow-row = "55.2"
-arrow-schema = "55.2"
-arrow-select = "55.2"
+arrow = { version = "56.1", optional = false, features = ["prettyprint"] }
+arrow-arith = "56.1"
+arrow-array = "56.1"
+arrow-buffer = "56.1"
+arrow-cast = "56.1"
+arrow-data = "56.1"
+arrow-ipc = { version = "56.1", features = ["zstd"] }
+arrow-ord = "56.1"
+arrow-row = "56.1"
+arrow-schema = "56.1"
+arrow-select = "56.1"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -81,7 +88,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance-bitpacking = { version = "=0.36.0", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=0.40.0-beta.2", path = "./rust/compression/bitpacking" }
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
@@ -89,6 +96,7 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4.41", default-features = false, features = [
     "std",
     "now",
+    "serde",
 ] }
 criterion = { version = "0.5", features = [
     "async",
@@ -96,7 +104,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "49.0.2", default-features = false, features = [
+datafusion = { version = "50.0.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -105,21 +113,21 @@ datafusion = { version = "49.0.2", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "49.0.2"
-datafusion-functions = { version = "49.0.2", features = ["regex_expressions"] }
-datafusion-sql = "49.0.2"
-datafusion-expr = "49.0.2"
-datafusion-ffi = "49.0.2"
-datafusion-execution = "49.0.2"
-datafusion-optimizer = "49.0.2"
-datafusion-physical-expr = { version = "49.0.2" }
-datafusion-physical-plan = { version = "49.0.2" }
-datafusion-substrait = { version = "49.0.2" }
+datafusion-common = "50.0.0"
+datafusion-functions = { version = "50.0.0", features = ["regex_expressions"] }
+datafusion-sql = "50.0.0"
+datafusion-expr = "50.0.0"
+datafusion-ffi = "50.0.0"
+datafusion-execution = "50.0.0"
+datafusion-optimizer = "50.0.0"
+datafusion-physical-expr = "50.0.0"
+datafusion-physical-plan = "50.0.0"
+datafusion-substrait = "50.0.0"
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.36.0", path = "./rust/compression/fsst" }
+fsst = { version = "=0.40.0-beta.2", path = "./rust/compression/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
@@ -130,8 +138,9 @@ jsonb = { version = "0.5.3", default-features = false, features = ["databend"]}
 libm = "0.2.15"
 log = "0.4"
 mockall = { version = "0.13.1" }
-mock_instant = { version = "0.3.1", features = ["sync"] }
+mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
+ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.12.3" }
 opendal = { version = "0.54" }
@@ -153,9 +162,10 @@ rstest = "0.23.0"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
+semver = "1.0"
 shellexpand = "3.0"
 snafu = "0.8"
-strum = "0.25"
+strum = "0.26"
 tantivy = { version = "0.24.1", features = ["stopwords"] }
 lindera = { version = "0.44.0" }
 lindera-tantivy = { version = "0.44.0" }
@@ -170,8 +180,9 @@ tokio = { version = "1.23", features = [
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10" }
 tracing = "0.1"
-url = "2.3"
+url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
+wiremock = "0.6"
 pretty_assertions = "1.4.0"
 
 [profile.bench]

@@ -17,6 +17,7 @@ arrow-array.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+arrow-arith.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
@@ -43,6 +44,7 @@ lance-linalg.workspace = true
 lance-table.workspace = true
 libm.workspace = true
 log.workspace = true
+ndarray.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -62,23 +64,21 @@ tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
 uuid.workspace = true
-fastbloom = "0.14.0"
 twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
+rand_distr.workspace = true
 lance-datagen.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
-clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 env_logger = "0.11.6"
 lance-datagen.workspace = true
 lance-testing.workspace = true
-tempfile.workspace = true
 test-log.workspace = true
-datafusion-sql.workspace = true
 rstest.workspace = true
+chrono.workspace = true
 
 [features]
 protoc = ["dep:protobuf-src"]
@@ -138,6 +138,10 @@ harness = false
 
 [[bench]]
 name = "compute_partition"
+harness = false
+
+[[bench]]
+name = "rq"
 harness = false
 
 [lints]

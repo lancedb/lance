@@ -58,7 +58,9 @@ use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
-    format::{pb, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta},
+    format::{
+        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+    },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
@@ -86,21 +88,8 @@ pub struct Transaction {
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
-    /// If the transaction modified the blobs dataset, this is the operation
-    /// to apply to the blobs dataset.
-    ///
-    /// If this is `None`, then the blobs dataset was not modified
-    pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum BlobsOperation {
-    /// The operation did not modify the blobs dataset
-    Unchanged,
-    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
-    Updated(u64),
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -171,10 +160,12 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
         config_upsert_values: Option<HashMap<String, String>>,
+        initial_bases: Option<Vec<BasePath>>,
     },
     /// A new index has been created.
     CreateIndex {
-        /// The new secondary indices that are being added
+        /// The new secondary indices,
+        /// any existing indices with the same name will be replaced.
         new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
         removed_indices: Vec<IndexMetadata>,
@@ -285,6 +276,13 @@ pub enum Operation {
         ref_name: Option<String>,
         ref_version: u64,
         ref_path: String,
+        branch_name: Option<String>,
+    },
+
+    // Update base paths in the dataset (currently only supports adding new bases).
+    UpdateBases {
+        /// The new base paths to add to the manifest.
+        new_bases: Vec<BasePath>,
     },
 }
 
@@ -318,6 +316,7 @@ impl std::fmt::Display for Operation {
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
+            Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
     }
 }
@@ -340,18 +339,21 @@ impl PartialEq for Operation {
                     ref_name: a_ref_name,
                     ref_version: a_ref_version,
                     ref_path: a_source_path,
+                    branch_name: a_branch_name,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
                     ref_name: b_ref_name,
                     ref_version: b_ref_version,
                     ref_path: b_source_path,
+                    branch_name: b_branch_name,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
                     && a_ref_name == b_ref_name
                     && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
+                    && a_branch_name == b_branch_name
             }
             (
                 Self::Delete {
@@ -374,16 +376,19 @@ impl PartialEq for Operation {
                     fragments: a_fragments,
                     schema: a_schema,
                     config_upsert_values: a_config,
+                    initial_bases: a_initial,
                 },
                 Self::Overwrite {
                     fragments: b_fragments,
                     schema: b_schema,
                     config_upsert_values: b_config,
+                    initial_bases: b_initial,
                 },
             ) => {
                 compare_vec(a_fragments, b_fragments)
                     && a_schema == b_schema
                     && a_config == b_config
+                    && a_initial == b_initial
             }
             (
                 Self::CreateIndex {
@@ -1058,6 +1063,96 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+
+            (Self::UpdateBases { new_bases: a }, Self::UpdateBases { new_bases: b }) => {
+                compare_vec(a, b)
+            }
+
+            (Self::UpdateBases { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Append { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -1207,6 +1302,7 @@ impl Operation {
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
+            Self::UpdateBases { .. } => "UpdateBases",
         }
     }
 }
@@ -1321,7 +1417,6 @@ pub struct TransactionBuilder {
     // uuid is optional for builder since it can autogenerate
     uuid: Option<String>,
     operation: Operation,
-    blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
@@ -1332,7 +1427,6 @@ impl TransactionBuilder {
             read_version,
             uuid: None,
             operation,
-            blobs_op: None,
             tag: None,
             transaction_properties: None,
         }
@@ -1340,11 +1434,6 @@ impl TransactionBuilder {
 
     pub fn uuid(mut self, uuid: String) -> Self {
         self.uuid = Some(uuid);
-        self
-    }
-
-    pub fn blobs_op(mut self, blobs_op: Option<Operation>) -> Self {
-        self.blobs_op = blobs_op;
         self
     }
 
@@ -1369,7 +1458,6 @@ impl TransactionBuilder {
             read_version: self.read_version,
             uuid,
             operation: self.operation,
-            blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
         }
@@ -1381,18 +1469,8 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation).build()
     }
 
-    pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
-        Self { blobs_op, ..self }
-    }
-
-    pub fn new(
-        read_version: u64,
-        operation: Operation,
-        blobs_op: Option<Operation>,
-        tag: Option<String>,
-    ) -> Self {
+    pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
         TransactionBuilder::new(read_version, operation)
-            .blobs_op(blobs_op)
             .tag(tag)
             .build()
     }
@@ -1463,7 +1541,6 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-        new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -1475,10 +1552,41 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let reference_paths = match current_manifest {
+        let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
         };
+
+        if let Operation::Overwrite {
+            initial_bases: Some(initial_bases),
+            ..
+        } = &self.operation
+        {
+            if current_manifest.is_none() {
+                // CREATE mode: registering base paths
+                // Base IDs should have been assigned during write operation
+                // Validate uniqueness and insert them into the manifest
+                for base_path in initial_bases.iter() {
+                    if reference_paths.contains_key(&base_path.id) {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "Duplicate base path ID {} detected. Base path IDs must be unique.",
+                                base_path.id
+                            ),
+                            location!(),
+                        ));
+                    }
+                    reference_paths.insert(base_path.id, base_path.clone());
+                }
+            } else {
+                // OVERWRITE mode with initial_bases should have been rejected by validation
+                // This branch should never be reached
+                return Err(Error::invalid_input(
+                    "OVERWRITE mode cannot register new bases. This should have been caught by validation.",
+                    location!(),
+                ));
+            }
+        }
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1550,6 +1658,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
             }
@@ -1579,16 +1695,33 @@ impl Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
             } => {
-                final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
-                    if removed_fragment_ids.contains(&f.id) {
-                        return None;
-                    }
-                    if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
-                        Some(updated.clone())
-                    } else {
-                        Some(f.clone())
-                    }
-                }));
+                // Extract existing fragments once for reuse
+                let existing_fragments = maybe_existing_fragments?;
+
+                // Apply updates to existing fragments
+                let updated_frags: Vec<Fragment> = existing_fragments
+                    .iter()
+                    .filter_map(|f| {
+                        if removed_fragment_ids.contains(&f.id) {
+                            return None;
+                        }
+                        if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                            Some(updated.clone())
+                        } else {
+                            Some(f.clone())
+                        }
+                    })
+                    .collect();
+
+                // Update version metadata for updated fragments if stable row IDs are enabled
+                // Note: We don't update version metadata for fragments with deletion vectors
+                // because the version sequences are indexed by physical row position, not logical position.
+                // Version metadata for deleted rows will be filtered out during scan using the deletion vector.
+                if next_row_id.is_some() {
+                    // Version metadata will be properly set during compaction when deletions are materialized
+                }
+
+                final_fragments.extend(updated_frags);
 
                 // If we updated any fields, remove those fragments from indices covering those fields
                 Self::prune_updated_fields_from_indices(
@@ -1600,6 +1733,140 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+
+                // Assign row IDs to any fragments that don't have them yet
+                // (e.g., inserted rows from merge_insert operations)
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+
+                // Set version metadata for newly created fragments (updated rows)
+                // Preserve created_at from original fragments, set last_updated to new version
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+
+                    // Build a map of original fragment ID -> original fragment for lookup
+                    let original_frags_map: std::collections::HashMap<u64, &Fragment> =
+                        existing_fragments.iter().map(|f| (f.id, f)).collect();
+
+                    for fragment in new_fragments.iter_mut() {
+                        // For update operations with RewriteRows mode:
+                        // - Rows are deleted from old fragments and rewritten to new fragments
+                        // - last_updated_at should be the current version (when update happened)
+                        // - created_at should be preserved from the original fragment
+
+                        // Read row IDs from this fragment to find original fragments
+                        let row_ids = if let Some(row_id_meta) = &fragment.row_id_meta {
+                            match row_id_meta {
+                                lance_table::format::RowIdMeta::Inline(data) => {
+                                    lance_table::rowids::read_row_ids(data).ok()
+                                }
+                                lance_table::format::RowIdMeta::External(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(row_ids) = row_ids {
+                            // Extract created_at version for each row from original fragments
+                            let physical_rows = fragment.physical_rows.unwrap_or(0);
+                            let mut created_at_versions = Vec::with_capacity(physical_rows);
+
+                            for row_id in row_ids.iter() {
+                                // Row ID format: upper 32 bits = fragment ID, lower 32 bits = row offset
+                                let orig_frag_id = row_id >> 32;
+                                let row_offset = (row_id & 0xFFFFFFFF) as usize;
+
+                                // Look up the original fragment
+                                if let Some(orig_frag) = original_frags_map.get(&orig_frag_id) {
+                                    // Get created_at version from original fragment's metadata
+                                    let created_version = if let Some(created_meta) =
+                                        &orig_frag.created_at_version_meta
+                                    {
+                                        // Load and index into the version sequence
+                                        match created_meta.load_sequence() {
+                                            Ok(seq) => {
+                                                let versions: Vec<u64> = seq.versions().collect();
+                                                versions.get(row_offset).copied().unwrap_or(1)
+                                            }
+                                            Err(_e) => {
+                                                1 // Default to version 1 on error
+                                            }
+                                        }
+                                    } else {
+                                        // No metadata on original fragment, default to version 1
+                                        1
+                                    };
+                                    created_at_versions.push(created_version);
+                                } else {
+                                    // Original fragment not found, default to version 1
+                                    created_at_versions.push(1);
+                                }
+                            }
+
+                            // Build version metadata from the collected versions
+                            // Compress into runs: consecutive identical versions become one run
+                            let mut runs = Vec::new();
+                            if !created_at_versions.is_empty() {
+                                let mut current_version = created_at_versions[0];
+                                let mut run_start = 0u64;
+
+                                for (i, &version) in created_at_versions.iter().enumerate().skip(1)
+                                {
+                                    if version != current_version {
+                                        // End current run, start new one
+                                        runs.push(lance_table::format::RowDatasetVersionRun {
+                                            span: lance_table::rowids::segment::U64Segment::Range(
+                                                run_start..i as u64,
+                                            ),
+                                            version: current_version,
+                                        });
+                                        current_version = version;
+                                        run_start = i as u64;
+                                    }
+                                }
+                                // Add final run
+                                runs.push(lance_table::format::RowDatasetVersionRun {
+                                    span: lance_table::rowids::segment::U64Segment::Range(
+                                        run_start..created_at_versions.len() as u64,
+                                    ),
+                                    version: current_version,
+                                });
+                            }
+
+                            let created_at_seq =
+                                lance_table::format::RowDatasetVersionSequence { runs };
+                            fragment.created_at_version_meta = Some(
+                                lance_table::format::RowDatasetVersionMeta::from_sequence(
+                                    &created_at_seq,
+                                )
+                                .map_err(|e| Error::Internal {
+                                    message: format!(
+                                        "Failed to create created_at version metadata: {}",
+                                        e
+                                    ),
+                                    location: location!(),
+                                })?,
+                            );
+
+                            // Set last_updated_at to the new version for all rows
+                            let last_updated_meta =
+                                lance_table::rowids::version::build_version_meta(
+                                    fragment,
+                                    new_version,
+                                );
+                            fragment.last_updated_at_version_meta = last_updated_meta;
+                        } else {
+                            // Fallback: can't read row IDs, set both to new version
+                            let version_meta = lance_table::rowids::version::build_version_meta(
+                                fragment,
+                                new_version,
+                            );
+                            fragment.last_updated_at_version_meta = version_meta.clone();
+                            fragment.created_at_version_meta = version_meta;
+                        }
+                    }
+                }
 
                 if config.use_stable_row_ids
                     && update_mode.is_some()
@@ -1625,7 +1892,13 @@ impl Transaction {
 
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Note: Version metadata is already set above (lines 1627-1755)
+                    // for Update operations, preserving created_at from original fragments.
+                    // Don't overwrite it here.
                 }
+                // Identify fragments that were updated or newly created in this update
+                let mut target_ids: HashSet<u64> = HashSet::new();
+                target_ids.extend(new_fragments.iter().map(|f| f.id));
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
@@ -1649,6 +1922,14 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    // Add version metadata for all new fragments
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    for fragment in new_fragments.iter_mut() {
+                        let version_meta =
+                            lance_table::rowids::version::build_version_meta(fragment, new_version);
+                        fragment.last_updated_at_version_meta = version_meta.clone();
+                        fragment.created_at_version_meta = version_meta;
+                    }
                 }
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
@@ -1665,6 +1946,7 @@ impl Transaction {
                     groups,
                     &mut fragment_id,
                     current_version,
+                    next_row_id.as_ref(),
                 )?;
 
                 if next_row_id.is_some() {
@@ -1854,6 +2136,11 @@ impl Transaction {
                     removed.clone(),
                 )?;
             }
+            Operation::UpdateBases { .. } => {
+                // UpdateBases operation doesn't modify fragments or indices
+                // Base paths are handled in the manifest creation section below
+                final_fragments.extend(maybe_existing_fragments?.clone());
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -1870,12 +2157,10 @@ impl Transaction {
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            let mut prev_manifest = Manifest::new_from_previous(
-                current_manifest,
-                schema,
-                Arc::new(final_fragments),
-                new_blob_version,
-            );
+            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
+            // So we always use new_from_previous which preserves base_paths
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -1894,7 +2179,6 @@ impl Transaction {
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
-                new_blob_version,
                 reference_paths,
             )
         };
@@ -1948,6 +2232,41 @@ impl Transaction {
                 }
             }
             _ => {}
+        }
+
+        // Handle UpdateBases operation to update manifest base_paths
+        if let Operation::UpdateBases { new_bases } = &self.operation {
+            // Validate and add new base paths to the manifest
+            for new_base in new_bases {
+                // Check for conflicts with existing base paths
+                if let Some(existing_base) = manifest
+                    .base_paths
+                    .values()
+                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
+                {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
+                            new_base.name, new_base.path, existing_base.name, existing_base.path
+                        ),
+                        location!(),
+                    ));
+                }
+
+                // Assign a new ID if not already assigned
+                let mut base_to_add = new_base.clone();
+                if base_to_add.id == 0 {
+                    let next_id = manifest
+                        .base_paths
+                        .keys()
+                        .max()
+                        .map(|&id| id + 1)
+                        .unwrap_or(1);
+                    base_to_add.id = next_id;
+                }
+
+                manifest.base_paths.insert(base_to_add.id, base_to_add);
+            }
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
@@ -2053,7 +2372,7 @@ impl Transaction {
     fn retain_relevant_indices(
         indices: &mut Vec<IndexMetadata>,
         schema: &Schema,
-        _fragments: &[Fragment],
+        fragments: &[Fragment],
     ) {
         let field_ids = schema
             .fields_pre_order()
@@ -2091,6 +2410,11 @@ impl Transaction {
         // Build a set of UUIDs to keep based on retention rules
         let mut uuids_to_keep = std::collections::HashSet::new();
 
+        let existing_fragments = fragments
+            .iter()
+            .map(|f| f.id as u32)
+            .collect::<RoaringBitmap>();
+
         // For each group of indices with the same name
         for (_, same_name_indices) in indices_by_name {
             if same_name_indices.len() > 1 {
@@ -2098,7 +2422,7 @@ impl Transaction {
                 let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
                     same_name_indices.iter().partition(|index| {
                         index
-                            .fragment_bitmap
+                            .effective_fragment_bitmap(&existing_fragments)
                             .as_ref()
                             .is_none_or(|bitmap| bitmap.is_empty())
                     });
@@ -2125,7 +2449,7 @@ impl Transaction {
                 // Single index - keep it unless it's an empty vector index
                 if let Some(index) = same_name_indices.first() {
                     let is_empty = index
-                        .fragment_bitmap
+                        .effective_fragment_bitmap(&existing_fragments)
                         .as_ref()
                         .is_none_or(|bitmap| bitmap.is_empty());
                     let is_vector = Self::is_vector_index(index);
@@ -2223,13 +2547,14 @@ impl Transaction {
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
         version: u64,
+        _next_row_id: Option<&u64>,
     ) -> Result<()> {
         for group in groups {
             // If the old fragments are contiguous, find the range
             let replace_range = {
                 let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
                     .ok_or_else(|| Error::CommitConflict { version, source:
-                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() , location:location!()})?.0;
+                    format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() , location:location!()})?.0;
 
                 // Verify old_fragments matches contiguous range
                 let mut i = 1;
@@ -2244,7 +2569,13 @@ impl Transaction {
                 }
             };
 
-            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id);
+            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
+                .collect::<Vec<_>>();
+
+            // Version metadata for rewritten fragments is handled by the compaction code
+            // (recalc_versions_for_rewritten_fragments) which preserves version information
+            // from the original fragments. We don't modify it here.
+
             if let Some(replace_range) = replace_range {
                 // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
@@ -2414,11 +2745,13 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             })) => Operation::Clone {
                 is_shallow,
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
@@ -2437,6 +2770,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
                 config_upsert_values,
+                initial_bases,
             })) => {
                 let config_upsert_option = if config_upsert_values.is_empty() {
                     Some(config_upsert_values)
@@ -2451,6 +2785,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                     schema: Schema::from(&Fields(schema)),
                     config_upsert_values: config_upsert_option,
+                    initial_bases: if initial_bases.is_empty() {
+                        None
+                    } else {
+                        Some(initial_bases.into_iter().map(BasePath::from).collect())
+                    },
                 }
             }
             Some(pb::transaction::Operation::ReserveFragments(
@@ -2658,6 +2997,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(|m| MemWal::try_from(m).unwrap())
                     .collect(),
             },
+            Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
+                new_bases,
+            })) => Operation::UpdateBases {
+                new_bases: new_bases.into_iter().map(BasePath::from).collect(),
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -2665,45 +3009,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                 });
             }
         };
-        let blobs_op = message
-            .blob_operation
-            .map(|blob_op| match blob_op {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments,
-                }) => Result::Ok(Operation::Append {
-                    fragments: fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                }),
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments,
-                    schema,
-                    schema_metadata: _schema_metadata, // TODO: handle metadata
-                    config_upsert_values,
-                }) => {
-                    let config_upsert_option = if config_upsert_values.is_empty() {
-                        Some(config_upsert_values)
-                    } else {
-                        None
-                    };
-
-                    Ok(Operation::Overwrite {
-                        fragments: fragments
-                            .into_iter()
-                            .map(Fragment::try_from)
-                            .collect::<Result<Vec<_>>>()?,
-                        schema: Schema::from(&Fields(schema)),
-                        config_upsert_values: config_upsert_option,
-                    })
-                }
-            })
-            .transpose()?;
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
-            blobs_op,
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -2790,11 +3099,13 @@ impl From<&Transaction> for pb::Transaction {
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
                 ref_name: ref_name.clone(),
                 ref_version: *ref_version,
                 ref_path: ref_path.clone(),
+                branch_name: branch_name.clone(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -2812,6 +3123,7 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_bases,
             } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -2820,6 +3132,16 @@ impl From<&Transaction> for pb::Transaction {
                     config_upsert_values: config_upsert_values
                         .clone()
                         .unwrap_or(Default::default()),
+                    initial_bases: initial_bases
+                        .as_ref()
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .cloned()
+                                .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                                .collect::<Vec<pb::BasePath>>()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             Operation::ReserveFragments { num_fragments } => {
@@ -2948,30 +3270,16 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<_>>(),
                 })
             }
+            Operation::UpdateBases { new_bases } => {
+                pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
+                    new_bases: new_bases
+                        .iter()
+                        .cloned()
+                        .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                        .collect::<Vec<pb::BasePath>>(),
+                })
+            }
         };
-
-        let blob_operation = value.blobs_op.as_ref().map(|op| match op {
-            Operation::Append { fragments } => {
-                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                })
-            }
-            Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values,
-            } => {
-                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                    config_upsert_values: config_upsert_values
-                        .clone()
-                        .unwrap_or(Default::default()),
-                })
-            }
-            _ => panic!("Invalid blob operation: {:?}", value),
-        });
 
         let transaction_properties = value
             .transaction_properties
@@ -2982,7 +3290,6 @@ impl From<&Transaction> for pb::Transaction {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
-            blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
         }
@@ -3060,6 +3367,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments,
             schema,
             config_upsert_values: None,
+            initial_bases: _,
         } => schema_fragments_valid(Some(manifest), schema, fragments),
         Operation::Update {
             updated_fragments,
@@ -3223,6 +3531,7 @@ mod tests {
             &rewrite_groups,
             &mut fragment_id,
             version,
+            None,
         )
         .unwrap();
 
@@ -3264,7 +3573,6 @@ mod tests {
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(original_fragments),
             DataStorageFormat::new(LanceFileVersion::V2_0),
-            None,
             HashMap::new(),
         );
 
@@ -3390,6 +3698,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3420,6 +3730,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3450,6 +3762,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3483,6 +3797,8 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3509,6 +3825,8 @@ mod tests {
                 row_id_meta: None,
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3516,6 +3834,8 @@ mod tests {
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
                 deletion_file: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3558,6 +3878,8 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3569,5 +3891,451 @@ mod tests {
         } else {
             panic!("Expected Internal error about missing physical rows");
         }
+    }
+
+    // Helper functions for retain_relevant_indices tests
+    fn create_test_index(
+        name: &str,
+        field_id: i32,
+        dataset_version: u64,
+        fragment_bitmap: Option<RoaringBitmap>,
+        is_vector: bool,
+    ) -> IndexMetadata {
+        use prost_types::Any;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let index_details = if is_vector {
+            Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            }))
+        } else {
+            Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.ScalarIndexDetails".to_string(),
+                value: vec![],
+            }))
+        };
+
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            name: name.to_string(),
+            dataset_version,
+            fragment_bitmap,
+            index_details,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        }
+    }
+
+    fn create_system_index(name: &str, field_id: i32) -> IndexMetadata {
+        use prost_types::Any;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            name: name.to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
+            index_details: Some(Arc::new(Any {
+                type_url: "type.googleapis.com/lance.index.SystemIndexDetails".to_string(),
+                value: vec![],
+            })),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        }
+    }
+
+    fn create_test_schema(field_ids: &[i32]) -> Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        let fields: Vec<ArrowField> = field_ids
+            .iter()
+            .map(|id| ArrowField::new(format!("field_{}", id), DataType::Int32, false))
+            .collect();
+
+        let arrow_schema = ArrowSchema::new(fields);
+        let mut lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Assign field IDs
+        for (i, field_id) in field_ids.iter().enumerate() {
+            lance_schema.mut_field_by_id(i as i32).unwrap().id = *field_id;
+        }
+
+        lance_schema
+    }
+
+    #[test]
+    fn test_retain_indices_removes_missing_fields() {
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)];
+
+        let mut indices = vec![
+            create_test_index("idx1", 1, 1, Some(RoaringBitmap::from_iter([1])), false),
+            create_test_index("idx2", 2, 1, Some(RoaringBitmap::from_iter([1])), false),
+            create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().all(|idx| idx.fields[0] != 99));
+    }
+
+    #[test]
+    fn test_retain_indices_keeps_system_indices() {
+        use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_system_index(FRAG_REUSE_INDEX_NAME, 99), // Field doesn't exist but should be kept
+            create_system_index(MEM_WAL_INDEX_NAME, 99), // Field doesn't exist but should be kept
+            create_test_index("regular_idx", 99, 1, Some(RoaringBitmap::new()), false), // Should be removed
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+        assert!(indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME));
+    }
+
+    #[test]
+    fn test_retain_indices_keeps_fragment_reuse_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_system_index(FRAG_REUSE_INDEX_NAME, 1),
+            create_test_index("other_idx", 1, 1, Some(RoaringBitmap::new()), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Fragment reuse index should always be kept
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+    }
+
+    #[test]
+    fn test_retain_single_empty_scalar_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::new()), // Empty bitmap
+            false,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Single empty scalar index should be kept
+        assert_eq!(indices.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_single_empty_vector_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::new()), // Empty bitmap
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Single empty vector index should be removed
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_single_nonempty_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut scalar_indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1])),
+            false,
+        )];
+
+        let mut vector_indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Both should be kept
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_single_index_with_none_bitmap() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut scalar_indices = vec![create_test_index("scalar_idx", 1, 1, None, false)];
+        let mut vector_indices = vec![create_test_index("vector_idx", 1, 1, None, true)];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Scalar should be kept, vector should be removed
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_multiple_empty_scalar_indices_keeps_oldest() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::new()), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only the oldest (dataset_version = 1)
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
+    }
+
+    #[test]
+    fn test_retain_multiple_empty_vector_indices_removes_all() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec_idx", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_idx", 1, 2, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // All empty vector indices should be removed
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_mixed_empty_nonempty_keeps_nonempty() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false), // Empty
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::from_iter([1])), false), // Non-empty
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false), // Empty
+            create_test_index("idx", 1, 4, Some(RoaringBitmap::from_iter([1])), false), // Non-empty
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only non-empty indices
+        assert_eq!(indices.len(), 2);
+        assert!(indices
+            .iter()
+            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4));
+    }
+
+    #[test]
+    fn test_retain_mixed_empty_nonempty_vector_keeps_nonempty() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec_idx", 1, 1, Some(RoaringBitmap::new()), true), // Empty
+            create_test_index("vec_idx", 1, 2, Some(RoaringBitmap::from_iter([1])), true), // Non-empty
+            create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),          // Empty
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should keep only non-empty index
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 2);
+    }
+
+    #[test]
+    fn test_retain_fragment_bitmap_with_nonexistent_fragments() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)]; // Only fragments 1 and 2 exist
+
+        let mut indices = vec![create_test_index(
+            "idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3, 4])), // References non-existent fragments 3, 4
+            false,
+        )];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Should still keep the index (effective bitmap will be intersection with existing)
+        assert_eq!(indices.len(), 1);
+        // Original bitmap should be unchanged
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn test_retain_effective_empty_bitmap_single_index() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(5), Fragment::new(6)];
+
+        // Bitmap references fragments that don't exist, so effective bitmap is empty
+        let mut scalar_indices = vec![create_test_index(
+            "scalar_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3])),
+            false,
+        )];
+
+        let mut vector_indices = vec![create_test_index(
+            "vector_idx",
+            1,
+            1,
+            Some(RoaringBitmap::from_iter([1, 2, 3])),
+            true,
+        )];
+
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+
+        // Scalar should be kept (single index, even if effective bitmap is empty)
+        // Vector should be removed (empty effective bitmap)
+        assert_eq!(scalar_indices.len(), 1);
+        assert_eq!(vector_indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_different_index_names() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_b", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("idx_c", 1, 1, Some(RoaringBitmap::from_iter([1])), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // idx_a (empty scalar) should be kept, idx_b (empty vector) removed, idx_c (non-empty) kept
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.name == "idx_a"));
+        assert!(indices.iter().any(|idx| idx.name == "idx_c"));
+        assert!(!indices.iter().any(|idx| idx.name == "idx_b"));
+    }
+
+    #[test]
+    fn test_retain_empty_indices_vec() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices: Vec<IndexMetadata> = vec![];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_all_indices_removed() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+
+        let mut indices = vec![
+            create_test_index("vec1", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec2", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Bad field
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_complex_scenario() {
+        let schema = create_test_schema(&[1, 2]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)];
+
+        let mut indices = vec![
+            // System index - should always be kept
+            create_system_index(FRAG_REUSE_INDEX_NAME, 1),
+            // Group "idx_a" - all empty scalars, keep oldest
+            create_test_index("idx_a", 1, 3, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
+            create_test_index("idx_a", 1, 2, Some(RoaringBitmap::new()), false),
+            // Group "vec_b" - all empty vectors, remove all
+            create_test_index("vec_b", 1, 1, Some(RoaringBitmap::new()), true),
+            create_test_index("vec_b", 1, 2, Some(RoaringBitmap::new()), true),
+            // Group "idx_c" - mixed empty/non-empty, keep non-empty
+            create_test_index("idx_c", 2, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx_c", 2, 2, Some(RoaringBitmap::from_iter([1])), false), // Keep
+            create_test_index("idx_c", 2, 3, Some(RoaringBitmap::from_iter([2])), false), // Keep
+            // Single non-empty - keep
+            create_test_index("idx_d", 1, 1, Some(RoaringBitmap::from_iter([1, 2])), false),
+            // Index with bad field - remove
+            create_test_index("idx_e", 99, 1, Some(RoaringBitmap::from_iter([1])), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // Expected: frag_reuse, idx_a (oldest), idx_c (2 non-empty), idx_d = 5 total
+        assert_eq!(indices.len(), 5);
+
+        // Verify system index kept
+        assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+
+        // Verify idx_a kept oldest only
+        let idx_a_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_a").collect();
+        assert_eq!(idx_a_indices.len(), 1);
+        assert_eq!(idx_a_indices[0].dataset_version, 1);
+
+        // Verify vec_b all removed
+        assert!(!indices.iter().any(|idx| idx.name == "vec_b"));
+
+        // Verify idx_c kept non-empty only
+        let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
+        assert_eq!(idx_c_indices.len(), 2);
+        assert!(idx_c_indices
+            .iter()
+            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3));
+
+        // Verify idx_d kept
+        assert!(indices.iter().any(|idx| idx.name == "idx_d"));
+
+        // Verify idx_e removed (bad field)
+        assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
     }
 }

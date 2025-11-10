@@ -7,7 +7,7 @@ use crate::utils::to_rust_map;
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
-    RT,
+    JNIEnvExt, RT,
 };
 use arrow::{
     array::{RecordBatch, StructArray},
@@ -67,18 +67,29 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNative<'l
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
     file_uri: JString,
-    storage_options_obj: JObject, // Map<String, String>
+    data_storage_version: JObject, // Optional<String>
+    storage_options_obj: JObject,  // Map<String, String>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_open(&mut env, file_uri, storage_options_obj))
+    ok_or_throw!(
+        env,
+        inner_open(
+            &mut env,
+            file_uri,
+            data_storage_version,
+            storage_options_obj
+        )
+    )
 }
 
 fn inner_open<'local>(
     env: &mut JNIEnv<'local>,
     file_uri: JString,
+    data_storage_version: JObject,
     storage_options_obj: JObject,
 ) -> Result<JObject<'local>> {
     let file_uri_str: String = env.get_string(&file_uri)?.into();
     let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let data_storage_version_opt = env.get_string_opt(&data_storage_version)?;
     let storage_options = to_rust_map(env, &jmap)?;
 
     let writer = RT.block_on(async move {
@@ -98,7 +109,9 @@ fn inner_open<'local>(
         Result::Ok(FileWriter::new_lazy(
             obj_writer,
             FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
+                format_version: data_storage_version_opt
+                    .map(|v| v.parse::<LanceFileVersion>())
+                    .transpose()?,
                 ..Default::default()
             },
         ))

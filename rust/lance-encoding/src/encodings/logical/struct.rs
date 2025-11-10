@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BinaryHeap, ops::Range, sync::Arc};
+use std::{
+    collections::{BinaryHeap, VecDeque},
+    ops::Range,
+    sync::Arc,
+};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, LoadedPage, NextDecodeTask, PageEncoding,
+        DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
         ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
         StructuralFieldScheduler, StructuralSchedulingJob,
     },
@@ -35,6 +39,7 @@ struct StructuralSchedulingJobWithStatus<'a> {
     job: Box<dyn StructuralSchedulingJob + 'a>,
     rows_scheduled: u64,
     rows_remaining: u64,
+    ready_scan_lines: VecDeque<ScheduledScanLine>,
 }
 
 impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
@@ -87,6 +92,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
                 job,
                 rows_scheduled: 0,
                 rows_remaining: num_rows,
+                ready_scan_lines: VecDeque::new(),
             })
             .collect::<BinaryHeap<_>>();
         Self {
@@ -101,17 +107,17 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    ) -> Result<Vec<ScheduledScanLine>> {
         if self.children.is_empty() {
             // Special path for empty structs
             if self.rows_scheduled == self.num_rows {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             self.rows_scheduled = self.num_rows;
-            return Ok(Some(ScheduledScanLine {
+            return Ok(vec![ScheduledScanLine {
                 decoders: Vec::new(),
                 rows_scheduled: self.num_rows,
-            }));
+            }]);
         }
 
         let mut decoders = Vec::new();
@@ -119,16 +125,22 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
         // Schedule as many children as we need to until we have scheduled at least one
         // complete row
         while old_rows_scheduled == self.rows_scheduled {
-            let mut next_child = self.children.pop().unwrap();
-            let scoped = context.push(next_child.col_name, next_child.col_idx);
-            let child_scan = next_child.job.schedule_next(scoped.context)?;
-            // next_child is the least-scheduled child and, if it's done, that
-            // means we are completely done.
-            if child_scan.is_none() {
-                return Ok(None);
+            if self.children.is_empty() {
+                // Early exit when schedulers are exhausted prematurely (TODO: does this still happen?)
+                return Ok(Vec::new());
             }
-            let child_scan = child_scan.unwrap();
-
+            let mut next_child = self.children.pop().unwrap();
+            if next_child.ready_scan_lines.is_empty() {
+                let scoped = context.push(next_child.col_name, next_child.col_idx);
+                let child_scans = next_child.job.schedule_next(scoped.context)?;
+                context = scoped.pop();
+                if child_scans.is_empty() {
+                    // Continue without pushing next_child back onto the heap (it is done)
+                    continue;
+                }
+                next_child.ready_scan_lines.extend(child_scans);
+            }
+            let child_scan = next_child.ready_scan_lines.pop_front().unwrap();
             trace!(
                 "Scheduled {} rows for child {}",
                 child_scan.rows_scheduled,
@@ -139,13 +151,12 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
             decoders.extend(child_scan.decoders);
             self.children.push(next_child);
             self.rows_scheduled = self.children.peek().unwrap().rows_scheduled;
-            context = scoped.pop();
         }
         let struct_rows_scheduled = self.rows_scheduled - old_rows_scheduled;
-        Ok(Some(ScheduledScanLine {
+        Ok(vec![ScheduledScanLine {
             decoders,
             rows_scheduled: struct_rows_scheduled,
-        }))
+        }])
     }
 }
 
@@ -246,7 +257,7 @@ impl StructuralStructDecoder {
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() {
+                if field.is_packed_struct() || field.is_blob() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Box::new(decoder)
@@ -279,7 +290,7 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
-    fn accept_page(&mut self, mut child: LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
         // This decoder is intended for one of our children
@@ -347,6 +358,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         } else {
             repdef.unravel_validity(length)
         };
+
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),

@@ -24,7 +24,7 @@ use futures::stream::StreamExt;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
 use lance_io::stream::RecordBatchStream;
 
-use crate::RT;
+use crate::rt;
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -38,8 +38,8 @@ pub struct LanceReader {
 }
 
 impl LanceReader {
-    pub async fn try_new(scanner: Arc<LanceScanner>) -> ::lance::error::Result<Self> {
-        let stream = scanner.try_into_stream().await?;
+    pub async fn try_new(mut scanner: Arc<LanceScanner>) -> ::lance::Result<Self> {
+        let stream = Arc::make_mut(&mut scanner).try_into_stream().await?;
         let schema = stream.schema();
         Ok(Self {
             schema,
@@ -60,7 +60,7 @@ impl Iterator for LanceReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let stream = self.stream.clone();
-        RT.spawn(None, async move {
+        rt().spawn(None, async move {
             let mut stream = stream.lock().await;
             stream.next().await
         })

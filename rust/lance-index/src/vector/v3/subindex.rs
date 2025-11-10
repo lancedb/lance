@@ -52,7 +52,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self>
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized;
 

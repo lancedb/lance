@@ -321,6 +321,9 @@ impl ValueEncoder {
                 has_validity = true;
                 nullable.data.as_ref()
             }
+            DataBlock::AllNull(_) => {
+                return ProtobufUtils21::constant(None);
+            }
             _ => inner,
         };
         let inner_encoding = match inner {
@@ -328,7 +331,10 @@ impl ValueEncoder {
                 ProtobufUtils21::flat(fixed_width.bits_per_value, None)
             }
             DataBlock::FixedSizeList(inner) => Self::fsl_to_encoding(inner),
-            _ => unreachable!("Unexpected data block type in value encoder's fsl_to_encoding"),
+            _ => unreachable!(
+                "Unexpected data block type in value encoder's fsl_to_encoding: {}",
+                inner.name()
+            ),
         };
         ProtobufUtils21::fsl(fsl.dimension, has_validity, inner_encoding)
     }
@@ -396,6 +402,11 @@ impl ValueEncoder {
                         (fixed_width.bits_per_value.div_ceil(8) * cum_dim) as usize;
                     bytes_per_row += data_bytes_per_row;
                     data_buffer = fixed_width.data;
+                    break;
+                }
+                DataBlock::AllNull(_) => {
+                    data_bytes_per_row = 0;
+                    data_buffer = LanceBuffer::empty();
                     break;
                 }
                 _ => unreachable!(
@@ -676,7 +687,7 @@ impl ValueDecompressor {
 
         // Finally, restore the structure
         let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bits_per_value,
+            bits_per_value: self.bits_per_item,
             num_values: num_items as u64,
             data: LanceBuffer::from(data_buffer),
             block_info: BlockInfo::new(),
@@ -747,9 +758,10 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array,
+        make_array, new_null_array, types::UInt32Type, Array, ArrayRef, Decimal128Array,
+        FixedSizeListArray, Int32Array, ListArray, UInt8Array,
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
 
@@ -764,7 +776,10 @@ pub(crate) mod tests {
             physical::value::ValueDecompressor,
         },
         format::pb21::compressive_encoding::Compression,
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{
+            check_basic_random, check_round_trip_encoding_generated,
+            check_round_trip_encoding_of_data, FnArrayGeneratorProvider, TestCases,
+        },
         version::LanceFileVersion,
     };
 
@@ -1024,6 +1039,39 @@ pub(crate) mod tests {
         assert_eq!(decompressed.as_ref(), &sample_list);
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_all_null() {
+        let items = new_null_array(&DataType::Int32, 12);
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
+        let list_array =
+            FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn regress_list_fsl() {
+        // This regresses a case where rows are large lists that span multiple
+        // mini-block chunks which gives us some all-premable mini-block chunks.
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 393, 755, 1156, 1536]);
+        let data = UInt8Array::from(vec![0; 1536 * 16]);
+        let fsl_field = Arc::new(Field::new("item", DataType::UInt8, true));
+        let fsl = FixedSizeListArray::new(fsl_field, 16, Arc::new(data), None);
+        let list_field = Arc::new(Field::new("item", fsl.data_type().clone(), false));
+        let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(1);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
+            .await;
+    }
+
     fn create_random_fsl() -> Arc<dyn Array> {
         // Several levels of def and multiple pages
         let inner = array::rand_type(&DataType::Int32).with_random_nulls(0.1);
@@ -1105,6 +1153,20 @@ pub(crate) mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_fsl_nullable_items() {
+        let datagen = Box::new(FnArrayGeneratorProvider::new(move || {
+            lance_datagen::array::rand_vec_nullable::<UInt32Type>(Dimension::from(128), 0.5)
+        }));
+
+        let field = Field::new(
+            "",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, true)), 128),
+            false,
+        );
+        check_round_trip_encoding_generated(field, datagen, TestCases::default()).await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_value_encoding_verification() {
         use std::collections::HashMap;
 
@@ -1133,5 +1195,15 @@ pub(crate) mod tests {
             (0..100).map(|i| i * 73 + 19).collect::<Vec<i32>>(),
         )) as Arc<dyn Array>;
         check_round_trip_encoding_of_data(vec![arr_fallback], &test_cases, metadata).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_mixed_page_validity() {
+        let no_nulls = Arc::new(Int32Array::from_iter_values([1, 2]));
+        let has_nulls = Arc::new(Int32Array::from_iter([Some(3), None, Some(5)]));
+
+        let test_cases = TestCases::default().with_page_sizes(vec![1]);
+        check_round_trip_encoding_of_data(vec![no_nulls, has_nulls], &test_cases, HashMap::new())
+            .await;
     }
 }

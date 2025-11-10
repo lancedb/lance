@@ -8,7 +8,7 @@ use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_array::array_has;
+use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 use std::collections::{HashMap, HashSet};

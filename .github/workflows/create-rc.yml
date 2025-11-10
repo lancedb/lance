@@ -1,0 +1,120 @@
+name: Create RC on Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: 'Release branch (e.g., release/v1.3)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (simulate without pushing)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  create-rc:
+    runs-on: ubuntu-latest
+    outputs:
+      rc_version: ${{ steps.create.outputs.RC_VERSION }}
+      rc_tag: ${{ steps.create.outputs.RC_TAG }}
+    steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
+
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        fetch-depth: 0
+        lfs: true
+
+    - name: Setup release environment
+      uses: ./.github/actions/setup-release-env
+
+    - name: Create RC
+      id: create
+      run: |
+        bash ci/create_rc.sh "${{ inputs.release_branch }}"
+
+    - name: Create GitHub Discussion for voting
+      if: ${{ !inputs.dry_run }}
+      id: create_discussion
+      env:
+        GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        DISCUSSION_URL=$(bash ci/create_rc_discussion.sh \
+          "${{ steps.create.outputs.RC_TAG }}" \
+          "${{ steps.create.outputs.RC_VERSION }}" \
+          "${{ inputs.release_branch }}" \
+          "${{ steps.create.outputs.RELEASE_TYPE }}")
+        echo "DISCUSSION_URL=$DISCUSSION_URL" >> $GITHUB_OUTPUT
+
+    - name: Push changes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      run: |
+        git push origin "${{ inputs.release_branch }}"
+        git push origin "${{ steps.create.outputs.RC_TAG }}"
+
+    - name: Generate Release Notes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      id: rc_release_notes
+      env:
+        GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+      run: |
+        PREVIOUS_TAG="${{ steps.create.outputs.PREVIOUS_TAG }}"
+        RC_TAG="${{ steps.create.outputs.RC_TAG }}"
+
+        if [ -n "${PREVIOUS_TAG}" ]; then
+          echo "Generating release notes from ${PREVIOUS_TAG} to ${RC_TAG}"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${RC_TAG}" \
+            -f previous_tag_name="${PREVIOUS_TAG}" \
+            --jq .body)
+        else
+          echo "No previous tag found, using automatic generation"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${RC_TAG}" \
+            --jq .body)
+        fi
+
+        # Save to output
+        echo "notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$NOTES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Pre-Release (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.create.outputs.RC_TAG }}
+        name: ${{ steps.create.outputs.RC_TAG }}
+        draft: false
+        prerelease: true
+        body: ${{ steps.rc_release_notes.outputs.notes }}
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+
+    - name: Summary
+      run: |
+        echo "## RC Creation Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Branch:** ${{ inputs.release_branch }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **RC Version:** ${{ steps.create.outputs.RC_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **RC Tag:** ${{ steps.create.outputs.RC_TAG }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This was a dry run. No changes were pushed." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ RC ${{ steps.create.outputs.RC_TAG }} created!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check the GitHub Discussion thread for voting" >> $GITHUB_STEP_SUMMARY
+          echo "2. Test RC artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "3. Vote on the RC" >> $GITHUB_STEP_SUMMARY
+          echo "4. If approved, use approve-rc workflow" >> $GITHUB_STEP_SUMMARY
+        fi

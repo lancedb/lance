@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -46,7 +47,7 @@ use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::io::exec::knn::KNN_INDEX_SCHEMA;
-use crate::{arrow::*, Dataset};
+use crate::Dataset;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -290,7 +291,7 @@ impl VectorIndex for PQIndex {
         .await
     }
 
-    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 
@@ -626,7 +627,7 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
-    use tempfile::tempdir;
+    use lance_core::utils::tempfile::TempStrDir;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowIdMask;
@@ -663,8 +664,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_l2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
 
@@ -694,8 +695,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_cosine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 

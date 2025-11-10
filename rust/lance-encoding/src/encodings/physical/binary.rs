@@ -10,7 +10,6 @@
 //! is needed in the encoding description.
 
 use arrow_array::OffsetSizeTrait;
-use bytemuck::cast_slice;
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
@@ -305,11 +304,11 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 
 /// Most basic encoding for variable-width data which does no compression at all
 /// The DataBlock memory layout looks like below:
-/// ----------------------------------------------------------------------------------------
-/// | bits_per_offset | number of values  | bytes_start_offset | offsets data | bytes data
-/// ----------------------------------------------------------------------------------------
-/// |       1 byte    |<bits_per_offset>/8|<bits_per_offset>/8 |  offsets_len | dat_len
-/// ----------------------------------------------------------------------------------------
+///
+/// | bits_per_offset           | bytes_start_offset        | offsets data | bytes data |
+/// | ------------------------- | ------------------------- | ------------ | ---------- |
+/// | <bits_per_offset>/8 bytes | <bits_per_offset>/8 bytes | offsets_len  | data_len   |
+///
 /// It's used in VariableEncoder and BinaryBlockDecompressor
 ///
 #[derive(Debug, Default)]
@@ -319,35 +318,26 @@ impl BlockCompressor for VariableEncoder {
     fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
         match data {
             DataBlock::VariableWidth(ref mut variable_width_data) => {
-                let num_values: u64 = variable_width_data.num_values;
                 match variable_width_data.bits_per_offset {
                     32 => {
-                        let num_values: u32 = num_values
-            .try_into()
-            .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
-
                         let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
                         let offsets = offsets.as_ref();
-                        // the first bit stores the bits_per_offset, the next 4 bytes store the number of values,
-                        // then 4 bytes for bytes_start_offset,
-                        // then offsets data, then bytes data.
-                        let bytes_start_offset = 1 + 4 + 4 + std::mem::size_of_val(offsets) as u32;
+                        // The first 4 bytes store the bits per offset, the next 4 bytes store the start
+                        // offset of the bytes data, then offsets data, then bytes data.
+                        let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
 
                         let output_total_bytes =
                             bytes_start_offset as usize + variable_width_data.data.len();
                         let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
 
                         // Store bit_per_offset info
-                        output.push(32_u8);
-
-                        // store `num_values` in the first 4 bytes of output buffer
-                        output.extend_from_slice(&(num_values).to_le_bytes());
+                        output.extend_from_slice(&(32_u32).to_le_bytes());
 
                         // store `bytes_start_offset` in the next 4 bytes of output buffer
                         output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
 
                         // store offsets
-                        output.extend_from_slice(cast_slice(offsets));
+                        output.extend_from_slice(&variable_width_data.offsets);
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
@@ -356,27 +346,22 @@ impl BlockCompressor for VariableEncoder {
                     64 => {
                         let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
                         let offsets = offsets.as_ref();
-                        // the first bit stores the bits_per_offset, the next 8 bytes store the number of values,
-                        // then 8 bytes for bytes_start_offset,
-                        // then offsets data, then bytes data.
-
-                        let bytes_start_offset = 1 + 8 + 8 + std::mem::size_of_val(offsets) as u64;
+                        // The first 8 bytes store the bits per offset, the next 8 bytes store the start
+                        // offset of the bytes data, then offsets data, then bytes data.
+                        let bytes_start_offset = 8 + 8 + std::mem::size_of_val(offsets) as u64;
 
                         let output_total_bytes =
                             bytes_start_offset as usize + variable_width_data.data.len();
                         let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
 
                         // Store bit_per_offset info
-                        output.push(64_u8);
-
-                        // store `num_values` in the first 8 bytes of output buffer
-                        output.extend_from_slice(&(num_values).to_le_bytes());
+                        output.extend_from_slice(&(64_u64).to_le_bytes());
 
                         // store `bytes_start_offset` in the next 8 bytes of output buffer
                         output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
 
                         // store offsets
-                        output.extend_from_slice(cast_slice(offsets));
+                        output.extend_from_slice(&variable_width_data.offsets);
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
@@ -423,61 +408,78 @@ pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        // The first byte contains bytes_per_offset info
-        let bits_per_offset = data[0];
-        match bits_per_offset {
-            32 => {
-                // the next 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-                let stored_num_values = LittleEndian::read_u32(&data[1..5]);
-                debug_assert_eq!(num_values, stored_num_values as u64);
+        // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
+        // as four bytes.  However, this led to alignment problems and was wasteful since we already store the num_values
+        // in higher layers.
+        //
+        // In the standard scheme we use 4 bytes for the bits per offset and 4 bytes for the bytes_start_offset and we
+        // rely on the passed in num_values to be correct.
 
-                // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-                let bytes_start_offset = LittleEndian::read_u32(&data[5..9]);
+        // This isn't perfect but it's probably good enough and the best I think we can do.  The bits per offset will
+        // never be more than 255 and it's little endian so the last 3 bytes will always be 0.  These will be the least
+        // significant 3 bytes of the number of values in the old scheme.  It's pretty unlikely these are all 0 (that would
+        // mean there are at least 16M values in a single page) so we'll use this to determine if the old scheme is used.
+        let is_old_scheme = data[1] != 0 || data[2] != 0 || data[3] != 0;
 
-                // the next `bytes_start_offset - 9` stores the offsets.
-                let offsets = data.slice_with_length(9, bytes_start_offset as usize - 9);
-
-                // the rest are the binary bytes.
-                let data = data.slice_with_length(
-                    bytes_start_offset as usize,
-                    data.len() - bytes_start_offset as usize,
-                );
-
-                Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data,
-                    offsets,
-                    bits_per_offset: 32,
-                    num_values,
-                    block_info: BlockInfo::new(),
-                }))
+        let (bits_per_offset, bytes_start_offset, offset_start) = if is_old_scheme {
+            // Old scheme
+            let bits_per_offset = data[0];
+            match bits_per_offset {
+                32 => {
+                    debug_assert_eq!(LittleEndian::read_u32(&data[1..5]), num_values as u32);
+                    let bytes_start_offset = LittleEndian::read_u32(&data[5..9]);
+                    (bits_per_offset, bytes_start_offset as u64, 9)
+                }
+                64 => {
+                    debug_assert_eq!(LittleEndian::read_u64(&data[1..9]), num_values);
+                    let bytes_start_offset = LittleEndian::read_u64(&data[9..17]);
+                    (bits_per_offset, bytes_start_offset, 17)
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                        location: location!(),
+                    });
+                }
             }
-            64 => {
-                // the next 8 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-                let stored_num_values = LittleEndian::read_u64(&data[1..9]);
-                debug_assert_eq!(num_values, stored_num_values);
-
-                // the next 8 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-                let bytes_start_offset = LittleEndian::read_u64(&data[9..17]);
-
-                // the next `bytes_start_offset - 17` stores the offsets.
-                let offsets = data.slice_with_length(17, bytes_start_offset as usize - 17);
-
-                // the rest are the binary bytes.
-                let data = data.slice_with_length(
-                    bytes_start_offset as usize,
-                    data.len() - bytes_start_offset as usize,
-                );
-
-                Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data,
-                    offsets,
-                    bits_per_offset: 64,
-                    num_values,
-                    block_info: BlockInfo::new(),
-                }))
+        } else {
+            // Standard scheme
+            let bits_per_offset = LittleEndian::read_u32(&data[0..4]) as u8;
+            match bits_per_offset {
+                32 => {
+                    let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
+                    (bits_per_offset, bytes_start_offset as u64, 8)
+                }
+                64 => {
+                    let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
+                    (bits_per_offset, bytes_start_offset, 16)
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                        location: location!(),
+                    });
+                }
             }
-            _ => panic!("Unsupported bits_per_offset={}", bits_per_offset),
-        }
+        };
+
+        // the next `bytes_start_offset - offset_start` stores the offsets.
+        let offsets =
+            data.slice_with_length(offset_start, bytes_start_offset as usize - offset_start);
+
+        // the rest are the binary bytes.
+        let data = data.slice_with_length(
+            bytes_start_offset as usize,
+            data.len() - bytes_start_offset as usize,
+        );
+
+        Ok(DataBlock::VariableWidth(VariableWidthBlock {
+            data,
+            offsets,
+            bits_per_offset,
+            num_values,
+            block_info: BlockInfo::new(),
+        }))
     }
 }
 

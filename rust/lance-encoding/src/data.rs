@@ -20,7 +20,10 @@ use std::{
 };
 
 use arrow_array::{
-    cast::AsArray, new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+    cast::AsArray,
+    new_empty_array, new_null_array,
+    types::{ArrowDictionaryKeyType, UInt16Type, UInt32Type, UInt64Type, UInt8Type},
+    Array, ArrayRef, OffsetSizeTrait, UInt64Array,
 };
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
@@ -342,23 +345,7 @@ struct StructDataBlockBuilder {
 }
 
 impl StructDataBlockBuilder {
-    // Currently only Struct with fixed-width fields are supported.
-    // And the assumption that all fields have `bits_per_value % 8 == 0` is made here.
-    fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
-        let mut children = vec![];
-
-        debug_assert!(bits_per_values.iter().all(|bpv| bpv % 8 == 0));
-
-        let bytes_per_row: u32 = bits_per_values.iter().sum::<u32>() / 8;
-        let bytes_per_row = bytes_per_row as u64;
-
-        for bits_per_value in bits_per_values.iter() {
-            let this_estimated_size_bytes =
-                estimated_size_bytes / bytes_per_row * (*bits_per_value as u64) / 8;
-            let child =
-                FixedWidthDataBlockBuilder::new(*bits_per_value as u64, this_estimated_size_bytes);
-            children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
-        }
+    fn new(children: Vec<Box<dyn DataBlockBuilderImpl>>) -> Self {
         Self { children }
     }
 }
@@ -384,6 +371,24 @@ impl DataBlockBuilderImpl for StructDataBlockBuilder {
         })
     }
 }
+
+#[derive(Debug, Default)]
+struct AllNullDataBlockBuilder {
+    num_values: u64,
+}
+
+impl DataBlockBuilderImpl for AllNullDataBlockBuilder {
+    fn append(&mut self, _data_block: &DataBlock, selection: Range<u64>) {
+        self.num_values += selection.end - selection.start;
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        DataBlock::AllNull(AllNullDataBlock {
+            num_values: self.num_values,
+        })
+    }
+}
+
 /// A data block to represent a fixed size list
 #[derive(Debug, Clone)]
 pub struct FixedSizeListBlock {
@@ -676,6 +681,12 @@ impl StructDataBlock {
             .collect()
     }
 
+    pub fn has_variable_width_child(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+    }
+
     pub fn data_size(&self) -> u64 {
         self.children
             .iter()
@@ -694,24 +705,63 @@ pub struct DictionaryDataBlock {
 }
 
 impl DictionaryDataBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
-        let (key_type, value_type) = if let DataType::Dictionary(key_type, value_type) = &data_type
-        {
-            (key_type.as_ref().clone(), value_type.as_ref().clone())
-        } else {
-            return Err(Error::Internal {
-                message: format!("Expected Dictionary, got {:?}", data_type),
-                location: location!(),
-            });
-        };
+    fn decode_helper<K: ArrowDictionaryKeyType>(self) -> Result<DataBlock> {
+        // Handle empty batch - this can happen when decoding a range that contains
+        // only empty/null lists, or when reading sparse data
+        if self.indices.num_values == 0 {
+            return Ok(DataBlock::AllNull(AllNullDataBlock { num_values: 0 }));
+        }
 
-        let indices = self.indices.into_arrow(key_type, validate)?;
-        let dictionary = self.dictionary.into_arrow(value_type, validate)?;
+        // assume the indices are uniformly distributed.
+        let estimated_size_bytes = self.dictionary.data_size()
+            * (self.indices.num_values + self.dictionary.num_values() - 1)
+            / self.dictionary.num_values();
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+
+        let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
+        let indices = indices.as_ref();
+
+        indices
+            .iter()
+            .map(|idx| idx.to_usize().unwrap() as u64)
+            .for_each(|idx| {
+                data_builder.append(&self.dictionary, idx..idx + 1);
+            });
+
+        Ok(data_builder.finish())
+    }
+
+    pub fn decode(self) -> Result<DataBlock> {
+        match self.indices.bits_per_value {
+            8 => self.decode_helper::<UInt8Type>(),
+            16 => self.decode_helper::<UInt16Type>(),
+            32 => self.decode_helper::<UInt32Type>(),
+            64 => self.decode_helper::<UInt64Type>(),
+            _ => Err(lance_core::Error::Internal {
+                message: format!(
+                    "Unsupported dictionary index bit width: {} bits",
+                    self.indices.bits_per_value
+                ),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn into_arrow_dict(
+        self,
+        key_type: Box<DataType>,
+        value_type: Box<DataType>,
+        validate: bool,
+    ) -> Result<ArrayData> {
+        let indices = self.indices.into_arrow((*key_type).clone(), validate)?;
+        let dictionary = self
+            .dictionary
+            .into_arrow((*value_type).clone(), validate)?;
 
         let builder = indices
             .into_builder()
             .add_child_data(dictionary)
-            .data_type(data_type);
+            .data_type(DataType::Dictionary(key_type, value_type));
 
         if validate {
             Ok(builder.build()?)
@@ -720,10 +770,29 @@ impl DictionaryDataBlock {
         }
     }
 
+    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        if let DataType::Dictionary(key_type, value_type) = data_type {
+            self.into_arrow_dict(key_type, value_type, validate)
+        } else {
+            self.decode()?.into_arrow(data_type, validate)
+        }
+    }
+
     fn into_buffers(self) -> Vec<LanceBuffer> {
         let mut buffers = self.indices.into_buffers();
         buffers.extend(self.dictionary.into_buffers());
         buffers
+    }
+
+    pub fn into_parts(self) -> (DataBlock, DataBlock) {
+        (DataBlock::FixedWidth(self.indices), *self.dictionary)
+    }
+
+    pub fn from_parts(indices: FixedWidthDataBlock, dictionary: DataBlock) -> Self {
+        Self {
+            indices,
+            dictionary: Box::new(dictionary),
+        }
     }
 }
 
@@ -980,17 +1049,20 @@ impl DataBlock {
                 ))
             }
             Self::Struct(struct_data_block) => {
-                let mut bits_per_values = vec![];
-                for child in struct_data_block.children.iter() {
-                    let child = child.as_fixed_width_ref().
-                        expect("Currently StructDataBlockBuilder is only used in packed-struct encoding, and currently in packed-struct encoding, only fixed-width fields are supported.");
-                    bits_per_values.push(child.bits_per_value as u32);
-                }
-                Box::new(StructDataBlockBuilder::new(
-                    bits_per_values,
-                    estimated_size_bytes,
-                ))
+                let num_children = struct_data_block.children.len();
+                let per_child_estimate = if num_children == 0 {
+                    0
+                } else {
+                    estimated_size_bytes / num_children as u64
+                };
+                let child_builders = struct_data_block
+                    .children
+                    .iter()
+                    .map(|child| child.make_builder(per_child_estimate))
+                    .collect();
+                Box::new(StructDataBlockBuilder::new(child_builders))
             }
+            Self::AllNull(_) => Box::new(AllNullDataBlockBuilder::default()),
             _ => todo!("make_builder for {:?}", self),
         }
     }
@@ -1411,6 +1483,8 @@ impl DataBlock {
             }
             DataType::Date32
             | DataType::Date64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::Duration(_)

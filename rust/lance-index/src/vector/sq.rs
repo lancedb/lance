@@ -270,7 +270,7 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Rang
         .iter()
         .map(|&v| {
             let v = v.to_f64().unwrap();
-            let v = ((v - bounds.start) * 255.0 / range).round();
+            let v = (v - bounds.start) * 255.0 / range;
             v as u8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
         })
         .collect_vec()

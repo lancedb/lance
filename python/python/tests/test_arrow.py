@@ -20,6 +20,7 @@ from lance.arrow import (
     PandasBFloat16Array,
     bfloat16_array,
 )
+from lance.file import LanceFileReader
 from ml_dtypes import bfloat16
 
 
@@ -190,6 +191,46 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
         [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
         [12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
     ]
+
+
+def test_struct_variable_children_roundtrip(tmp_path: Path):
+    struct_type = pa.struct(
+        [
+            pa.field("id", pa.int32()),
+            pa.field("text", pa.utf8()),
+            pa.field("payload", pa.binary()),
+        ]
+    )
+    struct_field = pa.field(
+        "record",
+        struct_type,
+        metadata={"lance-encoding:packed": "true"},
+    )
+    struct_array = pa.StructArray.from_arrays(
+        [
+            pa.array([1, 2, 3, 4], pa.int32()),
+            pa.array(["alpha", "beta", "gamma", "delta"], pa.utf8()),
+            pa.array(
+                [b"\x01\x02", b"\xff", b"\x03\x04\x05", b"\x10"],
+                type=pa.binary(),
+            ),
+        ],
+        type=struct_type,
+    )
+    table = pa.Table.from_arrays([struct_array], schema=pa.schema([struct_field]))
+
+    dataset_uri = tmp_path / "struct.lance"
+    ds = lance.write_dataset(table, dataset_uri, data_storage_version="2.2")
+
+    round_trip = ds.to_table()
+    assert round_trip.schema == table.schema
+    assert round_trip.equals(table)
+    assert round_trip.to_pylist() == table.to_pylist()
+
+    data_file = next((dataset_uri / "data").glob("*.lance"))
+    metadata = LanceFileReader(str(data_file)).metadata()
+    encodings = [page.encoding for page in metadata.columns[0].pages]
+    assert any("VariablePackedStruct" in encoding for encoding in encodings)
 
 
 @pytest.fixture

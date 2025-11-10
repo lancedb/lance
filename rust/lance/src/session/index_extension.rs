@@ -65,7 +65,7 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
@@ -140,7 +140,7 @@ mod test {
             unimplemented!()
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!()
         }
 
@@ -344,12 +344,11 @@ mod test {
             .load_index_called
             .load(std::sync::atomic::Ordering::Acquire));
 
-        let mut ds_with_extension =
-            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
-                .with_session(Arc::new(session))
-                .load()
-                .await
-                .unwrap();
+        let mut ds_with_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
 
         // create index
         ds_with_extension
@@ -366,11 +365,10 @@ mod test {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // check that the index was created
-        let ds_without_extension =
-            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
-                .load()
-                .await
-                .unwrap();
+        let ds_without_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .load()
+            .await
+            .unwrap();
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid

@@ -19,7 +19,7 @@ use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 
 use super::{dot::dot, Normalize};
 use super::{norm_l2::norm_l2, Dot};
@@ -91,7 +91,7 @@ mod kernel {
 
 impl Cosine for f16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        match *FP16_SIMD_SUPPORT {
+        match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
@@ -101,7 +101,7 @@ impl Cosine for f16 {
                 kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512 => unsafe {
+            SimdSupport::Avx512FP16 => unsafe {
                 kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]

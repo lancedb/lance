@@ -4,6 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
+use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -95,6 +96,7 @@ fn selection_as_expr(
                 make_struct.clone(),
                 sub_exprs,
                 project_field(field, selection),
+                Arc::new(ConfigOptions::default()),
             ))
         }
     }
@@ -110,6 +112,7 @@ fn sub_field(parent_expr: Arc<dyn PhysicalExpr>, field: &FieldRef) -> Arc<dyn Ph
             Arc::new(Literal::new(ScalarValue::Utf8(Some(field.name().clone())))),
         ],
         field.clone(),
+        Arc::new(ConfigOptions::default()),
     ))
 }
 

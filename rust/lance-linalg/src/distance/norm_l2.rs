@@ -3,11 +3,15 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::FixedSizeListArray;
+use arrow_schema::DataType;
 use half::{bf16, f16};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
-use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
@@ -46,7 +50,7 @@ impl Normalize for u8 {
 impl Normalize for f16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match *FP16_SIMD_SUPPORT {
+        match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::norm_l2_f16_neon(vector.as_ptr(), vector.len() as u32)
@@ -56,7 +60,7 @@ impl Normalize for f16 {
                 kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512 => unsafe {
+            SimdSupport::Avx512FP16 => unsafe {
                 kernel::norm_l2_f16_avx512(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
@@ -134,6 +138,36 @@ pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
     T::norm_l2(vector)
 }
 
+pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
+    let dim = fsl.value_length() as usize;
+    match fsl.value_type() {
+        DataType::Float16 => fsl
+            .values()
+            .as_primitive::<Float16Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f16>().to_f32())
+            .collect::<Vec<_>>(),
+        DataType::Float32 => fsl
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f32>())
+            .collect::<Vec<_>>(),
+        DataType::Float64 => fsl
+            .values()
+            .as_primitive::<Float64Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f64>() as f32)
+            .collect::<Vec<_>>(),
+        _ => {
+            unimplemented!("Unsupported data type: {}", fsl.value_type())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +177,7 @@ mod tests {
 
     /// Reference implementation of L2 norm.
     fn norm_l2_reference(data: &[f64]) -> f32 {
-        data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
+        data.iter().map(|v| *v * *v).sum::<f64>().sqrt() as f32
     }
 
     fn do_norm_l2_test<T: Normalize + ToPrimitive>(

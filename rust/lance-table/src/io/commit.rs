@@ -731,6 +731,7 @@ pub async fn commit_handler_from_url(
             let options = options.clone().unwrap_or_default();
             let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
             let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
+            let expires_at_millis = storage_options.expires_at_millis();
             let storage_options = storage_options.as_s3_options();
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
@@ -740,6 +741,8 @@ pub async fn commit_handler_from_url(
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
+                options.storage_options_provider.clone(),
+                expires_at_millis,
             )
             .await?;
 
@@ -1075,6 +1078,8 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::tempfile::TempObjDir;
+
     use super::*;
 
     #[test]
@@ -1166,12 +1171,11 @@ mod tests {
         let (object_store, base) = if lexical_list_store {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
-            tempdir = Some(tempfile::tempdir().unwrap());
-            let base = Path::from_absolute_path(tempdir.as_ref().unwrap().path().to_str().unwrap())
-                .unwrap();
+            tempdir = TempObjDir::default();
+            let path = tempdir.child("base");
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
-            (store, base)
+            (store, path)
         };
 
         // Write 12 manifest files, latest first

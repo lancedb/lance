@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
@@ -10,7 +11,7 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
@@ -166,10 +167,23 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fragments = extract_vec(&ob.getattr("fragments")?)?;
 
+                let initial_bases = ob
+                    .getattr("initial_bases")
+                    .ok()
+                    .and_then(|attr| attr.extract::<Option<Vec<DatasetBasePath>>>().ok())
+                    .flatten()
+                    .map(|py_bases| {
+                        py_bases
+                            .into_iter()
+                            .map(BasePath::from)
+                            .collect::<Vec<BasePath>>()
+                    });
+
                 let op = Operation::Overwrite {
                     schema,
                     fragments,
                     config_upsert_values: None,
+                    initial_bases,
                 };
                 Ok(Self(op))
             }
@@ -489,6 +503,20 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
+            Operation::UpdateBases { ref new_bases } => {
+                if let Ok(cls) = namespace.getattr("UpdateBases") {
+                    use crate::dataset::DatasetBasePath;
+                    let new_bases_py: Vec<DatasetBasePath> = new_bases
+                        .iter()
+                        .map(|bp| DatasetBasePath::from(bp.clone()))
+                        .collect();
+                    let new_bases_list = pyo3::types::PyList::new(py, new_bases_py)?;
+                    cls.call1((new_bases_list,))
+                } else {
+                    let base_op = namespace.getattr("BaseOperation")?;
+                    base_op.call0()
+                }
+            }
             _ => todo!(),
         }
     }
@@ -499,10 +527,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
-        let blobs_op = ob
-            .getattr("blobs_op")?
-            .extract::<Option<PyLance<Operation>>>()?
-            .map(|op| op.0);
         let transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
@@ -512,7 +536,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             read_version,
             uuid,
             operation,
-            blobs_op,
             tag: None,
             transaction_properties,
         }))
@@ -532,18 +555,12 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let read_version = self.0.read_version;
         let uuid = &self.0.uuid;
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
-        let blobs_op = self
-            .0
-            .blobs_op
-            .as_ref()
-            .map(|op| PyLance(op).into_pyobject(py))
-            .transpose()?;
 
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
 
-        let py_transaction = cls.call1((read_version, operation, uuid, blobs_op))?;
+        let py_transaction = cls.call1((read_version, operation, uuid))?;
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;

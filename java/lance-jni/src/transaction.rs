@@ -10,12 +10,12 @@ use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
-use jni::objects::{JByteArray, JMap, JObject, JString, JValue};
+use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::jbyte;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
-    UpdateMap, UpdateMapEntry,
+    UpdateMap, UpdateMapEntry, UpdateMode,
 };
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -23,7 +23,6 @@ use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -98,18 +97,19 @@ impl IntoJava for &IndexMetadata {
         };
         let name = env.new_string(&self.name)?;
 
-        let fragment_bitmap = if let Some(bitmap) = &self.fragment_bitmap {
-            let mut bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bytes)
-                .map_err(|e| Error::input_error(e.to_string()))?;
-
-            let jbytes =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) };
-
-            let byte_array = env.new_byte_array(bytes.len() as i32)?;
-            env.set_byte_array_region(&byte_array, 0, jbytes)?;
-            byte_array.into()
+        let fragments = if let Some(bitmap) = &self.fragment_bitmap {
+            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for frag_id in bitmap.iter() {
+                let id_obj =
+                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(frag_id as i32)])?;
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&id_obj)],
+                )?;
+            }
+            array_list
         } else {
             JObject::null()
         };
@@ -152,19 +152,38 @@ impl IntoJava for &IndexMetadata {
         // Create IndexMetadata object
         Ok(env.new_object(
             "com/lancedb/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;Ljava/lang/Integer;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
                 JValue::Object(&name),
                 JValue::Long(self.dataset_version as i64),
-                JValue::Object(&fragment_bitmap),
+                JValue::Object(&fragments),
                 JValue::Object(&index_details),
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
             ],
         )?)
+    }
+}
+
+impl IntoJava for &UpdateMode {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let name = match self {
+            UpdateMode::RewriteRows => "RewriteRows",
+            UpdateMode::RewriteColumns => "RewriteColumns",
+        };
+        let update_mode_type_class = "com/lancedb/lance/operation/Update$UpdateMode";
+        env.get_static_field(
+            update_mode_type_class,
+            name,
+            format!("L{};", update_mode_type_class),
+        )?
+        .l()
+        .map_err(|e| {
+            Error::runtime_error(format!("failed to get {}: {}", update_mode_type_class, e))
+        })
     }
 }
 
@@ -232,12 +251,12 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
 
         let fragment_bitmap: Option<RoaringBitmap> =
-            env.get_optional_from_method(self, "fragmentBitmap", |env, bitmap_obj| {
-                let byte_array: JByteArray = bitmap_obj.into();
-                let bytes = env.convert_byte_array(&byte_array)?;
-                let bitmap = RoaringBitmap::deserialize_from(Cursor::new(bytes)).map_err(|e| {
-                    Error::input_error(format!("Invalid RoaringBitmap data: {}", e))
-                })?;
+            env.get_optional_from_method(self, "fragments", |env, fragments_obj| {
+                let frag_ids = env.get_integers(&fragments_obj)?;
+                let bitmap = frag_ids
+                    .iter()
+                    .map(|val| *val as u32)
+                    .collect::<RoaringBitmap>();
                 Ok(bitmap)
             })?;
 
@@ -292,6 +311,21 @@ impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
             .extract_object(env)?;
 
         Ok(DataReplacementGroup(fragment_id, new_file))
+    }
+}
+
+impl FromJObjectWithEnv<UpdateMode> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<UpdateMode> {
+        let s = env
+            .call_method(self, "toString", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let s: String = env.get_string(&JString::from(s))?.into();
+        let t = if s == "RewriteRows" {
+            UpdateMode::RewriteRows
+        } else {
+            UpdateMode::RewriteColumns
+        };
+        Ok(t)
     }
 }
 
@@ -363,18 +397,16 @@ fn convert_to_java_transaction<'local>(
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
     };
-    let operation = convert_to_java_operation_inner(env, transaction.operation)?;
-    let blobs_op = convert_to_java_operation(env, transaction.blobs_op)?;
+    let operation = convert_to_java_operation(env, Some(transaction.operation))?;
 
     let java_transaction = env.new_object(
         "com/lancedb/lance/Transaction",
-        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
         &[
             JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&blobs_op),
             JValue::Object(&JObject::null()),
             JValue::Object(&transaction_properties),
         ],
@@ -438,6 +470,7 @@ fn convert_to_java_operation_inner<'local>(
             fragments: rust_fragments,
             schema,
             config_upsert_values,
+            initial_bases: _,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
             let java_schema = convert_to_java_schema(env, schema)?;
@@ -460,10 +493,10 @@ fn convert_to_java_operation_inner<'local>(
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
-            fields_modified: _,
+            fields_modified,
             mem_wal_to_merge: _,
-            fields_for_preserving_frag_bitmap: _,
-            update_mode: _,
+            fields_for_preserving_frag_bitmap,
+            update_mode,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -472,14 +505,31 @@ fn convert_to_java_operation_inner<'local>(
             let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
-
+            let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
+            let fields_for_preserving_frag_bitmap =
+                JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
+            let update_mode = match update_mode {
+                Some(update_mode) => update_mode.into_java(env),
+                None => Ok(JObject::null()),
+            }?;
+            let update_mode_optional = env
+                .call_static_method(
+                    "java/util/Optional",
+                    "ofNullable",
+                    "(Ljava/lang/Object;)Ljava/util/Optional;",
+                    &[JValue::Object(&update_mode)],
+                )?
+                .l()?;
             Ok(env.new_object(
                 "com/lancedb/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
                     JValue::Object(&new_fragments_obj),
+                    JValueGen::Object(&fields_modified),
+                    JValueGen::Object(&fields_for_preserving_frag_bitmap),
+                    JValue::Object(&update_mode_optional),
                 ],
             )?)
         }
@@ -655,11 +705,6 @@ fn convert_to_rust_transaction(
         .l()?;
     let op = convert_to_rust_operation(env, &op, java_dataset)?;
 
-    let blobs_op =
-        env.get_optional_from_method(&java_transaction, "blobsOperation", |env, blobs_op| {
-            convert_to_rust_operation(env, &blobs_op, java_dataset)
-        })?;
-
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
         "transactionProperties",
@@ -670,7 +715,6 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
-        .blobs_op(blobs_op)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }
@@ -839,6 +883,7 @@ fn convert_to_rust_operation(
                 fragments,
                 schema,
                 config_upsert_values,
+                initial_bases: None,
             }
         }
         "Rewrite" => {
@@ -886,14 +931,30 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
+            let fields_modified = env
+                .call_method(java_operation, "fieldsModified", "()[J", &[])?
+                .l()?;
+            let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
+
+            let fields_for_preserving_frag_bitmap = env
+                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
+                .l()?;
+            let fields_for_preserving_frag_bitmap =
+                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+
+            let update_mode: Option<UpdateMode> =
+                env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
+                    update_mode.extract_object(env)
+                })?;
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified: vec![],
+                fields_modified,
                 mem_wal_to_merge: None,
-                update_mode: None,
-                fields_for_preserving_frag_bitmap: vec![],
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             }
         }
         "DataReplacement" => {
@@ -924,6 +985,20 @@ fn convert_to_rust_operation(
                 .call_method(java_operation, "numFragments", "()I", &[])?
                 .i()? as u32;
             return Ok(Operation::ReserveFragments { num_fragments });
+        }
+        "CreateIndex" => {
+            let new_indices =
+                import_vec_from_method(env, java_operation, "getNewIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            let removed_indices =
+                import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
+                    index.extract_object(env)
+                })?;
+            return Ok(Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            });
         }
         _ => unimplemented!(),
     };

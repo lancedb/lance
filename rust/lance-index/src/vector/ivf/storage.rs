@@ -107,7 +107,7 @@ impl IvfModel {
         query: &dyn Array,
         nprobes: usize,
         distance_type: DistanceType,
-    ) -> Result<UInt32Array> {
+    ) -> Result<(UInt32Array, Float32Array)> {
         let internal = crate::vector::ivf::new_ivf_transformer(
             self.centroids.clone().unwrap(),
             distance_type,

@@ -430,6 +430,15 @@ fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
                 }
             }
         }
+        // Include gauge-based I/O metrics (some nodes record I/O as gauges)
+        for (metric_name, gauge) in metrics.iter_gauges() {
+            match metric_name.as_ref() {
+                IOPS_METRIC => counts.iops += gauge.value(),
+                REQUESTS_METRIC => counts.requests += gauge.value(),
+                BYTES_READ_METRIC => counts.bytes_read += gauge.value(),
+                _ => {}
+            }
+        }
     }
     for child in node.children() {
         visit_node(child.as_ref(), counts);
@@ -770,5 +779,9 @@ impl ExecutionPlan for StrictBatchSizeExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
     }
 }

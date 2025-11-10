@@ -15,16 +15,16 @@ message FileDescriptor {
 
 // A schema which describes the data type of each of the columns
 message Schema {
-    // All fields in this file, including the nested fields.
-    repeated lance.file.Field fields = 1;
-    // Schema metadata.
-    map<string, bytes> metadata = 5;
+  // All fields in this file, including the nested fields.
+  repeated lance.file.Field fields = 1;
+  // Schema metadata.
+  map<string, bytes> metadata = 5;
 }
 
 // Metadata of one Lance file.
 message Metadata {
-  // 4 was used for StatisticsMetadata in the past, but has been moved to prevent
-  // a bug in older readers.
+  // 4 was used for StatisticsMetadata in the past, but has been moved to
+  // prevent a bug in older readers.
   reserved 4;
 
   // Position of the manifest in the file. If it is zero, the manifest is stored
@@ -44,7 +44,7 @@ message Metadata {
   // contiguously stored.
   //
   // Every field that is a part of the file will have a run in the page table.
-  // This includes struct columns, which will have a run of length 0 since 
+  // This includes struct columns, which will have a run of length 0 since
   // they don't store any actual data.
   //
   // For example, for the column 5 and batch 4, we have:
@@ -57,7 +57,7 @@ message Metadata {
   message StatisticsMetadata {
     // The schema of the statistics.
     //
-    // This might be empty, meaning there are no statistics. It also might not 
+    // This might be empty, meaning there are no statistics. It also might not
     // contain statistics for every field.
     repeated Field schema = 1;
 
@@ -70,20 +70,20 @@ message Metadata {
 
     // The file position of the statistics page table
     //
-    // The page table is a matrix of N x 2, where N = length of stats_fields. This is
-    // the same layout as the main page table, except there is always only one
-    // batch.
+    // The page table is a matrix of N x 2, where N = length of stats_fields.
+    // This is the same layout as the main page table, except there is always
+    // only one batch.
     //
     // For example, to get the stats column 5, we have:
     // ```text
     //   position = stats_page_table[5][0];
     //   length = stats_page_table[5][1];
     // ```
-      uint64 page_table_position = 3;
+    uint64 page_table_position = 3;
   }
 
   StatisticsMetadata statistics = 5;
-} // Metadata
+}  // Metadata
 
 // Supported encodings.
 enum Encoding {
@@ -154,7 +154,8 @@ message Field {
   // * "date32:day"
   // * "date64:ms"
   // * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"
-  // * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is "s", "ms", "us", "ns"
+  // * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is
+  // "s", "ms", "us", "ns"
   // * "dict:{value_type}:{index_type}:false"
   string logical_type = 5;
   // If this field is nullable.
@@ -168,24 +169,18 @@ message Field {
   /// The logic type presents the value type of the column, i.e., string value.
   Dictionary dictionary = 8;
 
-  // Deprecated: optional extension type name, use metadata field ARROW:extension:name
+  // Deprecated: optional extension type name, use metadata field
+  // ARROW:extension:name
   string extension_name = 9;
 
   // optional field metadata (e.g. extension type name/parameters)
   map<string, bytes> metadata = 10;
 
-  /// The storage class of the field
-  ///
-  /// This determines the rate at which the field is compacted.
-  ///
-  /// Currently, there are only two storage classes:
-  /// 
-  /// "" - The default storage class.
-  /// "blob" - The field is compacted into fewer rows per fragment.
-  ///
-  /// Fields that have non-default storage classes are stored in different
-  /// datasets (e.g. blob fields are stored in the nested "_blobs" dataset)
-  string storage_class = 11;
+  // Field number 11 was previously `string storage_class`.
+  // Keep it reserved so older manifests remain compatible while new writers
+  // avoid reusing the slot.
+  reserved 11;
+  reserved "storage_class";
 
   bool unenforced_primary_key = 12;
 }

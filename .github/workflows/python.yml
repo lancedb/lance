@@ -95,7 +95,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["9", "12"]
+        python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04"
     defaults:
@@ -119,24 +119,20 @@ jobs:
           cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
-      - name: Generate forward compatibility files
-        run: python python/tests/forward_compat/datagen.py
-      - name: Run forward compatibility tests (pylance 0.16.0)
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pytest pylance==0.16.0
-          pytest python/tests/forward_compat --run-forward
-      - name: Run forward compatibility tests (pylance 0.29.1.beta2)
-        run: |
-          source venv/bin/activate
-          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
-          pytest python/tests/forward_compat --run-forward
+      - name: Upload wheels as artifacts
+        if: ${{ matrix.python-minor-version == '13' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/target/wheels/pylance-*.whl
 
-  linux-arm:
-    timeout-minutes: 45
-    runs-on: ubuntu-2404-4x-arm64
-    name: Python Linux 3.12 ARM
+  forward-compat:
+    needs: linux
+    runs-on: ubuntu-24.04
+    name: Forward Compatibility Tests (${{ matrix.lance-version }})
+    strategy:
+      matrix:
+        lance-version: ["0.16.0", "0.30.0", "0.36.0"]
     defaults:
       run:
         shell: bash
@@ -149,7 +145,43 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.12
+          python-version: 3.13
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/wheels
+      - name: Install dependencies
+        run: |
+          pip install $(ls wheels/pylance-*.whl)[tests,ray]
+      - name: Generate forward compatibility files
+        env:
+          PYTHONPATH: python/tests
+        run: python -m forward_compat.datagen
+      - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install pytest pylance==${{ matrix.lance-version }}
+          pytest python/tests/forward_compat --run-forward
+
+  linux-arm:
+    timeout-minutes: 45
+    runs-on: ubuntu-2404-4x-arm64
+    name: Python Linux 3.13 ARM
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -167,7 +199,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
-    name: Python macOS 3.12 ARM
+    name: Python macOS 3.13 ARM
     runs-on: "macos-14"
     defaults:
       run:
@@ -181,7 +213,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python

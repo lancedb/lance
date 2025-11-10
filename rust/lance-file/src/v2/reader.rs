@@ -212,18 +212,25 @@ impl ReaderProjection {
             let is_structural = file_version >= LanceFileVersion::V2_1;
             // In the 2.0 system we needed ids for intermediate fields.  In 2.1+
             // we only need ids for leaf fields.
-            if !is_structural || field.children.is_empty() {
+            if !is_structural
+                || field.children.is_empty()
+                || field.is_blob()
+                || field.is_packed_struct()
+            {
                 if let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied()
                 {
                     column_indices.push(column_idx);
                 }
             }
-            Self::from_field_ids_helper(
-                file_version,
-                field.children.iter(),
-                field_id_to_column_index,
-                column_indices,
-            )?;
+            // Don't recurse into children if the field is a blob or packed struct in 2.1
+            if !is_structural || (!field.is_blob() && !field.is_packed_struct()) {
+                Self::from_field_ids_helper(
+                    file_version,
+                    field.children.iter(),
+                    field_id_to_column_index,
+                    column_indices,
+                )?;
+            }
         }
         Ok(())
     }
@@ -298,7 +305,9 @@ impl ReaderProjection {
             .fields_pre_order()
             // In the 2.0 system we needed ids for intermediate fields.  In 2.1+
             // we only need ids for leaf fields.
-            .filter(|field| file_version < LanceFileVersion::V2_1 || field.is_leaf())
+            .filter(|field| {
+                file_version < LanceFileVersion::V2_1 || field.is_leaf() || field.is_packed_struct()
+            })
             .enumerate()
             .map(|(idx, field)| (field.id as u32, idx as u32))
             .collect::<BTreeMap<_, _>>();
@@ -1735,7 +1744,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            LanceFileVersion::default(),
+            version,
             None,
         )
         .await
@@ -1753,7 +1762,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            LanceFileVersion::default(),
+            version,
             None,
         )
         .await
@@ -2014,10 +2023,13 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), total_rows);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_blocking_take() {
+    async fn test_blocking_take(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let fs = FsFixture::default();
-        let WrittenFile { data, schema, .. } = create_some_file(&fs, LanceFileVersion::V2_1).await;
+        let WrittenFile { data, schema, .. } = create_some_file(&fs, version).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs
@@ -2027,10 +2039,7 @@ pub mod tests {
             .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
-            Some(
-                ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["score"])
-                    .unwrap(),
-            ),
+            Some(ReaderProjection::from_column_names(version, &schema, &["score"]).unwrap()),
             Arc::<DecoderPlugins>::default(),
             &test_cache(),
             FileReaderOptions::default(),
