@@ -538,6 +538,7 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             operation,
             tag: None,
             transaction_properties,
+            primary_key_filter: None,
         }))
     }
 }
