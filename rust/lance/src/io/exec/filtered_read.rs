@@ -34,7 +34,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Projection, Error, Result};
+use lance_core::{datatypes::Projection, Error, Result, ROW_ID};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
@@ -56,6 +56,7 @@ use crate::dataset::scanner::{
     get_default_batch_size, BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD,
 };
 use crate::Dataset;
+use crate::io::exec::TakeExec;
 
 use super::utils::IoMetrics;
 
@@ -199,6 +200,10 @@ pub struct FilteredReadGlobalMetrics {
     ranges_scanned: Count,
     rows_scanned: Count,
     io_metrics: IoMetrics,
+    // Adaptive late materialization metrics
+    adaptive_used_take: Count,
+    adaptive_used_full_scan: Count,
+    adaptive_pass1_rows: Count,
 }
 
 impl FilteredReadGlobalMetrics {
@@ -208,6 +213,9 @@ impl FilteredReadGlobalMetrics {
             ranges_scanned: metrics.new_count(RANGES_SCANNED_METRIC, 0),
             rows_scanned: metrics.new_count(ROWS_SCANNED_METRIC, 0),
             io_metrics: IoMetrics::new(metrics, 0),
+            adaptive_used_take: metrics.new_count("adaptive_used_take", 0),
+            adaptive_used_full_scan: metrics.new_count("adaptive_used_full_scan", 0),
+            adaptive_pass1_rows: metrics.new_count("adaptive_pass1_rows", 0),
         }
     }
 }
@@ -1185,6 +1193,17 @@ impl FilteredReadStream {
     }
 }
 
+/// Configuration for adaptive expensive column handling
+#[derive(Debug, Clone)]
+pub struct AdaptiveColumnConfig {
+    /// Column to handle adaptively (will be excluded from initial scan)
+    pub expensive_column: String,
+    /// Selectivity threshold (0.0 to 1.0)
+    pub threshold: f64,
+    /// Total row count for selectivity calculation
+    pub total_row_count: usize,
+}
+
 /// Options for a filtered read.
 #[derive(Debug, Clone)]
 pub struct FilteredReadOptions {
@@ -1213,6 +1232,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// Enable adaptive expensive column handling
+    pub adaptive_expensive_column: Option<AdaptiveColumnConfig>,
 }
 
 impl FilteredReadOptions {
@@ -1243,6 +1264,7 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
+            adaptive_expensive_column: None,
         }
     }
 
@@ -1390,6 +1412,12 @@ impl FilteredReadOptions {
         self.io_buffer_size_bytes = Some(io_buffer_size);
         self
     }
+
+    /// Enable adaptive expensive column handling
+    pub fn with_adaptive_column(mut self, config: AdaptiveColumnConfig) -> Self {
+        self.adaptive_expensive_column = Some(config);
+        self
+    }
 }
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
@@ -1494,6 +1522,11 @@ impl FilteredReadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> SendableRecordBatchStream {
+        // Check if adaptive mode is enabled
+        if self.options.adaptive_expensive_column.is_some() {
+            return self.obtain_adaptive_stream(partition, context);
+        }
+
         // There are two subtleties here:
         //
         // First, we need to defer execution until first polled (hence the once/flatten)
@@ -1538,6 +1571,262 @@ impl FilteredReadExec {
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
     }
 
+    /// Adaptive stream that decides at runtime whether to use take or full scan
+    fn obtain_adaptive_stream(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> SendableRecordBatchStream {
+        use futures::StreamExt;
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_datafusion::exec::OneShotExec;
+
+        let dataset = self.dataset.clone();
+        let options = self.options.clone();
+        let metrics = self.metrics.clone();
+        let index_input = self.index_input.clone();
+        let output_schema = self.schema();
+        let output_schema_for_adapter = output_schema.clone();
+
+        let stream = futures::stream::once(async move {
+            let config = options.adaptive_expensive_column.as_ref().unwrap().clone();
+
+            // Check if adaptive materialization is applicable
+            // If not applicable, fall back to normal stream
+
+            // 1. Check if filter uses the expensive column
+            // If it does, we'd need to load it anyway for filtering, so no benefit
+            let filter_columns: Vec<String> = {
+                let mut cols = Vec::new();
+                if let Some(ref full_filter) = options.full_filter {
+                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(full_filter));
+                }
+                if let Some(ref refine_filter) = options.refine_filter {
+                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(refine_filter));
+                }
+                cols
+            };
+
+            if filter_columns.contains(&config.expensive_column) {
+                // Fall back to normal stream - filter needs the expensive column
+                let normal_stream = FilteredReadStream::try_new(
+                    dataset.clone(), options, &metrics, None
+                ).await?;
+                return DataFusionResult::Ok(normal_stream.get_stream(&metrics, partition));
+            }
+
+            // 2. Check if total_row_count is valid
+            if config.total_row_count == 0 {
+                let normal_stream = FilteredReadStream::try_new(
+                    dataset.clone(), options, &metrics, None
+                ).await?;
+                return DataFusionResult::Ok(normal_stream.get_stream(&metrics, partition));
+            }
+
+            // PASS 1: Scan cheap columns (exclude expensive column)
+            // Build projection without the expensive column
+            let projection_schema = options.projection.to_bare_schema();
+            let cheap_columns: Vec<String> = projection_schema
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .filter(|name| name != &config.expensive_column)
+                .collect();
+
+            let cheap_column_refs: Vec<&str> = cheap_columns.iter().map(|s| s.as_str()).collect();
+            let cheap_projection = dataset
+                .empty_projection()
+                .union_columns(cheap_column_refs, OnMissing::Error)?
+                .with_row_id();
+
+            let mut cheap_options = options.clone();
+            cheap_options.projection = cheap_projection;
+            cheap_options.adaptive_expensive_column = None; // Disable recursion
+
+            // Evaluate index if present
+            let mut evaluated_index = None;
+            if let Some(index_input) = index_input {
+                let mut index_search = index_input.execute(partition, context.clone())
+                    .map_err(|e| Error::from(e))?;
+                let index_search_result =
+                    index_search.next().await.ok_or_else(|| Error::Internal {
+                        message: "Index search did not yield any results".to_string(),
+                        location: location!(),
+                    })?
+                    .map_err(|e| Error::from(e))?;
+                evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
+                    &index_search_result,
+                )?));
+            }
+
+            let cheap_stream = FilteredReadStream::try_new(
+                dataset.clone(), cheap_options, &metrics, evaluated_index.clone()
+            ).await?;
+
+            let mut cheap_stream_boxed = cheap_stream.get_stream(&metrics, partition);
+
+            // Collect row IDs with EARLY TERMINATION
+            let threshold_count = (config.total_row_count as f64 * config.threshold).ceil() as usize;
+            let mut row_ids = Vec::new();
+            let mut cheap_batches = Vec::new();
+            let mut filtered_count = 0;
+
+            while let Some(batch_result) = cheap_stream_boxed.next().await {
+                let batch = batch_result.map_err(|e| Error::from(e))?;
+
+                // EARLY STOP CHECK
+                if filtered_count + batch.num_rows() >= threshold_count {
+                    // NOT SELECTIVE - switch to full scan
+                    drop(cheap_stream_boxed); // Drop the cheap stream
+
+                    // Record metrics: full scan path taken
+                    let global_metrics = FilteredReadGlobalMetrics::new(&metrics);
+                    global_metrics.adaptive_used_full_scan.add(1);
+                    global_metrics.adaptive_pass1_rows.add(filtered_count);
+
+                    let full_stream = FilteredReadStream::try_new(
+                        dataset.clone(), options, &metrics, evaluated_index
+                    ).await?;
+
+                    return DataFusionResult::Ok(full_stream.get_stream(&metrics, partition));
+                }
+
+                filtered_count += batch.num_rows();
+
+                // Extract row IDs
+                let rowid_col = batch
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| Error::Internal {
+                        message: format!("Expected {} column in batch", ROW_ID),
+                        location: location!(),
+                    })?;
+                let rowid_array = rowid_col
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal {
+                        message: format!("{} column is not UInt64Array", ROW_ID),
+                        location: location!(),
+                    })?;
+
+                row_ids.extend(rowid_array.values().iter().copied());
+                cheap_batches.push(batch);
+            }
+
+            // SELECTIVE - do Pass 2 (take expensive column)
+
+            // Record metrics: take path taken
+            let global_metrics = FilteredReadGlobalMetrics::new(&metrics);
+            global_metrics.adaptive_used_take.add(1);
+            global_metrics.adaptive_pass1_rows.add(filtered_count);
+
+            // Handle empty result case
+            if cheap_batches.is_empty() || row_ids.is_empty() {
+                // No rows matched the filter, return empty stream
+                let empty_batch = RecordBatch::new_empty(output_schema.clone());
+                let stream = futures::stream::iter(vec![Ok(empty_batch)]);
+                let stream_adapter = RecordBatchStreamAdapter::new(output_schema.clone(), stream);
+                return Result::<SendableRecordBatchStream>::Ok(Box::pin(stream_adapter) as SendableRecordBatchStream);
+            }
+
+            let expensive_projection = dataset.empty_projection()
+                .union_column(&config.expensive_column, OnMissing::Error)?;
+
+            // Create row ID batch for TakeExec
+            let row_id_array = Arc::new(UInt64Array::from(row_ids.clone()));
+            let row_id_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )]));
+            let row_id_batch = RecordBatch::try_new(row_id_schema, vec![row_id_array])?;
+            let row_id_plan = Arc::new(OneShotExec::from_batch(row_id_batch));
+
+            let take_exec = TakeExec::try_new(
+                dataset.clone(),
+                row_id_plan,
+                expensive_projection,
+            )?;
+
+            let take_exec = take_exec.ok_or_else(|| Error::Internal {
+                message: "TakeExec returned None unexpectedly".to_string(),
+                location: location!(),
+            })?;
+
+            let mut expensive_stream = take_exec.execute(partition, context)
+                .map_err(|e| Error::from(e))?;
+
+            // Concatenate all cheap batches into one
+            use arrow_select::concat::concat_batches;
+            let cheap_schema = cheap_batches[0].schema();
+            let cheap_batch_combined = concat_batches(&cheap_schema, &cheap_batches)
+                .map_err(|e| Error::Arrow {
+                    message: format!("Failed to concatenate cheap batches: {}", e),
+                    location: location!(),
+                })?;
+
+            // Collect all expensive batches
+            let mut expensive_batches = Vec::new();
+            while let Some(batch_result) = expensive_stream.next().await {
+                let batch = batch_result.map_err(|e| Error::from(e))?;
+                expensive_batches.push(batch);
+            }
+
+            // Concatenate all expensive batches into one
+            if expensive_batches.is_empty() {
+                return Err(Error::Internal {
+                    message: "TakeExec returned no batches".to_string(),
+                    location: location!(),
+                });
+            }
+            let expensive_schema = expensive_batches[0].schema();
+            let expensive_batch_combined = concat_batches(&expensive_schema, &expensive_batches)
+                .map_err(|e| Error::Arrow {
+                    message: format!("Failed to concatenate expensive batches: {}", e),
+                    location: location!(),
+                })?;
+
+            // Merge the two combined batches - build columns in the order of output_schema
+            let expensive_col_idx = expensive_batch_combined.schema().index_of(&config.expensive_column)
+                .map_err(|e| Error::Internal {
+                    message: format!("Expected {} column in expensive batch: {}", config.expensive_column, e),
+                    location: location!(),
+                })?;
+
+            let mut columns = Vec::new();
+            for field in output_schema.fields() {
+                let col_name = field.name();
+                if col_name == &config.expensive_column {
+                    // Take from expensive batch
+                    columns.push(expensive_batch_combined.column(expensive_col_idx).clone());
+                } else {
+                    // Take from cheap batch
+                    let cheap_col_idx = cheap_batch_combined.schema().index_of(col_name)
+                        .map_err(|e| Error::Internal {
+                            message: format!("Expected {} column in cheap batch: {}", col_name, e),
+                            location: location!(),
+                        })?;
+                    columns.push(cheap_batch_combined.column(cheap_col_idx).clone());
+                }
+            }
+
+            let combined_batch: RecordBatch = RecordBatch::try_new(
+                output_schema.clone(),
+                columns,
+            ).map_err(|e: arrow_schema::ArrowError| Error::from(e))?;
+
+            // Return stream with single combined batch
+            let stream = futures::stream::iter(
+                vec![Ok(combined_batch)]
+            );
+            let stream_adapter = RecordBatchStreamAdapter::new(output_schema.clone(), stream);
+            Result::<SendableRecordBatchStream>::Ok(Box::pin(stream_adapter) as SendableRecordBatchStream)
+        })
+        .try_flatten();
+
+        Box::pin(RecordBatchStreamAdapter::new(output_schema_for_adapter, stream))
+    }
+
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
     }
@@ -1562,11 +1851,22 @@ impl DisplayAs for FilteredReadExec {
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+
+        let adaptive_info = if let Some(ref config) = self.options.adaptive_expensive_column {
+            format!(
+                ", adaptive_column={}, threshold={}",
+                config.expensive_column,
+                config.threshold
+            )
+        } else {
+            String::new()
+        };
+
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}",
+                    "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}{}",
                     self.dataset.data_dir(),
                     columns,
                     self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
@@ -1576,10 +1876,11 @@ impl DisplayAs for FilteredReadExec {
                     self.options.projection.with_row_addr,
                     self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
                     self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
+                    adaptive_info,
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
+                write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}{}",
                 self.dataset.data_dir(),
                 columns,
                 self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
@@ -1589,6 +1890,7 @@ impl DisplayAs for FilteredReadExec {
                 self.options.projection.with_row_addr,
                 self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
                 self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
+                adaptive_info,
             )
             }
         }
@@ -3358,5 +3660,85 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
         assert!(iops > 0, "Should have recorded IO operations");
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_metrics() {
+        // Test that adaptive late materialization metrics are recorded correctly
+        use super::AdaptiveColumnConfig;
+
+        let fixture = TestFixture::new().await;
+
+        // Test SELECTIVE case - should use take path
+        // Filter for fully_indexed < 10 matches only 10 rows out of 300
+        let mut options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        options.adaptive_expensive_column = Some(AdaptiveColumnConfig {
+            expensive_column: "vector".to_string(),
+            threshold: 0.99, // Very high threshold, so it will use take
+            total_row_count: 300,
+        });
+
+        // Add a filter that matches only a few rows (10 out of 300 = 3.3%)
+        options.full_filter = Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(10u32)));
+
+        let filtered_read = Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let _batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let metrics = filtered_read.metrics().unwrap();
+        let used_take = metrics
+            .sum_by_name("adaptive_used_take")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        let used_full_scan = metrics
+            .sum_by_name("adaptive_used_full_scan")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        let pass1_rows = metrics
+            .sum_by_name("adaptive_pass1_rows")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+
+        assert_eq!(used_take, 1, "Should have used take path for selective filter");
+        assert_eq!(used_full_scan, 0, "Should not have used full scan path");
+        assert!(pass1_rows > 0 && pass1_rows <= 10, "Should have scanned ~10 rows in pass 1");
+
+        // Test NON-SELECTIVE case - should use full scan path
+        // Filter for fully_indexed < 290 matches 290 rows out of 300
+        let mut options2 = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        options2.adaptive_expensive_column = Some(AdaptiveColumnConfig {
+            expensive_column: "vector".to_string(),
+            threshold: 0.01, // Very low threshold (1%), so it will use full scan
+            total_row_count: 300,
+        });
+
+        // Add a filter that matches many rows (290 out of 300 = 96.7%)
+        options2.full_filter = Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(290u32)));
+
+        let filtered_read2 = Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options2, None).unwrap());
+
+        let _batches2 = filtered_read2
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let metrics2 = filtered_read2.metrics().unwrap();
+        let used_take2 = metrics2
+            .sum_by_name("adaptive_used_take")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        let used_full_scan2 = metrics2
+            .sum_by_name("adaptive_used_full_scan")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(used_take2, 0, "Should not have used take path for non-selective filter");
+        assert_eq!(used_full_scan2, 1, "Should have used full scan path");
     }
 }
