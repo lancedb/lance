@@ -2990,7 +2990,8 @@ impl Scanner {
                 // Include columns referenced by refine expression
                 if let Some(ref refine_expr) = filter_plan.refine_expr {
                     let refine_cols = Planner::column_names_in_expr(refine_expr);
-                    scan_projection = scan_projection.union_columns(refine_cols, OnMissing::Error)?;
+                    scan_projection =
+                        scan_projection.union_columns(refine_cols, OnMissing::Error)?;
                 }
 
                 scan_projection.with_row_addr =
