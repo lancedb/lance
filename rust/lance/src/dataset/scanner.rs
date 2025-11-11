@@ -3009,7 +3009,7 @@ impl Scanner {
                     .await?;
 
                 // Apply refine filter if present
-                
+
                 if let Some(ref refine_expr) = filter_plan.refine_expr {
                     Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?)
                 } else {
