@@ -55,14 +55,11 @@ const RTREE_INDEX_VERSION: u32 = 0;
 const RTREE_PAGES_NAME: &str = "page_data.lance";
 const RTREE_NULLS_NAME: &str = "nulls.lance";
 
-static BBOX_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
-    let bbox_type = RectType::new(Dimension::XY, Default::default());
-    Arc::new(ArrowSchema::new(vec![bbox_type.to_field("bbox", false)]))
-});
 static BBOX_ROWID_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
-    let mut fields = BBOX_SCHEMA.fields().iter().cloned().collect::<Vec<_>>();
-    fields.push(Arc::new(ArrowField::new(ROW_ID, DataType::UInt64, true)));
-    Arc::new(ArrowSchema::new(fields))
+    let bbox_type = RectType::new(Dimension::XY, Default::default());
+    let bbox_field = bbox_type.to_field("bbox", false);
+    let rowid_field = ArrowField::new(ROW_ID, DataType::UInt64, true);
+    Arc::new(ArrowSchema::new(vec![bbox_field, rowid_field]))
 });
 static RTREE_PAGE_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| BBOX_ROWID_SCHEMA.clone());
 
