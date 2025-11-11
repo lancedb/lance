@@ -32,8 +32,8 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::writer::FileWriterOptions;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -776,7 +776,7 @@ impl IvfShuffler {
                         true,
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
-                    let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
+                    let mut file_writer = lance_file::writer::FileWriter::try_new(
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),
@@ -820,7 +820,7 @@ impl IvfShuffler {
             let file_scheduler = scan_scheduler
                 .open_file(&path, &CachedFileSize::unknown())
                 .await?;
-            let reader = lance_file::v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),

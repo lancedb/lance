@@ -772,9 +772,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::v2::reader::{describe_encoding, FileReader, FileReaderOptions};
-    use crate::v2::testing::FsFixture;
-    use crate::v2::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
+    use crate::reader::{describe_encoding, FileReader, FileReaderOptions};
+    use crate::testing::FsFixture;
+    use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};

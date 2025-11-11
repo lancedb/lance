@@ -761,7 +761,7 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
 
-        use crate::previous::reader::FileReader;
+    use crate::previous::reader::FileReader;
 
     #[tokio::test]
     async fn test_write_file() {

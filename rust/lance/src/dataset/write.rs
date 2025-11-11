@@ -16,8 +16,7 @@ use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_file::version::LanceFileVersion;
 use lance_file::previous::writer::{
     FileWriter as PreviousFileWriter,
@@ -705,7 +704,7 @@ where
 }
 
 struct V2WriterAdapter {
-    writer: v2::writer::FileWriter,
+    writer: current_writer::FileWriter,
     path: String,
     base_id: Option<u32>,
 }
@@ -788,7 +787,7 @@ pub async fn open_writer_with_options(
         })
     } else {
         let writer = object_store.create(&full_path).await?;
-        let file_writer = v2::writer::FileWriter::try_new(
+        let file_writer = current_writer::FileWriter::try_new(
             writer,
             schema.clone(),
             FileWriterOptions {

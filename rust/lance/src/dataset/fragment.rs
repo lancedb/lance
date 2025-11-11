@@ -33,10 +33,9 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::previous::reader::{read_batch as previous_read_batch, FileReader as PreviousFileReader};
-use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::v2::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
+use lance_file::{determine_file_version, LanceEncodingsIo};
 use lance_file::version::LanceFileVersion;
-use lance_file::{determine_file_version, v2};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
@@ -298,7 +297,7 @@ mod v2_adapter {
 
     #[derive(Debug, Clone)]
     pub struct Reader {
-        reader: Arc<v2::reader::FileReader>,
+        reader: Arc<lance_file::reader::FileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
@@ -307,7 +306,7 @@ mod v2_adapter {
 
     impl Reader {
         pub fn new(
-            reader: Arc<v2::reader::FileReader>,
+            reader: Arc<lance_file::reader::FileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
@@ -752,7 +751,7 @@ impl FileFragment {
             let file_scheduler = scheduler
                 .open_file(&filepath, &CachedFileSize::unknown())
                 .await?;
-            let reader = v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
@@ -764,7 +763,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::ReaderProjection::from_whole_schema(
+            let projection = lance_file::reader::ReaderProjection::from_whole_schema(
                 dataset.schema(),
                 reader.metadata().version(),
             );
@@ -996,7 +995,7 @@ impl FileFragment {
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
-                v2::reader::FileReader::try_open_with_file_metadata(
+                lance_file::reader::FileReader::try_open_with_file_metadata(
                     Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
@@ -1369,7 +1368,7 @@ impl FileFragment {
         let file_metadata = cache
             .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
-                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                    lance_file::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
             })
             .await?;
@@ -2609,7 +2608,7 @@ mod tests {
     };
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use v2::writer::FileWriterOptions;
+    use lance_file::writer::FileWriterOptions;
 
     use super::*;
     use crate::{
@@ -3825,7 +3824,7 @@ mod tests {
         let file_path = dataset.data_dir().child("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer =
-            v2::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 

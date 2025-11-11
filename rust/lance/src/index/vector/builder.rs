@@ -27,7 +27,7 @@ use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
-use lance_file::v2::writer::FileWriter;
+use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;

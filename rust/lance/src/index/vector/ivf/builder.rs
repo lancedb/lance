@@ -13,7 +13,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::writer::FileWriterOptions;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
@@ -222,7 +222,7 @@ pub async fn write_vector_storage(
     };
 
     let mut writer =
-        lance_file::v2::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
+        lance_file::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
     let mut transformed_stream = data
         .map_ok(move |batch| {
             let ivf_transformer = ivf_transformer.clone();

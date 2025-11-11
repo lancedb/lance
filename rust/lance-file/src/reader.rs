@@ -46,10 +46,9 @@ use lance_io::{
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION},
-    v2::writer::PAGE_BUFFER_ALIGNMENT,
+    io::LanceEncodingsIo,
+    writer::PAGE_BUFFER_ALIGNMENT,
 };
-
-use super::io::LanceEncodingsIo;
 
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
@@ -238,7 +237,7 @@ impl ReaderProjection {
     /// Creates a projection using a mapping from field IDs to column indices
     ///
     /// You can obtain such a mapping when the file is written using the
-    /// [`crate::v2::writer::FileWriter::field_id_to_column_indices`] method.
+    /// [`crate::writer::FileWriter::field_id_to_column_indices`] method.
     pub fn from_field_ids(
         file_version: LanceFileVersion,
         schema: &Schema,
@@ -1577,11 +1576,9 @@ pub mod tests {
     use rstest::rstest;
     use tokio::sync::mpsc;
 
-    use crate::v2::{
-        reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection},
-        testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
-        writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
-    };
+    use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection};
+    use crate::testing::{test_cache, write_lance_file, FsFixture, WrittenFile};
+    use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {

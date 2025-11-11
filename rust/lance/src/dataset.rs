@@ -28,7 +28,7 @@ use lance_core::utils::tracing::{
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -2634,7 +2634,7 @@ mod tests {
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use lance_file::v2::writer::FileWriter;
+    use lance_file::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
