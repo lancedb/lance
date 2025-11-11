@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
-use lance_file::previous::{reader::FileReader, writer::FileWriter};
+use lance_file::previous::{reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
@@ -145,7 +145,7 @@ impl IvfModel {
         start..end
     }
 
-    pub async fn load(reader: &FileReader) -> Result<Self> {
+    pub async fn load(reader: &PreviousFileReader) -> Result<Self> {
         let schema = reader.schema();
         let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
             message: format!("{} not found during search", IVF_METADATA_KEY),
@@ -166,7 +166,7 @@ impl IvfModel {
     }
 
     /// Write the IVF metadata to the lance file.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+    pub async fn write(&self, writer: &mut PreviousFileWriter<ManifestDescribing>) -> Result<()> {
         let pb = PbIvf::try_from(self)?;
         let pos = writer.object_writer.write_protobuf(&pb).await?;
         let ivf_metadata = IvfMetadata { pb_position: pos };
@@ -286,7 +286,7 @@ mod tests {
 
         {
             let mut writer =
-                FileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
+                PreviousFileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
                     .await
                     .unwrap();
             // Write some dummy data
@@ -300,7 +300,7 @@ mod tests {
             writer.finish().await.unwrap();
         }
 
-        let reader = FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));

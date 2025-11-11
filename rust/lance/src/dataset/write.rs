@@ -19,7 +19,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
-use lance_file::previous::writer::{FileWriter, ManifestProvider};
+use lance_file::previous::writer::{FileWriter as PreviousFileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
@@ -671,7 +671,7 @@ struct V1WriterAdapter<M>
 where
     M: ManifestProvider + Send + Sync,
 {
-    writer: FileWriter<M>,
+    writer: PreviousFileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -773,7 +773,7 @@ pub async fn open_writer_with_options(
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
-            writer: FileWriter::<ManifestDescribing>::try_new(
+            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
@@ -1033,7 +1033,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
-    use lance_file::previous::reader::FileReader;
+    use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_io::traits::Reader;
 
     #[tokio::test]
@@ -1305,7 +1305,7 @@ mod tests {
             .child(DATA_DIR)
             .child(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = FileReader::try_new_from_reader(
+        let reader = PreviousFileReader::try_new_from_reader(
             &path,
             file_reader,
             None,

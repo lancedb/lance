@@ -19,7 +19,7 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::previous::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
 use snafu::location;
@@ -94,7 +94,7 @@ impl QuantizerStorage for FlatFloatStorage {
     }
 
     async fn load_partition(
-        _: &FileReader,
+        _: &PreviousFileReader,
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
@@ -252,7 +252,7 @@ impl QuantizerStorage for FlatBinStorage {
     }
 
     async fn load_partition(
-        _: &FileReader,
+        _: &PreviousFileReader,
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,

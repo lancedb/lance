@@ -786,7 +786,7 @@ where
 
 #[cfg(test)]
 mod tests {
-        use crate::previous::writer::{FileWriter, NotSelfDescribing};
+    use crate::previous::writer::{FileWriter as PreviousFileWriter, NotSelfDescribing};
 
     use super::*;
 
@@ -841,7 +841,7 @@ mod tests {
         }
         schema.set_dictionary(&batches[0]).unwrap();
 
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -905,7 +905,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
 
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -959,7 +959,7 @@ mod tests {
             .collect::<Vec<_>>();
         let batches_ref = batches.iter().collect::<Vec<_>>();
 
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -986,7 +986,7 @@ mod tests {
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1111,7 +1111,7 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/takes");
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1228,7 +1228,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1305,7 +1305,7 @@ mod tests {
         .unwrap();
 
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1339,7 +1339,7 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/read_range");
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1366,7 +1366,7 @@ mod tests {
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1426,7 +1426,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1471,7 +1471,7 @@ mod tests {
         let partial_schema = schema.project(&["f50"]).unwrap();
         let partial_arrow: ArrowSchema = (&partial_schema).into();
 
-        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             partial_schema.clone(),

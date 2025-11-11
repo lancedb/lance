@@ -14,8 +14,8 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::previous::{
-    reader::FileReader,
-    writer::{FileWriter, ManifestProvider},
+    reader::FileReader as PreviousFileReader,
+    writer::{FileWriter as PreviousFileWriter, ManifestProvider},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -68,7 +68,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
+impl<M: ManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
@@ -107,7 +107,7 @@ impl IndexWriter for v2::writer::FileWriter {
 }
 
 #[async_trait]
-impl IndexReader for FileReader {
+impl IndexReader for PreviousFileReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
@@ -244,7 +244,7 @@ impl IndexStore for LanceIndexStore {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
                     let path = self.index_dir.child(name);
-                    let file_reader = FileReader::try_new_self_described(
+                    let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
                         &path,
                         Some(&self.metadata_cache),
