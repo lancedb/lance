@@ -75,6 +75,8 @@ extra:
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/lancedb
 
+copyright: © 2025 Lance Format. All rights reserved.
+
 extra_css:
   - assets/stylesheets/termynal.css
   - assets/stylesheets/home.css

@@ -224,6 +224,27 @@
     </div>
   </section>
 
+  <!-- Feature 5: Rich Ecosystem Integration -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>Rich Ecosystem Integrations</h2>
+          <p>
+            As an open format, Lance integrates seamlessly with the Python data ecosystem and modern data platforms.
+            Work with your favorite tools including Pandas, Polars, and PyTorch for data processing and machine learning.
+            Connect with leading query engines like Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink/Fluss
+            to run SQL analytics and distributed processing on your Lance datasets.
+          </p>
+          <a href="integrations/duckdb" class="md-button">View Integrations</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/ecosystem-integrations.png" alt="Lance Ecosystem Integrations" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
   <script
     src="assets/javascript/termynal.js"
     data-termynal-container="#termynal-hybrid-search|#termynal-random-access|#termynal-multimodal|#termynal-evolution">
@@ -232,4 +253,6 @@
 {% endblock %}
 
 {% block content %}{% endblock %}
-{% block footer %}{% endblock %}
+{% block footer %}
+  {{ super() }}
+{% endblock %}
