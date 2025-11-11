@@ -10,6 +10,8 @@ jobs:
     strategy:
       matrix:
         dataset: ["sift"]
+    env:
+      UV_PYTHON: "3.10"
     steps:
     - uses: actions/checkout@v4
       with:
@@ -19,18 +21,18 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: "3.10"
-    - uses: ./.github/workflows/build_linux_wheel
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
       with:
-        python-minor-version: "10"
-    - name: Pip install
+        enable-cache: true
+    - name: Sync environment
       working-directory: python
       run: |
-        pip install $(ls target/wheels/*.whl)
-        pip install pandas
+        uv sync --frozen --install-project --extra tests --extra benchmarks
     - name: Run test
-      working-directory: benchmarks/${{ matrix.dataset }}
+      working-directory: python
       run: |
-        ./test_dataset.sh
+        uv run bash ../benchmarks/${{ matrix.dataset }}/test_dataset.sh
     - name: Archive results
       uses: actions/upload-artifact@v3
       with:

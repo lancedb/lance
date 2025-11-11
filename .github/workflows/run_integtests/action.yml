@@ -1,14 +1,15 @@
 name: run-tests
 
-description: "Install lance wheel and run integ tests"
+description: "Install lance with uv and run integration tests"
 runs:
   using: "composite"
   steps:
-  - name: Install dependencies
+  - name: Sync environment
     working-directory: python
     shell: bash
     run: |
-      pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+      set -euo pipefail
+      uv sync --frozen --install-project --extra tests
   - name: Start localstack
     shell: bash
     run: |

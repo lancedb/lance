@@ -42,6 +42,15 @@ classifiers = [
 [tool.maturin]
 python-source = "python"
 
+[tool.uv]
+
+[[tool.uv.index]]
+name = "torch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = { index = "torch-cpu" }
+
 [build-system]
 requires = ["maturin>=1.4"]
 build-backend = "maturin"
@@ -61,10 +70,12 @@ tests = [
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
     "datafusion>=50.1",
+    "torch",
+    "ray[data]; python_version < '3.12'",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
-torch = ["torch"]
+notebook = ["jupyter", "duckdb>=0.7"]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
