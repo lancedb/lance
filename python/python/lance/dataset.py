@@ -690,6 +690,7 @@ class LanceDataset(pa.dataset.Dataset):
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        late_materialize_selectivity_threshold: Optional[float] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -870,6 +871,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.strict_batch_size, strict_batch_size)
         setopt(builder.order_by, order_by)
         setopt(builder.disable_scoring_autoprojection, disable_scoring_autoprojection)
+        setopt(builder.late_materialize_selectivity_threshold, late_materialize_selectivity_threshold)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -4207,6 +4209,7 @@ class ScannerBuilder:
         self._strict_batch_size = False
         self._orderings = None
         self._disable_scoring_autoprojection = False
+        self._late_materialize_selectivity_threshold: Optional[float] = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -4588,6 +4591,47 @@ class ScannerBuilder:
         self._disable_scoring_autoprojection = disable
         return self
 
+    def late_materialize_selectivity_threshold(
+        self, threshold: float
+    ) -> ScannerBuilder:
+        """
+        Set the selectivity threshold for late materialization in filtered KNN searches.
+
+        When a filter is present in a KNN search, Lance first executes it to measure selectivity.
+        If the filter selects fewer than this percentage of rows, Lance uses late materialization
+        (scan scalars first, then take vectors for filtered rows only). If the filter selects
+        this percentage or more rows, Lance does a single scan with both filter and vector columns
+        to avoid the random access overhead of the take operation.
+
+        The optimal value depends on your storage medium:
+        - **Object storage (S3, GCS, Azure)**: Use a low threshold like 0.005 (0.5%) since
+          random access is very expensive
+        - **Local SSD**: Can use a higher threshold like 0.05 (5%) since random access is cheaper
+        - **NVMe**: Can use even higher thresholds like 0.1 (10%)
+
+        The default is 0.005 (0.5%), which is conservative for object storage.
+
+        Parameters
+        ----------
+        threshold : float
+            The selectivity threshold as a fraction (e.g., 0.005 for 0.5%)
+
+        Returns
+        -------
+        ScannerBuilder
+            Returns self for method chaining
+        """
+        if not isinstance(threshold, (int, float)):
+            raise TypeError(
+                f"late_materialize_selectivity_threshold must be a number, got {type(threshold)}"
+            )
+        if not (0.0 <= threshold <= 1.0):
+            raise ValueError(
+                f"late_materialize_selectivity_threshold must be between 0.0 and 1.0 (inclusive), got {threshold}"
+            )
+        self._late_materialize_selectivity_threshold = float(threshold)
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -4616,6 +4660,7 @@ class ScannerBuilder:
             self._strict_batch_size,
             self._orderings,
             self._disable_scoring_autoprojection,
+            self._late_materialize_selectivity_threshold,
         )
         return LanceScanner(scanner, self.ds)
 
