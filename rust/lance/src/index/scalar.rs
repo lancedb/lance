@@ -1192,12 +1192,12 @@ mod tests {
         use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
 
-        // Create dataset with 10 rows: alternating boolean values
+        // Create dataset with 10 rows in two fragments: alternating boolean values
         // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
         let mut ds = lance_datagen::gen_batch()
             .col("id", array::step::<UInt64Type>())
             .col("value", array::cycle_bool(vec![true, false]))
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
             .await
             .unwrap();
 
@@ -1205,31 +1205,23 @@ mod tests {
         ds.delete("NOT value").await.unwrap();
 
         // Verify data before index creation: should have 5 rows with value=true
-        let before_index: Vec<arrow_array::RecordBatch> = ds
+        let before_index = ds
             .scan()
             .filter("value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let before_ids: Vec<u64> = before_index[0]
-            .column_by_name("id")
-            .unwrap()
+        let before_ids = before_index["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         assert_eq!(
             before_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Before index: should have 5 rows"
         );
 
@@ -1239,21 +1231,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Query after index creation - THIS IS WHERE THE BUG MANIFESTS
-        let after_index: Vec<arrow_array::RecordBatch> = ds
+        let after_index = ds
             .scan()
             .filter("value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let after_ids: Vec<u64> = after_index[0]
-            .column_by_name("id")
-            .unwrap()
+        let after_ids: Vec<u64> = after_index["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
@@ -1291,21 +1277,14 @@ mod tests {
         let mut ds = lance_datagen::gen_batch()
             .col("id", array::step::<UInt64Type>())
             .col("value", array::cycle_bool(vec![true, false]))
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
             .await
             .unwrap();
 
         // Verify initial data: should have 10 rows
-        let initial_data: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
 
-        let initial_count: usize = initial_data.iter().map(|b| b.num_rows()).sum();
+        let initial_count: usize = initial_data["id"].len();
         assert_eq!(initial_count, 10, "Should start with 10 rows");
 
         // CREATE INDEX FIRST (before deletion)
@@ -1315,31 +1294,23 @@ mod tests {
             .unwrap();
 
         // Query with index before deletion - should return all 5 rows with value=true
-        let before_deletion: Vec<arrow_array::RecordBatch> = ds
+        let before_deletion = ds
             .scan()
             .filter("value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let before_deletion_ids: Vec<u64> = before_deletion[0]
-            .column_by_name("id")
-            .unwrap()
+        let before_deletion_ids = before_deletion["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         assert_eq!(
             before_deletion_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Before deletion: should return 5 rows with value=true"
         );
 
@@ -1347,27 +1318,19 @@ mod tests {
         ds.delete("NOT value").await.unwrap();
 
         // Query after deletion - should still return 5 rows with value=true
-        let after_deletion: Vec<arrow_array::RecordBatch> = ds
+        let after_deletion = ds
             .scan()
             .filter("value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let after_deletion_ids: Vec<u64> = after_deletion[0]
-            .column_by_name("id")
-            .unwrap()
+        let after_deletion_ids = after_deletion["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         // Verify we get the correct data after deletion
         assert_eq!(
@@ -1378,14 +1341,12 @@ mod tests {
         );
         assert_eq!(
             after_deletion_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "After deletion: Should return rows [0, 2, 4, 6, 8] with value=true"
         );
 
         // Verify the actual values are correct
-        let after_deletion_values: Vec<bool> = after_deletion[0]
-            .column_by_name("value")
-            .unwrap()
+        let after_deletion_values: Vec<bool> = after_deletion["value"]
             .as_any()
             .downcast_ref::<arrow_array::BooleanArray>()
             .unwrap()
@@ -1400,30 +1361,24 @@ mod tests {
         );
 
         // Count rows matching "value = true"
-        let count_true: Vec<arrow_array::RecordBatch> = ds
+        let count_true = ds
             .scan()
             .filter("value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
-        let count_true_rows: usize = count_true.iter().map(|b| b.num_rows()).sum();
+        let count_true_rows: usize = count_true.num_rows();
 
         // Count rows matching "value = false" (should be 0 after deletion)
-        let count_false: Vec<arrow_array::RecordBatch> = ds
+        let count_false = ds
             .scan()
             .filter("NOT value")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
-        let count_false_rows: usize = count_false.iter().map(|b| b.num_rows()).sum();
+        let count_false_rows: usize = count_false.num_rows();
 
         // The key assertions: filtered queries should return correct data
         assert_eq!(
@@ -1458,31 +1413,23 @@ mod tests {
         ds.delete("value = 'banana'").await.unwrap();
 
         // Verify data before index creation: should have 5 rows with value="apple"
-        let before_index: Vec<arrow_array::RecordBatch> = ds
+        let before_index = ds
             .scan()
             .filter("value = 'apple'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let before_ids: Vec<u64> = before_index[0]
-            .column_by_name("id")
-            .unwrap()
+        let before_ids = before_index["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         assert_eq!(
             before_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Before index: should have 5 rows"
         );
 
@@ -1502,27 +1449,19 @@ mod tests {
             .await
             .unwrap();
 
-        let after_index: Vec<arrow_array::RecordBatch> = ds
+        let after_index = ds
             .scan()
             .filter("value = 'apple'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let after_ids: Vec<u64> = after_index[0]
-            .column_by_name("id")
-            .unwrap()
+        let after_ids = after_index["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         // This assertion verifies the fix works
         assert_eq!(
@@ -1534,7 +1473,7 @@ mod tests {
         );
         assert_eq!(
             after_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Bloom filter index with deletions returns wrong results"
         );
     }
@@ -1553,21 +1492,14 @@ mod tests {
         let mut ds = lance_datagen::gen_batch()
             .col("id", array::step::<UInt64Type>())
             .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
             .await
             .unwrap();
 
         // Verify initial data: should have 10 rows
-        let initial_data: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
 
-        let initial_count: usize = initial_data.iter().map(|b| b.num_rows()).sum();
+        let initial_count: usize = initial_data.num_rows();
         assert_eq!(initial_count, 10, "Should start with 10 rows");
 
         // CREATE INDEX FIRST (before deletion)
@@ -1587,31 +1519,23 @@ mod tests {
             .unwrap();
 
         // Query with index before deletion - should return all 5 rows with value="apple"
-        let before_deletion: Vec<arrow_array::RecordBatch> = ds
+        let before_deletion = ds
             .scan()
             .filter("value = 'apple'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let before_deletion_ids: Vec<u64> = before_deletion[0]
-            .column_by_name("id")
-            .unwrap()
+        let before_deletion_ids = before_deletion["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         assert_eq!(
             before_deletion_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Before deletion: should return 5 rows with value='apple'"
         );
 
@@ -1619,27 +1543,19 @@ mod tests {
         ds.delete("value = 'banana'").await.unwrap();
 
         // Query after deletion - should still return 5 rows with value="apple"
-        let after_deletion: Vec<arrow_array::RecordBatch> = ds
+        let after_deletion = ds
             .scan()
             .filter("value = 'apple'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
 
-        let after_deletion_ids: Vec<u64> = after_deletion[0]
-            .column_by_name("id")
-            .unwrap()
+        let after_deletion_ids = after_deletion["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         // Verify we get the correct data after deletion
         assert_eq!(
@@ -1650,14 +1566,12 @@ mod tests {
         );
         assert_eq!(
             after_deletion_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "After deletion: Should return rows [0, 2, 4, 6, 8] with value='apple'"
         );
 
         // Verify the actual values are correct
-        let after_deletion_values: Vec<&str> = after_deletion[0]
-            .column_by_name("value")
-            .unwrap()
+        let after_deletion_values: Vec<&str> = after_deletion["value"]
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .unwrap()
@@ -1672,30 +1586,24 @@ mod tests {
         );
 
         // Count rows matching "value = 'apple'"
-        let count_apple: Vec<arrow_array::RecordBatch> = ds
+        let count_apple = ds
             .scan()
             .filter("value = 'apple'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
-        let count_apple_rows: usize = count_apple.iter().map(|b| b.num_rows()).sum();
+        let count_apple_rows: usize = count_apple.num_rows();
 
         // Count rows matching "value = 'banana'" (should be 0 after deletion)
-        let count_banana: Vec<arrow_array::RecordBatch> = ds
+        let count_banana = ds
             .scan()
             .filter("value = 'banana'")
             .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
+            .try_into_batch()
             .await
             .unwrap();
-        let count_banana_rows: usize = count_banana.iter().map(|b| b.num_rows()).sum();
+        let count_banana_rows: usize = count_banana.num_rows();
 
         // The key assertions: filtered queries should return correct data
         assert_eq!(

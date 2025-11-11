@@ -16,7 +16,8 @@ use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
 };
 use crate::{pb, Any};
-use arrow_array::{Array, UInt64Array};
+use arrow_array::{Array, UInt32Array};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
@@ -49,14 +50,30 @@ const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
+//
+// Example: Suppose we have two fragments, each with 4 rows. Now building the bloom filter index:
+// Fragment 0: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 0
+// The row addresses for fragment 0 are: 0, 1, 2, 3
+// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 1
+// The row addresses for fragment 1 are: 32>>1, 32>>1 + 1, 32>>1 + 2, 32>>1 + 3
+//
+// Example: Suppose we have two fragments, each with 4 rows. Deletion is 0 index based.
+// We delete the 0th and 1st row in fragment 0, and the 1st and 2nd row in fragment 1,
+// now building the bloom filter index:
+// Fragment 0: zone_start = 2, zone_length = 2 // covers rows 2, 3 in fragment 0
+// The row addresses for fragment 0 are: 2, 3
+// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 3 in fragment 1
+// The row addresses for fragment 1 are: 32>>1, 32>>1 + 3
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
-    fragment_id: u64,
-    // zone_start is the actual first row address (local offset within fragment)
-    zone_start: u64,
-    // zone_length is the address span: (last_row_addr - first_row_addr + 1)
-    // AKA offset in the fragment, which allows handling non-contiguous addresses after deletions
-    zone_length: u64,
+    fragment_id: u32,
+    // zone_start is start row of the zone in the fragment, also known
+    // as the local offset. To get the actual first row address,
+    // you can do `fragment_id << 32 + zone_start`
+    zone_start: u32,
+    // zone_length is the `row address span` between the first and the last row in the current SBBF block
+    // calculated as: (last_row_addr - first_row_addr + 1)
+    zone_length: u32,
     // Whether this zone contains any null values
     has_null: bool,
     // The actual bloom filter (SBBF) for efficient querying
@@ -141,10 +158,10 @@ impl BloomFilterIndex {
                 )
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
+            .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "BloomFilterIndex: 'fragment_id' column is not UInt64",
+                    "BloomFilterIndex: 'fragment_id' column is not UInt32",
                     location!(),
                 )
             })?;
@@ -155,10 +172,10 @@ impl BloomFilterIndex {
                 Error::invalid_input("BloomFilterIndex: missing 'zone_start' column", location!())
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
+            .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "BloomFilterIndex: 'zone_start' column is not UInt64",
+                    "BloomFilterIndex: 'zone_start' column is not UInt32",
                     location!(),
                 )
             })?;
@@ -172,10 +189,10 @@ impl BloomFilterIndex {
                 )
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
+            .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "BloomFilterIndex: 'zone_length' column is not UInt64",
+                    "BloomFilterIndex: 'zone_length' column is not UInt32",
                     location!(),
                 )
             })?;
@@ -448,7 +465,7 @@ impl Index for BloomFilterIndex {
 
         // Loop through zones and add unique fragment IDs to the bitmap
         for block in &self.zones {
-            frag_ids.insert(block.fragment_id as u32);
+            frag_ids.insert(block.fragment_id);
         }
 
         Ok(frag_ids)
@@ -473,8 +490,8 @@ impl ScalarIndex for BloomFilterIndex {
                 // Calculate the range of row addresses for this zone
                 // zone_length is the address span (not row count), so we can directly use it
                 // This handles non-contiguous addresses from deletions correctly
-                let zone_start_addr = (block.fragment_id << 32) + block.zone_start;
-                let zone_end_addr = zone_start_addr + block.zone_length;
+                let zone_start_addr = ((block.fragment_id as u64) << 32) + block.zone_start as u64;
+                let zone_end_addr = zone_start_addr + block.zone_length as u64;
 
                 // Add all row addresses in this zone to the result
                 row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
@@ -620,11 +637,11 @@ pub struct BloomFilterIndexBuilder {
     blocks: Vec<BloomFilterStatistics>,
     // The local offset within the current zones
     cur_zone_offset: usize,
-    cur_fragment_id: u64,
-    // Track the actual first and last row addresses in the current zone
-    // This handles non-contiguous addresses after deletions
-    cur_zone_first_row_addr: Option<u64>,
-    cur_zone_last_row_addr: Option<u64>,
+    cur_fragment_id: u32,
+    // Track the actual first and last row offsets in the current zone
+    // This handles non-contiguous offsets after deletions
+    cur_zone_first_row_offset: Option<u32>,
+    cur_zone_last_row_offset: Option<u32>,
     cur_zone_has_null: bool,
     sbbf: Option<Sbbf>,
 }
@@ -645,8 +662,8 @@ impl BloomFilterIndexBuilder {
             blocks: Vec::new(),
             cur_zone_offset: 0,
             cur_fragment_id: 0,
-            cur_zone_first_row_addr: None,
-            cur_zone_last_row_addr: None,
+            cur_zone_first_row_offset: None,
+            cur_zone_last_row_offset: None,
             cur_zone_has_null: false,
             sbbf: Some(sbbf),
         })
@@ -929,15 +946,15 @@ impl BloomFilterIndexBuilder {
         Ok(())
     }
 
-    fn new_block(&mut self, fragment_id: u64) -> Result<()> {
-        // Use the actual first and last row addresses we tracked
-        // zone_length is the address span (last - first + 1), not row count
-        // This correctly handles non-contiguous addresses after deletions
-        let zone_start = self.cur_zone_first_row_addr.unwrap_or(0);
+    fn new_block(&mut self, fragment_id: u32) -> Result<()> {
+        // Use the actual first and last row offsets we tracked
+        // zone_length is the offset span (last - first + 1), not row count
+        // This correctly handles non-contiguous offsets after deletions
+        let zone_start = self.cur_zone_first_row_offset.unwrap_or(0);
         let zone_length = self
-            .cur_zone_last_row_addr
-            .map(|last_addr| last_addr - zone_start + 1)
-            .unwrap_or(self.cur_zone_offset as u64);
+            .cur_zone_last_row_offset
+            .map(|last_offset| last_offset - zone_start + 1)
+            .unwrap_or(self.cur_zone_offset as u32);
 
         // Store the current bloom filter directly
         let bloom_filter = if let Some(ref sbbf) = self.sbbf {
@@ -964,8 +981,8 @@ impl BloomFilterIndexBuilder {
 
         self.blocks.push(new_block);
         self.cur_zone_offset = 0;
-        self.cur_zone_first_row_addr = None;
-        self.cur_zone_last_row_addr = None;
+        self.cur_zone_first_row_offset = None;
+        self.cur_zone_last_row_offset = None;
         self.cur_zone_has_null = false;
 
         // Reset sbbf for the next block
@@ -1008,14 +1025,14 @@ impl BloomFilterIndexBuilder {
             // Initialize cur_fragment_id from the first row address if this is the first batch
             if self.blocks.is_empty() && self.cur_zone_offset == 0 {
                 let first_row_addr = row_addrs_array.value(0);
-                self.cur_fragment_id = first_row_addr >> 32;
+                self.cur_fragment_id = (first_row_addr >> 32) as u32;
             }
 
             while remaining > 0 {
                 // Find the next fragment boundary in this batch
                 let next_fragment_index = (array_offset..row_addrs_array.len()).find(|&i| {
                     let row_addr = row_addrs_array.value(i);
-                    let fragment_id = row_addr >> 32;
+                    let fragment_id = (row_addr >> 32) as u32;
                     fragment_id == self.cur_fragment_id + 1
                 });
                 let empty_rows_left_in_cur_zone: usize =
@@ -1023,7 +1040,7 @@ impl BloomFilterIndexBuilder {
 
                 // Check if there is enough data from the current fragment to fill the current zone
                 let desired = if let Some(idx) = next_fragment_index {
-                    self.cur_fragment_id = row_addrs_array.value(idx) >> 32;
+                    self.cur_fragment_id = (row_addrs_array.value(idx) >> 32) as u32;
                     // Take the minimum between distance to boundary and space left in zone
                     // to ensure we don't exceed the zone size limit
                     std::cmp::min(idx - array_offset, empty_rows_left_in_cur_zone)
@@ -1035,14 +1052,17 @@ impl BloomFilterIndexBuilder {
                     // Not enough data to fill a map, just increment counts
                     self.update_stats(&data_array.slice(array_offset, remaining))?;
 
-                    // Track first and last row addresses (local offsets within fragment)
-                    let first_addr = row_addrs_array.value(array_offset) & 0xFFFFFFFF;
-                    let last_addr =
-                        row_addrs_array.value(array_offset + remaining - 1) & 0xFFFFFFFF;
-                    if self.cur_zone_first_row_addr.is_none() {
-                        self.cur_zone_first_row_addr = Some(first_addr);
+                    // Track first and last row offsets using RowAddress::new_from_u64
+                    let first_row_offset =
+                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
+                    let last_offset = RowAddress::new_from_u64(
+                        row_addrs_array.value(array_offset + remaining - 1),
+                    )
+                    .row_offset();
+                    if self.cur_zone_first_row_offset.is_none() {
+                        self.cur_zone_first_row_offset = Some(first_row_offset);
                     }
-                    self.cur_zone_last_row_addr = Some(last_addr);
+                    self.cur_zone_last_row_offset = Some(last_offset);
 
                     self.cur_zone_offset += remaining;
                     break;
@@ -1050,20 +1070,23 @@ impl BloomFilterIndexBuilder {
                     // There is enough data, create a new zone
                     self.update_stats(&data_array.slice(array_offset, desired))?;
 
-                    // Track first and last row addresses (local offsets within fragment)
-                    let first_addr = row_addrs_array.value(array_offset) & 0xFFFFFFFF;
-                    let last_addr = row_addrs_array.value(array_offset + desired - 1) & 0xFFFFFFFF;
-                    if self.cur_zone_first_row_addr.is_none() {
-                        self.cur_zone_first_row_addr = Some(first_addr);
+                    // Track first and last row offsets (local offsets within fragment)
+                    let first_row_offset =
+                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
+                    let last_offset =
+                        RowAddress::new_from_u64(row_addrs_array.value(array_offset + desired - 1))
+                            .row_offset();
+                    if self.cur_zone_first_row_offset.is_none() {
+                        self.cur_zone_first_row_offset = Some(first_row_offset);
                     }
-                    self.cur_zone_last_row_addr = Some(last_addr);
+                    self.cur_zone_last_row_offset = Some(last_offset);
 
                     self.cur_zone_offset += desired;
-                    self.new_block(row_addrs_array.value(array_offset) >> 32)?;
+                    self.new_block((row_addrs_array.value(array_offset) >> 32) as u32)?;
                 } else if desired == 0 {
                     // The new batch starts with a new fragment. Flush the current zone if it's not empty
                     if self.cur_zone_offset > 0 {
-                        self.new_block(self.cur_fragment_id - 1)?;
+                        self.new_block(self.cur_fragment_id.wrapping_sub(1))?;
                     }
                     // Let the loop run again
                     // to find the next fragment boundary
@@ -1083,13 +1106,13 @@ impl BloomFilterIndexBuilder {
 
     fn bloomfilter_stats_as_batch(&self) -> Result<RecordBatch> {
         let fragment_ids =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.fragment_id));
+            UInt32Array::from_iter_values(self.blocks.iter().map(|block| block.fragment_id));
 
         let zone_starts =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_start));
+            UInt32Array::from_iter_values(self.blocks.iter().map(|block| block.zone_start));
 
         let zone_lengths =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_length));
+            UInt32Array::from_iter_values(self.blocks.iter().map(|block| block.zone_length));
 
         let has_nulls = arrow_array::BooleanArray::from(
             self.blocks
@@ -1115,9 +1138,9 @@ impl BloomFilterIndexBuilder {
         };
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
+            Field::new("fragment_id", DataType::UInt32, false),
+            Field::new("zone_start", DataType::UInt32, false),
+            Field::new("zone_length", DataType::UInt32, false),
             Field::new("has_null", DataType::Boolean, false),
             Field::new("bloom_filter_data", DataType::Binary, false),
         ]));
@@ -1709,7 +1732,7 @@ mod tests {
         // Verify zone structure
         for (i, block) in index.zones.iter().enumerate() {
             assert_eq!(block.fragment_id, 0);
-            assert_eq!(block.zone_start, (i * 1000) as u64);
+            assert_eq!(block.zone_start, (i * 1000) as u32);
             assert_eq!(block.zone_length, 1000);
             // Check that the bloom filter has some data (non-zero bytes when serialized)
             assert!(!block.bloom_filter.to_bytes().is_empty());
