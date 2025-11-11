@@ -3,10 +3,8 @@
 
 pub mod datatypes;
 pub mod format;
-pub mod page_table;
-pub mod reader;
+pub mod previous;
 pub mod v2;
-pub mod writer;
 
 use format::MAGIC;
 pub use lance_encoding::version;

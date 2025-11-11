@@ -13,7 +13,7 @@ use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_file::{
+use lance_file::previous::{
     reader::FileReader,
     writer::{FileWriter, ManifestProvider},
 };

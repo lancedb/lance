@@ -39,8 +39,8 @@ use object_store::path::Path;
 use snafu::location;
 use tracing::instrument;
 
-use crate::format::metadata::Metadata;
-use crate::page_table::{PageInfo, PageTable};
+use crate::previous::format::metadata::Metadata;
+use crate::previous::page_table::{PageInfo, PageTable};
 
 /// Lance File Reader.
 ///
@@ -786,7 +786,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::writer::{FileWriter, NotSelfDescribing};
+        use crate::previous::writer::{FileWriter, NotSelfDescribing};
 
     use super::*;
 

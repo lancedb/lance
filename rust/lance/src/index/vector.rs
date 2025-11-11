@@ -19,7 +19,7 @@ use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;

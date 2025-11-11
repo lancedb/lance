@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;

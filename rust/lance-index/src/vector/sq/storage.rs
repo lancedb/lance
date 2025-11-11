@@ -14,7 +14,7 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
 use lance_table::format::SelfDescribingFileReader;

@@ -10,7 +10,7 @@ use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;

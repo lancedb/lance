@@ -19,7 +19,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::{FileWriter, ManifestProvider};
+use lance_file::previous::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
@@ -1033,7 +1033,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
-    use lance_file::reader::FileReader;
+    use lance_file::previous::reader::FileReader;
     use lance_io::traits::Reader;
 
     #[tokio::test]

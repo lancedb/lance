@@ -11,6 +11,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
 use snafu::location;
+
 /// Data File Metadata
 #[derive(Debug, Default, DeepSizeOf, PartialEq)]
 pub struct Metadata {

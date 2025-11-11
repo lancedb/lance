@@ -14,7 +14,7 @@ use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::v2::writer::FileWriterOptions;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::PART_ID_COLUMN;

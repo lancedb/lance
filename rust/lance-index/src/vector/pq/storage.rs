@@ -20,7 +20,7 @@ use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::{reader::FileReader, writer::FileWriter};
+use lance_file::previous::{reader::FileReader, writer::FileWriter};
 use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;

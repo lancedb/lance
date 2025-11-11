@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader;
 use lance_index::{vector::VectorIndex, IndexParams, IndexType};
 
 use crate::Dataset;
@@ -70,7 +70,7 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_file::previous::writer::{FileWriter, FileWriterOptions};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         metrics::MetricsCollector,

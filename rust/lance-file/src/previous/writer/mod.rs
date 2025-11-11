@@ -28,9 +28,9 @@ use object_store::path::Path;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 
-use crate::format::metadata::{Metadata, StatisticsMetadata};
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use crate::page_table::{PageInfo, PageTable};
+use crate::previous::format::metadata::{Metadata, StatisticsMetadata};
+use crate::previous::page_table::{PageInfo, PageTable};
 
 /// The file format currently includes a "manifest" where it stores the schema for
 /// self-describing files.  Historically this has been a table format manifest that
@@ -761,7 +761,7 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
 
-    use crate::reader::FileReader;
+        use crate::previous::reader::FileReader;
 
     #[tokio::test]
     async fn test_write_file() {

@@ -32,7 +32,7 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::reader::{read_batch, FileReader};
+use lance_file::previous::reader::{read_batch, FileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;

@@ -840,13 +840,13 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_file::{
+    use lance_file::previous::{
         reader::FileReader,
         writer::{FileWriter, FileWriterOptions},
     };
+    use lance_table::format::SelfDescribingFileReader;
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
-    use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;

@@ -23,7 +23,7 @@ use arrow_schema::DataType;
 use lance::datatypes::Schema;
 use lance::Result;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::kmeans::{

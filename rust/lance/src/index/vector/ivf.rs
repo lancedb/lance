@@ -43,7 +43,7 @@ use lance_core::{
 };
 use lance_file::{
     format::MAGIC,
-    writer::{FileWriter, FileWriterOptions},
+    previous::writer::{FileWriter, FileWriterOptions},
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
