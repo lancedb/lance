@@ -183,18 +183,19 @@ See the `transaction.proto` file for its definition.
 The commit process is as follows:
 
 1. The writer finishes writing all data files.
-2. The writer creates a transaction file in the `_transactions` directory.
-   This file describes the operations that were performed, which is used for two purposes:
-   (1) to detect conflicts, and (2) to re-build the manifest during retries.
+2. Build a transaction struct based on the current version to tell how the manifest changes. Different operations have different structures for metadata changing.
 3. Look for any new commits since the writer started writing.
-   If there are any, read their transaction files and check for conflicts.
-   If there are any conflicts, abort the commit. Otherwise, continue.
-4. Build a manifest and attempt to commit it to the next version.
+   If there are any, begin the rebase process: read their transaction structures and check for conflicts.
+   If there are any conflicts and the conflicts are not retryable, abort the commit.
+   If the conflicts are retryable, attempt to resolve conflicts between the candidate transaction and the conflicting transaction. For example, if they delete disjoint sets of rows, then the deletion files can be merged. If conflicts can't be resolved, the retryable conflict error is bubbled up. This can be handled as a full retry of the write operation.
+4. Create a transaction file in the _transactions directory which describes the operations that were performed for two purposes: 
+   (1) to detect conflicts, and (2) to re-build the manifest during retries.
+5. Build a manifest and attempt to commit it to the next version.
    If the commit fails because another writer has already committed, go back to step 3.
 
 When checking whether two transactions conflict, be conservative.
-If the transaction file is missing, assume it conflicts.
-If the transaction file has an unknown operation, assume it conflicts.
+If the transaction structure is missing, assume it conflicts.
+If the transaction structure has an unknown operation, assume it conflicts.
 
 ### External Manifest Store
 
