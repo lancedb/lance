@@ -111,7 +111,7 @@ async fn rect_search_rtree(
 
 fn bench_rtree(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
-    let num_points = 1_000_000;
+    let num_rows = 1_000_000;
 
     let tempdir = tempfile::tempdir().unwrap();
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
@@ -123,7 +123,7 @@ fn bench_rtree(c: &mut Criterion) {
         ))
     });
 
-    let geo_data = rt.block_on(async { black_box(generate_geo_data(num_points, 42)) });
+    let geo_data = rt.block_on(async { black_box(generate_geo_data(num_rows, 42)) });
 
     let mut group = c.benchmark_group("RTree");
     group.sample_size(10);
