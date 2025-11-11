@@ -70,7 +70,9 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
-    use lance_file::previous::writer::{FileWriter as PreviousFileWriter, FileWriterOptions};
+    use lance_file::previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    };
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         metrics::MetricsCollector,
@@ -269,7 +271,7 @@ mod test {
                 PreviousFileWriter::with_object_writer(
                     writer,
                     schema,
-                    &FileWriterOptions::default(),
+                    &PreviousFileWriterOptions::default(),
                 )
                     .unwrap();
             writer.add_metadata(

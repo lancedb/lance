@@ -32,7 +32,7 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::previous::reader::{read_batch, FileReader as PreviousFileReader};
+use lance_file::previous::reader::{read_batch as previous_read_batch, FileReader as PreviousFileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;
@@ -149,7 +149,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                read_batch(
+                previous_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,

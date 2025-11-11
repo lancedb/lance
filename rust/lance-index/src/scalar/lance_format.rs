@@ -15,7 +15,10 @@ use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
-    writer::{FileWriter as PreviousFileWriter, ManifestProvider},
+    writer::{
+        FileWriter as PreviousFileWriter,
+        ManifestProvider as PreviousManifestProvider,
+    },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -68,7 +71,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl<M: ManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
+impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;

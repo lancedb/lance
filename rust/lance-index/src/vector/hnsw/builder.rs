@@ -842,7 +842,10 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_file::previous::{
         reader::FileReader as PreviousFileReader,
-        writer::{FileWriter as PreviousFileWriter, FileWriterOptions},
+        writer::{
+            FileWriter as PreviousFileWriter,
+            FileWriterOptions as PreviousFileWriterOptions,
+        },
     };
     use lance_table::format::SelfDescribingFileReader;
     use lance_io::object_store::ObjectStore;
@@ -890,7 +893,7 @@ mod tests {
         let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &FileWriterOptions::default(),
+            &PreviousFileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();

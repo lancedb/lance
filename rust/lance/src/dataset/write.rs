@@ -19,7 +19,10 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
-use lance_file::previous::writer::{FileWriter as PreviousFileWriter, ManifestProvider};
+use lance_file::previous::writer::{
+    FileWriter as PreviousFileWriter,
+    ManifestProvider as PreviousManifestProvider,
+};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
@@ -669,7 +672,7 @@ pub trait GenericWriter: Send {
 
 struct V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
     writer: PreviousFileWriter<M>,
     path: String,
@@ -679,7 +682,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await

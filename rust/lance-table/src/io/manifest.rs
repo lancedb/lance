@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::{previous::writer::ManifestProvider, version::LanceFileVersion};
+use lance_file::{
+    previous::writer::ManifestProvider as PreviousManifestProvider,
+    version::LanceFileVersion,
+};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
@@ -227,7 +230,7 @@ pub async fn write_manifest(
 pub struct ManifestDescribing {}
 
 #[async_trait]
-impl ManifestProvider for ManifestDescribing {
+impl PreviousManifestProvider for ManifestDescribing {
     async fn store_schema(
         object_writer: &mut ObjectWriter,
         schema: &Schema,
