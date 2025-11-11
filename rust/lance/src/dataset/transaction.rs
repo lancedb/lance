@@ -1582,10 +1582,6 @@ impl Transaction {
                 Operation::Overwrite { .. } | Operation::Restore { .. }
             ),
             Operation::CreateIndex { new_indices, .. } => {
-                let affected_fields = new_indices
-                    .iter()
-                    .flat_map(|index| index.fields.iter())
-                    .collect::<HashSet<_>>();
                 match &other.operation {
                     Operation::Append { .. } => false,
                     // Indices are identified by UUIDs, so they shouldn't conflict.
@@ -1605,12 +1601,29 @@ impl Transaction {
                     // Because we modify the fragment in place, the index cannot be
                     // re-used if it's on something that we've modified.
                     Operation::DataReplacement { replacements } => {
-                        replacements.iter().any(|replacement| {
-                            replacement
-                                .1
-                                .fields
-                                .iter()
-                                .any(|field| affected_fields.contains(field))
+                        new_indices.iter().any(|index| {
+                            // Check if the index fields overlap with the replacement fields
+                            let fields_overlap = replacements.iter().any(|replacement| {
+                                replacement
+                                    .1
+                                    .fields
+                                    .iter()
+                                    .any(|field| index.fields.contains(field))
+                            });
+
+                            if !fields_overlap {
+                                return false;
+                            }
+
+                            // If fields overlap, check if the fragment bitmap overlaps
+                            if let Some(ref bitmap) = index.fragment_bitmap {
+                                replacements
+                                    .iter()
+                                    .any(|replacement| bitmap.contains(replacement.0 as u32))
+                            } else {
+                                // If no fragment bitmap, conservatively assume conflict
+                                true
+                            }
                         })
                     }
                     _ => true,
@@ -1680,17 +1693,29 @@ impl Transaction {
                 | Operation::Merge { .. }
                 | Operation::UpdateConfig { .. } => false,
                 Operation::CreateIndex { new_indices, .. } => {
-                    let affected_fields = new_indices
-                        .iter()
-                        .flat_map(|index| index.fields.iter())
-                        .collect::<HashSet<_>>();
+                    new_indices.iter().any(|index| {
+                        // Check if the index fields overlap with the replacement fields
+                        let fields_overlap = replacements.iter().any(|replacement| {
+                            replacement
+                                .1
+                                .fields
+                                .iter()
+                                .any(|field| index.fields.contains(field))
+                        });
 
-                    replacements.iter().any(|replacement| {
-                        replacement
-                            .1
-                            .fields
-                            .iter()
-                            .any(|field| affected_fields.contains(field))
+                        if !fields_overlap {
+                            return false;
+                        }
+
+                        // If fields overlap, check if the fragment bitmap overlaps
+                        if let Some(ref bitmap) = index.fragment_bitmap {
+                            replacements
+                                .iter()
+                                .any(|replacement| bitmap.contains(replacement.0 as u32))
+                        } else {
+                            // If no fragment bitmap, conservatively assume conflict
+                            true
+                        }
                     })
                 }
                 Operation::Rewrite { .. } => self.operation.modifies_same_ids(&other.operation),
@@ -4663,7 +4688,8 @@ mod tests {
         let replacements = vec![DataReplacementGroup(0, data_file)];
         let operation = Operation::DataReplacement { replacements };
 
-        let index = IndexMetadata {
+        // Test 1: Index without fragment_bitmap conflicts when fields overlap
+        let index_no_bitmap = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test_index".to_string(),
             fields: vec![0],
@@ -4676,15 +4702,101 @@ mod tests {
         };
 
         let create_index_operation = Operation::CreateIndex {
-            new_indices: vec![index],
+            new_indices: vec![index_no_bitmap],
             removed_indices: vec![],
         };
 
-        let transaction = Transaction::new(0, operation, None, None);
+        let transaction = Transaction::new(0, operation.clone(), None, None);
         let create_index_transaction = Transaction::new(0, create_index_operation, None, None);
 
         // Conflicts because the index is being created on the same field being replaced
+        // and we don't have fragment bitmap info
         assert!(transaction.conflicts_with(&create_index_transaction));
+
+        // Test 2: Index with fragment_bitmap that includes the replaced fragment conflicts
+        let mut bitmap_with_fragment = RoaringBitmap::new();
+        bitmap_with_fragment.insert(0);
+        bitmap_with_fragment.insert(1);
+
+        let index_with_overlapping_bitmap = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test_index".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap_with_fragment),
+            index_details: None,
+            created_at: None,
+            index_version: 1,
+            base_id: None,
+        };
+
+        let create_index_overlapping = Operation::CreateIndex {
+            new_indices: vec![index_with_overlapping_bitmap],
+            removed_indices: vec![],
+        };
+
+        let transaction2 = Transaction::new(0, operation.clone(), None, None);
+        let create_index_transaction2 = Transaction::new(0, create_index_overlapping, None, None);
+
+        // Conflicts because fragment 0 is in the index bitmap
+        assert!(transaction2.conflicts_with(&create_index_transaction2));
+
+        // Test 3: Index with fragment_bitmap that doesn't include the replaced fragment doesn't conflict
+        let mut bitmap_without_fragment = RoaringBitmap::new();
+        bitmap_without_fragment.insert(1);
+        bitmap_without_fragment.insert(2);
+
+        let index_with_non_overlapping_bitmap = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test_index".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap_without_fragment),
+            index_details: None,
+            created_at: None,
+            index_version: 1,
+            base_id: None,
+        };
+
+        let create_index_non_overlapping = Operation::CreateIndex {
+            new_indices: vec![index_with_non_overlapping_bitmap],
+            removed_indices: vec![],
+        };
+
+        let transaction3 = Transaction::new(0, operation.clone(), None, None);
+        let create_index_transaction3 =
+            Transaction::new(0, create_index_non_overlapping, None, None);
+
+        // No conflict because fragment 0 is not in the index bitmap
+        assert!(!transaction3.conflicts_with(&create_index_transaction3));
+
+        // Test 4: Index on different field doesn't conflict even if fragment overlaps
+        let mut bitmap_with_fragment2 = RoaringBitmap::new();
+        bitmap_with_fragment2.insert(0);
+
+        let index_different_field = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test_index".to_string(),
+            fields: vec![1], // Different field
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap_with_fragment2),
+            index_details: None,
+            created_at: None,
+            index_version: 1,
+            base_id: None,
+        };
+
+        let create_index_different_field = Operation::CreateIndex {
+            new_indices: vec![index_different_field],
+            removed_indices: vec![],
+        };
+
+        let transaction4 = Transaction::new(0, operation, None, None);
+        let create_index_transaction4 =
+            Transaction::new(0, create_index_different_field, None, None);
+
+        // No conflict because fields don't overlap
+        assert!(!transaction4.conflicts_with(&create_index_transaction4));
     }
 
     #[test]
