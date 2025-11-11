@@ -1,6 +1,6 @@
 site_name: Lance
 site_description: Open Lakehouse Format for Multimodal AI
-site_url: https://lancedb.github.io/lance/
+site_url: https://lance.org/
 docs_dir: src
 
 repo_name: lancedb/lance
