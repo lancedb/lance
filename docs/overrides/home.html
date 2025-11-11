@@ -4,6 +4,11 @@
   {{ super() }}
 
   <style>
+    /* Prevent horizontal overflow */
+    body {
+      overflow-x: hidden;
+    }
+
     /* Hide main content for home page */
     .md-content {
       display: none;

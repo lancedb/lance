@@ -1,15 +1,13 @@
 # Format Versioning
 
-## Feature Flags
-
-As the table format evolve, new feature flags are added to the format.
+As the table format evolves, new feature flags are added to the format.
 There are two separate fields for checking for feature flags,
 depending on whether you are trying to read or write the table.
 Readers should check the `reader_feature_flags` to see if there are any flag it is not aware of.
 Writers should check `writer_feature_flags`. If either sees a flag they don't know,
 they should return an "unsupported" error on any read or write operation.
 
-### Current Feature Flags
+## Current Feature Flags
 
 | Flag Bit | Flag Name                       | Reader Required | Writer Required | Description                                                                                                 |
 |----------|---------------------------------|-----------------|-----------------|-------------------------------------------------------------------------------------------------------------|

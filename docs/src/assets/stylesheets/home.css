@@ -1,5 +1,9 @@
 /* Lance Homepage Styles */
 
+* {
+  box-sizing: border-box;
+}
+
 .container {
   width: 100%;
   max-width: 1140px;
@@ -224,6 +228,11 @@
 
 /* Responsive Design */
 @media (max-width: 768px) {
+  .container {
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
   .mdx-hero__content h1 {
     font-size: 2.2rem;
   }

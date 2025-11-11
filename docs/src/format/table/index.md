@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Lance table format organizes datasets as versioned collections of fragments.
+The Lance table format organizes datasets as versioned collections of fragments and indices.
 Each version is described by an immutable manifest file that references data files, deletion files, transaction file and indices.
 The format supports ACID transactions, schema evolution, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).
 
@@ -25,12 +25,12 @@ a monotonically increasing version number, and an optional reference to the inde
 
 ## Schema & Fields
 
-Lance primarily uses Apache Arrow schema to define the structure of data in the dataset.
-The manifest stores an Arrow schema as a list of fields.
-At initial table creation time, fields are listed in depth-first order.
+The schema of the table is written as a series of fields, plus a schema metadata map. 
+The data types generally have a 1-1 correspondence with the Apache Arrow data types.
+Each field, including nested fields, have a unique integer id. At initial table creation time, fields are assigned ids in depth-first order.
 Afterwards, field IDs are assigned incrementally for newly added fields.
 
-Column encodings are specified through field metadata using the `lance-encoding:` prefix.
+Column encoding configurations are specified through field metadata using the `lance-encoding:` prefix.
 See [File Format Encoding Specification](../file/encoding.md) for details on available encodings, compression schemes, and configuration options.
 
 <details>
@@ -68,6 +68,14 @@ This fragment design enables a new concept called data evolution, which means ef
 For example, when adding a new column, new column data are added by appending new data files to each fragment, with values computed for all existing rows in the fragment.
 There is no need to rewrite the entire table to just add data for a single column.
 This enables efficient feature engineering and embedding updates for ML/AI workloads.
+
+Each data file should contain a distinct set of field ids. 
+It is not required that all field ids in the dataset schema are found in one of the data files. 
+If there is no corresponding data file, that column should be read as entirely `NULL`.
+
+Field ids might be replaced with `-2`, a tombstone value. 
+In this case that column should be ignored. This used, for example, when rewriting a column: 
+The old data file replaces the field id with `-2` to ignore the old data, and a new data file is appended to the fragment.
 
 ## Data Files
 
