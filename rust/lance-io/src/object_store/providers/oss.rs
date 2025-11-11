@@ -102,6 +102,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            io_tracker: Default::default(),
         })
     }
 }

@@ -45,6 +45,7 @@ pub struct IoStats {
     pub write_bytes: u64,
     /// Number of disjoint periods where at least one IO is in-flight.
     pub num_hops: u64,
+    #[cfg(feature = "test-util")]
     pub requests: Vec<IoRequestRecord>,
 }
 
@@ -52,6 +53,7 @@ pub struct IoStats {
 /// assert_io_eq!(io_stats, read_iops, 1);
 /// assert_io_eq!(io_stats, write_iops, 0, "should be no writes");
 /// assert_io_eq!(io_stats, num_hops, 1, "should be just {}", "one hop");
+#[cfg(feature = "test-util")]
 #[macro_export]
 macro_rules! assert_io_eq {
     ($io_stats:expr, $field:ident, $expected:expr) => {
@@ -77,6 +79,7 @@ macro_rules! assert_io_eq {
     };
 }
 
+#[cfg(feature = "test-util")]
 #[macro_export]
 macro_rules! assert_io_gt {
     ($io_stats:expr, $field:ident, $expected:expr) => {
@@ -102,6 +105,7 @@ macro_rules! assert_io_gt {
     };
 }
 
+#[cfg(feature = "test-util")]
 #[macro_export]
 macro_rules! assert_io_lt {
     ($io_stats:expr, $field:ident, $expected:expr) => {
@@ -173,7 +177,7 @@ impl Display for IoTrackingStore {
 }
 
 impl IoTrackingStore {
-    fn new(target: Arc<dyn ObjectStore>, stats: Arc<Mutex<IoStats>>) -> Self {
+    pub fn new(target: Arc<dyn ObjectStore>, stats: Arc<Mutex<IoStats>>) -> Self {
         Self {
             target,
             stats,
@@ -191,22 +195,28 @@ impl IoTrackingStore {
         let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
+        #[cfg(feature = "test-util")]
         stats.requests.push(IoRequestRecord {
             method,
             path,
             range,
         });
+        #[cfg(not(feature = "test-util"))]
+        let _ = (method, path, range); // Suppress unused variable warnings
     }
 
     fn record_write(&self, method: &'static str, path: Path, num_bytes: u64) {
         let mut stats = self.stats.lock().unwrap();
         stats.write_iops += 1;
         stats.write_bytes += num_bytes;
+        #[cfg(feature = "test-util")]
         stats.requests.push(IoRequestRecord {
             method,
             path,
             range: None,
         });
+        #[cfg(not(feature = "test-util"))]
+        let _ = (method, path); // Suppress unused variable warnings
     }
 
     fn hop_guard(&self) -> HopGuard {
@@ -415,6 +425,7 @@ impl MultipartUpload for IoTrackingMultipartUpload {
             let mut stats = self.stats.lock().unwrap();
             stats.write_iops += 1;
             stats.write_bytes += payload.content_length() as u64;
+            #[cfg(feature = "test-util")]
             stats.requests.push(IoRequestRecord {
                 method: "put_part",
                 path: self.path.to_owned(),

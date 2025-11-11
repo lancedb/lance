@@ -170,6 +170,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 }

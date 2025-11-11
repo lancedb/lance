@@ -124,6 +124,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// IO tracker for monitoring read/write operations
+    io_tracker: crate::utils::tracking_store::IOTracker,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -350,8 +352,13 @@ impl ObjectStore {
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
+
+            // Always wrap with IO tracking
+            let io_tracker = crate::utils::tracking_store::IOTracker::default();
+            let tracked_store = io_tracker.wrap("", inner);
+
             let store = Self {
-                inner,
+                inner: tracked_store,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -359,6 +366,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                io_tracker,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -449,6 +457,21 @@ impl ObjectStore {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+    }
+
+    /// Get the IO tracker for this object store
+    ///
+    /// The IO tracker can be used to get statistics about read/write operations
+    /// performed on this object store.
+    pub fn io_tracker(&self) -> &crate::utils::tracking_store::IOTracker {
+        &self.io_tracker
+    }
+
+    /// Get IO statistics since the last call to this method
+    ///
+    /// This returns the accumulated statistics and resets the counters.
+    pub fn io_stats(&self) -> crate::utils::tracking_store::IoStats {
+        self.io_tracker.incremental_stats()
     }
 
     /// Open a file for path.
@@ -757,8 +780,12 @@ impl ObjectStore {
             None => store,
         };
 
+        // Always wrap with IO tracking
+        let io_tracker = crate::utils::tracking_store::IOTracker::default();
+        let tracked_store = io_tracker.wrap("", store);
+
         Self {
-            inner: store,
+            inner: tracked_store,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -766,6 +793,7 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            io_tracker,
         }
     }
 }
