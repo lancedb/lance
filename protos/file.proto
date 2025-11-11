@@ -161,26 +161,35 @@ message Field {
   // If this field is nullable.
   bool nullable = 6;
 
+  // optional field metadata (e.g. extension type name/parameters)
+  map<string, bytes> metadata = 10;  
+
+  bool unenforced_primary_key = 12;
+
+  // DEPRECATED ----------------------------------------------------------------
+
+  // Deprecated: Only used in V1 file format. V2 uses variable encodings defined
+  // per page.
+  //
+  // The global encoding to use for this field.
   Encoding encoding = 7;
 
-  /// The file offset for storing the dictionary value.
-  /// It is only valid if encoding is DICTIONARY.
-  ///
-  /// The logic type presents the value type of the column, i.e., string value.
+  // Deprecated: Only used in V1 file format. V2 dynamically chooses when to
+  // do dictionary encoding and keeps the dictionary in the data files.
+  //
+  // The file offset for storing the dictionary value.
+  // It is only valid if encoding is DICTIONARY.
+  //
+  // The logic type presents the value type of the column, i.e., string value.
   Dictionary dictionary = 8;
 
   // Deprecated: optional extension type name, use metadata field
   // ARROW:extension:name
   string extension_name = 9;
 
-  // optional field metadata (e.g. extension type name/parameters)
-  map<string, bytes> metadata = 10;
-
   // Field number 11 was previously `string storage_class`.
   // Keep it reserved so older manifests remain compatible while new writers
   // avoid reusing the slot.
   reserved 11;
   reserved "storage_class";
-
-  bool unenforced_primary_key = 12;
 }
