@@ -55,13 +55,21 @@ const RTREE_INDEX_VERSION: u32 = 0;
 const RTREE_PAGES_NAME: &str = "page_data.lance";
 const RTREE_NULLS_NAME: &str = "nulls.lance";
 
-static BBOX_ROWID_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
+static BBOX_FIELD: LazyLock<Arc<ArrowField>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
-    let bbox_field = bbox_type.to_field("bbox", false);
-    let rowid_field = ArrowField::new(ROW_ID, DataType::UInt64, true);
-    Arc::new(ArrowSchema::new(vec![bbox_field, rowid_field]))
+    Arc::new(bbox_type.to_field("bbox", false))
 });
-static RTREE_PAGE_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| BBOX_ROWID_SCHEMA.clone());
+static BBOX_ROWID_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
+    let rowid_field = ArrowField::new(ROW_ID, DataType::UInt64, false);
+    Arc::new(ArrowSchema::new(vec![
+        BBOX_FIELD.clone(),
+        rowid_field.into(),
+    ]))
+});
+static RTREE_PAGE_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
+    let id_field = ArrowField::new("id", DataType::UInt64, false);
+    Arc::new(ArrowSchema::new(vec![BBOX_FIELD.clone(), id_field.into()]))
+});
 
 static RTREE_NULLS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
     Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -75,36 +83,47 @@ static RTREE_NULLS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
 pub struct RTreeMetadata {
     pub(crate) page_size: u32,
     pub(crate) num_pages: u64,
-    pub(crate) page_offsets: Vec<usize>,
     pub(crate) num_items: usize,
     pub(crate) bbox: BoundingBox,
+    pub(crate) page_offsets: Vec<usize>,
 }
 
 impl RTreeMetadata {
-    pub fn new(
-        page_size: u32,
-        num_pages: u64,
-        page_offsets: Vec<usize>,
-        num_items: usize,
-        bbox: BoundingBox,
-    ) -> Self {
+    pub fn new(page_size: u32, num_pages: u64, num_items: usize, bbox: BoundingBox) -> Self {
+        let page_offsets = Self::calculate_page_offsets(num_items, page_size);
+        debug_assert_eq!(page_offsets.len(), num_pages as usize);
         Self {
             page_size,
             num_pages,
-            page_offsets,
             num_items,
             bbox,
+            page_offsets,
         }
+    }
+
+    fn calculate_page_offsets(num_items: usize, page_size: u32) -> Vec<usize> {
+        let mut page_offsets = vec![];
+        let mut cur_level_items = num_items;
+        let mut cur_offset = 0;
+        while cur_level_items > 0 {
+            if cur_level_items <= page_size as usize {
+                page_offsets.push(cur_offset);
+                break;
+            }
+            for off in (0..cur_level_items).step_by(page_size as usize) {
+                page_offsets.push(cur_offset + off);
+            }
+            cur_offset += cur_level_items;
+            cur_level_items = cur_level_items.div_ceil(page_size as usize);
+        }
+
+        page_offsets
     }
 
     fn into_map(self) -> HashMap<String, String> {
         HashMap::from_iter(vec![
             ("page_size".to_owned(), self.page_size.to_string()),
             ("num_pages".to_owned(), self.num_pages.to_string()),
-            (
-                "page_offsets".to_owned(),
-                serde_json::json!(self.page_offsets).to_string(),
-            ),
             ("num_items".to_owned(), self.num_items.to_string()),
             ("bbox".to_owned(), serde_json::json!(self.bbox).to_string()),
         ])
@@ -121,10 +140,6 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
             .get("num_pages")
             .map(|bs| bs.parse().unwrap_or(0))
             .unwrap_or(0);
-        let page_offsets: Vec<usize> = metadata
-            .get("page_offsets")
-            .map(|bs| serde_json::from_str(bs).unwrap_or_default())
-            .unwrap_or_default();
         let num_items = metadata
             .get("num_items")
             .map(|bs| bs.parse().unwrap_or(0))
@@ -133,7 +148,7 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
             .get("bbox")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
             .unwrap_or_default();
-        Self::new(page_size, num_pages, page_offsets, num_items, bbox)
+        Self::new(page_size, num_pages, num_items, bbox)
     }
 }
 
@@ -245,10 +260,10 @@ impl RTreeIndex {
         }
 
         let mut row_ids = RowIdTreeMap::new();
-        let mut outer_page_idx = Some(self.metadata.num_pages - 1);
+        let mut outer_page_id = Some(self.metadata.num_pages - 1);
         let mut queue = vec![];
 
-        while let Some(page_idx) = outer_page_idx {
+        while let Some(page_idx) = outer_page_id {
             let range = self.page_range(page_idx).await?;
             let is_leaf = range.start < self.metadata.num_items;
             let batch = self
@@ -282,7 +297,7 @@ impl RTreeIndex {
                 }
             }
 
-            outer_page_idx = queue.pop();
+            outer_page_id = queue.pop();
         }
 
         Ok(row_ids)
@@ -318,7 +333,7 @@ impl RTreeIndex {
         Ok(null_map)
     }
 
-    /// Create a stream of all the data in the index, in the same format used to train the index
+    /// Create a stream of all the data in the index, in the format (bbox, row_id)
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(RTREE_PAGES_NAME).await?;
         let reader_stream = IndexReaderStream::new_with_limit(
@@ -328,11 +343,16 @@ impl RTreeIndex {
         )
         .await;
         let batches = reader_stream
+            .map(|fut| {
+                fut.map_ok(|batch| {
+                    RecordBatch::try_new(BBOX_ROWID_SCHEMA.clone(), batch.columns().into()).unwrap()
+                })
+            })
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(self.store.io_parallelism())
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            RTREE_PAGE_SCHEMA.clone(),
+            BBOX_ROWID_SCHEMA.clone(),
             batches,
         )))
     }
@@ -350,7 +370,7 @@ impl RTreeIndex {
         let merged = futures::stream::select(old_input, new_input);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            RTREE_PAGE_SCHEMA.clone(),
+            BBOX_ROWID_SCHEMA.clone(),
             merged,
         )))
     }
@@ -392,10 +412,10 @@ impl Index for RTreeIndex {
 
     async fn prewarm(&self) -> Result<()> {
         if self.metadata.num_pages > 0 {
-            let mut outer_page_idx = Some(self.metadata.num_pages - 1);
+            let mut outer_page_id = Some(self.metadata.num_pages - 1);
             let mut queue = vec![];
 
-            while let Some(page_idx) = outer_page_idx {
+            while let Some(page_idx) = outer_page_id {
                 let range = self.page_range(page_idx).await?;
                 let is_leaf = range.start < self.metadata.num_items;
                 let batch = Arc::new(self.pages_reader.read_range(range, None).await?);
@@ -419,7 +439,7 @@ impl Index for RTreeIndex {
                     }
                 }
 
-                outer_page_idx = queue.pop();
+                outer_page_id = queue.pop();
             }
         }
 
@@ -446,11 +466,7 @@ impl Index for RTreeIndex {
         let mut read_rows = 0;
         while let Some(page) = reader_stream.try_next().await? {
             let mut page_frag_ids = page
-                .column_by_name(ROW_ID)
-                .ok_or_else(|| Error::Index {
-                    message: format!("RTree page lacks {} column", ROW_ID),
-                    location: location!(),
-                })?
+                .column(1)
                 .as_primitive::<UInt64Type>()
                 .iter()
                 .flatten()
@@ -527,7 +543,7 @@ impl ScalarIndex for RTreeIndex {
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let (new_bbox_data, analyze) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
+        let (new_bbox_data, stats) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
             bbox_data,
             self.metadata.page_size,
             spill_store.clone(),
@@ -539,13 +555,13 @@ impl ScalarIndex for RTreeIndex {
         let null_map = self.search_null(&NoOpMetricsCollector).await?;
 
         let mut new_bbox = BoundingBox::new();
-        new_bbox.add_rect(&analyze.total_bbox);
+        new_bbox.add_rect(&stats.total_bbox);
         new_bbox.add_rect(&self.metadata.bbox);
 
         let merge_analyze = BboxStreamStats {
-            null_map: RowIdTreeMap::union_all(&[&null_map, &analyze.null_map]),
+            null_map: RowIdTreeMap::union_all(&[&null_map, &stats.null_map]),
             total_bbox: new_bbox,
-            num_items: self.metadata.num_items + analyze.num_items,
+            num_items: self.metadata.num_items + stats.num_items,
         };
 
         RTreeIndexPlugin::train_rtree_index(
@@ -643,11 +659,10 @@ impl RTreeIndexPlugin {
                 let geometry_field = schema.field(0);
                 let geometry_array = batch.column(0);
                 let bbox_array = extract_bounding_boxes(geometry_array, geometry_field)?;
-                let bbox_field = bbox_array.extension_type().clone().to_field("bbox", true);
 
                 let bbox_schema = Arc::new(ArrowSchema::new(vec![
-                    bbox_field,
-                    ArrowField::new(ROW_ID, DataType::UInt64, true),
+                    bbox_array.extension_type().clone().to_field("bbox", true),
+                    ArrowField::new(ROW_ID, DataType::UInt64, false),
                 ]));
                 RecordBatch::try_new(
                     bbox_schema,
@@ -747,17 +762,12 @@ impl RTreeIndexPlugin {
             .new_index_file(RTREE_PAGES_NAME, RTREE_PAGE_SCHEMA.clone())
             .await?;
 
-        let mut page_offsets = vec![];
-        let mut curr_offset = 0;
-
         if num_items > 0 {
             let mut current_level = Some((sorted_data, num_items));
             while let Some((mut data, num_items)) = current_level.take() {
                 if num_items <= page_size as usize {
                     while let Some(batch) = data.next().await {
                         let batch = batch?;
-                        page_offsets.push(curr_offset);
-                        curr_offset += batch.num_rows();
                         train_rtree_page(batch, page_idx, writer.as_mut()).await?;
                         page_idx += 1;
                     }
@@ -766,8 +776,6 @@ impl RTreeIndexPlugin {
                     let mut paged_source = chunk_concat_stream(data, page_size as usize);
                     while let Some(batch) = paged_source.next().await {
                         let batch = batch?;
-                        page_offsets.push(curr_offset);
-                        curr_offset += batch.num_rows();
                         let encoded_batch =
                             train_rtree_page(batch, page_idx, writer.as_mut()).await?;
                         page_idx += 1;
@@ -786,7 +794,7 @@ impl RTreeIndexPlugin {
 
         writer
             .finish_with_metadata(
-                RTreeMetadata::new(page_size, page_idx, page_offsets, num_items, bbox).into_map(),
+                RTreeMetadata::new(page_size, page_idx, num_items, bbox).into_map(),
             )
             .await?;
 
@@ -960,7 +968,11 @@ async fn train_rtree_page(
 ) -> Result<EncodedBatch> {
     let geo_array = extract_bounding_boxes(batch.column(0).as_ref(), batch.schema().field(0))?;
     let bbox = total_bounds(&geo_array)?;
-    writer.write_record_batch(batch).await?;
+    let new_batch = RecordBatch::try_new(
+        RTREE_PAGE_SCHEMA.clone(),
+        vec![batch.column(0).clone(), batch.column(1).clone()],
+    )?;
+    writer.write_record_batch(new_batch).await?;
     Ok(EncodedBatch { bbox, page_id })
 }
 
@@ -976,27 +988,8 @@ mod tests {
     use geoarrow_schema::{Dimension, PointType, RectType};
     use lance_core::utils::tempfile::TempObjDir;
 
-    fn expected_page_offsets(num_items: usize, page_size: u32) -> Vec<usize> {
-        let mut page_offsets = vec![];
-        let mut cur_level_items = num_items;
-        let mut cur_offset = 0;
-        while cur_level_items > 0 {
-            if cur_level_items <= page_size as usize {
-                page_offsets.push(cur_offset);
-                break;
-            }
-            for off in (0..cur_level_items).step_by(page_size as usize) {
-                page_offsets.push(cur_offset + off);
-            }
-            cur_offset += cur_level_items;
-            cur_level_items = cur_level_items.div_ceil(page_size as usize);
-        }
-
-        page_offsets
-    }
-
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
-        expected_page_offsets(num_items, page_size).len() as u64
+        RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64
     }
 
     fn convert_bbox_rowid_batch_stream(
@@ -1059,10 +1052,6 @@ mod tests {
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
         assert_eq!(metadata.num_items, num_items);
         assert_eq!(metadata.num_pages, expected_num_pages(num_items, page_size));
-        assert_eq!(
-            metadata.page_offsets,
-            expected_page_offsets(num_items, page_size)
-        );
 
         (
             RTreeIndex::load(store, None, &LanceCache::no_cache())

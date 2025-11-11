@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use geo_traits::{
-    CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
+    CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait, LineTrait,
     MultiLineStringTrait, MultiPointTrait, MultiPolygonTrait, PointTrait, PolygonTrait, RectTrait,
-    UnimplementedGeometryCollection, UnimplementedLine, UnimplementedLineString,
+    TriangleTrait, UnimplementedGeometryCollection, UnimplementedLine, UnimplementedLineString,
     UnimplementedMultiLineString, UnimplementedMultiPoint, UnimplementedMultiPolygon,
     UnimplementedPoint, UnimplementedPolygon, UnimplementedTriangle,
 };
@@ -128,6 +128,18 @@ impl BoundingBox {
         }
     }
 
+    pub fn add_triangle(&mut self, triangle: &impl TriangleTrait<T = f64>) {
+        for coord in triangle.coords() {
+            self.add_coord(&coord);
+        }
+    }
+
+    pub fn add_line(&mut self, line: &impl LineTrait<T = f64>) {
+        for coord in line.coords() {
+            self.add_coord(&coord);
+        }
+    }
+
     pub fn add_geometry(&mut self, geometry: &impl GeometryTrait<T = f64>) {
         use geo_traits::GeometryType::{
             GeometryCollection, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point,
@@ -143,7 +155,8 @@ impl BoundingBox {
             MultiPolygon(g) => self.add_multi_polygon(g),
             GeometryCollection(g) => self.add_geometry_collection(g),
             Rect(g) => self.add_rect(g),
-            Triangle(_) | Line(_) => todo!(),
+            Triangle(g) => self.add_triangle(g),
+            Line(g) => self.add_line(g),
         }
     }
 
