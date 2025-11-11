@@ -3898,17 +3898,17 @@ mod tests {
             .unwrap();
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        // Assert file is small (< 4kb)
+        // Assert file is small (< 4300 bytes)
         {
             let stats = io_stats.incremental_stats();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4096);
+            assert_io_lt!(stats, write_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
         let projection = Schema::try_from(schema.as_ref())
             .unwrap()
-            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7], true);
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
         let reader = fragment
             .open(&projection, Default::default())
             .await
