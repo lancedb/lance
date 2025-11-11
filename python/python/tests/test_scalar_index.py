@@ -412,7 +412,7 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "KNNVectorDistance" in plan
-    assert "LanceScan" in plan
+    assert "LanceRead" in plan
     assert make_vec_search(ds).to_table().num_rows == 12
 
     plan = make_fts_search(ds).explain_plan()
