@@ -140,7 +140,7 @@
   line-height: 1.8;
   margin-bottom: 32px;
   opacity: 0.9;
-  text-align: left;
+  text-align: center;
 }
 
 .lance-intro-content .md-button {
@@ -274,15 +274,28 @@
   }
 }
 
+@media (max-width: 960px) {
+  .intro-message .list-inline li {
+    display: block;
+    padding: 0;
+    margin-bottom: 12px;
+  }
+
+  .intro-message .md-button {
+    display: block;
+    margin: 0 auto;
+    width: 90%;
+    max-width: 350px;
+  }
+}
+
 @media (max-width: 480px) {
-  .mdx-hero__content h1 {
+  .intro-message h1 {
     font-size: 1.8rem;
   }
 
-  .mdx-hero__content .md-button {
-    display: block;
-    margin: 8px auto;
-    width: 90%;
+  .intro-message .md-button {
+    max-width: 300px;
   }
 
   [data-termynal] {
