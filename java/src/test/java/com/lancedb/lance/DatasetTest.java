@@ -1523,7 +1523,10 @@ public class DatasetTest {
             assertEquals(2, branch1V2.version());
 
             // Write batch B on branch1: 3 rows -> global@3
-            FragmentMetadata fragB = suite.createNewFragment(3);
+            // Create fragment using the branch's URI, not the main dataset URI
+            TestUtils.SimpleTestDataset branch1Suite =
+                new TestUtils.SimpleTestDataset(allocator, branch1V2.uri());
+            FragmentMetadata fragB = branch1Suite.createNewFragment(3);
             Append appendB = Append.builder().fragments(Collections.singletonList(fragB)).build();
             try (Dataset branch1V3 =
                 branch1V2.newTransactionBuilder().operation(appendB).build().commit()) {
@@ -1538,7 +1541,10 @@ public class DatasetTest {
                 assertEquals(8, branch2V3.countRows()); // A(5) + B(3)
 
                 // Step 4. Write batch C on branch2: 2 rows -> branch2:4
-                FragmentMetadata fragC = suite.createNewFragment(2);
+                // Create fragment using branch2's URI
+                TestUtils.SimpleTestDataset branch2Suite =
+                    new TestUtils.SimpleTestDataset(allocator, branch2V3.uri());
+                FragmentMetadata fragC = branch2Suite.createNewFragment(2);
                 Append appendC = Append.builder().fragments(Arrays.asList(fragC)).build();
                 try (Dataset branch2V4 =
                     branch2V3.newTransactionBuilder().operation(appendC).build().commit()) {

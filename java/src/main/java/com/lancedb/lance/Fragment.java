@@ -208,9 +208,30 @@ public class Fragment {
    */
   public static List<FragmentMetadata> create(
       String datasetUri, BufferAllocator allocator, VectorSchemaRoot root, WriteParams params) {
+    return create(datasetUri, allocator, root, Optional.empty(), params);
+  }
+
+  /**
+   * Create a fragment from the given data with a specified fragment ID.
+   *
+   * @param datasetUri the dataset uri
+   * @param allocator the buffer allocator
+   * @param root the vector schema root
+   * @param fragmentId the fragment id (optional). If not provided, fragments will be auto-assigned
+   *     IDs starting from 0
+   * @param params the write params
+   * @return the fragment metadata
+   */
+  public static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      VectorSchemaRoot root,
+      Optional<Integer> fragmentId,
+      WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
+    Preconditions.checkNotNull(fragmentId);
     Preconditions.checkNotNull(params);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
@@ -219,6 +240,7 @@ public class Fragment {
           datasetUri,
           arrowArray.memoryAddress(),
           arrowSchema.memoryAddress(),
+          fragmentId,
           params.getMaxRowsPerFile(),
           params.getMaxRowsPerGroup(),
           params.getMaxBytesPerFile(),
@@ -239,12 +261,32 @@ public class Fragment {
    */
   public static List<FragmentMetadata> create(
       String datasetUri, ArrowArrayStream stream, WriteParams params) {
+    return create(datasetUri, stream, Optional.empty(), params);
+  }
+
+  /**
+   * Create a fragment from the given arrow stream with a specified fragment ID.
+   *
+   * @param datasetUri the dataset uri
+   * @param stream the arrow stream
+   * @param fragmentId the fragment id (optional). If not provided, fragments will be auto-assigned
+   *     IDs starting from 0
+   * @param params the write params
+   * @return the fragment metadata
+   */
+  public static List<FragmentMetadata> create(
+      String datasetUri,
+      ArrowArrayStream stream,
+      Optional<Integer> fragmentId,
+      WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
+    Preconditions.checkNotNull(fragmentId);
     Preconditions.checkNotNull(params);
     return createWithFfiStream(
         datasetUri,
         stream.memoryAddress(),
+        fragmentId,
         params.getMaxRowsPerFile(),
         params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(),
@@ -263,6 +305,7 @@ public class Fragment {
       String datasetUri,
       long arrowArrayMemoryAddress,
       long arrowSchemaMemoryAddress,
+      Optional<Integer> fragmentId,
       Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
@@ -279,6 +322,7 @@ public class Fragment {
   private static native List<FragmentMetadata> createWithFfiStream(
       String datasetUri,
       long arrowStreamMemoryAddress,
+      Optional<Integer> fragmentId,
       Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,

@@ -56,6 +56,62 @@ public class FragmentTest {
   }
 
   @Test
+  void testFragmentCreateWithDefaultId(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_default_id").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Create fragment without specifying fragment_id (using the overload that returns List)
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(20, Integer.MAX_VALUE);
+
+      // Should create exactly one fragment with ID = 0
+      assertEquals(1, fragments.size());
+      assertEquals(0, fragments.get(0).getId());
+    }
+  }
+
+  @Test
+  void testFragmentCreateWithSpecificId(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_specific_id").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Create fragment with specific fragment_id
+      int expectedFragmentId = 42;
+      List<FragmentMetadata> fragments =
+          testDataset.createNewFragmentWithId(20, expectedFragmentId);
+
+      // Should create exactly one fragment with the specified ID
+      assertEquals(1, fragments.size());
+      assertEquals(expectedFragmentId, fragments.get(0).getId());
+    }
+  }
+
+  @Test
+  void testFragmentCreateSingleFragmentRegardlessOfSize(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_single").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Create fragment with many rows and small max_rows_per_file
+      // to verify it still creates a single fragment
+      List<FragmentMetadata> fragments =
+          testDataset.createNewFragmentWithId(
+              100, 5, 10); // 100 rows, fragment_id=5, maxRowsPerFile=10
+
+      // Should create exactly ONE fragment with all data, not multiple fragments
+      assertEquals(1, fragments.size());
+      assertEquals(5, fragments.get(0).getId());
+    }
+  }
+
+  @Test
   void testFragmentCreate(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("new_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -166,20 +222,24 @@ public class FragmentTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      List<FragmentMetadata> fragments = testDataset.createNewFragment(0, 10);
-      assertEquals(0, fragments.size());
+      // Empty fragments are not allowed - should throw exception
+      assertThrows(IllegalArgumentException.class, () -> testDataset.createNewFragment(0, 10));
     }
   }
 
   @Test
-  void testMultiFragments(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("testMultiFragments").toString();
+  void testSingleFragmentCreation(@TempDir Path tempDir) {
+    // Fragment.create() ALWAYS creates a SINGLE fragment, even with max_rows_per_file
+    // This matches Python's behavior where Fragment.create() creates one fragment
+    String datasetPath = tempDir.resolve("testSingleFragmentCreation").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
+      // 20 rows with max_rows_per_file=10 still creates 1 fragment (not 2!)
       List<FragmentMetadata> fragments = testDataset.createNewFragment(20, 10);
-      assertEquals(2, fragments.size());
+      assertEquals(1, fragments.size()); // Always 1 fragment
+      assertEquals(0, fragments.get(0).getId()); // Default ID is 0
     }
   }
 
