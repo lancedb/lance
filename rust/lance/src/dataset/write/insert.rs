@@ -216,30 +216,28 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let config_upsert_values = if let Some(auto_cleanup_params) =
-                    context.params.auto_cleanup.as_ref()
-                {
-                    let mut upsert_values = HashMap::new();
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.interval"),
-                        auto_cleanup_params.interval.to_string(),
-                    );
+                let config_upsert_values =
+                    if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
+                        let mut upsert_values = HashMap::new();
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.interval"),
+                            auto_cleanup_params.interval.to_string(),
+                        );
 
-                    let duration = auto_cleanup_params
-                        .older_than
-                        .to_std()
-                        .map_err(|e| Error::InvalidInput {
-                            source: e.into(),
-                            location: location!(),
+                        let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
+                            Error::InvalidInput {
+                                source: e.into(),
+                                location: location!(),
+                            }
                         })?;
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.older_than"),
-                        format_duration(duration).to_string(),
-                    );
-                    Some(upsert_values)
-                } else {
-                    None
-                };
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.older_than"),
+                            format_duration(duration).to_string(),
+                        );
+                        Some(upsert_values)
+                    } else {
+                        None
+                    };
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
