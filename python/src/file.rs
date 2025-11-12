@@ -26,7 +26,7 @@ use lance_file::reader::{
     ReaderProjection,
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_file::{LanceEncodingsIo, version::LanceFileVersion};
+use lance_file::{version::LanceFileVersion, LanceEncodingsIo};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
