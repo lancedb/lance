@@ -1775,6 +1775,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
+            "BKDTREE" => IndexType::BkdTree,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -1876,6 +1877,10 @@ impl Dataset {
                 }
                 Box::new(params)
             }
+            "BKDTREE" => Box::new(ScalarIndexParams {
+                index_type: "bkdtree".to_string(),
+                params: None,
+            }),
             _ => {
                 let column_type = match self.ds.schema().field(columns[0]) {
                     Some(f) => f.data_type().clone(),

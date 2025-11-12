@@ -144,5 +144,9 @@ harness = false
 name = "rq"
 harness = false
 
+[[bench]]
+name = "geoindex"
+harness = false
+
 [lints]
 workspace = true
