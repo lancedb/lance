@@ -1611,12 +1611,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone())
+        Projection::empty(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone())
+        Projection::full(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Get fragments.
@@ -2603,10 +2603,6 @@ pub(crate) async fn write_manifest_file(
 impl Projectable for Dataset {
     fn schema(&self) -> &Schema {
         self.schema()
-    }
-
-    fn blob_version(&self) -> BlobVersion {
-        self.blob_version()
     }
 }
 

@@ -896,10 +896,6 @@ pub enum OnMissing {
 /// A trait for something that we can project fields from.
 pub trait Projectable: Debug + Send + Sync {
     fn schema(&self) -> &Schema;
-
-    fn blob_version(&self) -> BlobVersion {
-        BlobVersion::V1
-    }
 }
 
 impl Projectable for Schema {
@@ -992,7 +988,6 @@ impl Debug for Projection {
 impl Projection {
     /// Create a new empty projection
     pub fn empty(base: Arc<dyn Projectable>) -> Self {
-        let blob_version = base.blob_version();
         Self {
             base,
             field_ids: HashSet::new(),
@@ -1001,7 +996,7 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
-            blob_version,
+            blob_version: BlobVersion::V1,
         }
     }
 
