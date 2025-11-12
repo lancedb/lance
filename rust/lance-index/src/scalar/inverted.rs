@@ -196,4 +196,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 as Arc<dyn ScalarIndex>,
         )
     }
+
+    fn details_as_json(&self, details: &prost_types::Any) -> Result<String> {
+        let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let index_params = InvertedIndexParams::try_from(&index_details)?;
+        Ok(serde_json::to_string(&index_params)?)
+    }
 }

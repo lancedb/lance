@@ -42,10 +42,12 @@ pub use lance_index::IndexParams;
 use lance_index::{
     is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
-    ScalarIndexCriteria,
+    IndexCriteria,
 };
 use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION};
+use lance_index::{
+    DatasetIndexExt, IndexDescription, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION,
+};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -367,6 +369,64 @@ fn vector_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+struct IndexDescriptionImpl {
+    metadata: IndexMetadata,
+    details: IndexDetails,
+    rows_indexed: u64,
+}
+
+impl IndexDescriptionImpl {
+    fn try_new(metadata: IndexMetadata, dataset: &Dataset) -> Result<Self> {
+        // This should not fail as we should have already filtered out indexes without index details.
+        let index_details = metadata.index_details.as_ref().ok_or(Error::Index {
+            message:
+                "Index details are required for index description.  This index must be retrained to support this method."
+                    .to_string(),
+            location: location!(),
+        })?;
+        let fragment_bitmap = metadata
+            .fragment_bitmap
+            .as_ref()
+            .ok_or_else(|| Error::Index {
+                message: "Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string(),
+                location: location!(),
+            })?;
+        let details = IndexDetails(index_details.clone());
+        let mut rows_indexed = 0;
+
+        for fragment in dataset.get_fragments() {
+            if fragment_bitmap.contains(fragment.id() as u32) {
+                rows_indexed += fragment.fast_physical_rows()? as u64;
+            }
+        }
+
+        Ok(Self {
+            metadata,
+            details,
+            rows_indexed,
+        })
+    }
+}
+
+impl IndexDescription for IndexDescriptionImpl {
+    fn metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+
+    fn type_url(&self) -> &str {
+        self.details.0.type_url.as_str()
+    }
+
+    fn rows_indexed(&self) -> u64 {
+        self.rows_indexed
+    }
+
+    fn details(&self) -> Result<String> {
+        let plugin = self.details.get_plugin()?;
+        plugin.details_as_json(&self.details.0)
+    }
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -475,6 +535,42 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn describe_indexes<'a, 'b>(
+        &'a self,
+        criteria: Option<IndexCriteria<'b>>,
+    ) -> Result<Vec<Arc<dyn IndexDescription>>> {
+        let indices = self.load_indices().await?;
+        let indices = if let Some(criteria) = criteria {
+            indices.iter().filter(|idx| {
+                if idx.index_details.is_none() {
+                    log::warn!("The method describe_indexes does not support indexes without index details.  Please retrain the index {}", idx.name);
+                    return false;
+                }
+                let fields = idx
+                    .fields
+                    .iter()
+                    .filter_map(|id| self.schema().field_by_id(*id))
+                    .collect::<Vec<_>>();
+                match index_matches_criteria(idx, &criteria, &fields, false, self.schema()) {
+                    Ok(matched) => matched,
+                    Err(err) => {
+                        log::warn!("Could not describe index {}: {}", idx.name, err);
+                        false
+                    }
+                }
+            }).collect::<Vec<_>>()
+        } else {
+            indices.iter().collect::<Vec<_>>()
+        };
+        indices
+            .into_iter()
+            .map(|idx| {
+                let desc = IndexDescriptionImpl::try_new(idx.clone(), self)?;
+                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
@@ -567,7 +663,7 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_scalar_index<'a, 'b>(
         &'a self,
-        criteria: ScalarIndexCriteria<'b>,
+        criteria: IndexCriteria<'b>,
     ) -> Result<Option<IndexMetadata>> {
         let indices = self.load_indices().await?;
 
@@ -586,8 +682,9 @@ impl DatasetIndexExt for Dataset {
                 }
             })
             .collect::<Vec<_>>();
-        // This sorting & chunking is only needed to provide some backwards compatibility behavior for
-        // old versions of Lance that don't write index details.
+        // This sorting & chunking is only needed to calculate if there are multiple indexes on the same
+        // field.  This fact is only needed for backwards compatibility behavior for indexes that don't have
+        // index details.  At some point we should deprecate indexes without index details.
         //
         // TODO: At some point we should just fail if the index details are missing and ask the user to
         // retrain the index.
@@ -599,7 +696,13 @@ impl DatasetIndexExt for Dataset {
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
-                    if index_matches_criteria(idx, &criteria, field, has_multiple, self.schema())? {
+                    if index_matches_criteria(
+                        idx,
+                        &criteria,
+                        &[field],
+                        has_multiple,
+                        self.schema(),
+                    )? {
                         let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                             bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
                         });

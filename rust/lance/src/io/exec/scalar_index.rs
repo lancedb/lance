@@ -47,7 +47,7 @@ use lance_index::{
         },
         SargableQuery, ScalarIndex,
     },
-    DatasetIndexExt, ScalarIndexCriteria,
+    DatasetIndexExt, IndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -63,7 +63,7 @@ impl ScalarIndexLoader for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let idx = self
-            .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
+            .load_scalar_index(IndexCriteria::default().with_name(index_name))
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
@@ -137,9 +137,7 @@ impl ScalarIndexExec {
             }
             ScalarIndexExpr::Query(search_key) => {
                 let idx = dataset
-                    .load_scalar_index(
-                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
-                    )
+                    .load_scalar_index(IndexCriteria::default().with_name(&search_key.index_name))
                     .await?
                     .expect("Index not found even though it must have been found earlier");
                 Ok(idx
@@ -355,7 +353,7 @@ impl MapIndexExec {
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
         let index = dataset
-            .load_scalar_index(ScalarIndexCriteria::default().with_name(&index_name))
+            .load_scalar_index(IndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
         let deletion_mask_fut =
