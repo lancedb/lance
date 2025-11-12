@@ -1391,6 +1391,20 @@ def test_load_indices(dataset):
     assert len(indices) == 1
 
 
+def test_describe_vector_index(indexed_dataset):
+    info = indexed_dataset.describe_indexes()[0]
+
+    assert info.name == "vector_idx"
+    assert info.type_url == "/lance.table.VectorIndexDetails"
+    assert info.num_rows_indexed == 1000
+    assert info.fragment_ids == [0]
+    assert info.fields == [0]
+    assert info.field_names == ["vector"]
+    assert info.dataset_version == 1
+    assert info.index_version == 1
+    assert info.created_at is not None
+
+
 def test_optimize_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")

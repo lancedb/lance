@@ -4,6 +4,8 @@
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
+use chrono::{DateTime, Utc};
+use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
 use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
@@ -29,7 +31,7 @@ use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexDescription};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
@@ -463,6 +465,77 @@ pub fn load_shuffled_vectors(
     )?
 }
 
+#[pyclass(name = "IndexDescription", module = "lance.indices", get_all)]
+pub struct PyIndexDescription {
+    pub uuid: String,
+    pub name: String,
+    pub fields: Vec<i32>,
+    pub field_names: Vec<String>,
+    pub dataset_version: u64,
+    pub fragment_ids: Vec<u32>,
+    pub index_version: i32,
+    pub created_at: Option<DateTime<Utc>>,
+    pub type_url: String,
+    pub num_rows_indexed: u64,
+    pub details: String,
+}
+
+impl PyIndexDescription {
+    pub fn new(index: &dyn IndexDescription, dataset: &LanceDataset) -> Self {
+        let field_names = index
+            .metadata()
+            .fields
+            .iter()
+            .map(|field| {
+                dataset
+                    .schema()
+                    .field_by_id(*field)
+                    .map(|f| f.name.clone())
+                    .unwrap_or("<unknown>".to_string())
+            })
+            .collect();
+
+        let fragment_ids = index
+            .metadata()
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let details = index
+            .details()
+            .unwrap_or_else(|_| "<unknown-index-details>".to_string());
+
+        Self {
+            uuid: index.metadata().uuid.to_string(),
+            name: index.metadata().name.to_string(),
+            fields: index.metadata().fields.clone(),
+            field_names,
+            dataset_version: index.metadata().dataset_version,
+            fragment_ids,
+            index_version: index.metadata().index_version,
+            created_at: index.metadata().created_at,
+            type_url: index.type_url().to_string(),
+            num_rows_indexed: index.rows_indexed(),
+            details,
+        }
+    }
+}
+
+#[pymethods]
+impl PyIndexDescription {
+    pub fn __repr__(&self) -> String {
+        let created_at = self
+            .created_at
+            .map(|dt| dt.to_string())
+            .unwrap_or("unknown".to_string());
+        format!(
+            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fragment_ids={:?}, fields={:?}, field_names={:?}, dataset_version={}, index_version={}, created_at={})",
+            self.name, self.type_url, self.num_rows_indexed, self.fragment_ids, self.fields, self.field_names, self.dataset_version, self.index_version, created_at
+        )
+    }
+}
+
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
@@ -472,6 +545,7 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
+    indices.add_class::<PyIndexDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())

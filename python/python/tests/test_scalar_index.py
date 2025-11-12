@@ -4006,3 +4006,95 @@ def test_json_inverted_match_query(tmp_path):
         full_text_query=MatchQuery("Author,str,tolkien", "json_col")
     )
     assert results.num_rows == 1
+
+
+def test_describe_indexes(tmp_path):
+    data = pa.table(
+        {
+            "id": range(100),
+            "text": [f"document {i} about lance database" for i in range(100)],
+            "btree": range(100),
+            "bitmap": range(100),
+            "ngram": [f"document {i}" for i in range(100)],
+            "zonemap": range(100),
+            "bloomfilter": range(100),
+            "json": pa.array(
+                [json.dumps({"key": f"value_{i}"}) for i in range(100)], pa.json_()
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED")
+    indices = ds.describe_indexes()
+    assert len(indices) == 1
+
+    assert indices[0].name == "text_idx"
+    assert indices[0].type_url == "/lance.table.InvertedIndexDetails"
+    assert indices[0].num_rows_indexed == 100
+    assert indices[0].fragment_ids == [0]
+    assert indices[0].fields == [1]
+    assert indices[0].field_names == ["text"]
+    assert indices[0].dataset_version == 1
+    assert indices[0].index_version == 1
+    assert indices[0].created_at is not None
+    assert isinstance(indices[0].created_at, datetime)
+
+    details = indices[0].details
+    assert details is not None and len(details) > 0
+    details = json.loads(details)
+    assert details["lance_tokenizer"] is None
+    assert details["base_tokenizer"] == "simple"
+    assert details["language"] == "English"
+    assert not details["with_position"]
+    assert details["max_token_length"] == 40
+    assert details["lower_case"]
+    assert details["stem"]
+    assert details["remove_stop_words"]
+    assert details["custom_stop_words"] is None
+    assert details["ascii_folding"]
+    assert details["min_ngram_length"] == 3
+    assert details["max_ngram_length"] == 3
+    assert not details["prefix_only"]
+
+    ds.create_scalar_index("btree", index_type="BTREE")
+    ds.create_scalar_index("bitmap", index_type="BITMAP")
+    ds.create_scalar_index("ngram", index_type="NGRAM")
+    ds.create_scalar_index("zonemap", index_type="ZONEMAP")
+    ds.create_scalar_index("bloomfilter", index_type="BLOOMFILTER")
+    ds.create_scalar_index(
+        "json",
+        IndexConfig(
+            index_type="json", parameters={"target_index_type": "btree", "path": "x"}
+        ),
+    )
+    indices = ds.describe_indexes()
+
+    names = [f"{col}_idx" for col in data.column_names[2:]]
+    types = [
+        "/lance.table.BTreeIndexDetails",
+        "/lance.table.BitmapIndexDetails",
+        "/lance.table.NGramIndexDetails",
+        "/lance.table.ZoneMapIndexDetails",
+        "/lance.index.pb.BloomFilterIndexDetails",
+        "/lance.index.pb.JsonIndexDetails",
+    ]
+    details = [
+        "{}",
+        "{}",
+        "{}",
+        "{}",
+        "{}",
+        '{"path":"x","target_details":"{}"}',
+    ]
+
+    for i in range(len(indices) - 1):
+        idx_pos = i + 1  # Skip over inverted since we already tested it
+        assert indices[idx_pos].name == names[i]
+        assert indices[idx_pos].type_url == types[i]
+        assert indices[idx_pos].num_rows_indexed == 100
+        assert indices[idx_pos].fragment_ids == [0]
+        assert indices[idx_pos].fields == [i + 2]
+        assert indices[idx_pos].field_names == [data.column_names[i + 2]]
+        assert indices[idx_pos].dataset_version == i + 2
+        assert indices[idx_pos].index_version == 0
+        assert indices[idx_pos].details == details[i]

@@ -1115,6 +1115,18 @@ impl FileFragment {
         }
     }
 
+    /// Get the number of physical rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count in the metadata.  This method should
+    /// only be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_physical_rows(&self) -> Result<usize> {
+        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
+            Ok(self.metadata.physical_rows.unwrap())
+        } else {
+            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+        }
+    }
+
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
