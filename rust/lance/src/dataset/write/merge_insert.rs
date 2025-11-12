@@ -1462,20 +1462,21 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, fields_modified) = Self::update_fragments(
-                self.dataset.clone(),
-                Box::pin(stream),
-                self.dataset.manifest.version + 1,
-            )
-            .await?;
+            let (updated_fragments, new_fragments, bitmap_prune_field_ids) =
+                Self::update_fragments(
+                    self.dataset.clone(),
+                    Box::pin(stream),
+                    self.dataset.manifest.version + 1,
+                )
+                .await?;
 
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
                 new_fragments,
-                fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
+                bitmap_preserve_field_ids: vec![], // in-place update does not affect preserving fragment bitmap
                 update_mode: Some(RewriteColumns),
             };
             // We have rewritten the fragments, not just the deletion files, so
@@ -1543,13 +1544,9 @@ impl MergeInsertJob {
                 new_fragments,
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
-                fields_modified: vec![],
+                bitmap_prune_field_ids: vec![],
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.id as u32)
-                    .collect(),
+                bitmap_preserve_field_ids: full_schema.fields.iter().map(|f| f.id as u32).collect(),
                 update_mode: Some(RewriteRows),
             };
 

@@ -540,17 +540,17 @@ def test_fragment_update_columns_basic(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, bitmap_prune_field_ids = fragment.update_columns(update_data)
 
-    # Verify fields_modified is returned
-    assert isinstance(fields_modified, list)
-    assert len(fields_modified) > 0
+    # Verify bitmap_prune_field_ids is returned
+    assert isinstance(bitmap_prune_field_ids, list)
+    assert len(bitmap_prune_field_ids) > 0
 
     # Commit the changes using Update operation
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=bitmap_prune_field_ids,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -588,7 +588,7 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(
+    updated_fragment, bitmap_prune_field_ids = fragment.update_columns(
         update_data, left_on="id", right_on="id"
     )
 
@@ -596,7 +596,7 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=bitmap_prune_field_ids,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -633,13 +633,13 @@ def test_fragment_update_columns_with_nulls(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, bitmap_prune_field_ids = fragment.update_columns(update_data)
 
     # Commit the changes
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=bitmap_prune_field_ids,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -674,13 +674,13 @@ def test_fragment_update_columns_partial_update(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, bitmap_prune_field_ids = fragment.update_columns(update_data)
 
     # Commit the changes
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=bitmap_prune_field_ids,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version
@@ -717,13 +717,13 @@ def test_fragment_update_columns_no_match(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, bitmap_prune_field_ids = fragment.update_columns(update_data)
 
     # Commit the changes
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
-        fields_modified=fields_modified,
+        bitmap_prune_field_ids=bitmap_prune_field_ids,
     )
     updated_dataset = lance.LanceDataset.commit(
         str(dataset_uri), op, read_version=dataset.version

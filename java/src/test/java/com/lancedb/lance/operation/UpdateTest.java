@@ -152,7 +152,7 @@ public class UpdateTest extends OperationTestBase {
                   Update.builder()
                       .updatedFragments(
                           Collections.singletonList(updateResult.getUpdatedFragment()))
-                      .fieldsModified(updateResult.getFieldsModified())
+                      .bitmapPruneFieldIds(updateResult.getBitmapPruneFieldIds())
                       .build())
               .build();
       try (Dataset dataset = updateTransaction.commit()) {

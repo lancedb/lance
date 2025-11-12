@@ -680,7 +680,7 @@ class LanceFragment(pa.dataset.Fragment):
         ... })
         >>> # Update the fragment
         >>> fragment = dataset.get_fragment(0)
-        >>> updated_fragment, fields_modified = fragment.update_columns(
+        >>> updated_fragment, bitmap_prune_field_ids = fragment.update_columns(
         ...     update_data,
         ...     left_on="id",
         ...     right_on="id"
@@ -689,7 +689,7 @@ class LanceFragment(pa.dataset.Fragment):
         >>> from lance import LanceOperation
         >>> op = LanceOperation.Update(
         ...     updated_fragments=[updated_fragment],
-        ...     fields_modified=fields_modified,
+        ...     bitmap_prune_field_ids=bitmap_prune_field_ids,
         ... )
         >>> dataset = lance.LanceDataset.commit(
         ...     "dataset",

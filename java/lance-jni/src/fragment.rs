@@ -37,7 +37,7 @@ pub(crate) struct FragmentMergeResult {
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
-    fields_modified: Vec<u32>,
+    bitmap_prune_field_ids: Vec<u32>,
 }
 
 //////////////////
@@ -412,11 +412,11 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let (updated_fragment, fields_modified) =
+    let (updated_fragment, bitmap_prune_field_ids) =
         RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentUpdateResult {
         updated_fragment,
-        fields_modified,
+        bitmap_prune_field_ids,
     };
     result.into_java(env)
 }
@@ -456,13 +456,14 @@ impl IntoJava for &FragmentMergeResult {
 impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
-        let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
+        let java_bitmap_prune_field_ids =
+            JLance(self.bitmap_prune_field_ids.clone()).into_java(env)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Object(&java_updated_fragment),
-                JValueGen::Object(&java_fields_modified),
+                JValueGen::Object(&java_bitmap_prune_field_ids),
             ],
         )?)
     }
