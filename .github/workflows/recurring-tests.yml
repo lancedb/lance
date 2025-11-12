@@ -82,14 +82,14 @@ jobs:
           workspaces: python
       - name: Install Pylance
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch
+          uv sync --frozen --extra tests
           uv pip install pylance==${{ matrix.pylance-version }}
       - name: Run recurring tests
         id: run_recurring_tests
         run: uv run pytest -vvv -s python/tests/recurring/test_recurring.py
       - name: Upgrade Pylance
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch
+          uv sync --frozen --extra tests
       - name: Run recurring tests again
         run: uv run pytest -vvv -s python/tests/recurring/test_recurring.py
 
@@ -126,6 +126,6 @@ jobs:
           enable-cache: true
       - name: Sync environment
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch
+          uv sync --frozen --extra tests
       - name: Run recurring tests
         run: uv run pytest -vvv -s python/tests/recurring/test_recurring.py

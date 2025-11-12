@@ -13,7 +13,7 @@ runs:
       working-directory: python
       run: |
         set -euo pipefail
-        uv sync --frozen --install-project --extra tests
+        uv sync --frozen --extra tests
     - name: Run python tests
       shell: bash
       working-directory: python

@@ -9,7 +9,7 @@ runs:
     shell: bash
     run: |
       set -euo pipefail
-      uv sync --frozen --install-project --extra tests
+      uv sync --frozen --extra tests
   - name: Start localstack
     shell: bash
     run: |

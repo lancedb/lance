@@ -37,7 +37,7 @@ jobs:
     - name: Sync environment
       working-directory: python
       run: |
-        uv sync --frozen --install-project --extra notebook
+        uv sync --frozen --extra notebook
     - name: Run python tests
       shell: bash
       working-directory: notebooks

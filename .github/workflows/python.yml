@@ -73,7 +73,7 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Sync environment
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch --extra dev
+          uv sync --frozen --extra tests --extra dev
       - name: Lint Python
         run: |
           uv run ruff format --check --diff python
@@ -159,7 +159,7 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Sync environment
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch
+          uv sync --frozen --extra tests
       - name: Generate forward compatibility files
         env:
           PYTHONPATH: python/tests

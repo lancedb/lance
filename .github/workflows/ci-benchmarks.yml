@@ -47,7 +47,7 @@ env:
       - name: Sync environment
         working-directory: python
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch --extra benchmarks
+          uv sync --frozen --extra tests --extra benchmarks
       - name: Generate datasets
         working-directory: python
         run: |

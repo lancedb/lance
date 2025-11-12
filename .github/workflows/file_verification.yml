@@ -56,7 +56,7 @@ jobs:
       - name: Build Lance
         working-directory: ./python
         run: |
-          uv sync --frozen --install-project --extra tests --extra ray --extra torch
+          uv sync --frozen --extra tests
 
       - name: Test Lance File Write Read Round Trip
         working-directory: python
