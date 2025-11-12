@@ -279,7 +279,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> # Using default dataset schema
         >>> builder = dataset.merge_insert("id")
         >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
-        >>> plan = builder.explain_plan()  # Uses dataset schema
+        >>> plan = builder.explain_plan(verbose=True)  # Uses dataset schema
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
           CoalescePartitionsExec
