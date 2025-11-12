@@ -55,8 +55,8 @@ use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     get_default_batch_size, BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD,
 };
-use crate::Dataset;
 use crate::io::exec::TakeExec;
+use crate::Dataset;
 
 use super::utils::IoMetrics;
 
@@ -1577,9 +1577,9 @@ impl FilteredReadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> SendableRecordBatchStream {
-        use futures::StreamExt;
         use arrow_array::UInt64Array;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use futures::StreamExt;
         use lance_datafusion::exec::OneShotExec;
 
         let dataset = self.dataset.clone();
@@ -1600,27 +1600,29 @@ impl FilteredReadExec {
             let filter_columns: Vec<String> = {
                 let mut cols = Vec::new();
                 if let Some(ref full_filter) = options.full_filter {
-                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(full_filter));
+                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(
+                        full_filter,
+                    ));
                 }
                 if let Some(ref refine_filter) = options.refine_filter {
-                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(refine_filter));
+                    cols.extend(lance_datafusion::planner::Planner::column_names_in_expr(
+                        refine_filter,
+                    ));
                 }
                 cols
             };
 
             if filter_columns.contains(&config.expensive_column) {
                 // Fall back to normal stream - filter needs the expensive column
-                let normal_stream = FilteredReadStream::try_new(
-                    dataset.clone(), options, &metrics, None
-                ).await?;
+                let normal_stream =
+                    FilteredReadStream::try_new(dataset.clone(), options, &metrics, None).await?;
                 return DataFusionResult::Ok(normal_stream.get_stream(&metrics, partition));
             }
 
             // 2. Check if total_row_count is valid
             if config.total_row_count == 0 {
-                let normal_stream = FilteredReadStream::try_new(
-                    dataset.clone(), options, &metrics, None
-                ).await?;
+                let normal_stream =
+                    FilteredReadStream::try_new(dataset.clone(), options, &metrics, None).await?;
                 return DataFusionResult::Ok(normal_stream.get_stream(&metrics, partition));
             }
 
@@ -1647,33 +1649,41 @@ impl FilteredReadExec {
             // Evaluate index if present
             let mut evaluated_index = None;
             if let Some(index_input) = index_input {
-                let mut index_search = index_input.execute(partition, context.clone())
-                    .map_err(|e| Error::from(e))?;
-                let index_search_result =
-                    index_search.next().await.ok_or_else(|| Error::Internal {
+                let mut index_search = index_input
+                    .execute(partition, context.clone())
+                    .map_err(Error::from)?;
+                let index_search_result = index_search
+                    .next()
+                    .await
+                    .ok_or_else(|| Error::Internal {
                         message: "Index search did not yield any results".to_string(),
                         location: location!(),
                     })?
-                    .map_err(|e| Error::from(e))?;
+                    .map_err(Error::from)?;
                 evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
                     &index_search_result,
                 )?));
             }
 
             let cheap_stream = FilteredReadStream::try_new(
-                dataset.clone(), cheap_options, &metrics, evaluated_index.clone()
-            ).await?;
+                dataset.clone(),
+                cheap_options,
+                &metrics,
+                evaluated_index.clone(),
+            )
+            .await?;
 
             let mut cheap_stream_boxed = cheap_stream.get_stream(&metrics, partition);
 
             // Collect row IDs with EARLY TERMINATION
-            let threshold_count = (config.total_row_count as f64 * config.threshold).ceil() as usize;
+            let threshold_count =
+                (config.total_row_count as f64 * config.threshold).ceil() as usize;
             let mut row_ids = Vec::new();
             let mut cheap_batches = Vec::new();
             let mut filtered_count = 0;
 
             while let Some(batch_result) = cheap_stream_boxed.next().await {
-                let batch = batch_result.map_err(|e| Error::from(e))?;
+                let batch = batch_result.map_err(Error::from)?;
 
                 // EARLY STOP CHECK
                 if filtered_count + batch.num_rows() >= threshold_count {
@@ -1686,8 +1696,12 @@ impl FilteredReadExec {
                     global_metrics.adaptive_pass1_rows.add(filtered_count);
 
                     let full_stream = FilteredReadStream::try_new(
-                        dataset.clone(), options, &metrics, evaluated_index
-                    ).await?;
+                        dataset.clone(),
+                        options,
+                        &metrics,
+                        evaluated_index,
+                    )
+                    .await?;
 
                     return DataFusionResult::Ok(full_stream.get_stream(&metrics, partition));
                 }
@@ -1726,10 +1740,13 @@ impl FilteredReadExec {
                 let empty_batch = RecordBatch::new_empty(output_schema.clone());
                 let stream = futures::stream::iter(vec![Ok(empty_batch)]);
                 let stream_adapter = RecordBatchStreamAdapter::new(output_schema.clone(), stream);
-                return Result::<SendableRecordBatchStream>::Ok(Box::pin(stream_adapter) as SendableRecordBatchStream);
+                return Result::<SendableRecordBatchStream>::Ok(
+                    Box::pin(stream_adapter) as SendableRecordBatchStream
+                );
             }
 
-            let expensive_projection = dataset.empty_projection()
+            let expensive_projection = dataset
+                .empty_projection()
                 .union_column(&config.expensive_column, OnMissing::Error)?;
 
             // Create row ID batch for TakeExec
@@ -1742,25 +1759,22 @@ impl FilteredReadExec {
             let row_id_batch = RecordBatch::try_new(row_id_schema, vec![row_id_array])?;
             let row_id_plan = Arc::new(OneShotExec::from_batch(row_id_batch));
 
-            let take_exec = TakeExec::try_new(
-                dataset.clone(),
-                row_id_plan,
-                expensive_projection,
-            )?;
+            let take_exec = TakeExec::try_new(dataset.clone(), row_id_plan, expensive_projection)?;
 
             let take_exec = take_exec.ok_or_else(|| Error::Internal {
                 message: "TakeExec returned None unexpectedly".to_string(),
                 location: location!(),
             })?;
 
-            let mut expensive_stream = take_exec.execute(partition, context)
-                .map_err(|e| Error::from(e))?;
+            let mut expensive_stream = take_exec
+                .execute(partition, context)
+                .map_err(Error::from)?;
 
             // Concatenate all cheap batches into one
             use arrow_select::concat::concat_batches;
             let cheap_schema = cheap_batches[0].schema();
-            let cheap_batch_combined = concat_batches(&cheap_schema, &cheap_batches)
-                .map_err(|e| Error::Arrow {
+            let cheap_batch_combined =
+                concat_batches(&cheap_schema, &cheap_batches).map_err(|e| Error::Arrow {
                     message: format!("Failed to concatenate cheap batches: {}", e),
                     location: location!(),
                 })?;
@@ -1768,7 +1782,7 @@ impl FilteredReadExec {
             // Collect all expensive batches
             let mut expensive_batches = Vec::new();
             while let Some(batch_result) = expensive_stream.next().await {
-                let batch = batch_result.map_err(|e| Error::from(e))?;
+                let batch = batch_result.map_err(Error::from)?;
                 expensive_batches.push(batch);
             }
 
@@ -1787,9 +1801,14 @@ impl FilteredReadExec {
                 })?;
 
             // Merge the two combined batches - build columns in the order of output_schema
-            let expensive_col_idx = expensive_batch_combined.schema().index_of(&config.expensive_column)
+            let expensive_col_idx = expensive_batch_combined
+                .schema()
+                .index_of(&config.expensive_column)
                 .map_err(|e| Error::Internal {
-                    message: format!("Expected {} column in expensive batch: {}", config.expensive_column, e),
+                    message: format!(
+                        "Expected {} column in expensive batch: {}",
+                        config.expensive_column, e
+                    ),
                     location: location!(),
                 })?;
 
@@ -1801,30 +1820,37 @@ impl FilteredReadExec {
                     columns.push(expensive_batch_combined.column(expensive_col_idx).clone());
                 } else {
                     // Take from cheap batch
-                    let cheap_col_idx = cheap_batch_combined.schema().index_of(col_name)
-                        .map_err(|e| Error::Internal {
-                            message: format!("Expected {} column in cheap batch: {}", col_name, e),
-                            location: location!(),
-                        })?;
+                    let cheap_col_idx =
+                        cheap_batch_combined
+                            .schema()
+                            .index_of(col_name)
+                            .map_err(|e| Error::Internal {
+                                message: format!(
+                                    "Expected {} column in cheap batch: {}",
+                                    col_name, e
+                                ),
+                                location: location!(),
+                            })?;
                     columns.push(cheap_batch_combined.column(cheap_col_idx).clone());
                 }
             }
 
-            let combined_batch: RecordBatch = RecordBatch::try_new(
-                output_schema.clone(),
-                columns,
-            ).map_err(|e: arrow_schema::ArrowError| Error::from(e))?;
+            let combined_batch: RecordBatch = RecordBatch::try_new(output_schema.clone(), columns)
+                .map_err(|e: arrow_schema::ArrowError| Error::from(e))?;
 
             // Return stream with single combined batch
-            let stream = futures::stream::iter(
-                vec![Ok(combined_batch)]
-            );
+            let stream = futures::stream::iter(vec![Ok(combined_batch)]);
             let stream_adapter = RecordBatchStreamAdapter::new(output_schema.clone(), stream);
-            Result::<SendableRecordBatchStream>::Ok(Box::pin(stream_adapter) as SendableRecordBatchStream)
+            Result::<SendableRecordBatchStream>::Ok(
+                Box::pin(stream_adapter) as SendableRecordBatchStream
+            )
         })
         .try_flatten();
 
-        Box::pin(RecordBatchStreamAdapter::new(output_schema_for_adapter, stream))
+        Box::pin(RecordBatchStreamAdapter::new(
+            output_schema_for_adapter,
+            stream,
+        ))
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -1855,8 +1881,7 @@ impl DisplayAs for FilteredReadExec {
         let adaptive_info = if let Some(ref config) = self.options.adaptive_expensive_column {
             format!(
                 ", adaptive_column={}, threshold={}",
-                config.expensive_column,
-                config.threshold
+                config.expensive_column, config.threshold
             )
         } else {
             String::new()
@@ -3679,9 +3704,11 @@ mod tests {
         });
 
         // Add a filter that matches only a few rows (10 out of 300 = 3.3%)
-        options.full_filter = Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(10u32)));
+        options.full_filter =
+            Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(10u32)));
 
-        let filtered_read = Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
 
         let _batches = filtered_read
             .execute(0, Arc::new(TaskContext::default()))
@@ -3704,9 +3731,15 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
 
-        assert_eq!(used_take, 1, "Should have used take path for selective filter");
+        assert_eq!(
+            used_take, 1,
+            "Should have used take path for selective filter"
+        );
         assert_eq!(used_full_scan, 0, "Should not have used full scan path");
-        assert!(pass1_rows > 0 && pass1_rows <= 10, "Should have scanned ~10 rows in pass 1");
+        assert!(
+            pass1_rows > 0 && pass1_rows <= 10,
+            "Should have scanned ~10 rows in pass 1"
+        );
 
         // Test NON-SELECTIVE case - should use full scan path
         // Filter for fully_indexed < 290 matches 290 rows out of 300
@@ -3718,9 +3751,11 @@ mod tests {
         });
 
         // Add a filter that matches many rows (290 out of 300 = 96.7%)
-        options2.full_filter = Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(290u32)));
+        options2.full_filter =
+            Some(datafusion_expr::col("fully_indexed").lt(datafusion_expr::lit(290u32)));
 
-        let filtered_read2 = Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options2, None).unwrap());
+        let filtered_read2 =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options2, None).unwrap());
 
         let _batches2 = filtered_read2
             .execute(0, Arc::new(TaskContext::default()))
@@ -3738,7 +3773,10 @@ mod tests {
             .sum_by_name("adaptive_used_full_scan")
             .map(|v| v.as_usize())
             .unwrap_or(0);
-        assert_eq!(used_take2, 0, "Should not have used take path for non-selective filter");
+        assert_eq!(
+            used_take2, 0,
+            "Should not have used take path for non-selective filter"
+        );
         assert_eq!(used_full_scan2, 1, "Should have used full scan path");
     }
 }

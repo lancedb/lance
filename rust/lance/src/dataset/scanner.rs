@@ -8984,11 +8984,9 @@ mod test {
             ArrowField::new("vector", vectors.data_type().clone(), false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(metadata), Arc::new(vectors)],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(metadata), Arc::new(vectors)])
+                .unwrap();
 
         let tmp_dir = TempStrDir::default();
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
