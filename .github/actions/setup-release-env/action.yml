@@ -23,4 +23,4 @@ runs:
       shell: bash
       run: |
         git config user.name 'Lance Release Bot'
-        git config user.email 'lance-dev@lancedb.com'
+        git config user.email 'dev+gha@lance.org'

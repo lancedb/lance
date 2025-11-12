@@ -1,11 +1,11 @@
-# Rust Implementation of Lance Data Format
+# Rust Implementation of Lance
 
 <div align="center">
 <p align="center">
 
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**A new columnar data format for data science and machine learning**
+**The Open Lakehouse Format for Multimodal AI**
 </p></div>
 
 ## Installation
@@ -67,31 +67,22 @@ params.num_sub_vectors = 16;
 dataset.create_index(&["embeddings"], IndexType::Vector, None, &params, true).await;
 ```
 
-## Motivation
+## What is Lance?
 
-Why do we *need* a new format for data science and machine learning?
+Lance is an open lakehouse format for multimodal AI. It contains a file format, table format, and catalog spec that allows you to build a complete lakehouse on top of object storage to power your AI workflows.
 
-### 1. Reproducibility is a must-have
+The key features of Lance include:
 
-Versioning and experimentation support should be built into the dataset instead of requiring multiple tools.<br/>
-It should also be efficient and not require expensive copying everytime you want to create a new version.<br/>
-We call this "Zero copy versioning" in Lance. It makes versioning data easy without increasing storage costs.
+* **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
 
-### 2. Cloud storage is now the default
+* **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
 
-Remote object storage is the default now for data science and machine learning and the performance characteristics of cloud are fundamentally different.<br/>
-Lance format is optimized to be cloud native. Common operations like filter-then-take can be order of magnitude faster
-using Lance than Parquet, especially for ML data.
+* **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
 
-### 3. Vectors must be a first class citizen, not a separate thing
+* **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
 
-The majority of reasonable scale workflows should not require the added complexity and cost of a
-specialized database just to compute vector similarity. Lance integrates optimized vector indices
-into a columnar format so no additional infrastructure is required to get low latency top-K similarity search.
+* **Zero-copy versioning:** ACID transactions, time travel, and automatic versioning without needing extra infrastructure.
 
-### 4. Open standards is a requirement
+* **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
 
-The DS/ML ecosystem is incredibly rich and data *must be* easily accessible across different languages, tools, and environments.
-Lance makes Apache Arrow integration its primary interface, which means conversions to/from is 2 lines of code, your
-code does not need to change after conversion, and nothing is locked-up to force you to pay for vendor compute.
-We need open-source not fauxpen-source.
+For more details, see the full [Lance format specification](https://lance.org/format).

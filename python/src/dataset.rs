@@ -2567,8 +2567,7 @@ impl Dataset {
 
     #[pyo3(signature=(sql))]
     fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
-        let mut ds = self.ds.as_ref().clone();
-        let builder = ds.sql(&sql);
+        let builder = self.ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
 }
