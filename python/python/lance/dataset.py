@@ -3473,6 +3473,41 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def delta(self) -> "DatasetDeltaBuilder":
+        """
+        Create a Delta comparison builder to explore changes between two versions.
+
+        Returns
+        -------
+        DatasetDeltaBuilder
+            A chainable builder. Call ``build()`` to get a ``DatasetDelta``,
+            which can list transactions or stream inserted/updated rows.
+
+        Examples
+        ----
+        .. code-block:: python
+
+            import lance
+            import pyarrow as pa
+
+            # Write initial data (v1)
+            ds = lance.write_dataset(pa.table({"id": [1, 2], "val": ["a", "b"]}), "memory://delta_demo")
+
+            # Append some data to create v2
+            ds_append = lance.write_dataset(
+                pa.table({"id": [3], "val": ["c"]}),
+                "memory://delta_demo",
+                mode="append"
+            )
+
+            # Compute inserted rows from v1 -> v2
+            delta = ds_append.delta().compared_against_version(1).build()
+            reader = delta.get_inserted_rows()
+            for batch in reader:
+                print(batch)
+        """
+        return DatasetDeltaBuilder(self._ds.delta())
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3635,6 +3670,77 @@ class SqlQueryBuilder:
             An executable query object.
         """
         return SqlQuery(self._builder.build())
+
+
+class DatasetDelta:
+    """
+    A view of differences between two versions.
+
+    Created by :meth:`DatasetDeltaBuilder.build`.
+    Provides convenient methods to stream inserted/updated rows or list transactions.
+    """
+
+    def __init__(self, delta):
+        self._delta = delta
+
+    def list_transactions(self) -> List[Transaction]:
+        """
+        List transactions in the range from begin_version + 1 to end_version.
+        """
+        return self._delta.list_transactions()
+
+    def get_inserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted rows.
+        """
+        return self._delta.get_inserted_rows()
+
+    def get_updated_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for updated rows.
+        """
+        return self._delta.get_updated_rows()
+
+
+class DatasetDeltaBuilder:
+    """
+    A builder for :class:`DatasetDelta`.
+
+    Supports chainable configuration: set a comparison version or
+    an explicit version range, then call :meth:`build` to obtain the delta object.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def compared_against_version(self, version: int) -> "DatasetDeltaBuilder":
+        """
+        Configure comparison against the given version.
+        """
+        self._builder = self._builder.compared_against_version(version)
+        return self
+
+    def with_begin_version(self, version: int) -> "DatasetDeltaBuilder":
+        """
+        Set the start version (exclusive).
+        Must be used together with :meth:`with_end_version`.
+        """
+        self._builder = self._builder.with_begin_version(version)
+        return self
+
+    def with_end_version(self, version: int) -> "DatasetDeltaBuilder":
+        """
+        Set the end version (inclusive).
+        Must be used together with :meth:`with_begin_version`.
+        """
+        self._builder = self._builder.with_end_version(version)
+        return self
+
+    def build(self) -> DatasetDelta:
+        """
+        Build a :class:`DatasetDelta` object.
+        """
+        return DatasetDelta(self._builder.build())
 
 
 class BulkCommitResult(TypedDict):
