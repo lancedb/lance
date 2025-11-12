@@ -29,6 +29,7 @@ lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }

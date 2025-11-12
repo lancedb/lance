@@ -67,6 +67,7 @@ pub mod index;
 mod metadata;
 pub mod optimize;
 pub mod progress;
+pub mod put;
 pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
@@ -2513,6 +2514,38 @@ impl Dataset {
             },
         )
         .await
+    }
+
+    /// Create a new put builder for point updates
+    ///
+    /// The put interface allows updating specific rows without immediately committing
+    /// the changes. Changes are staged and only become visible after a commit operation.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use lance::dataset::Dataset;
+    /// # use arrow_array::RecordBatch;
+    /// # tokio_test::block_on(async {
+    /// let dataset = Dataset::open("path/to/dataset").await?;
+    ///
+    /// // Create new values for the row
+    /// let new_values = RecordBatch::try_new(/* schema and data */);
+    ///
+    /// // Put a single row by row ID and execute uncommitted
+    /// let uncommitted_put = dataset
+    ///     .put()
+    ///     .put_row_by_id(123, new_values)
+    ///     .await?
+    ///     .execute_uncommitted()
+    ///     .await?;
+    ///
+    /// // The transaction can be committed separately using Lance's commit system
+    /// # Ok::<(), lance::Error>(())
+    /// # });
+    /// ```
+    pub fn put(&self) -> put::DatasetPutBuilder {
+        put::DatasetPutBuilder::new(Arc::new(self.clone()))
     }
 }
 
