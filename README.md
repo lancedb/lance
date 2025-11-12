@@ -7,14 +7,13 @@
 **High-performance vector search, full-text search, random access, and feature engineering capabilities for the lakehouse.**<br/>
 **Compatible with Pandas, DuckDB, Polars, PyArrow, Ray, Spark, and more integrations on the way.**
 
-<a href="https://lancedb.github.io/lance/">Documentation</a> •
-<a href="https://blog.lancedb.com/">Blog</a> •
-<a href="https://discord.gg/zMM32dvNtd">Discord</a> •
-<a href="https://x.com/lancedb">X</a>
+<a href="https://lance.org">Documentation</a> •
+<a href="https://lance.org/community">Community</a> •
+<a href="https://discord.gg/zMM32dvNtd">Discord</a>
 
 [CI]: https://github.com/lancedb/lance/actions/workflows/rust.yml
 [CI Badge]: https://github.com/lancedb/lance/actions/workflows/rust.yml/badge.svg
-[Docs]: https://lancedb.github.io/lance/
+[Docs]: https://lance.org
 [Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
 [crates.io]: https://crates.io/crates/lance
 [crates.io badge]: https://img.shields.io/crates/v/lance.svg
@@ -54,7 +53,7 @@ The key features of Lance include:
 For more details, see the full [Lance format specification](https://lance.org/format).
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/docs/community/contributing) for more information.
 
 ## Quick Start
 
@@ -234,20 +233,3 @@ A comparison of different formats across ML development stages:
 | Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
 | Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
 
-## Community Highlights
-
-Lance is currently used in production by:
-* [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
-* [LanceDB Enterprise](https://docs.lancedb.com/enterprise/introduction), hyperscale LanceDB with enterprise SLA.
-* Leading multimodal Gen AI companies for training over petabyte-scale multimodal data.
-* Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
-* E-commerce company for billion-scale+ vector personalized search.
-* and more.
-
-## Presentations, Blogs and Talks
-
-* [Designing a Table Format for ML Workloads](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/), Feb 2025.
-* [Transforming Multimodal Data Management with LanceDB, Ray Summit](https://www.youtube.com/watch?v=xmTFEzAh8ho), Oct 2024.
-* [Lance v2: A columnar container format for modern data](https://blog.lancedb.com/lance-v2/), Apr 2024.
-* [Lance Deep Dive](https://drive.google.com/file/d/1Orh9rK0Mpj9zN_gnQF1eJJFpAc6lStGm/view?usp=drive_link). July 2023.
-* [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.
