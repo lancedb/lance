@@ -71,6 +71,8 @@ pub struct SchemaCompareOptions {
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
+    /// Allow the source schema to be a subset of the target schema (default false)
+    pub allow_subschema: bool,
 }
 
 /// Blob column format version.
