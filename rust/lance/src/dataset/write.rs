@@ -16,10 +16,11 @@ use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::{
+    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
+};
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::{FileWriter, ManifestProvider};
+use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
@@ -681,9 +682,9 @@ pub trait GenericWriter: Send {
 
 struct V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
-    writer: FileWriter<M>,
+    writer: PreviousFileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -691,7 +692,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
@@ -714,7 +715,7 @@ where
 }
 
 struct V2WriterAdapter {
-    writer: v2::writer::FileWriter,
+    writer: current_writer::FileWriter,
     path: String,
     base_id: Option<u32>,
 }
@@ -785,7 +786,7 @@ pub async fn open_writer_with_options(
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
-            writer: FileWriter::<ManifestDescribing>::try_new(
+            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
@@ -797,7 +798,7 @@ pub async fn open_writer_with_options(
         })
     } else {
         let writer = object_store.create(&full_path).await?;
-        let file_writer = v2::writer::FileWriter::try_new(
+        let file_writer = current_writer::FileWriter::try_new(
             writer,
             schema.clone(),
             FileWriterOptions {
@@ -1045,7 +1046,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
-    use lance_file::reader::FileReader;
+    use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_io::traits::Reader;
 
     #[tokio::test]
@@ -1317,7 +1318,7 @@ mod tests {
             .child(DATA_DIR)
             .child(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = FileReader::try_new_from_reader(
+        let reader = PreviousFileReader::try_new_from_reader(
             &path,
             file_reader,
             None,

@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
+use lance_file::{
+    previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileVersion,
+};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
@@ -227,7 +229,7 @@ pub async fn write_manifest(
 pub struct ManifestDescribing {}
 
 #[async_trait]
-impl ManifestProvider for ManifestDescribing {
+impl PreviousManifestProvider for ManifestDescribing {
     async fn store_schema(
         object_writer: &mut ObjectWriter,
         schema: &Schema,
@@ -251,7 +253,9 @@ mod test {
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-    use lance_file::{reader::FileReader, writer::FileWriter};
+    use lance_file::previous::{
+        reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+    };
     use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
@@ -323,7 +327,7 @@ mod test {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -343,7 +347,7 @@ mod test {
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
+        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());
