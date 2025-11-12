@@ -1697,7 +1697,7 @@ def test_zonemap_deletion_handling(tmp_path: Path):
             "value": [True, False] * 5,
         }
     )
-    ds = lance.write_dataset(data, "memory://")
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
     ds.delete("NOT value")
     assert ds.to_table(filter="value = True").num_rows == 5
     assert ds.to_table(filter="value = False").num_rows == 0
@@ -1709,7 +1709,7 @@ def test_zonemap_deletion_handling(tmp_path: Path):
     assert ids == [0, 2, 4, 6, 8]
 
     # now create the index before deletion
-    ds = lance.write_dataset(data, "memory://")
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
     ds.create_scalar_index("value", index_type="zonemap")
     ds.delete("NOT value")
     assert ds.to_table(filter="value = True").num_rows == 5
@@ -1815,7 +1815,7 @@ def test_bloomfilter_deletion_handling(tmp_path: Path):
             "value": [1, 0] * 5,
         }
     )
-    ds = lance.write_dataset(data, "memory://")
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
     ds.delete("value = 0")
     assert ds.to_table(filter="value = 1").num_rows == 5
     assert ds.to_table(filter="value = 0").num_rows == 0
@@ -1827,7 +1827,7 @@ def test_bloomfilter_deletion_handling(tmp_path: Path):
     assert ids == [0, 2, 4, 6, 8]
 
     # now create the index before deletion
-    ds = lance.write_dataset(data, "memory://")
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
     ds.create_scalar_index("value", index_type="bloomfilter")
     ds.delete("value = 0")
     assert ds.to_table(filter="value = 1").num_rows == 5

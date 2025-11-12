@@ -1,0 +1,43 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 71561804..b050dca3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4661,6 +4661,7 @@ dependencies = [
+  "itertools 0.13.0",
+  "jieba-rs",
+  "jsonb",
++ "lance",
+  "lance-arrow",
+  "lance-core",
+  "lance-datafusion",
+diff --git a/rust/lance-index/src/scalar/zonemap.rs b/rust/lance-index/src/scalar/zonemap.rs
+index 0a746d0e..2e8a3852 100644
+--- a/rust/lance-index/src/scalar/zonemap.rs
++++ b/rust/lance-index/src/scalar/zonemap.rs
+@@ -546,6 +546,10 @@ impl ScalarIndex for ZoneMapIndex {
+                 // Row addresses are: (fragment_id << 32) + zone_start
+                 let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
+                 let zone_end_addr = zone_start_addr + (zone.zone_length as u64);
++                println!(
++                    "found a match! zone_start_addr: {}, zone_end_addr: {}",
++                    zone_start_addr, zone_end_addr
++                );
+ 
+                 // Add all row addresses in this zone to the result
+                 row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
+@@ -763,6 +767,7 @@ impl ZoneMapIndexBuilder {
+             chunk_concat_stream(batches_source, self.options.rows_per_zone as usize);
+ 
+         while let Some(batch) = batches_source.try_next().await? {
++            println!("incoming data is {:?}", batch);
+             if batch.num_rows() == 0 {
+                 continue;
+             }
+@@ -831,6 +836,7 @@ impl ZoneMapIndexBuilder {
+         if self.cur_zone_offset > 0 {
+             self.new_map(self.cur_fragment_id)?;
+         }
++        println!("after training, the zone_maps are {:?}", self.maps);
+ 
+         Ok(())
+     }

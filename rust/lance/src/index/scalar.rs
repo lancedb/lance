@@ -1405,7 +1405,7 @@ mod tests {
         let mut ds = lance_datagen::gen_batch()
             .col("id", array::step::<UInt64Type>())
             .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
             .await
             .unwrap();
 

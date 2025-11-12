@@ -30,7 +30,7 @@ use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -53,15 +53,14 @@ const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 //
-// Example: Suppose we have two fragments, each with 4 rows. Now building the zonemap index:
+// Example: Suppose we have two fragments, each with 4 rows.
 // Fragment 0: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 0
 // The row addresses for fragment 0 are: 0, 1, 2, 3
 // Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 1
 // The row addresses for fragment 1 are: 32>>1, 32>>1 + 1, 32>>1 + 2, 32>>1 + 3
 //
-// Example: Suppose we have two fragments, each with 4 rows. Deletion is 0 index based.
-// We delete the 0th and 1st row in fragment 0, and the 1st and 2nd row in fragment 1,
-// now building the zonemap index:
+// Deletion is 0 index based. We delete the 0th and 1st row in fragment 0,
+// and the 1st and 2nd row in fragment 1,
 // Fragment 0: zone_start = 2, zone_length = 2 // covers rows 2, 3 in fragment 0
 // The row addresses for fragment 0 are: 2, 3
 // Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 3 in fragment 1
@@ -74,14 +73,14 @@ struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
-    fragment_id: u32,
+    fragment_id: u64,
     // zone_start is start row of the zone in the fragment, also known
     // as the local offset. To get the actual first row address,
     // you can do `fragment_id << 32 + zone_start`
-    zone_start: u32,
-    // zone_length is the `row address span` between the first and the last row in the zone
-    // calculated as: (last_row_addr - first_row_addr + 1)
-    zone_length: u32,
+    zone_start: u64,
+    // zone_length is the `row offset span` between the first and the last row in the zone
+    // calculated as: (last_row_offset - first_row_offset + 1)
+    zone_length: usize,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -419,10 +418,10 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
+            .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "ZoneMapIndex: 'zone_length' column is not UInt32",
+                    "ZoneMapIndex: 'zone_length' column is not UInt64",
                     location!(),
                 )
             })?;
@@ -433,10 +432,10 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column", location!())
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
+            .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "ZoneMapIndex: 'fragment_id' column is not UInt32",
+                    "ZoneMapIndex: 'fragment_id' column is not UInt64",
                     location!(),
                 )
             })?;
@@ -447,10 +446,10 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: missing 'zone_start' column", location!())
             })?
             .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
+            .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "ZoneMapIndex: 'zone_start' column is not UInt32",
+                    "ZoneMapIndex: 'zone_start' column is not UInt64",
                     location!(),
                 )
             })?;
@@ -484,7 +483,7 @@ impl ZoneMapIndex {
                 nan_count,
                 fragment_id: fragment_id_col.value(i),
                 zone_start: zone_start_col.value(i),
-                zone_length: zone_length.value(i),
+                zone_length: zone_length.value(i) as usize,
             });
         }
 
@@ -537,7 +536,7 @@ impl Index for ZoneMapIndex {
 
         // Loop through zones and add unique fragment IDs to the bitmap
         for zone in &self.zones {
-            frag_ids.insert(zone.fragment_id);
+            frag_ids.insert(zone.fragment_id as u32);
         }
 
         Ok(frag_ids)
@@ -561,7 +560,7 @@ impl ScalarIndex for ZoneMapIndex {
             // Check if this zone matches the query
             if self.evaluate_zone_against_query(zone, query)? {
                 // Calculate the range of row addresses for this zone
-                let zone_start_addr = ((zone.fragment_id as u64) << 32) + zone.zone_start as u64;
+                let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
                 let zone_end_addr = zone_start_addr + zone.zone_length as u64;
 
                 // Add all row addresses in this zone to the result
@@ -752,21 +751,20 @@ impl ZoneMapIndexBuilder {
     }
 
     fn new_map(&mut self, fragment_id: u32) -> Result<()> {
-        // Use the actual first and last row offsets we tracked
-        // zone_length is the offset span (last - first + 1), not row count
-        // This correctly handles non-contiguous offsets after deletions
-        let zone_start = self.cur_zone_first_row_offset.unwrap_or(0);
+        let zone_start = self.cur_zone_first_row_offset.unwrap_or(0) as u64;
         let zone_length = self
             .cur_zone_last_row_offset
-            .map(|last_row_offset| last_row_offset - zone_start + 1)
-            .unwrap_or(self.cur_zone_offset as u32);
+            .map(|last_row_offset| {
+                (last_row_offset - self.cur_zone_first_row_offset.unwrap_or(0) + 1) as usize
+            })
+            .unwrap_or(self.cur_zone_offset);
 
         let new_map = ZoneMapStatistics {
             min: self.min.evaluate()?,
             max: self.max.evaluate()?,
             null_count: self.null_count,
             nan_count: self.nan_count,
-            fragment_id,
+            fragment_id: fragment_id as u64,
             zone_start,
             zone_length,
         };
@@ -905,13 +903,13 @@ impl ZoneMapIndexBuilder {
         let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
 
         let fragment_ids =
-            UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
 
         let zone_lengths =
-            UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length as u64));
 
         let zone_starts =
-            UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             // min and max can be null if the entire batch is null values
@@ -919,9 +917,9 @@ impl ZoneMapIndexBuilder {
             Field::new("max", self.items_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
-            Field::new("fragment_id", DataType::UInt32, false),
-            Field::new("zone_start", DataType::UInt32, false),
-            Field::new("zone_length", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
@@ -1210,7 +1208,7 @@ mod tests {
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
             assert_eq!(zone.zone_length, 5000);
-            assert_eq!(zone.fragment_id, i as u32);
+            assert_eq!(zone.fragment_id, i as u64);
         }
 
         // Equals query: null (should match all zones since they contain null values)
@@ -1263,7 +1261,7 @@ mod tests {
 
         // Verify the new zone was added
         let new_zone = &updated_index.zones[10]; // Last zone should be the new one
-        assert_eq!(new_zone.fragment_id, 10); // New fragment ID
+        assert_eq!(new_zone.fragment_id, 10u64); // New fragment ID
         assert_eq!(new_zone.zone_length, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
         assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
@@ -1362,7 +1360,11 @@ mod tests {
                 "Zone {} should have zone_length 100",
                 i
             );
-            assert_eq!(zone.fragment_id, 0, "Zone {} should have fragment_id 0", i);
+            assert_eq!(
+                zone.fragment_id, 0u64,
+                "Zone {} should have fragment_id 0",
+                i
+            );
         }
 
         // Test search for NaN values using Equals with NaN
