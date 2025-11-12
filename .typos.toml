@@ -11,6 +11,7 @@ afe = "afe"
 typ = "typ"
 rabit = "rabit"
 flate = "flate"
+Ines = "Ines"
 
 [default.expect]
 nprobs = "nprobes"

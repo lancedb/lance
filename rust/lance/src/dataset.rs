@@ -8873,12 +8873,7 @@ mod tests {
         }
 
         fn make_tx(read_version: u64) -> Transaction {
-            Transaction::new(
-                read_version,
-                Operation::Append { fragments: vec![] },
-                None,
-                None,
-            )
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
         }
 
         async fn delete_external_tx_file(ds: &Dataset) {
@@ -8939,7 +8934,6 @@ mod tests {
                 ds.load_indices().await.unwrap().as_ref().clone(),
                 &tx_file,
                 &ManifestWriteConfig::default(),
-                None,
             )
             .unwrap();
         let location = write_manifest_file(
