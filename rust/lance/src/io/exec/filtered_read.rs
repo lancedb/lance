@@ -66,7 +66,7 @@ pub struct EvaluatedIndex {
 }
 
 impl EvaluatedIndex {
-    /// Get a reference to the index result
+    /// Get the row id mask representing which rows matched the index filter.
     pub fn index_result(&self) -> &IndexExprResult {
         &self.index_result
     }
