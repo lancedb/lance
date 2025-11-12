@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +21,9 @@ use jni::{
 };
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{OnMissing, Projection, Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::v2::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
@@ -237,15 +239,34 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
         };
 
         let file_version = reader.inner.metadata().version();
+        let base_schema = Schema::try_from(reader.schema()?.as_ref())?;
 
         if !projected_names.is_null() {
-            let schema = Schema::try_from(reader.schema()?.as_ref())?;
             let column_names: Vec<String> = env.get_strings(&projected_names)?;
-            let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
-            reader_projection = Some(ReaderProjection::from_column_names(
+
+            // Build field_id_to_column_index mapping from base schema (file layout)
+            let field_id_to_column_index = base_schema
+                .fields_pre_order()
+                .filter(|field| {
+                    file_version < LanceFileVersion::V2_1
+                        || field.is_leaf()
+                        || field.is_packed_struct()
+                })
+                .enumerate()
+                .map(|(idx, field)| (field.id as u32, idx as u32))
+                .collect::<BTreeMap<_, _>>();
+
+            // Use Projection to get transformed schema (with blob fields as descriptors)
+            let projection = Projection::empty(Arc::new(base_schema.clone()))
+                .union_columns(&column_names, OnMissing::Error)?;
+            let transformed_schema = projection.to_bare_schema();
+
+            // Use from_field_ids with transformed schema
+            // This tells the decoder to expect Struct types for blob fields
+            reader_projection = Some(ReaderProjection::from_field_ids(
                 file_version,
-                &schema,
-                names.as_slice(),
+                &transformed_schema,
+                &field_id_to_column_index,
             )?);
         }
 

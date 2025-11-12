@@ -32,7 +32,7 @@ use snafu::location;
 
 use lance_core::{
     cache::LanceCache,
-    datatypes::{Field, Schema},
+    datatypes::{Field, OnMissing, Projection, Schema},
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
