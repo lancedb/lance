@@ -3883,12 +3883,7 @@ mod tests {
         )
         .unwrap();
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(IOTracker::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -3901,7 +3896,7 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = io_stats.incremental_stats();
+            let stats = dataset.object_store().io_stats();
             assert_io_eq!(stats, write_iops, 3);
             assert_io_lt!(stats, write_bytes, 4300);
         }
@@ -3926,7 +3921,7 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = io_stats.incremental_stats();
+        let stats = dataset.object_store().io_stats();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }

@@ -96,10 +96,12 @@ use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
+use self::io_stats::IoStats;
 
 pub mod blob;
 pub mod cleanup;
 pub mod commit;
+pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
@@ -2043,6 +2045,33 @@ impl Dataset {
 
     fn session(&self) -> Session {
         Session::new(self.ds.session())
+    }
+
+    /// Get IO statistics for this dataset
+    ///
+    /// Returns the accumulated IO statistics since the last call to this method
+    /// and resets the internal counters (incremental stats pattern).
+    ///
+    /// Returns
+    /// -------
+    /// IOStats
+    ///     Statistics about read/write operations including:
+    ///     - read_iops: Number of read operations
+    ///     - read_bytes: Total bytes read
+    ///     - write_iops: Number of write operations
+    ///     - write_bytes: Total bytes written
+    ///     - num_hops: Number of disjoint IO periods (lower means more parallelism)
+    ///
+    /// Examples
+    /// --------
+    /// >>> import lance
+    /// >>> dataset = lance.dataset("my_dataset")
+    /// >>> # Perform some operations...
+    /// >>> stats = dataset.io_stats()
+    /// >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+    fn io_stats(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats();
+        IoStats::from_lance(stats)
     }
 
     #[staticmethod]

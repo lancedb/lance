@@ -53,6 +53,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
+    IOStats,
     LanceSchema,
     ScanStatistics,
     _Dataset,
@@ -1344,6 +1345,39 @@ class LanceDataset(pa.dataset.Dataset):
         if raw_fragment is None:
             return None
         return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
+
+    def io_stats(self) -> IOStats:
+        """
+        Get incremental IO statistics for operations on this dataset.
+
+        Returns IO statistics (number of operations and bytes) since the last
+        time this method was called. The statistics are automatically reset
+        after being read, making this useful for tracking IO between operations.
+
+        Returns
+        -------
+        IOStats
+            Object containing IO statistics with the following attributes:
+            - read_iops: Number of read operations
+            - read_bytes: Total bytes read
+            - write_iops: Number of write operations
+            - write_bytes: Total bytes written
+            - num_hops: Number of network hops (for remote storage)
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://test_stats")
+        >>> # Perform some operations
+        >>> result = dataset.to_table()
+        >>> # Get incremental stats
+        >>> stats = dataset.io_stats()
+        >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+        Read ... bytes in ... operations
+        """
+        return self._ds.io_stats()
 
     def to_batches(
         self,

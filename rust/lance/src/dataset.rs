@@ -2898,8 +2898,6 @@ mod tests {
     #[tokio::test]
     async fn test_load_manifest_iops() {
         // Need to use in-memory for accurate IOPS tracking.
-        let io_tracker = Arc::new(IOTracker::default());
-
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2917,10 +2915,6 @@ mod tests {
             batches,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 session: Some(session.clone()),
                 ..Default::default()
             }),
@@ -2928,17 +2922,10 @@ mod tests {
         .await
         .unwrap();
 
-        let _ = io_tracker.incremental_stats(); //reset
+        let _ = _original_ds.object_store().io_stats(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session),
-                ..Default::default()
-            })
+            .with_session(session)
             .load()
             .await
             .unwrap();
@@ -2947,7 +2934,7 @@ mod tests {
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = _dataset.object_store().io_stats();
         assert_io_eq!(io_stats, read_iops, 2);
     }
 
@@ -8884,7 +8871,6 @@ mod tests {
         }
 
         let session = Arc::new(Session::default());
-        let io_tracker = Arc::new(IOTracker::default());
 
         // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
         let ds = create_dataset(5).await;
@@ -8901,23 +8887,15 @@ mod tests {
         // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
         let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
             .with_session(session.clone())
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session.clone()),
-                ..Default::default()
-            })
             .load()
             .await
             .unwrap();
-        let stats = io_tracker.incremental_stats(); // Reset
+        let stats = read_ds2.object_store().io_stats(); // Reset
         assert!(stats.read_bytes < 64 * 1024);
         // Because the manifest is so small, we should have opportunistically
         // cached the transaction in memory already.
         let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = read_ds2.object_store().io_stats();
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(inline_tx, tx);

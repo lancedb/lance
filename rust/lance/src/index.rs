@@ -2358,12 +2358,7 @@ mod tests {
     #[lance_test_macros::test(tokio::test)]
     async fn test_load_indices() {
         let session = Arc::new(Session::default());
-        let io_tracker = Arc::new(IOTracker::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -2392,10 +2387,10 @@ mod tests {
             )
             .await
             .unwrap();
-        io_tracker.incremental_stats(); // Reset
+        dataset.object_store().io_stats(); // Reset
 
         let indices = dataset.load_indices().await.unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = dataset.object_store().io_stats();
         // We should already have this cached since we just wrote it.
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
@@ -2405,24 +2400,16 @@ mod tests {
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session.clone()),
-                ..Default::default()
-            })
             .load()
             .await
             .unwrap();
-        let stats = io_tracker.incremental_stats(); // Reset
+        let stats = dataset2.object_store().io_stats(); // Reset
         assert_io_lt!(stats, read_bytes, 64 * 1024);
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = dataset2.object_store().io_stats();
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices2.len(), 1);

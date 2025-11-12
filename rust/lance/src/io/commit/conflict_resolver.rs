@@ -1672,13 +1672,8 @@ mod tests {
         io,
     };
 
-    async fn test_dataset(num_rows: usize, num_fragments: usize) -> (Dataset, Arc<IOTracker>) {
-        let io_tracker = Arc::new(IOTracker::default());
+    async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
-                ..Default::default()
-            }),
             max_rows_per_file: num_rows / num_fragments,
             ..Default::default()
         };
@@ -1700,7 +1695,7 @@ mod tests {
             .execute(vec![data])
             .await
             .unwrap();
-        (dataset, io_tracker)
+        dataset
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -1752,7 +1747,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_overlapping_rebase_delete_update() {
-        let (dataset, io_tracker) = test_dataset(5, 5).await;
+        let dataset = test_dataset(5, 5).await;
         let operation = Operation::Update {
             updated_fragments: vec![Fragment::new(0)],
             removed_fragment_ids: vec![],
@@ -1793,12 +1788,12 @@ mod tests {
             .await
             .unwrap();
 
-        io_tracker.incremental_stats(); // reset
+        dataset.object_store().io_stats(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
-            let io_stats = io_tracker.incremental_stats();
+            let io_stats = dataset.object_store().io_stats();
             assert_io_eq!(io_stats, read_iops, 0);
             assert_io_eq!(io_stats, write_iops, 0);
         }
@@ -1812,7 +1807,7 @@ mod tests {
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction, expected_transaction);
         // We didn't need to do any IO, so the stats should be 0.
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
     }
@@ -1865,7 +1860,7 @@ mod tests {
     #[rstest::rstest]
     async fn test_non_conflicting_rebase_delete_update() {
         // 5 rows, all in one fragment. Each transaction modifies a different row.
-        let (mut dataset, io_tracker) = test_dataset(5, 1).await;
+        let mut dataset = test_dataset(5, 1).await;
         let mut fragment = dataset.fragments().as_slice()[0].clone();
 
         // Other operations modify the 1st, 2nd, and 3rd rows sequentially.
@@ -1915,12 +1910,12 @@ mod tests {
                     .await
                     .unwrap();
 
-            io_tracker.incremental_stats(); // reset
+            dataset.object_store().io_stats(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
                     .check_txn(other_transaction, other_version as u64)
                     .unwrap();
-                let io_stats = io_tracker.incremental_stats();
+                let io_stats = dataset.object_store().io_stats();
                 assert_io_eq!(io_stats, read_iops, 0);
                 assert_io_eq!(io_stats, write_iops, 0);
             }
@@ -1931,7 +1926,7 @@ mod tests {
             let rebased_transaction = rebase.finish(&dataset).await.unwrap();
             assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
 
-            let io_stats = io_tracker.incremental_stats();
+            let io_stats = dataset.object_store().io_stats();
             if expected_rewrite {
                 // Read the current deletion file, and write the new one.
                 assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
@@ -1998,7 +1993,7 @@ mod tests {
         #[values("update_full", "update_partial", "delete_full", "delete_partial")] other: &str,
     ) {
         // 5 rows, all in one fragment. Each transaction modifies the same row.
-        let (dataset, io_tracker) = test_dataset(5, 1).await;
+        let dataset = test_dataset(5, 1).await;
         let mut fragment = dataset.fragments().as_slice()[0].clone();
 
         let sample_file = Fragment::new(0)
@@ -2078,12 +2073,12 @@ mod tests {
 
         let affected_rows = RowIdTreeMap::from_iter([0]);
 
-        io_tracker.incremental_stats(); // reset
+        dataset.object_store().io_stats(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2108,7 +2103,7 @@ mod tests {
             vec![(0, true)],
         );
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2118,7 +2113,7 @@ mod tests {
             Err(crate::Error::RetryableCommitConflict { .. })
         ));
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats();
         assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
         assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
     }
@@ -2620,7 +2615,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_non_conflicting() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Create two transactions adding different bases
         let txn1 = Transaction::new_from_version(
@@ -2656,7 +2651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_name_conflict() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Create two transactions adding bases with the same name
         let txn1 = Transaction::new_from_version(
@@ -2697,7 +2692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_path_conflict() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Create two transactions adding bases with the same path
         let txn1 = Transaction::new_from_version(
@@ -2738,7 +2733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_id_conflict() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Create two transactions adding bases with the same non-zero ID
         let txn1 = Transaction::new_from_version(
@@ -2779,7 +2774,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_no_conflict_with_data_operations() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         let add_bases_txn = Transaction::new_from_version(
             1,
@@ -2827,7 +2822,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_multiple_bases() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // txn1 adds two bases
         let txn1 = Transaction::new_from_version(
@@ -2877,7 +2872,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_with_none_name() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Bases with None names should not conflict on name
         let txn1 = Transaction::new_from_version(
@@ -2913,7 +2908,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_bases_with_zero_id() {
-        let (dataset, _) = test_dataset(10, 2).await;
+        let dataset = test_dataset(10, 2).await;
 
         // Bases with zero IDs should not conflict on ID
         let txn1 = Transaction::new_from_version(
