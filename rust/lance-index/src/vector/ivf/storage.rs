@@ -8,7 +8,9 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
-use lance_file::previous::{reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter};
+use lance_file::previous::{
+    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+};
 use lance_io::{traits::WriteExt, utils::read_message};
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
@@ -285,10 +287,14 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         {
-            let mut writer =
-                PreviousFileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
-                    .await
-                    .unwrap();
+            let mut writer = PreviousFileWriter::try_new(
+                &object_store,
+                &path,
+                schema.clone(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
             // Write some dummy data
             let batch = RecordBatch::try_new(
                 Arc::new(arrow_schema),

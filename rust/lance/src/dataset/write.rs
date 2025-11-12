@@ -16,12 +16,11 @@ use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::writer::{self as current_writer, FileWriterOptions};
-use lance_file::version::LanceFileVersion;
 use lance_file::previous::writer::{
-    FileWriter as PreviousFileWriter,
-    ManifestProvider as PreviousManifestProvider,
+    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
 };
+use lance_file::version::LanceFileVersion;
+use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};

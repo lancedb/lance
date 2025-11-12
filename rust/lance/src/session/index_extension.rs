@@ -69,10 +69,10 @@ mod test {
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
-    use lance_file::version::LanceFileVersion;
     use lance_file::previous::writer::{
         FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
     };
+    use lance_file::version::LanceFileVersion;
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         metrics::MetricsCollector,
@@ -273,7 +273,7 @@ mod test {
                     schema,
                     &PreviousFileWriterOptions::default(),
                 )
-                    .unwrap();
+                .unwrap();
             writer.add_metadata(
                 INDEX_METADATA_SCHEMA_KEY,
                 json!(IndexMetadata {

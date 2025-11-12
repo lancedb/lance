@@ -6,8 +6,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
 use lance_file::{
-    previous::writer::ManifestProvider as PreviousManifestProvider,
-    version::LanceFileVersion,
+    previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileVersion,
 };
 use object_store::path::Path;
 use prost::Message;
@@ -254,7 +253,9 @@ mod test {
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-    use lance_file::previous::{reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter};
+    use lance_file::previous::{
+        reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+    };
     use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 

@@ -32,10 +32,12 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::previous::reader::{read_batch as previous_read_batch, FileReader as PreviousFileReader};
+use lance_file::previous::reader::{
+    read_batch as previous_read_batch, FileReader as PreviousFileReader,
+};
 use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::{determine_file_version, LanceEncodingsIo};
 use lance_file::version::LanceFileVersion;
+use lance_file::{determine_file_version, LanceEncodingsIo};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
@@ -2601,6 +2603,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriterOptions;
     use lance_io::{
         assert_io_eq, assert_io_lt,
         object_store::{ObjectStore, ObjectStoreParams},
@@ -2608,7 +2611,6 @@ mod tests {
     };
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use lance_file::writer::FileWriterOptions;
 
     use super::*;
     use crate::{

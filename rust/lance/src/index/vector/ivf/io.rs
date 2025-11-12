@@ -427,7 +427,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
-                PreviousFileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
+                PreviousFileReader::try_new_self_described(&object_store, aux_part_file, None)
+                    .await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {

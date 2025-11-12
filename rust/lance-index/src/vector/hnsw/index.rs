@@ -71,7 +71,8 @@ impl<Q: Quantization> HNSWIndex<Q> {
         aux_reader: Arc<dyn Reader>,
         options: HNSWIndexOptions,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
+        let reader =
+            PreviousFileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
 
         let partition_metadata = match reader.schema().metadata.get(IVF_PARTITION_KEY) {
             Some(json) => {

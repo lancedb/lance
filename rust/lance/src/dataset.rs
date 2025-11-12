@@ -2634,8 +2634,8 @@ mod tests {
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use lance_file::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriter;
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
@@ -8873,11 +8873,7 @@ mod tests {
         }
 
         fn make_tx(read_version: u64) -> Transaction {
-            Transaction::new(
-                read_version,
-                Operation::Append { fragments: vec![] },
-                None,
-            )
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
         }
 
         async fn delete_external_tx_file(ds: &Dataset) {

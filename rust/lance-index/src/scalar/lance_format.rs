@@ -11,15 +11,12 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
-use lance_file::writer as current_writer;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
-    writer::{
-        FileWriter as PreviousFileWriter,
-        ManifestProvider as PreviousManifestProvider,
-    },
+    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
+use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
@@ -167,10 +164,7 @@ impl IndexReader for current_reader::FileReader {
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(
-                self.schema(),
-                self.metadata().version(),
-            )
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
         };
         let batches = self
             .read_stream_projected(

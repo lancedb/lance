@@ -32,9 +32,9 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::writer::FileWriterOptions;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
@@ -502,7 +502,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(buffer.as_str());
 
             if self.is_legacy {
-                let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
@@ -545,7 +546,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(file_name.as_str());
 
             if self.is_legacy {
-                let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -627,8 +629,9 @@ impl IvfShuffler {
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
-                _reader_handle =
-                    Some(PreviousFileReader::try_new_self_described(&object_store, &path, None).await?);
+                _reader_handle = Some(
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?,
+                );
 
                 stream::iter(start..end)
                     .map(|i| {
