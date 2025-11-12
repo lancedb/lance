@@ -267,6 +267,20 @@ public class FragmentTest {
   }
 
   @Test
+  void testWriteWithInvalidSchema(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMergeColumns").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.UnmatchedSchemaDataset dataset =
+          new TestUtils.UnmatchedSchemaDataset(allocator, datasetPath);
+
+      dataset.createUnmatchedDataset(datasetPath).close();
+
+      Throwable t = assertThrows(Exception.class, () -> dataset.createNewFragment(10));
+      assertTrue(t.getMessage().contains("Append with different schema"));
+    }
+  }
+
+  @Test
   void testMergeColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testMergeColumns").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
