@@ -71,7 +71,8 @@ impl EvaluatedIndex {
         &self.index_result
     }
 
-    /// Get a reference to the applicable fragments bitmap
+    /// Get a reference to the applicable fragments bitmap, containing the set of fragment IDs
+    /// implicated by the filter.
     pub fn applicable_fragments(&self) -> &RoaringBitmap {
         &self.applicable_fragments
     }
