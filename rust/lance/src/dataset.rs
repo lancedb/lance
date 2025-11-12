@@ -13,12 +13,15 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
+use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{
+    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
+};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -56,7 +59,7 @@ use std::sync::Arc;
 use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
-mod blob;
+pub(crate) mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -2332,6 +2335,10 @@ impl Dataset {
         &self.manifest.config
     }
 
+    pub(crate) fn blob_version(&self) -> BlobVersion {
+        blob_version_from_config(&self.manifest.config)
+    }
+
     /// Delete keys from the config.
     #[deprecated(
         note = "Use the new update_config(values, replace) method - pass None values to delete keys"
@@ -2596,6 +2603,10 @@ pub(crate) async fn write_manifest_file(
 impl Projectable for Dataset {
     fn schema(&self) -> &Schema {
         self.schema()
+    }
+
+    fn blob_version(&self) -> BlobVersion {
+        self.blob_version()
     }
 }
 
@@ -8877,7 +8888,6 @@ mod tests {
                 read_version,
                 Operation::Append { fragments: vec![] },
                 None,
-                None,
             )
         }
 
@@ -8939,7 +8949,6 @@ mod tests {
                 ds.load_indices().await.unwrap().as_ref().clone(),
                 &tx_file,
                 &ManifestWriteConfig::default(),
-                None,
             )
             .unwrap();
         let location = write_manifest_file(

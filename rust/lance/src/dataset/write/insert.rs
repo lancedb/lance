@@ -19,6 +19,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::location;
 
+use crate::dataset::blob::BLOB_VERSION_CONFIG_KEY;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
@@ -27,6 +28,7 @@ use crate::Dataset;
 use crate::{Error, Result};
 use tracing::info;
 
+use super::blob_version_for;
 use super::commit::CommitBuilder;
 use super::resolve_commit_handler;
 use super::WriteDestination;
@@ -214,43 +216,42 @@ impl<'a> InsertBuilder<'a> {
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
+        let blob_version = blob_version_for(context.storage_version);
+        let mut config_entries = HashMap::from([(
+            BLOB_VERSION_CONFIG_KEY.to_string(),
+            blob_version.config_value().to_string(),
+        )]);
+
+        if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
+            config_entries.insert(
+                String::from("lance.auto_cleanup.interval"),
+                auto_cleanup_params.interval.to_string(),
+            );
+
+            match auto_cleanup_params.older_than.to_std() {
+                Ok(duration) => {
+                    config_entries.insert(
+                        String::from("lance.auto_cleanup.older_than"),
+                        format_duration(duration).to_string(),
+                    );
+                }
+                Err(e) => {
+                    return Err(Error::InvalidInput {
+                        source: e.into(),
+                        location: location!(),
+                    })
+                }
+            };
+        }
+
+        let mut config_payload = Some(config_entries);
         let operation = match context.params.mode {
             WriteMode::Create => {
-                // Fetch auto_cleanup params from context
-                let config_upsert_values = match context.params.auto_cleanup.as_ref() {
-                    Some(auto_cleanup_params) => {
-                        let mut upsert_values = HashMap::new();
-
-                        upsert_values.insert(
-                            String::from("lance.auto_cleanup.interval"),
-                            auto_cleanup_params.interval.to_string(),
-                        );
-
-                        match auto_cleanup_params.older_than.to_std() {
-                            Ok(d) => {
-                                upsert_values.insert(
-                                    String::from("lance.auto_cleanup.older_than"),
-                                    format_duration(d).to_string(),
-                                );
-                            }
-                            Err(e) => {
-                                return Err(Error::InvalidInput {
-                                    source: e.into(),
-                                    location: location!(),
-                                })
-                            }
-                        };
-
-                        Some(upsert_values)
-                    }
-                    None => None,
-                };
-
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
                     fragments,
-                    config_upsert_values,
+                    config_upsert_values: config_payload.take(),
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
@@ -259,7 +260,7 @@ impl<'a> InsertBuilder<'a> {
                     // Use the full schema, not the written schema
                     schema,
                     fragments,
-                    config_upsert_values: None,
+                    config_upsert_values: config_payload.take(),
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
