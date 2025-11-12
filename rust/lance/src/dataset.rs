@@ -8884,11 +8884,7 @@ mod tests {
         }
 
         fn make_tx(read_version: u64) -> Transaction {
-            Transaction::new(
-                read_version,
-                Operation::Append { fragments: vec![] },
-                None,
-            )
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
         }
 
         async fn delete_external_tx_file(ds: &Dataset) {
