@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::{DistanceType, Dot};
 use lance_linalg::simd::dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE};
 use lance_linalg::simd::{self};
@@ -87,7 +87,7 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
         }
     }
 
-    async fn load(reader: &FileReader) -> Result<Self> {
+    async fn load(reader: &PreviousFileReader) -> Result<Self> {
         let metadata_str =
             reader
                 .schema()
@@ -647,7 +647,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
     }
 
     async fn load_partition(
-        reader: &FileReader,
+        reader: &PreviousFileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,

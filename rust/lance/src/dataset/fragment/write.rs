@@ -8,9 +8,9 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
@@ -138,7 +138,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::v2::writer::FileWriter::try_new(
+        let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
             schema,
             FileWriterOptions {
@@ -244,7 +244,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema,

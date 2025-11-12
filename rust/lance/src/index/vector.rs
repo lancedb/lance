@@ -19,7 +19,7 @@ use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -938,7 +938,7 @@ pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &str,
-    reader: FileReader,
+    reader: PreviousFileReader,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
