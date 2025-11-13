@@ -11,6 +11,72 @@ use lance_core::{Error, Result};
 use lance_namespace_reqwest_client::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
 use snafu::Location;
 
+/// Convert Arrow Schema to JsonArrowSchema
+pub fn arrow_schema_to_json(arrow_schema: &ArrowSchema) -> Result<JsonArrowSchema> {
+    let fields: Result<Vec<JsonArrowField>> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| arrow_field_to_json(f.as_ref()))
+        .collect();
+
+    let metadata = if arrow_schema.metadata().is_empty() {
+        None
+    } else {
+        Some(arrow_schema.metadata().clone())
+    };
+
+    Ok(JsonArrowSchema {
+        fields: fields?,
+        metadata,
+    })
+}
+
+/// Convert Arrow Field to JsonArrowField
+fn arrow_field_to_json(arrow_field: &Field) -> Result<JsonArrowField> {
+    let data_type = arrow_type_to_json(arrow_field.data_type())?;
+
+    Ok(JsonArrowField {
+        name: arrow_field.name().clone(),
+        nullable: arrow_field.is_nullable(),
+        r#type: Box::new(data_type),
+        metadata: if arrow_field.metadata().is_empty() {
+            None
+        } else {
+            Some(arrow_field.metadata().clone())
+        },
+    })
+}
+
+/// Convert Arrow DataType to JsonArrowDataType
+fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
+    let type_name = match data_type {
+        DataType::Null => "null",
+        DataType::Boolean => "bool",
+        DataType::Int8 => "int8",
+        DataType::UInt8 => "uint8",
+        DataType::Int16 => "int16",
+        DataType::UInt16 => "uint16",
+        DataType::Int32 => "int32",
+        DataType::UInt32 => "uint32",
+        DataType::Int64 => "int64",
+        DataType::UInt64 => "uint64",
+        DataType::Float32 => "float32",
+        DataType::Float64 => "float64",
+        DataType::Utf8 => "utf8",
+        DataType::Binary => "binary",
+        DataType::LargeUtf8 => "large_utf8",
+        DataType::LargeBinary => "large_binary",
+        _ => {
+            return Err(Error::Namespace {
+                source: format!("Unsupported Arrow type for JSON conversion: {:?}", data_type).into(),
+                location: Location::new(file!(), line!(), column!()),
+            })
+        }
+    };
+
+    Ok(JsonArrowDataType::new(type_name.to_string()))
+}
+
 /// Convert JsonArrowSchema to Arrow Schema
 pub fn convert_json_arrow_schema(json_schema: &JsonArrowSchema) -> Result<ArrowSchema> {
     let fields: Result<Vec<Field>> = json_schema

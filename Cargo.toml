@@ -80,6 +80,7 @@ arrow-schema = "56.1"
 arrow-select = "56.1"
 async-recursion = "1.0"
 async-trait = "0.1"
+axum = "0.7"
 aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
 aws-sdk-dynamodb = "1.38.0"
@@ -179,6 +180,8 @@ tokio = { version = "1.23", features = [
 ] }
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10" }
+tower = "0.5"
+tower-http = "0.5"
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
