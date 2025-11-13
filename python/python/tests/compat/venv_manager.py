@@ -13,12 +13,8 @@ import pickle
 import struct
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Optional
-
-# Enable detailed timing output with DEBUG=1
-DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 
 
 class VenvExecutor:
@@ -40,28 +36,27 @@ class VenvExecutor:
         self.version = version
         self.venv_path = Path(venv_path)
         self.persistent = persistent
-        self.python_path: Optional[Path] = None
         self._created = False
         self._subprocess: Optional[subprocess.Popen] = None
+
+    @property
+    def python_path(self) -> Path:
+        if sys.platform == "win32":
+            return self.venv_path / "Scripts" / "python.exe"
+        return self.venv_path / "bin" / "python"
 
     def _validate_venv(self) -> bool:
         """Check if existing venv is valid and has correct Lance version."""
         if not self.venv_path.exists():
             return False
 
-        # Determine python path
-        if sys.platform == "win32":
-            python_path = self.venv_path / "Scripts" / "python.exe"
-        else:
-            python_path = self.venv_path / "bin" / "python"
-
-        if not python_path.exists():
+        if not self.python_path.exists():
             return False
 
         # Check if pylance is installed with correct version
         try:
             result = subprocess.run(
-                [str(python_path), "-m", "pip", "show", "pylance"],
+                [str(self.python_path), "-m", "pip", "show", "pylance"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -87,40 +82,17 @@ class VenvExecutor:
 
         # Check if persistent venv already exists and is valid
         if self.persistent and self._validate_venv():
-            if DEBUG:
-                print(f"[TIMING] Reusing existing venv for {self.version}", flush=True)
-            # Set python path
-            if sys.platform == "win32":
-                self.python_path = self.venv_path / "Scripts" / "python.exe"
-            else:
-                self.python_path = self.venv_path / "bin" / "python"
             self._created = True
             return
 
-        start_time = time.time()
-        if DEBUG:
-            print(f"[TIMING] Creating venv for {self.version}...", flush=True)
-
         # Create virtual environment
-        venv_start = time.time()
         subprocess.run(
             [sys.executable, "-m", "venv", str(self.venv_path)],
             check=True,
             capture_output=True,
         )
-        if DEBUG:
-            print(
-                f"[TIMING]   venv creation: {time.time() - venv_start:.2f}s", flush=True
-            )
-
-        # Determine python path in venv
-        if sys.platform == "win32":
-            self.python_path = self.venv_path / "Scripts" / "python.exe"
-        else:
-            self.python_path = self.venv_path / "bin" / "python"
 
         # Install specific pylance version and pytest
-        install_start = time.time()
         subprocess.run(
             [
                 str(self.python_path),
@@ -137,29 +109,14 @@ class VenvExecutor:
             check=True,
             capture_output=True,
         )
-        if DEBUG:
-            print(
-                f"[TIMING]   package install: {time.time() - install_start:.2f}s",
-                flush=True,
-            )
 
         self._created = True
-        if DEBUG:
-            total_time = time.time() - start_time
-            print(
-                f"[TIMING] Total venv creation for {self.version}: {total_time:.2f}s",
-                flush=True,
-            )
 
     def _ensure_subprocess(self):
         """Ensure the persistent subprocess is running."""
         if self._subprocess is not None and self._subprocess.poll() is None:
             # Subprocess is already running
             return
-
-        if DEBUG:
-            print(f"[TIMING] Starting subprocess for {self.version}...", flush=True)
-        start_time = time.time()
 
         # Start persistent subprocess
         runner_script = Path(__file__).parent / "venv_runner.py"
@@ -176,11 +133,6 @@ class VenvExecutor:
             stderr=None,  # Inherit stderr to see timing messages
             env=env,
         )
-        if DEBUG:
-            print(
-                f"[TIMING] Subprocess started in {time.time() - start_time:.2f}s",
-                flush=True,
-            )
 
     def _send_message(self, obj: Any):
         """Send a length-prefixed pickled message to subprocess."""
@@ -235,37 +187,14 @@ class VenvExecutor:
         if not self._created:
             raise RuntimeError("Virtual environment not created. Call create() first.")
 
-        start_time = time.time()
-        if DEBUG:
-            print(f"[TIMING] Executing {method_name} in {self.version}...", flush=True)
-
         # Ensure subprocess is running
-        subprocess_start = time.time()
         self._ensure_subprocess()
-        if DEBUG and time.time() - subprocess_start > 0.1:
-            print(
-                f"[TIMING]   subprocess ensure: {time.time() - subprocess_start:.2f}s",
-                flush=True,
-            )
-
         try:
             # Send request: (obj, method_name)
-            send_start = time.time()
             self._send_message((obj, method_name))
-            send_time = time.time() - send_start
 
             # Receive response
-            receive_start = time.time()
             response = self._receive_message()
-            receive_time = time.time() - receive_start
-
-            if DEBUG:
-                total_time = time.time() - start_time
-                print(
-                    f"[TIMING]   send: {send_time:.2f}s, receive: {receive_time:.2f}s, "
-                    f"total: {total_time:.2f}s",
-                    flush=True,
-                )
 
             if response["success"]:
                 return response["result"]
