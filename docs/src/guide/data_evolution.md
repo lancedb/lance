@@ -95,7 +95,10 @@ dataset = lance.write_dataset(table, "ids")
 @lance.batch_udf(checkpoint_file="embedding_checkpoint.sqlite")
 def add_random_vector(batch):
     embeddings = np.random.rand(batch.num_rows, 128).astype("float32")
-    return pd.DataFrame({"embedding": embeddings})
+    return pa.RecordBatch.from_arrays(
+        [pa.FixedSizeListArray.from_arrays(embeddings.flatten(), 128)],
+        names=["embedding"]
+    )
 dataset.add_columns(add_random_vector)
 ```
 

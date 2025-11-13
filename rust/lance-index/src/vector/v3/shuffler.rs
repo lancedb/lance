@@ -18,10 +18,8 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::{
-    reader::{FileReader, FileReaderOptions},
-    writer::FileWriter,
-};
+use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::writer::FileWriter;
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},

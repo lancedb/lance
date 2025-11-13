@@ -15,9 +15,8 @@ use lance_io::{
     ReadBatchParams,
 };
 
-use crate::v2::reader::{FileReader, FileReaderOptions};
-
-use super::writer::{FileWriter, FileWriterOptions};
+use crate::reader::{FileReader, FileReaderOptions};
+use crate::writer::{FileWriter, FileWriterOptions};
 
 pub struct FsFixture {
     pub tmp_path: TempObjFile,

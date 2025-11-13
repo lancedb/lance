@@ -28,7 +28,7 @@ use lance_core::utils::tracing::{
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -1997,7 +1997,7 @@ impl Dataset {
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
-    pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
+    pub fn sql(&self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
     }
 
@@ -2634,8 +2634,8 @@ mod tests {
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriter;
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
@@ -8873,12 +8873,7 @@ mod tests {
         }
 
         fn make_tx(read_version: u64) -> Transaction {
-            Transaction::new(
-                read_version,
-                Operation::Append { fragments: vec![] },
-                None,
-                None,
-            )
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
         }
 
         async fn delete_external_tx_file(ds: &Dataset) {
@@ -8939,7 +8934,6 @@ mod tests {
                 ds.load_indices().await.unwrap().as_ref().clone(),
                 &tx_file,
                 &ManifestWriteConfig::default(),
-                None,
             )
             .unwrap();
         let location = write_manifest_file(

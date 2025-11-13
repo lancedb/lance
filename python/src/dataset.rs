@@ -61,7 +61,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -2567,8 +2567,7 @@ impl Dataset {
 
     #[pyo3(signature=(sql))]
     fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
-        let mut ds = self.ds.as_ref().clone();
-        let builder = ds.sql(&sql);
+        let builder = self.ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
 }
