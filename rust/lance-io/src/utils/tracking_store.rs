@@ -26,8 +26,20 @@ use crate::object_store::WrappingObjectStore;
 pub struct IOTracker(Arc<Mutex<IoStats>>);
 
 impl IOTracker {
+    /// Get IO statistics and reset the counters (incremental pattern).
+    ///
+    /// This returns the accumulated statistics since the last call and resets
+    /// the internal counters to zero.
     pub fn incremental_stats(&self) -> IoStats {
         std::mem::take(&mut *self.0.lock().unwrap())
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters.
+    ///
+    /// This returns a clone of the current statistics without modifying the
+    /// internal state. Use this when you need to check stats without resetting.
+    pub fn stats(&self) -> IoStats {
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -37,7 +49,7 @@ impl WrappingObjectStore for IOTracker {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IoStats {
     pub read_iops: u64,
     pub read_bytes: u64,
@@ -254,6 +266,7 @@ impl ObjectStore for IoTrackingStore {
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            #[cfg(feature = "test-util")]
             path: location.to_owned(),
             _guard,
         }))
@@ -269,6 +282,7 @@ impl ObjectStore for IoTrackingStore {
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            #[cfg(feature = "test-util")]
             path: location.to_owned(),
             _guard,
         }))
@@ -405,6 +419,7 @@ impl ObjectStore for IoTrackingStore {
 #[derive(Debug)]
 struct IoTrackingMultipartUpload {
     target: Box<dyn MultipartUpload>,
+    #[cfg(feature = "test-util")]
     path: Path,
     stats: Arc<Mutex<IoStats>>,
     _guard: HopGuard,

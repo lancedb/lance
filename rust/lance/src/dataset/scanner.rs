@@ -3911,7 +3911,7 @@ mod test {
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_io::utils::tracking_store::IOTracker;
+
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use object_store::throttle::ThrottleConfig;
@@ -6484,9 +6484,9 @@ mod test {
             .unwrap();
 
         // First run a full scan to get a baseline
-        let _ = dataset.object_store().io_stats(); // reset
+        let _ = dataset.object_store().io_stats_incremental(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -6498,7 +6498,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -6512,7 +6512,7 @@ mod test {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let io_stats = dataset.object_store().io_stats();
+            let io_stats = dataset.object_store().io_stats_incremental();
             assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
@@ -6526,7 +6526,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let index_scan_bytes = io_stats.read_bytes;
 
@@ -6539,7 +6539,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
@@ -7671,7 +7671,7 @@ mod test {
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
@@ -7684,7 +7684,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7696,7 +7696,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7709,7 +7709,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7722,7 +7722,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
     }
 

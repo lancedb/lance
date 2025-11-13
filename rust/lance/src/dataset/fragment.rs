@@ -2604,11 +2604,7 @@ mod tests {
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
-    use lance_io::{
-        assert_io_eq, assert_io_lt,
-        object_store::{ObjectStore, ObjectStoreParams},
-        utils::tracking_store::IOTracker,
-    };
+    use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -3896,7 +3892,7 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = dataset.object_store().io_stats();
+            let stats = dataset.object_store().io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
             assert_io_lt!(stats, write_bytes, 4300);
         }
@@ -3921,7 +3917,7 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = dataset.object_store().io_stats();
+        let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }

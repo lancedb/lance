@@ -467,10 +467,20 @@ impl ObjectStore {
         &self.io_tracker
     }
 
-    /// Get IO statistics since the last call to this method
+    /// Get a snapshot of current IO statistics without resetting counters
     ///
-    /// This returns the accumulated statistics and resets the counters.
-    pub fn io_stats(&self) -> crate::utils::tracking_store::IoStats {
+    /// Returns the current IO statistics without modifying the internal state.
+    /// Use this when you need to check stats without resetting them.
+    pub fn io_stats_snapshot(&self) -> crate::utils::tracking_store::IoStats {
+        self.io_tracker.stats()
+    }
+
+    /// Get incremental IO statistics since the last call to this method
+    ///
+    /// Returns the accumulated statistics since the last call and resets the
+    /// counters to zero. This is useful for tracking IO operations between
+    /// different stages of processing.
+    pub fn io_stats_incremental(&self) -> crate::utils::tracking_store::IoStats {
         self.io_tracker.incremental_stats()
     }
 

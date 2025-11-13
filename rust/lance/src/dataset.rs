@@ -2643,7 +2643,7 @@ mod tests {
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
     use lance_io::assert_io_eq;
-    use lance_io::utils::tracking_store::IOTracker;
+
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2922,7 +2922,7 @@ mod tests {
         .await
         .unwrap();
 
-        let _ = _original_ds.object_store().io_stats(); //reset
+        let _ = _original_ds.object_store().io_stats_incremental(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_session(session)
@@ -2934,7 +2934,7 @@ mod tests {
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        let io_stats = _dataset.object_store().io_stats();
+        let io_stats = _dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 2);
     }
 
@@ -8890,12 +8890,12 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let stats = read_ds2.object_store().io_stats(); // Reset
+        let stats = read_ds2.object_store().io_stats_incremental(); // Reset
         assert!(stats.read_bytes < 64 * 1024);
         // Because the manifest is so small, we should have opportunistically
         // cached the transaction in memory already.
         let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-        let stats = read_ds2.object_store().io_stats();
+        let stats = read_ds2.object_store().io_stats_incremental();
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(inline_tx, tx);
