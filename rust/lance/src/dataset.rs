@@ -2896,7 +2896,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_manifest_iops() {
-        // Need to use in-memory for accurate IOPS tracking.
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
