@@ -38,6 +38,7 @@ pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
+use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
 
@@ -125,7 +126,7 @@ pub struct ObjectStore {
     /// Number of times to retry a failed download
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
-    io_tracker: crate::utils::tracking_store::IOTracker,
+    io_tracker: IOTracker,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -354,7 +355,7 @@ impl ObjectStore {
             }
 
             // Always wrap with IO tracking
-            let io_tracker = crate::utils::tracking_store::IOTracker::default();
+            let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
@@ -463,7 +464,7 @@ impl ObjectStore {
     ///
     /// The IO tracker can be used to get statistics about read/write operations
     /// performed on this object store.
-    pub fn io_tracker(&self) -> &crate::utils::tracking_store::IOTracker {
+    pub fn io_tracker(&self) -> &IOTracker {
         &self.io_tracker
     }
 
@@ -471,7 +472,7 @@ impl ObjectStore {
     ///
     /// Returns the current IO statistics without modifying the internal state.
     /// Use this when you need to check stats without resetting them.
-    pub fn io_stats_snapshot(&self) -> crate::utils::tracking_store::IoStats {
+    pub fn io_stats_snapshot(&self) -> IoStats {
         self.io_tracker.stats()
     }
 
@@ -480,7 +481,7 @@ impl ObjectStore {
     /// Returns the accumulated statistics since the last call and resets the
     /// counters to zero. This is useful for tracking IO operations between
     /// different stages of processing.
-    pub fn io_stats_incremental(&self) -> crate::utils::tracking_store::IoStats {
+    pub fn io_stats_incremental(&self) -> IoStats {
         self.io_tracker.incremental_stats()
     }
 
@@ -807,7 +808,7 @@ impl ObjectStore {
         };
 
         // Always wrap with IO tracking
-        let io_tracker = crate::utils::tracking_store::IOTracker::default();
+        let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
         Self {
