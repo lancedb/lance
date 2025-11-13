@@ -321,6 +321,15 @@ impl std::fmt::Display for Operation {
     }
 }
 
+impl From<&Transaction> for lance_table::format::Transaction {
+    fn from(value: &Transaction) -> Self {
+        let pb_transaction: pb::Transaction = value.into();
+        Self {
+            inner: pb_transaction,
+        }
+    }
+}
+
 impl PartialEq for Operation {
     fn eq(&self, other: &Self) -> bool {
         // Many of the operations contain `Vec<T>` where the order of the
@@ -2186,7 +2195,11 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_stable_row_ids)?;
+            apply_feature_flags(
+                &mut manifest,
+                config.use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
