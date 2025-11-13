@@ -23,7 +23,7 @@ mod tests {
     use arrow_array::{Array, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field};
     use lance_core::Result;
-    use lance_file::v2::reader::{FileReader as V2Reader, FileReaderOptions};
+    use lance_file::reader::{FileReader as V2Reader, FileReaderOptions};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},

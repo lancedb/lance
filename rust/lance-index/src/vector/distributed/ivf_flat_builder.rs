@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
-use lance_file::v2::writer::{FileWriter as V2FileWriter, FileWriterOptions as V2WriterOptions};
+use lance_file::writer::{FileWriter as V2FileWriter, FileWriterOptions as V2WriterOptions};
 use lance_io::object_store::ObjectStore;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_linalg::distance::DistanceType;
@@ -213,7 +213,7 @@ async fn merge_ivf_flat_shards(
 ) -> Result<Path> {
     use arrow_array::Float32Array;
     use futures::TryStreamExt as _;
-    use lance_file::v2::reader::{FileReader as V2Reader, FileReaderOptions};
+    use lance_file::reader::{FileReader as V2Reader, FileReaderOptions};
     use lance_io::{
         scheduler::{ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
