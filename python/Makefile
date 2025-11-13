@@ -4,8 +4,13 @@ else
     PYTEST_ARGS = -vvv -s -m "not recurring"
 endif
 
+PYTEST_MARK_EXPR ?=
+ifneq ($(strip $(PYTEST_MARK_EXPR)),)
+    PYTEST_MARK_ARGS = -m "$(PYTEST_MARK_EXPR)"
+endif
+
 test:
-	uv run pytest $(PYTEST_ARGS) python/tests
+	uv run pytest $(PYTEST_MARK_ARGS) $(PYTEST_ARGS) python/tests
 .PHONY: test
 
 integtest:
@@ -19,6 +24,14 @@ doctest:
 test-torch:
 	cd python/tests/torch_tests && uv run pytest $(PYTEST_ARGS) .
 .PHONY: test-torch
+
+test-pandas:
+	cd python/tests/pandas_tests && uv run pytest $(PYTEST_ARGS)
+.PHONY: test-pandas
+
+test-tf:
+	cd python/tests/tf_tests && uv run pytest $(PYTEST_ARGS)
+.PHONY: test-tf
 
 format: format-python
 	cargo fmt

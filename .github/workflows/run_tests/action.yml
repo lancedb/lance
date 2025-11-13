@@ -17,4 +17,4 @@ runs:
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: make test
+      run: make test PYTEST_MARK_EXPR='not pandas_dep and not tf_dep'

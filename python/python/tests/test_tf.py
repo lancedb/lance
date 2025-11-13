@@ -7,24 +7,18 @@ import warnings
 import lance
 import ml_dtypes
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pytest
 from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
 from lance.fragment import LanceFragment
 
-pytest.skip("Skip tensorflow tests", allow_module_level=True)
+pytestmark = pytest.mark.tf_dep
 
-try:
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        import tensorflow as tf  # noqa: F401
-except ImportError:
-    pytest.skip(
-        "Tensorflow is not installed. Please install tensorflow to "
-        + "test lance.tf module.",
-        allow_module_level=True,
-    )
+pd = pytest.importorskip("pandas")
+
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    tf = pytest.importorskip("tensorflow")
 
 from lance.tf.data import (  # noqa: E402
     from_lance,

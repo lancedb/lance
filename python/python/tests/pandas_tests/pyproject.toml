@@ -1,0 +1,21 @@
+[project]
+name = "pylance-pandas-tests"
+version = "0.0.0"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "pylance[tests]",
+    "pandas",
+    "pillow",
+    "polars[pyarrow,pandas]",
+    "duckdb",
+    "datafusion>=50.1",
+    "ml_dtypes",
+    "datasets",
+    "psutil",
+]
+
+[tool.uv.sources]
+pylance = { path = "../../../" }
+
+[tool.pytest.ini_options]
+addopts = "-m pandas_dep"

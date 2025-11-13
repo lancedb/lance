@@ -49,18 +49,9 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "boto3",
-    "datasets",
-    "duckdb",
-    "ml_dtypes",
-    "pillow",
-    "pandas",
-    "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
-    # Only test tensorflow on linux for now, and Python < 3.13 until wheels exist.
-    "tensorflow; sys_platform == 'linux' and python_version < '3.13'",
     "tqdm",
-    "datafusion>=50.1",
     "ray[data]; python_version < '3.12'",
 ]
 dev = ["ruff==0.4.1", "pyright"]
@@ -101,6 +92,8 @@ markers = [
     "slow",
     "torch: tests which rely on pytorch being installed",
     "recurring: marks tests as recurring tests",
+    "pandas_dep: tests which require pandas/polars/duckdb/datafusion",
+    "tf_dep: tests which require tensorflow",
 ]
 filterwarnings = [
     'error::FutureWarning',

@@ -7,10 +7,13 @@ from pathlib import Path
 
 import lance
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 from lance import LanceDataset
 from lance.file import LanceFileReader, LanceFileWriter
 

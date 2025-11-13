@@ -5,10 +5,14 @@ import shutil
 
 import lance
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 from datafusion import SessionContext, col
 from lance import FFILanceTableProvider, LanceDataset
+import pytest
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 
 
 def normalize(batches: list[pa.RecordBatch]) -> pa.RecordBatch:

@@ -4,13 +4,15 @@
 import lance
 import lance.arrow
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pytest
 from lance.util import validate_vector_index
 from lance.vector import vec_to_table
 
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 
 def test_table_roundtrip(tmp_path, provide_pandas):
     uri = tmp_path

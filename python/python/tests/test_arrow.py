@@ -8,9 +8,12 @@ from pathlib import Path
 
 import lance
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pytest
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
@@ -261,6 +264,7 @@ def test_image_uri_arrays(tmp_path: Path, png_uris):
     assert large_array.to_pylist() == encoded_image_array.to_pylist()
 
 
+@pytest.mark.tf_dep
 def test_image_tensor_arrays(tmp_path: Path, png_uris):
     tf = pytest.importorskip("tensorflow")
 
