@@ -12,8 +12,10 @@ from pathlib import Path
 
 import lance
 import pandas as pd
+import pyarrow as pa
 import pytest
 from lance import DatasetBasePath
+from lance.fragment import write_fragments
 
 
 class TestMultiBase:
@@ -966,3 +968,127 @@ class TestAddBases:
         result = dataset.to_table().to_pandas()
         assert len(result) == 30
         assert set(result["id"]) == set(range(30))
+
+
+class TestWriteFragmentsWithTargetBases:
+    """Test write_fragments with target_bases parameter."""
+
+    def setup_method(self):
+        """Set up test directories for each test."""
+        self.test_dir = tempfile.mkdtemp()
+        self.test_id = str(uuid.uuid4())[:8]
+
+        # Create primary and additional path directories
+        self.primary_uri = str(Path(self.test_dir) / "primary")
+        self.base1_uri = str(Path(self.test_dir) / f"base1_{self.test_id}")
+        self.base2_uri = str(Path(self.test_dir) / f"base2_{self.test_id}")
+
+        # Create directories
+        for uri in [self.primary_uri, self.base1_uri, self.base2_uri]:
+            Path(uri).mkdir(parents=True, exist_ok=True)
+
+    def teardown_method(self):
+        """Clean up test directories after each test."""
+        if hasattr(self, "test_dir"):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_write_fragments_with_target_bases(self):
+        """Test write_fragments with target_bases parameter."""
+        # Create initial dataset with multiple bases
+        initial_data = pd.DataFrame(
+            {
+                "id": range(50),
+                "value": [f"initial_{i}" for i in range(50)],
+            }
+        )
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            max_rows_per_file=25,
+        )
+
+        # Verify initial data is written
+        assert len(dataset.to_table()) == 50
+
+        # Write fragments using write_fragments with target_bases
+        fragment_data = pd.DataFrame(
+            {
+                "id": range(50, 75),
+                "value": [f"fragment_{i}" for i in range(50, 75)],
+            }
+        )
+
+        # Use write_fragments with target_bases set to base2
+        fragments = write_fragments(
+            pa.Table.from_pandas(fragment_data),
+            dataset,
+            mode="append",
+            target_bases=["base2"],
+            max_rows_per_file=25,
+        )
+
+        # Fragments should be created
+        assert len(fragments) > 0
+
+        # Commit the fragments using dataset.commit
+        operation = lance.LanceOperation.Append(fragments)
+        dataset = lance.LanceDataset.commit(
+            dataset.uri, operation, read_version=dataset.version
+        )
+
+        # Verify all data is present
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 75
+        assert set(result["id"]) == set(range(75))
+
+        # Verify fragments are in the correct base
+        # Check that some fragments exist in base2
+        base2_path = Path(self.base2_uri)
+        data_files = list(base2_path.glob("**/*.lance"))
+        assert len(data_files) > 0, "Expected data files in base2"
+
+    def test_write_fragments_transaction_with_target_bases(self):
+        """Test write_fragments with return_transaction and target_bases."""
+        # Create initial dataset
+        initial_data = pd.DataFrame({"id": range(30), "value": range(30)})
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            max_rows_per_file=15,
+        )
+
+        # Use write_fragments with return_transaction=True and target_bases
+        new_data = pd.DataFrame({"id": range(30, 50), "value": range(30, 50)})
+
+        transaction = write_fragments(
+            pa.Table.from_pandas(new_data),
+            dataset,
+            mode="append",
+            return_transaction=True,
+            target_bases=["base2"],
+            max_rows_per_file=10,
+        )
+
+        # Commit the transaction
+        dataset = lance.LanceDataset.commit(
+            dataset.uri, transaction, read_version=dataset.version
+        )
+
+        # Verify data
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 50
+        assert set(result["id"]) == set(range(50))

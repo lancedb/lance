@@ -865,6 +865,7 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -883,6 +884,7 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -901,6 +903,7 @@ def write_fragments(
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
     enable_stable_row_ids: bool = False,
+    target_bases: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -954,6 +957,19 @@ def write_fragments(
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    target_bases : list of str, optional
+        References to base paths where data should be written. Can be
+        specified in all modes.
+
+        Each string is resolved by trying to match:
+        1. Base name (e.g., "primary", "archive") from registered bases
+        2. Base path URI (e.g., "s3://bucket1/data")
+
+        **CREATE mode**: References must match bases in `initial_bases`
+        (from dataset creation)
+        **APPEND/OVERWRITE modes**: References must match bases in the
+        existing manifest
+
     Returns
     -------
     List[FragmentMetadata] | Transaction
@@ -1002,6 +1018,7 @@ def write_fragments(
         data_storage_version=data_storage_version,
         storage_options=storage_options,
         enable_stable_row_ids=enable_stable_row_ids,
+        target_bases=target_bases,
     )
 
 
