@@ -370,38 +370,94 @@ fn vector_index_details() -> prost_types::Any {
 }
 
 struct IndexDescriptionImpl {
-    metadata: IndexMetadata,
+    name: String,
+    field_ids: Vec<u32>,
+    shards: Vec<IndexMetadata>,
+    index_type: String,
     details: IndexDetails,
     rows_indexed: u64,
 }
 
 impl IndexDescriptionImpl {
-    fn try_new(metadata: IndexMetadata, dataset: &Dataset) -> Result<Self> {
-        // This should not fail as we should have already filtered out indexes without index details.
-        let index_details = metadata.index_details.as_ref().ok_or(Error::Index {
+    fn try_new(shards: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
+        if shards.is_empty() {
+            return Err(Error::Index {
+                message: "Index metadata is empty".to_string(),
+                location: location!(),
+            });
+        }
+
+        // We assume the type URL and details are the same for all shards
+        let example_metadata = &shards[0];
+
+        let name = example_metadata.name.clone();
+        if !shards.iter().all(|shard| shard.name == name) {
+            return Err(Error::Index {
+                message: "Index name should be identical across all shards".to_string(),
+                location: location!(),
+            });
+        }
+
+        let field_ids = &example_metadata.fields;
+        if !shards.iter().all(|shard| shard.fields == *field_ids) {
+            return Err(Error::Index {
+                message: "Index fields should be identical across all shards".to_string(),
+                location: location!(),
+            });
+        }
+        let field_ids = field_ids.iter().map(|id| *id as u32).collect();
+
+        // This should not fail as we have already filtered out indexes without index details.
+        let index_details = example_metadata.index_details.as_ref().ok_or(Error::Index {
             message:
                 "Index details are required for index description.  This index must be retrained to support this method."
                     .to_string(),
             location: location!(),
         })?;
-        let fragment_bitmap = metadata
+        let type_url = &index_details.type_url;
+        if !shards.iter().all(|shard| {
+            shard
+                .index_details
+                .as_ref()
+                .map(|d| d.type_url == *type_url)
+                .unwrap_or(false)
+        }) {
+            return Err(Error::Index {
+                message: "Index type URL should be present and identical across all shards"
+                    .to_string(),
+                location: location!(),
+            });
+        }
+
+        let details = IndexDetails(index_details.clone());
+        let mut rows_indexed = 0;
+
+        let index_type = details
+            .get_plugin()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
+
+        for shard in &shards {
+            let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
             .ok_or_else(|| Error::Index {
                 message: "Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string(),
                 location: location!(),
             })?;
-        let details = IndexDetails(index_details.clone());
-        let mut rows_indexed = 0;
 
-        for fragment in dataset.get_fragments() {
-            if fragment_bitmap.contains(fragment.id() as u32) {
-                rows_indexed += fragment.fast_physical_rows()? as u64;
+            for fragment in dataset.get_fragments() {
+                if fragment_bitmap.contains(fragment.id() as u32) {
+                    rows_indexed += fragment.fast_physical_rows()? as u64;
+                }
             }
         }
 
         Ok(Self {
-            metadata,
+            name,
+            field_ids,
+            index_type,
+            shards,
             details,
             rows_indexed,
         })
@@ -409,8 +465,20 @@ impl IndexDescriptionImpl {
 }
 
 impl IndexDescription for IndexDescriptionImpl {
-    fn metadata(&self) -> &IndexMetadata {
-        &self.metadata
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn field_ids(&self) -> &[u32] {
+        &self.field_ids
+    }
+
+    fn index_type(&self) -> &str {
+        &self.index_type
+    }
+
+    fn metadata(&self) -> &[IndexMetadata] {
+        &self.shards
     }
 
     fn type_url(&self) -> &str {
@@ -540,7 +608,7 @@ impl DatasetIndexExt for Dataset {
         criteria: Option<IndexCriteria<'b>>,
     ) -> Result<Vec<Arc<dyn IndexDescription>>> {
         let indices = self.load_indices().await?;
-        let indices = if let Some(criteria) = criteria {
+        let mut indices = if let Some(criteria) = criteria {
             indices.iter().filter(|idx| {
                 if idx.index_details.is_none() {
                     log::warn!("The method describe_indexes does not support indexes without index details.  Please retrain the index {}", idx.name);
@@ -562,10 +630,15 @@ impl DatasetIndexExt for Dataset {
         } else {
             indices.iter().collect::<Vec<_>>()
         };
+        indices.sort_by_key(|idx| &idx.name);
+
         indices
             .into_iter()
-            .map(|idx| {
-                let desc = IndexDescriptionImpl::try_new(idx.clone(), self)?;
+            .chunk_by(|idx| &idx.name)
+            .into_iter()
+            .map(|(_, shards)| {
+                let shards = shards.cloned().collect::<Vec<_>>();
+                let desc = IndexDescriptionImpl::try_new(shards, self)?;
                 Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
             })
             .collect::<Result<Vec<_>>>()

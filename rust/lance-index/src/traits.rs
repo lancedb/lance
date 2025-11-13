@@ -60,22 +60,47 @@ impl<'a> IndexCriteria<'a> {
 pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
 
 /// Additional information about an index
+///
+/// Note that a single index might consist of multiple shards.  Each shard has its own
+/// UUID and collection of files and covers some subset of the data fragments.
+///
+/// All shards in an index should have the same index type and index details.
 pub trait IndexDescription: Send + Sync {
+    /// Returns the index name
+    ///
+    /// This is the user-defined name of the index.  It is shared by all shards of the index
+    /// and is what is used to refer to the index in the API.  It is guaranteed to be unique
+    /// within the dataset.
+    fn name(&self) -> &str;
+
     /// Returns the index metadata
     ///
-    /// This is the raw metadata information stored in the manifest.
-    fn metadata(&self) -> &IndexMetadata;
+    /// This is the raw metadata information stored in the manifest.  There is one
+    /// IndexMetadata for each shard of the index.
+    fn metadata(&self) -> &[IndexMetadata];
 
-    /// Returns the index type
+    /// Returns the index type URL
     ///
     /// This is extracted from the type url of the index details
     fn type_url(&self) -> &str;
 
-    /// Returns the number of rows indexed by the index
+    /// Returns the index type
+    ///
+    /// This is a short string identifier that is friendlier than the type URL but not
+    /// guaranteed to be unique.
+    ///
+    /// This is calculated by the plugin and will be "Unknown" if no plugin could be found
+    /// for the type URL.
+    fn index_type(&self) -> &str;
+
+    /// Returns the number of rows indexed by the index, across all shards.
     ///
     /// This is an approximate count and may include rows that have been
     /// deleted.
     fn rows_indexed(&self) -> u64;
+
+    /// Returns the ids of the fields that the index is built on.
+    fn field_ids(&self) -> &[u32];
 
     /// Returns a JSON string representation of the index details
     ///

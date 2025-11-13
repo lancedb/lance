@@ -105,6 +105,10 @@ impl TrainingRequest for InvertedIndexTrainingRequest {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn name(&self) -> &str {
+        "Inverted"
+    }
+
     fn new_training_request(
         &self,
         params: &str,

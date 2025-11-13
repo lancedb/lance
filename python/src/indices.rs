@@ -465,56 +465,77 @@ pub fn load_shuffled_vectors(
     )?
 }
 
-#[pyclass(name = "IndexDescription", module = "lance.indices", get_all)]
-pub struct PyIndexDescription {
+#[pyclass(name = "IndexShardDescription", module = "lance.indices", get_all)]
+#[derive(Clone)]
+pub struct PyIndexShardDescription {
     pub uuid: String,
-    pub name: String,
-    pub fields: Vec<i32>,
-    pub field_names: Vec<String>,
     pub dataset_version: u64,
     pub fragment_ids: Vec<u32>,
     pub index_version: i32,
     pub created_at: Option<DateTime<Utc>>,
+}
+
+impl PyIndexShardDescription {
+    pub fn __repr__(&self) -> String {
+        format!("IndexShardDescription(uuid={}, dataset_version={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version, self.fragment_ids, self.index_version, self.created_at)
+    }
+}
+
+#[pyclass(name = "IndexDescription", module = "lance.indices", get_all)]
+pub struct PyIndexDescription {
+    pub name: String,
     pub type_url: String,
+    pub index_type: String,
+    pub fields: Vec<u32>,
+    pub field_names: Vec<String>,
     pub num_rows_indexed: u64,
     pub details: String,
+    pub shards: Vec<PyIndexShardDescription>,
 }
 
 impl PyIndexDescription {
     pub fn new(index: &dyn IndexDescription, dataset: &LanceDataset) -> Self {
         let field_names = index
-            .metadata()
-            .fields
+            .field_ids()
             .iter()
             .map(|field| {
                 dataset
                     .schema()
-                    .field_by_id(*field)
+                    .field_by_id(*field as i32)
                     .map(|f| f.name.clone())
                     .unwrap_or("<unknown>".to_string())
             })
             .collect();
 
-        let fragment_ids = index
+        let shards = index
             .metadata()
-            .fragment_bitmap
-            .as_ref()
-            .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .iter()
+            .map(|shard| {
+                let fragment_ids = shard
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                PyIndexShardDescription {
+                    uuid: shard.uuid.to_string(),
+                    dataset_version: shard.dataset_version,
+                    fragment_ids,
+                    index_version: shard.index_version,
+                    created_at: shard.created_at,
+                }
+            })
+            .collect();
 
         let details = index
             .details()
             .unwrap_or_else(|_| "<unknown-index-details>".to_string());
 
         Self {
-            uuid: index.metadata().uuid.to_string(),
-            name: index.metadata().name.to_string(),
-            fields: index.metadata().fields.clone(),
+            name: index.name().to_string(),
+            fields: index.field_ids().to_vec(),
             field_names,
-            dataset_version: index.metadata().dataset_version,
-            fragment_ids,
-            index_version: index.metadata().index_version,
-            created_at: index.metadata().created_at,
+            index_type: index.index_type().to_string(),
+            shards,
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
             details,
@@ -525,14 +546,7 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        let created_at = self
-            .created_at
-            .map(|dt| dt.to_string())
-            .unwrap_or("unknown".to_string());
-        format!(
-            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fragment_ids={:?}, fields={:?}, field_names={:?}, dataset_version={}, index_version={}, created_at={})",
-            self.name, self.type_url, self.num_rows_indexed, self.fragment_ids, self.fields, self.field_names, self.dataset_version, self.index_version, created_at
-        )
+        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_shards={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.shards.len())
     }
 }
 

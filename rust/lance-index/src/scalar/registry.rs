@@ -116,6 +116,16 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex>;
 
+    /// A short name for the index
+    ///
+    /// This is a friendly name for display purposes and also can be used as an alias for
+    /// the index type URL.  If multiple plugins have the same name, then the first one
+    /// found will be used.
+    ///
+    /// By convention this is MixedCase with no spaces.  When used as an alias, it will be
+    /// compared case-insensitively.
+    fn name(&self) -> &str;
+
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
