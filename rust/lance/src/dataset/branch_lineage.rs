@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use crate::dataset::refs::{normalize_branch, BranchContents};
 use lance_core::Error;
 use lance_core::Result;
