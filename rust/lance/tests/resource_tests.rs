@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// If NEXTEST_RUN_ID is set, or --test-threads=1 is passed, then we are running in single-threaded mode.
-// Otherwise, we should skip these tests to avoid interference.
-
-use std::sync::LazyLock;
-
 #[test]
 fn test_settings() {
     let can_run = std::env::var("NEXTEST_RUN_ID").is_ok()
@@ -15,7 +10,7 @@ fn test_settings() {
     assert!(
         can_run,
         "Memory tests require single-threaded execution. \
-            Please run with `-- --test-threads=1` or use `cargo nextest`."
+            Please run with `CARGO_TEST_THREADS=1` or use `cargo nextest`."
     );
 }
 
