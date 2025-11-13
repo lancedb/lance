@@ -1,5 +1,10 @@
 Tests for memory and IO usage.
 
+> [!IMPORTANT]
+> These tests cannot be run with multi-threading. If using `cargo test`, then
+> you must pass `-- --test-threads=1` to disable multi-threading. To run tests,
+> in parallel, you can use `cargo nextest`, which runs each test in its own process.
+
 ## Debugging memory usage
 
 Once you've identified a test that is using too much memory, you can use
