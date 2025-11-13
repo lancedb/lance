@@ -207,6 +207,45 @@ jobs:
       - uses: ./.github/workflows/run_tests
         with:
           python-minor-version: "13"
+  torch:
+    name: Python Torch Tests (3.11 Linux)
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 45
+    needs: linux
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync torch environment
+        run: |
+          uv sync --frozen --package pylance-torch-tests
+      - name: Run torch tests
+        run: make test-torch
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM

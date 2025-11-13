@@ -1,0 +1,18 @@
+[project]
+name = "pylance-torch-tests"
+description = "Torch-specific test harness for pylance"
+version = "0.0.0"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "pylance[tests]",
+    "torch",
+    "numpy<2",
+]
+
+[tool.uv.sources]
+pylance = { workspace = true }
+torch = { index = "torch-cpu" }
+
+[[tool.uv.index]]
+name = "torch-cpu"
+url = "https://download.pytorch.org/whl/cpu"

@@ -42,8 +42,8 @@ classifiers = [
 [tool.maturin]
 python-source = "python"
 
-[tool.uv]
-extra-index-url = ["https://download.pytorch.org/whl/cpu"]
+[tool.uv.workspace]
+members = [".", "python/tests/torch_tests"]
 
 [build-system]
 requires = ["maturin>=1.4"]
@@ -64,7 +64,6 @@ tests = [
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
     "datafusion>=50.1",
-    "torch; python_version < '3.13'",
     "ray[data]; python_version < '3.12'",
 ]
 dev = ["ruff==0.4.1", "pyright"]
