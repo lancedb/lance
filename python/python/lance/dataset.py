@@ -42,6 +42,7 @@ from lance.log import LOGGER
 from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
+    _check_for_torch,
     torch,
 )
 from .dependencies import numpy as np
@@ -2546,7 +2547,7 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         # distributed indexing parameters
         fragment_ids: Optional[List[int]] = None,
-        fragment_uuid: Optional[str] = None,
+        index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
         **kwargs,
@@ -2624,7 +2625,7 @@ class LanceDataset(pa.dataset.Dataset):
             method creates temporary index metadata but does not commit the index
             to the dataset. The index can be committed later using
             merge_index_metadata(index_uuid, "VECTOR", column=..., index_name=...).
-        fragment_uuid : str, optional
+        index_uuid : str, optional
             A UUID to use for fragment-level distributed indexing. Multiple
             fragment-level indices need to share UUID for later merging.
             If not provided, a new UUID will be generated.
@@ -2795,6 +2796,34 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+
+        # Early detection and gating: Torch detected ⇒ enforce single-node
+        # & skip distributed keys. Also normalize index_file_version for
+        # downstream accelerator behavior.
+        idx_ver_obj = kwargs.get("index_file_version")
+        idx_ver_str = None
+        try:
+            if isinstance(idx_ver_obj, str):
+                idx_ver_str = idx_ver_obj
+            elif hasattr(idx_ver_obj, "value"):
+                idx_ver_str = str(idx_ver_obj.value)
+            elif hasattr(idx_ver_obj, "name"):
+                idx_ver_str = str(idx_ver_obj.name)
+            else:
+                idx_ver_str = str(idx_ver_obj)
+        except Exception:
+            idx_ver_str = None
+        # NOTE: Do not pass any distributed-related params when torch is involved
+        torch_detected_early = accelerator is not None
+        if torch_detected_early:
+            if fragment_ids is not None or index_uuid is not None:
+                LOGGER.info(
+                    "Torch detected (early); enforce single-node indexing "
+                    "(distributed is CPU-only)."
+                )
+            fragment_ids = None
+            index_uuid = None
+
         if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
@@ -2843,10 +2872,21 @@ class LanceDataset(pa.dataset.Dataset):
             )
             LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
 
-            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                shuffle_output_dir, "data"
-            )
+            # IMPORTANT: For V3 index file version, avoid passing precomputed
+            # PQ shuffle buffers to prevent PQ codebook mismatch (Rust retrains
+            # quantizer and ignores provided codebook).
+            ver = (idx_ver_str or "V3").upper()
+            if ver == "LEGACY":
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
+            else:
+                LOGGER.info(
+                    "IndexFileVersion=%s detected; skip precomputed shuffle "
+                    "buffers to stabilize IVF_PQ",
+                    ver,
+                )
         if index_type.startswith("IVF"):
             if (ivf_centroids is not None) and (ivf_centroids_file is not None):
                 raise ValueError(
@@ -2941,8 +2981,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
 
-            if pq_codebook is not None:
-                # User provided IVF centroids
+            # Only attach PQ codebook for LEGACY format; V3 retrains PQ and
+            # ignores user codebook.
+            ver = (idx_ver_str or "V3").upper()
+            if pq_codebook is not None and ver == "LEGACY":
+                # User provided PQ codebook
                 if _check_for_numpy(pq_codebook) and isinstance(
                     pq_codebook, np.ndarray
                 ):
@@ -2968,18 +3011,56 @@ class LanceDataset(pa.dataset.Dataset):
                     [pq_codebook], ["_pq_codebook"]
                 )
                 kwargs["pq_codebook"] = pq_codebook_batch
+            elif pq_codebook is not None:
+                LOGGER.info(
+                    "IndexFileVersion=%s detected; skip passing pq_codebook "
+                    "to avoid mismatch",
+                    ver,
+                )
 
         if shuffle_partition_batches is not None:
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        # Add fragment_ids and fragment_uuid to kwargs if provided for
+        # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
+        # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
+        # accelerator or torch-related path is detected.
+        torch_detected = False
+        try:
+            if accelerator is not None:
+                torch_detected = True
+            else:
+                impl = kwargs.get("implementation")
+                use_torch_flag = kwargs.get("use_torch") is True
+                one_pass_flag = kwargs.get("one_pass_ivfpq") is True
+                torch_centroids = _check_for_torch(ivf_centroids)
+                torch_codebook = _check_for_torch(pq_codebook)
+                if (
+                    (isinstance(impl, str) and impl.lower() == "torch")
+                    or use_torch_flag
+                    or one_pass_flag
+                    or torch_centroids
+                    or torch_codebook
+                ):
+                    torch_detected = True
+        except Exception:
+            # Be conservative: if detection fails, do not modify behavior
+            pass
+
+        if torch_detected:
+            if fragment_ids is not None or index_uuid is not None:
+                LOGGER.info(
+                    "Torch detected; "
+                    "enforce single-node indexing (distributed is CPU-only)."
+                )
+            fragment_ids = None
+            index_uuid = None
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
-        if fragment_uuid is not None:
-            kwargs["fragment_uuid"] = fragment_uuid
+        if index_uuid is not None:
+            kwargs["index_uuid"] = index_uuid
 
         timers["final_create_index:start"] = time.time()
         self._ds.create_index(

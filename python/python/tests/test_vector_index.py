@@ -1818,7 +1818,7 @@ def build_distributed_vector_index(
 
     Steps:
     - Partition fragments into `world` groups
-    - For each group, call create_index with fragment_ids and a shared fragment_uuid
+    - For each group, call create_index with fragment_ids and a shared index_uuid
     - Merge metadata (commit index manifest)
 
     Returns the dataset (post-merge) for querying.
@@ -1837,7 +1837,7 @@ def build_distributed_vector_index(
             column=column,
             index_type=index_type,
             fragment_ids=g,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=num_partitions,
             num_sub_vectors=num_sub_vectors,
             **index_params,
@@ -2122,7 +2122,7 @@ def test_distributed_api_basic_success(tmp_path):
         column="vector",
         index_type="IVF_PQ",
         fragment_ids=fragment_ids,
-        fragment_uuid=shared_uuid,
+        index_uuid=shared_uuid,
         num_partitions=8,
         num_sub_vectors=16,
     )
@@ -2152,7 +2152,7 @@ def test_fragment_allocations_divisibility_error(tmp_path, case_name, selector):
             column="vector",
             index_type="IVF_PQ",
             fragment_ids=fragment_ids,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=5,
             num_sub_vectors=96,
         )
@@ -2172,7 +2172,7 @@ def test_metadata_merge_pq_success(tmp_path):
             column="vector",
             index_type="IVF_PQ",
             fragment_ids=node1,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=8,
             num_sub_vectors=16,
             ivf_centroids=centroids,
@@ -2181,7 +2181,7 @@ def test_metadata_merge_pq_success(tmp_path):
             column="vector",
             index_type="IVF_PQ",
             fragment_ids=node2,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=8,
             num_sub_vectors=16,
             ivf_centroids=centroids,
@@ -2204,7 +2204,7 @@ def test_invalid_column_name_precise(tmp_path):
             column="nonexistent_column",
             index_type="IVF_PQ",
             fragment_ids=[ds.get_fragments()[0].fragment_id],
-            fragment_uuid=str(uuid.uuid4()),
+            index_uuid=str(uuid.uuid4()),
         )
 
 
@@ -2256,7 +2256,7 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             column="vector",
             index_type="IVF_PQ",
             fragment_ids=node1,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=4,
             num_sub_vectors=4,
             ivf_centroids=centroids,
@@ -2265,7 +2265,7 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             column="vector",
             index_type="IVF_PQ",
             fragment_ids=node2,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=4,
             num_sub_vectors=4,
             ivf_centroids=centroids,
@@ -2292,7 +2292,7 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         column="vector",
         index_type="IVF_FLAT",
         fragment_ids=shard1,
-        fragment_uuid=shared_uuid,
+        index_uuid=shared_uuid,
         num_partitions=4,
         num_sub_vectors=128,
     )
@@ -2300,7 +2300,7 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         column="vector",
         index_type="IVF_FLAT",
         fragment_ids=shard2,
-        fragment_uuid=shared_uuid,
+        index_uuid=shared_uuid,
         num_partitions=4,
         num_sub_vectors=128,
     )
@@ -2324,7 +2324,7 @@ def test_distributed_ivf_hnsw_pq_success(tmp_path):
             column="vector",
             index_type="IVF_HNSW_PQ",
             fragment_ids=node1,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=4,
             num_sub_vectors=4,
             ivf_centroids=centroids,
@@ -2333,7 +2333,7 @@ def test_distributed_ivf_hnsw_pq_success(tmp_path):
             column="vector",
             index_type="IVF_HNSW_PQ",
             fragment_ids=node2,
-            fragment_uuid=shared_uuid,
+            index_uuid=shared_uuid,
             num_partitions=4,
             num_sub_vectors=4,
             ivf_centroids=centroids,
@@ -2361,7 +2361,7 @@ def test_distributed_ivf_hnsw_flat_success(tmp_path):
         column="vector",
         index_type="IVF_HNSW_FLAT",
         fragment_ids=node1,
-        fragment_uuid=shared_uuid,
+        index_uuid=shared_uuid,
         num_partitions=4,
         num_sub_vectors=128,
     )
@@ -2369,7 +2369,7 @@ def test_distributed_ivf_hnsw_flat_success(tmp_path):
         column="vector",
         index_type="IVF_HNSW_FLAT",
         fragment_ids=node2,
-        fragment_uuid=shared_uuid,
+        index_uuid=shared_uuid,
         num_partitions=4,
         num_sub_vectors=128,
     )
