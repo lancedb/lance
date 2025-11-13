@@ -268,7 +268,7 @@ impl Default for WriteParams {
             enable_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             session: None,
-            auto_cleanup: None,
+            auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
             initial_bases: None,
