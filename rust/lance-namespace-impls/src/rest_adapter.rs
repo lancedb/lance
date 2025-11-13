@@ -150,6 +150,17 @@ fn error_to_response(err: Error) -> Response {
                     })),
                 )
                     .into_response()
+            } else if error_msg.contains("already exists") {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": error_msg,
+                            "type": "TableAlreadyExistsException"
+                        }
+                    })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::BAD_REQUEST,
