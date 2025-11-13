@@ -4013,14 +4013,14 @@ def test_describe_indexes(tmp_path):
         {
             "id": range(100),
             "text": [f"document {i} about lance database" for i in range(100)],
-            "btree": range(100),
             "bitmap": range(100),
-            "ngram": [f"document {i}" for i in range(100)],
-            "zonemap": range(100),
             "bloomfilter": range(100),
+            "btree": range(100),
             "json": pa.array(
                 [json.dumps({"key": f"value_{i}"}) for i in range(100)], pa.json_()
             ),
+            "ngram": [f"document {i}" for i in range(100)],
+            "zonemap": range(100),
         }
     )
     ds = lance.write_dataset(data, tmp_path)
@@ -4030,14 +4030,17 @@ def test_describe_indexes(tmp_path):
 
     assert indices[0].name == "text_idx"
     assert indices[0].type_url == "/lance.table.InvertedIndexDetails"
+    assert indices[0].index_type == "Inverted"
     assert indices[0].num_rows_indexed == 100
-    assert indices[0].fragment_ids == [0]
     assert indices[0].fields == [1]
     assert indices[0].field_names == ["text"]
-    assert indices[0].dataset_version == 1
-    assert indices[0].index_version == 1
-    assert indices[0].created_at is not None
-    assert isinstance(indices[0].created_at, datetime)
+    assert len(indices[0].shards) == 1
+    assert indices[0].shards[0].uuid is not None
+    assert indices[0].shards[0].fragment_ids == [0]
+    assert indices[0].shards[0].dataset_version == 1
+    assert indices[0].shards[0].index_version == 1
+    assert indices[0].shards[0].created_at is not None
+    assert isinstance(indices[0].shards[0].created_at, datetime)
 
     details = indices[0].details
     assert details is not None and len(details) > 0
@@ -4056,45 +4059,67 @@ def test_describe_indexes(tmp_path):
     assert details["max_ngram_length"] == 3
     assert not details["prefix_only"]
 
-    ds.create_scalar_index("btree", index_type="BTREE")
     ds.create_scalar_index("bitmap", index_type="BITMAP")
-    ds.create_scalar_index("ngram", index_type="NGRAM")
-    ds.create_scalar_index("zonemap", index_type="ZONEMAP")
     ds.create_scalar_index("bloomfilter", index_type="BLOOMFILTER")
+    ds.create_scalar_index("btree", index_type="BTREE")
     ds.create_scalar_index(
         "json",
         IndexConfig(
             index_type="json", parameters={"target_index_type": "btree", "path": "x"}
         ),
     )
-    indices = ds.describe_indexes()
+    ds.create_scalar_index("ngram", index_type="NGRAM")
+    ds.create_scalar_index("zonemap", index_type="ZONEMAP")
 
-    names = [f"{col}_idx" for col in data.column_names[2:]]
-    types = [
-        "/lance.table.BTreeIndexDetails",
+    indices = ds.describe_indexes()
+    # Skip text index since it is already asserted above
+    indices = [index for index in indices if index.name != "text_idx"]
+    indices.sort(key=lambda x: x.name)
+
+    names = [
+        "bitmap_idx",
+        "bloomfilter_idx",
+        "btree_idx",
+        "json_idx",
+        "ngram_idx",
+        "zonemap_idx",
+    ]
+    types_urls = [
         "/lance.table.BitmapIndexDetails",
+        "/lance.index.pb.BloomFilterIndexDetails",
+        "/lance.table.BTreeIndexDetails",
+        "/lance.index.pb.JsonIndexDetails",
         "/lance.table.NGramIndexDetails",
         "/lance.table.ZoneMapIndexDetails",
-        "/lance.index.pb.BloomFilterIndexDetails",
-        "/lance.index.pb.JsonIndexDetails",
+    ]
+    index_types = [
+        "Bitmap",
+        "BloomFilter",
+        "BTree",
+        "Json",
+        "NGram",
+        "ZoneMap",
     ]
     details = [
         "{}",
         "{}",
         "{}",
-        "{}",
-        "{}",
         '{"path":"x","target_details":"{}"}',
+        "{}",
+        "{}",
     ]
 
-    for i in range(len(indices) - 1):
-        idx_pos = i + 1  # Skip over inverted since we already tested it
-        assert indices[idx_pos].name == names[i]
-        assert indices[idx_pos].type_url == types[i]
-        assert indices[idx_pos].num_rows_indexed == 100
-        assert indices[idx_pos].fragment_ids == [0]
-        assert indices[idx_pos].fields == [i + 2]
-        assert indices[idx_pos].field_names == [data.column_names[i + 2]]
-        assert indices[idx_pos].dataset_version == i + 2
-        assert indices[idx_pos].index_version == 0
-        assert indices[idx_pos].details == details[i]
+    for i in range(len(indices)):
+        assert indices[i].name == names[i]
+        assert indices[i].type_url == types_urls[i]
+        assert indices[i].index_type == index_types[i]
+        assert indices[i].num_rows_indexed == 100
+        assert indices[i].fields == [i + 2]
+        assert indices[i].field_names == [data.column_names[i + 2]]
+        assert len(indices[i].shards) == 1
+        assert indices[i].shards[0].fragment_ids == [0]
+        assert indices[i].shards[0].dataset_version == i + 2
+        assert indices[i].shards[0].index_version == 0
+        assert indices[i].shards[0].created_at is not None
+        assert isinstance(indices[i].shards[0].created_at, datetime)
+        assert indices[i].details == details[i]

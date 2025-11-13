@@ -695,6 +695,10 @@ impl BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn name(&self) -> &str {
+        "Bitmap"
+    }
+
     fn new_training_request(
         &self,
         _params: &str,

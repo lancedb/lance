@@ -707,6 +707,10 @@ impl JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn name(&self) -> &str {
+        "Json"
+    }
+
     fn new_training_request(
         &self,
         params: &str,

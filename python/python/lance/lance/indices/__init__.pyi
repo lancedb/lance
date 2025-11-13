@@ -51,15 +51,23 @@ def transform_vectors(
     dst_uri: str,
 ): ...
 
-class IndexDescription:
+class IndexShardDescription:
     uuid: str
-    name: str
-    fields: list[int]
-    field_names: list[str]
     dataset_version: int
     fragment_ids: list[int]
     index_version: int
     created_at: Optional[datetime]
+
+    def __repr__(self) -> str: ...
+
+class IndexDescription:
+    name: str
     type_url: str
+    index_type: str
     num_rows_indexed: int
+    fields: list[int]
+    field_names: list[str]
+    shards: list[IndexShardDescription]
     details: str
+
+    def __repr__(self) -> str: ...
