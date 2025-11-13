@@ -1464,7 +1464,7 @@ class LanceDataset(pa.dataset.Dataset):
             [self._ds.take(indices, columns, columns_with_transform)]
         )
 
-    def _take_rows(
+    def take_rows(
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -1496,6 +1496,18 @@ class LanceDataset(pa.dataset.Dataset):
         return pa.Table.from_batches(
             [self._ds.take_rows(row_ids, columns, columns_with_transform)]
         )
+
+    def _take_rows(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        **kargs,
+    ) -> pa.Table:
+        warnings.warn(
+            "The `_take_rows` method is deprecated. Use the `take_rows` method instead",
+            DeprecationWarning,
+        )
+        return self.take_rows(row_ids, columns, **kargs)
 
     def take_blobs(
         self,

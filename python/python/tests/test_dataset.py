@@ -665,7 +665,7 @@ def test_take_with_projection(tmp_path: Path):
 
     assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
 
-    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    table3 = dataset.take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
     assert table3 == table2
 
 
@@ -3360,7 +3360,7 @@ def test_scan_with_row_ids(tmp_path: Path):
     row_ids = tbl["_rowid"].to_pylist()
     assert row_ids == list(range(0, 250, 10)) + list(range(2**32, 2**32 + 250, 10))
 
-    tbl2 = ds._take_rows(row_ids)
+    tbl2 = ds.take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]
 
 
