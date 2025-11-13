@@ -116,7 +116,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
     type Error = Error;
 
     fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
-        let defaults = InvertedIndexParams::default();
+        let defaults = Self::default();
         Ok(Self {
             lance_tokenizer: defaults.lance_tokenizer,
             base_tokenizer: details
