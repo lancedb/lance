@@ -12,34 +12,57 @@ import inspect
 import json
 import subprocess
 import sys
+import urllib.request
 from functools import lru_cache
+from typing import List
 
 import pytest
+from packaging.version import Version
 
 
 @lru_cache(maxsize=1)
-def last_stable_release():
-    """Returns the latest stable version available on PyPI.
-
-    Queries the PyPI JSON API to get the latest stable release of pylance.
-    Results are cached to avoid repeated network calls.
-    """
+def pylance_stable_versions() -> List[Version]:
+    """Fetches and returns a sorted list of stable pylance versions from PyPI."""
     try:
-        import urllib.request
-
         with urllib.request.urlopen(
             "https://pypi.org/pypi/pylance/json", timeout=5
         ) as response:
             data = json.loads(response.read())
-            version = data["info"]["version"]
-            return version
+            releases = data["releases"].keys()
+            stable_versions = [
+                Version(v)
+                for v in releases
+                if not any(c in v for c in ["a", "b", "rc"])
+            ]
+            stable_versions.sort()
+            return stable_versions
     except Exception as e:
-        # If we can't fetch, return None which will be filtered out
         print(
-            f"Warning: Could not fetch latest stable release from PyPI: {e}",
+            f"Warning: Could not fetch pylance versions from PyPI: {e}",
             file=sys.stderr,
         )
-        return None
+        return []
+
+
+def recent_major_versions(n: int) -> List[str]:
+    """Returns the n most recent major versions of pylance as strings."""
+    stable_versions = pylance_stable_versions()
+    major_versions = []
+    seen_majors = set()
+
+    def key(v: Version):
+        # On 0.x versions, we bumped minor version for breaking changes.
+        if v.major == 0:
+            return (0, v.minor)
+        return v.major
+
+    for v in reversed(stable_versions):
+        if key(v) not in seen_majors:
+            seen_majors.add(key(v))
+            major_versions.append(str(v))
+        if len(major_versions) >= n:
+            break
+    return major_versions
 
 
 @lru_cache(maxsize=1)
@@ -98,9 +121,10 @@ def last_beta_release():
         return None
 
 
-# Fetch versions (cached)
-LAST_STABLE_RELEASE = last_stable_release()
+VERSIONS = recent_major_versions(3)
 LAST_BETA_RELEASE = last_beta_release()
+if LAST_BETA_RELEASE is not None:
+    VERSIONS.append(LAST_BETA_RELEASE)
 
 
 class UpgradeDowngradeTest:
@@ -122,15 +146,7 @@ class UpgradeDowngradeTest:
         pass
 
 
-# Default versions to test, filtering out any that couldn't be fetched
-VERSIONS = [
-    v
-    for v in ["0.16.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
-    if v is not None
-]
-
-
-def compat_test(versions=None):
+def compat_test(min_version: str = "0.16.0"):
     """Decorator to generate upgrade/downgrade compatibility tests.
 
     This decorator transforms a test class into two parameterized pytest test functions:
@@ -173,19 +189,8 @@ def compat_test(versions=None):
             # Write data
             pass
     """
-    if versions is None:
-        versions = VERSIONS
-
-    # Filter out None values (in case some versions couldn't be fetched)
-    versions = [v for v in versions if v is not None]
-
-    # Skip if no valid versions
-    if not versions:
-
-        def decorator(cls):
-            return cls
-
-        return decorator
+    version = set([min_version, *VERSIONS])
+    versions = [v for v in version if Version(v) >= Version(min_version)]
 
     def decorator(cls):
         # Extract existing parametrize marks from the class

@@ -16,22 +16,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from .compat_decorator import (
-    LAST_BETA_RELEASE,
-    LAST_STABLE_RELEASE,
     UpgradeDowngradeTest,
     compat_test,
 )
 
 
-@compat_test(
-    versions=[
-        "0.29.1.beta2",
-        "0.30.0",
-        "0.36.0",
-        LAST_STABLE_RELEASE,
-        LAST_BETA_RELEASE,
-    ]
-)
+@compat_test(min_version="0.29.1.beta2")
 class PqVectorIndex(UpgradeDowngradeTest):
     """Test PQ (Product Quantization) vector index compatibility."""
 
@@ -92,13 +82,7 @@ class PqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(
-    versions=[
-        "0.39.0",
-        LAST_STABLE_RELEASE,
-        LAST_BETA_RELEASE,
-    ]
-)
+@compat_test(min_version="0.39.0")
 class HnswPqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_HNSW_PQ vector index compatibility.
 
@@ -163,13 +147,7 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(
-    versions=[
-        "0.39.0",
-        LAST_STABLE_RELEASE,
-        LAST_BETA_RELEASE,
-    ]
-)
+@compat_test(min_version="0.39.0")
 class HnswSqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_HNSW_SQ vector index compatibility.
 

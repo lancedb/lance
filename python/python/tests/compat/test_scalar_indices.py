@@ -16,16 +16,17 @@ import lance
 import pyarrow as pa
 
 from .compat_decorator import (
-    LAST_BETA_RELEASE,
-    LAST_STABLE_RELEASE,
     UpgradeDowngradeTest,
     compat_test,
 )
 
 
-@compat_test(versions=["0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.30.0")
 class BTreeIndex(UpgradeDowngradeTest):
-    """Test BTREE scalar index compatibility (introduced in 0.20.0)."""
+    """Test BTREE scalar index compatibility (introduced in 0.20.0).
+
+    Started fully working in 0.30.0 with various fixes.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -71,11 +72,12 @@ class BTreeIndex(UpgradeDowngradeTest):
         assert table.num_rows >= 1
 
 
-@compat_test(
-    versions=["0.22.0", "0.30.0", "0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE]
-)
+@compat_test(min_version="0.22.0")
 class BitmapLabelListIndex(UpgradeDowngradeTest):
-    """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0)."""
+    """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0).
+
+    Started fully working in 0.22.0 with fixes to LABEL_LIST index.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -123,7 +125,7 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.36.0")
 class NgramIndex(UpgradeDowngradeTest):
     """Test NGRAM index compatibility (introduced in 0.36.0)."""
 
@@ -167,7 +169,7 @@ class NgramIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.36.0")
 class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
     """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""
 
@@ -217,7 +219,7 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.36.0")
 class JsonIndex(UpgradeDowngradeTest):
     """Test JSON index compatibility (introduced in 0.36.0)."""
 
@@ -268,7 +270,7 @@ class JsonIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(versions=["0.36.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.36.0")
 class FtsIndex(UpgradeDowngradeTest):
     """Test FTS (full-text search) index compatibility (introduced in 0.36.0)."""
 

@@ -15,8 +15,6 @@ import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 from .compat_decorator import (
-    LAST_BETA_RELEASE,
-    LAST_STABLE_RELEASE,
     UpgradeDowngradeTest,
     compat_test,
 )
@@ -25,7 +23,7 @@ from .util import build_basic_types, build_large
 
 # We start testing against the first release where 2.1 was stable. Before that
 # the format was unstable so the readers will panic.
-@compat_test(versions=["0.38.0", LAST_STABLE_RELEASE, LAST_BETA_RELEASE])
+@compat_test(min_version="0.38.0")
 class BasicTypes2_1(UpgradeDowngradeTest):
     """Test file format 2.1 compatibility with basic data types."""
 
@@ -50,7 +48,7 @@ class BasicTypes2_1(UpgradeDowngradeTest):
             writer.write_batch(build_basic_types())
 
 
-@compat_test()
+@compat_test(min_version="0.16.0")
 @pytest.mark.parametrize(
     "data_factory,name",
     [
@@ -92,7 +90,7 @@ class FileCompat(UpgradeDowngradeTest):
             writer.write_batch(batch)
 
 
-@compat_test()
+@compat_test(min_version="0.16.0")
 class BasicTypesLegacy(UpgradeDowngradeTest):
     """Test legacy data storage version 0.1 compatibility."""
 
