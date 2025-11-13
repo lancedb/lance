@@ -18,14 +18,17 @@ from unittest import mock
 import lance
 import lance.fragment
 import numpy as np
-import pandas as pd
-import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
+tm = pytest.importorskip("pandas.testing")
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError

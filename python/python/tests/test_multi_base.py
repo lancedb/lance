@@ -11,9 +11,12 @@ import uuid
 from pathlib import Path
 
 import lance
-import pandas as pd
 import pytest
 from lance import DatasetBasePath
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 
 
 class TestMultiBase:

@@ -9,6 +9,8 @@ jobs:
   run:
     timeout-minutes: 45
     runs-on: warp-ubuntu-latest-x64-8x
+    env:
+      UV_PYTHON: "3.11"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,6 +19,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Install Build Requirements
         run: |
@@ -49,16 +56,12 @@ jobs:
       - name: Build Lance
         working-directory: ./python
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pyarrow maturin
-          maturin develop --release
+          uv sync --frozen --extra tests
 
       - name: Test Lance File Write Read Round Trip
+        working-directory: python
         run: |
-          source python/venv/bin/activate
-          cd .github/workflows/file_verification
-          python test_write_read.py
+          uv run python ../.github/workflows/file_verification/test_write_read.py
 
       - name: Cleanup
         run: |

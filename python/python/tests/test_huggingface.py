@@ -8,6 +8,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+pytestmark = pytest.mark.pandas_dep
+
 datasets = pytest.importorskip("datasets")
 pil = pytest.importorskip("PIL")
 

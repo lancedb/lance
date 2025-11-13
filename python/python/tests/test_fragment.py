@@ -8,7 +8,6 @@ import uuid
 from pathlib import Path
 
 import lance
-import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
@@ -24,6 +23,10 @@ from lance.debug import format_fragment
 from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
+
+pytestmark = pytest.mark.pandas_dep
+
+pd = pytest.importorskip("pandas")
 
 
 def test_write_fragment(tmp_path: Path):

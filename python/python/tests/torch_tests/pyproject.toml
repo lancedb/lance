@@ -1,0 +1,16 @@
+[project]
+name = "pylance-torch-tests"
+description = "Torch-specific tests for Pylance"
+version = "0.0.0"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "pylance[tests]",
+    "torch",
+    "numpy<2",
+]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cpu"]
+
+[tool.uv.sources]
+pylance = { path = "../../../" }

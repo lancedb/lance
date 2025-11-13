@@ -47,6 +47,7 @@ jobs:
       # Need up-to-date compilers for kernels
       CC: clang-18
       CXX: clang++-18
+      UV_PYTHON: "3.11"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,41 +57,36 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.11 # Ray does not support 3.12 yet.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - name: Install linting tools
-        run: |
-          pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - name: Lint Python
-        run: |
-          ruff format --check --diff python
-          ruff check python
-          pyright
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync environment
+        run: |
+          uv sync --frozen --extra tests --extra dev
+      - name: Lint Python
+        run: |
+          uv run ruff format --check --diff python
+          uv run ruff check python
+          uv run pyright
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
-      - name: Build
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          pip install maturin
-          maturin develop --locked --extras tests,ray
       - name: Run doctest
         run: |
-          source venv/bin/activate
-          pytest --doctest-modules python/lance
+          uv run pytest --doctest-modules python/lance
   linux:
     timeout-minutes: 45
     strategy:
@@ -102,6 +98,8 @@ jobs:
       run:
         shell: bash
         working-directory: python
+    env:
+      UV_PYTHON: "3.${{ matrix.python-minor-version }}"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,20 +109,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.${{ matrix.python-minor-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - uses: ./.github/workflows/build_linux_wheel
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - uses: ./.github/workflows/run_tests
-      - name: Upload wheels as artifacts
-        if: ${{ matrix.python-minor-version == '13' }}
-        uses: actions/upload-artifact@v4
         with:
-          name: linux-wheels
-          path: python/target/wheels/pylance-*.whl
+          python-minor-version: ${{ matrix.python-minor-version }}
 
   forward-compat:
     needs: linux
@@ -137,6 +138,8 @@ jobs:
       run:
         shell: bash
         working-directory: python
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,18 +149,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.13
-      - name: Download wheels
-        uses: actions/download-artifact@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          name: linux-wheels
-          path: python/wheels
-      - name: Install dependencies
+          enable-cache: true
+      - name: Install system dependencies
         run: |
-          pip install $(ls wheels/pylance-*.whl)[tests,ray]
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync environment
+        run: |
+          uv sync --frozen --extra tests
       - name: Generate forward compatibility files
         env:
           PYTHONPATH: python/tests
-        run: python -m forward_compat.datagen
+        run: uv run python -m forward_compat.datagen
       - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
         run: |
           python -m venv venv
@@ -173,6 +179,8 @@ jobs:
       run:
         shell: bash
         working-directory: python
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -182,21 +190,139 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.13
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - uses: ./.github/workflows/build_linux_wheel
-        with:
-          arm-build: "true"
-          manylinux: "2_28"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
-          sudo apt install -y libhdf5-dev
+          sudo apt install -y libhdf5-dev protobuf-compiler libssl-dev
       - uses: ./.github/workflows/run_tests
+        with:
+          python-minor-version: "13"
+  torch:
+    name: Python Torch Tests (3.11 Linux)
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync torch environment
+        run: |
+          uv sync --frozen --project python/tests/torch_tests
+      - name: Run torch tests
+        run: make test-torch
+
+  pandas:
+    name: Python Pandas/SQL Tests (3.11 Linux)
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync pandas environment
+        run: |
+          uv sync --frozen --project python/tests/pandas_tests
+      - name: Run pandas tests
+        run: make test-pandas
+
+  tensorflow:
+    name: Python TensorFlow Tests (3.11 Linux)
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Sync tensorflow environment
+        run: |
+          uv sync --frozen --project python/tests/tf_tests
+      - name: Run tensorflow tests
+        run: make test-tf
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
@@ -205,6 +331,8 @@ jobs:
       run:
         shell: bash
         working-directory: python
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -214,16 +342,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - uses: ./.github/workflows/build_mac_wheel
+      - name: Install system dependencies
+        run: |
+          brew install protobuf || true
       - uses: ./.github/workflows/run_tests
         with:
-          skip-torch: "true"
+          python-minor-version: "13"
 
   windows:
     runs-on: windows-latest
@@ -232,19 +366,34 @@ jobs:
       run:
         shell: powershell
         working-directory: python
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - uses: ./.github/workflows/build_windows_wheel
+      - name: Install Protoc
+        shell: powershell
+        run: |
+          choco install protoc --version=24.4 -y --no-progress
       - uses: ./.github/workflows/run_tests
+        with:
+          python-minor-version: "13"
   aws-integtest:
     timeout-minutes: 45
     runs-on: "ubuntu-latest"
@@ -252,6 +401,8 @@ jobs:
       run:
         shell: bash
         working-directory: python
+    env:
+      UV_PYTHON: "3.11"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -261,15 +412,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11" # TODO: upgrade when ray supports 3.12
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - uses: ./.github/workflows/build_linux_wheel
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          pip install ray[data]
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - uses: ./.github/workflows/run_integtests
