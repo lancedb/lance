@@ -23,9 +23,7 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=line-tables-only"
+  CARGO_PROFILE: ci
   RUST_BACKTRACE: "1"
   CI: "true"
   # Color output for pytest is off by default.
@@ -60,8 +58,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install linting tools
         run: |
           pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
@@ -115,8 +111,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Upload wheels as artifacts
@@ -179,8 +173,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
@@ -234,8 +226,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
   aws-integtest:
@@ -258,8 +248,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |

@@ -20,14 +20,11 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
   # CI builds are faster with incremental disabled.
   CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE: ci
 
 jobs:
   format:
@@ -47,9 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
@@ -92,9 +86,6 @@ jobs:
           rustup default ${{ matrix.toolchain }}
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
@@ -128,9 +119,6 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -189,9 +177,6 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Build tests
         run: |
           cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
@@ -209,9 +194,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
@@ -244,9 +226,6 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
