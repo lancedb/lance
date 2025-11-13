@@ -4762,7 +4762,6 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
-        compact_blobs: bool = False,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -4810,10 +4809,6 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
-        compact_blobs: bool, default False
-            When True, allows datasets containing blob columns to be compacted.
-            Required if any field has ``metadata={"lance-encoding:blob": "true"}``.
-
         Returns
         -------
         CompactionMetrics
@@ -4831,7 +4826,6 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
             batch_size=batch_size,
-            compact_blobs=compact_blobs,
         )
         return Compaction.execute(self._dataset, opts)
 

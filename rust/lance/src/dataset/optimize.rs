@@ -156,11 +156,6 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
-    /// Whether to rewrite blob columns during compaction.
-    ///
-    /// When enabled, blob columns are streamed as binary data so they can be
-    /// rewritten safely. Datasets containing blob columns must set this flag.
-    pub compact_blobs: bool,
 }
 
 impl Default for CompactionOptions {
@@ -175,7 +170,6 @@ impl Default for CompactionOptions {
             max_bytes_per_file: None,
             batch_size: None,
             defer_index_remap: false,
-            compact_blobs: false,
         }
     }
 }
@@ -686,14 +680,7 @@ async fn rewrite_files(
         .fields_pre_order()
         .any(|field| field.is_blob());
     if has_blob_columns {
-        if options.compact_blobs {
-            scanner.blob_handling(BlobHandling::AllBinary);
-        } else {
-            return Err(Error::invalid_input(
-                "Dataset contains blob columns. Please set compact_blobs=true in CompactionOptions to rewrite them.",
-                location!(),
-            ));
-        }
+        scanner.blob_handling(BlobHandling::AllBinary);
     }
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -1389,11 +1376,9 @@ mod tests {
         dataset.validate().await.unwrap();
         assert!(dataset.get_fragments().len() > 1);
 
-        let options = CompactionOptions {
-            compact_blobs: true,
-            ..Default::default()
-        };
-        compact_files(&mut dataset, options, None).await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
         dataset.validate().await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
 

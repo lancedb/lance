@@ -59,8 +59,3 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
-    compact_blobs: Optional[bool]
-    """
-    Whether to compact datasets containing blob columns. Set to True when your schema
-    includes columns marked with ``metadata={"lance-encoding:blob": "true"}``.
-    """

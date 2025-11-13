@@ -9,7 +9,6 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
-import pytest
 from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
@@ -37,7 +36,7 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
-def test_blob_compaction_requires_flag(tmp_path: Path):
+def test_blob_compaction(tmp_path: Path):
     base_dir = tmp_path / "blob_dataset"
     blob_field = pa.field(
         "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
@@ -61,10 +60,7 @@ def test_blob_compaction_requires_flag(tmp_path: Path):
     )
     assert len(dataset.get_fragments()) == 2
 
-    with pytest.raises(OSError, match="compact_blobs"):
-        dataset.optimize.compact_files()
-
-    dataset.optimize.compact_files(compact_blobs=True, num_threads=1)
+    dataset.optimize.compact_files(num_threads=1)
     assert len(dataset.get_fragments()) == 1
 
     blob_files = dataset.take_blobs("blob", indices=[0, 1])
