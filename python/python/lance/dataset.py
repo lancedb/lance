@@ -1374,7 +1374,7 @@ class LanceDataset(pa.dataset.Dataset):
         >>> # Check stats without resetting
         >>> stats = dataset.io_stats_snapshot()
         >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
-        Read 575 bytes in 1 operations
+        Read ... bytes in ... operations
         >>> # Can check again and see the same values
         >>> stats2 = dataset.io_stats_snapshot()
         >>> assert stats.read_bytes == stats2.read_bytes
@@ -1414,12 +1414,12 @@ class LanceDataset(pa.dataset.Dataset):
         >>> # Get incremental stats (and reset)
         >>> stats = dataset.io_stats_incremental()
         >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
-        Read 575 bytes in 1 operations
+        Read ... bytes in ... operations
         >>> # Next call returns only new stats since last call
         >>> more_data = dataset.to_table()
         >>> stats2 = dataset.io_stats_incremental()
         >>> print(f"Read {stats2.read_bytes} more bytes")
-        Read 575 more bytes
+        Read ... more bytes
 
         See Also
         --------

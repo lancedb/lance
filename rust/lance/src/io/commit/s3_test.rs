@@ -340,7 +340,7 @@ async fn test_ddb_open_iops() {
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
-    let io_stats = io_tracker.incremental_stats();
+    let io_stats = dataset.object_store().io_stats_incremental();
     // Checkout: 1 IOPS: manifest file
     assert_io_eq!(io_stats, read_iops, 1);
     assert_io_eq!(io_stats, write_iops, 0);
