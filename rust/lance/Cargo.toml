@@ -109,6 +109,9 @@ tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+geo-types.workspace = true
+geoarrow-array.workspace = true
+geoarrow-schema.workspace = true
 
 
 [features]
