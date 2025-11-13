@@ -8,15 +8,17 @@
 
 pub mod manifest;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use arrow::record_batch::RecordBatchIterator;
+use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -28,8 +30,8 @@ use lance_namespace::models::{
 };
 
 use lance_core::{box_error, Error, Result};
-use lance_namespace::LanceNamespace;
 use lance_namespace::schema::arrow_schema_to_json;
+use lance_namespace::LanceNamespace;
 
 /// Builder for creating a DirectoryNamespace.
 ///
@@ -284,7 +286,6 @@ impl DirectoryNamespaceBuilder {
             object_store,
             base_path,
             manifest_ns,
-            manifest_enabled: self.manifest_enabled,
             dir_listing_enabled: self.dir_listing_enabled,
         })
     }
@@ -343,7 +344,6 @@ pub struct DirectoryNamespace {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
-    manifest_enabled: bool,
     dir_listing_enabled: bool,
 }
 
@@ -374,7 +374,10 @@ impl DirectoryNamespace {
 
         // Apply page_token filtering (start_after semantics)
         if let Some(start_after) = page_token {
-            if let Some(index) = names.iter().position(|name| name.as_str() > start_after.as_str()) {
+            if let Some(index) = names
+                .iter()
+                .position(|name| name.as_str() > start_after.as_str())
+            {
                 names.drain(0..index);
             } else {
                 names.clear();
@@ -471,6 +474,87 @@ impl DirectoryNamespace {
             .child(format!("{}.lance", table_name).as_str())
             .child(".lance-reserved")
     }
+
+    /// Migrate directory-based tables to the manifest.
+    ///
+    /// This is a one-time migration operation that:
+    /// 1. Scans the directory for existing `.lance` tables
+    /// 2. Registers any unmigrated tables in the manifest
+    /// 3. Returns the count of tables that were migrated
+    ///
+    /// This method is safe to run multiple times - it will skip tables that are already
+    /// registered in the manifest.
+    ///
+    /// # Usage
+    ///
+    /// After creating tables in directory-only mode or dual mode, you can migrate them
+    /// to the manifest to enable manifest-only mode:
+    ///
+    /// ```no_run
+    /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Create namespace with dual mode (manifest + directory listing)
+    /// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+    ///     .manifest_enabled(true)
+    ///     .dir_listing_enabled(true)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// // ... tables are created and used ...
+    ///
+    /// // Migrate existing directory tables to manifest
+    /// let migrated_count = namespace.migrate().await?;
+    /// println!("Migrated {} tables", migrated_count);
+    ///
+    /// // Now you can disable directory listing for better performance:
+    /// // (requires rebuilding the namespace)
+    /// let namespace = DirectoryNamespaceBuilder::new("/path/to/data")
+    ///     .manifest_enabled(true)
+    ///     .dir_listing_enabled(false)  // All tables now in manifest
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of tables that were migrated to the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Manifest is not enabled
+    /// - Directory listing fails
+    /// - Manifest registration fails
+    pub async fn migrate(&self) -> Result<usize> {
+        // We only care about tables in the root namespace
+        let Some(ref manifest_ns) = self.manifest_ns else {
+            return Ok(0); // No manifest, nothing to migrate
+        };
+
+        // Get all table locations already in the manifest
+        let manifest_locations = manifest_ns.list_manifest_table_locations().await?;
+
+        // Get all tables from directory
+        let dir_tables = self.list_directory_tables().await?;
+
+        // Register each directory table that doesn't have an overlapping location
+        // If a directory name already exists in the manifest,
+        // that means the table must have already been migrated or created
+        // in the manifest, so we can skip it.
+        let mut migrated_count = 0;
+        for table_name in dir_tables {
+            // For root namespace tables, the directory name is "table_name.lance"
+            let dir_name = format!("{}.lance", table_name);
+            if !manifest_locations.contains(&dir_name) {
+                manifest_ns.register_table(&table_name, dir_name).await?;
+                migrated_count += 1;
+            }
+        }
+
+        Ok(migrated_count)
+    }
 }
 
 #[async_trait]
@@ -526,7 +610,7 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.drop_namespace(request).await;
         }
-        
+
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Err(Error::Namespace {
                 source: "Root namespace cannot be dropped".into(),
@@ -544,11 +628,11 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.namespace_exists(request).await;
         }
-        
+
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Ok(());
         }
-        
+
         Err(Error::Namespace {
             source: "Child namespaces are only supported when manifest mode is enabled".into(),
             location: snafu::location!(),
@@ -557,13 +641,10 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
         // Validate that namespace ID is provided
-        let namespace_id = request
-            .id
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput {
-                source: "Namespace ID is required".into(),
-                location: snafu::location!(),
-            })?;
+        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Namespace ID is required".into(),
+            location: snafu::location!(),
+        })?;
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
@@ -576,16 +657,23 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
-        // When only manifest is enabled, delegate directly to manifest with native pagination
-        if self.manifest_enabled && !self.dir_listing_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
+        // When only manifest is enabled (no directory listing), delegate directly to manifest
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            if !self.dir_listing_enabled {
                 return manifest_ns.list_tables(request).await;
             }
         }
 
         // When both manifest and directory listing are enabled, we need to merge and deduplicate
-        let mut tables = if self.manifest_enabled && self.dir_listing_enabled {
-            // Get all manifest tables without pagination
+        let mut tables = if self.manifest_ns.is_some() && self.dir_listing_enabled {
+            // Get all manifest table locations (for deduplication)
+            let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
+                manifest_ns.list_manifest_table_locations().await?
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // Get all manifest tables (without pagination for merging)
             let mut manifest_request = request.clone();
             manifest_request.limit = None;
             manifest_request.page_token = None;
@@ -596,16 +684,18 @@ impl LanceNamespace for DirectoryNamespace {
                 vec![]
             };
 
-            // Collect manifest table names into a set for deduplication
-            let manifest_names: std::collections::HashSet<String> =
-                manifest_tables.iter().cloned().collect();
-
             // Start with all manifest table names
-            // Add directory tables that aren't already in the manifest
+            // Add directory tables that aren't already in the manifest (by location)
             let mut all_tables: Vec<String> = manifest_tables;
             let dir_tables = self.list_directory_tables().await?;
             for table_name in dir_tables {
-                if !manifest_names.contains(&table_name) {
+                // Check if this table's location is already in the manifest
+                // Manifest stores full URIs, so we need to check both formats
+                let full_location = format!("{}/{}.lance", self.root, table_name);
+                let relative_location = format!("{}.lance", table_name);
+                if !manifest_locations.contains(&full_location)
+                    && !manifest_locations.contains(&relative_location)
+                {
                     all_tables.push(table_name);
                 }
             }
@@ -622,15 +712,13 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        if self.manifest_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                match manifest_ns.describe_table(request.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(_) if self.dir_listing_enabled => {
-                        // Fall through to directory check
-                    }
-                    Err(e) => return Err(e),
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            match manifest_ns.describe_table(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(_) if self.dir_listing_enabled => {
+                    // Fall through to directory check
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -697,15 +785,13 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
-        if self.manifest_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                match manifest_ns.table_exists(request.clone()).await {
-                    Ok(()) => return Ok(()),
-                    Err(_) if self.dir_listing_enabled => {
-                        // Fall through to directory check
-                    }
-                    Err(e) => return Err(e),
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            match manifest_ns.table_exists(request.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(_) if self.dir_listing_enabled => {
+                    // Fall through to directory check
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -729,20 +815,10 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        // Validate table ID is provided
-        let _table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: snafu::location!(),
-        })?;
-
-        // If manifest is enabled, fully delegate to ManifestNamespace
-        if self.manifest_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                return manifest_ns.drop_table(request).await;
-            }
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.drop_table(request).await;
         }
 
-        // Directory-only mode: drop from directory
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
         let table_path = self.table_path(&table_name);
@@ -768,25 +844,12 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableRequest,
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
-        // Validate table ID is provided
-        let _table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: snafu::location!(),
-        })?;
-
-        // If manifest is enabled, fully delegate to ManifestNamespace
-        // It will handle both table creation and manifest registration
-        if self.manifest_enabled {
-            if let Some(ref manifest_ns) = self.manifest_ns {
-                return manifest_ns.create_table(request, request_data).await;
-            }
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.create_table(request, request_data).await;
         }
 
-        // Directory-only mode: create table directly
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
-
-        // Validate that request_data is provided and is a valid Arrow IPC stream
         if request_data.is_empty() {
             return Err(Error::Namespace {
                 source: "Request data (Arrow IPC stream) is required for create_table".into(),
@@ -810,16 +873,11 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Parse the Arrow IPC stream from request_data
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-
         let cursor = Cursor::new(request_data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| Error::Namespace {
             source: format!("Invalid Arrow IPC stream: {}", e).into(),
             location: snafu::location!(),
         })?;
-
-        // Extract schema from the IPC stream
         let arrow_schema = stream_reader.schema();
 
         // Collect all batches from the stream
@@ -833,18 +891,14 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Create RecordBatchReader from the batches
         let reader = if batches.is_empty() {
-            // If no batches in the stream, create an empty batch with the schema
             let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
             let batches = vec![Ok(batch)];
-            arrow::record_batch::RecordBatchIterator::new(batches, arrow_schema.clone())
+            RecordBatchIterator::new(batches, arrow_schema.clone())
         } else {
-            // Convert to RecordBatchIterator
             let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            arrow::record_batch::RecordBatchIterator::new(batch_results, arrow_schema)
+            RecordBatchIterator::new(batch_results, arrow_schema)
         };
 
-        // Set up write parameters for creating a new dataset
-        // Populate store_params with storage options to ensure they're forwarded to Dataset::write
         let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
             storage_options: Some(opts.clone()),
             ..Default::default()
@@ -876,7 +930,6 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateEmptyTableRequest,
     ) -> Result<CreateEmptyTableResponse> {
-        // Delegate to manifest namespace if available
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.create_empty_table(request).await;
         }
@@ -1063,7 +1116,10 @@ mod tests {
             .create_table(request, bytes::Bytes::from(ipc_data))
             .await;
         // Should succeed with manifest enabled
-        assert!(result.is_ok(), "Multi-level table IDs should work with manifest enabled");
+        assert!(
+            result.is_ok(),
+            "Multi-level table IDs should work with manifest enabled"
+        );
     }
 
     #[tokio::test]
@@ -1143,9 +1199,16 @@ mod tests {
 
         let result = namespace.list_tables(request).await;
         // Should succeed (with manifest enabled) and return empty list (no tables yet)
-        assert!(result.is_ok(), "list_tables should work with child namespace when manifest is enabled");
+        assert!(
+            result.is_ok(),
+            "list_tables should work with child namespace when manifest is enabled"
+        );
         let response = result.unwrap();
-        assert_eq!(response.tables.len(), 0, "Namespace should have no tables yet");
+        assert_eq!(
+            response.tables.len(),
+            0,
+            "Namespace should have no tables yet"
+        );
     }
 
     #[tokio::test]
@@ -1313,25 +1376,37 @@ mod tests {
         let mut request = CreateNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.create_namespace(request).await;
-        assert!(result.is_ok(), "Child namespace creation should succeed with manifest enabled");
+        assert!(
+            result.is_ok(),
+            "Child namespace creation should succeed with manifest enabled"
+        );
 
         // Test namespace_exists for non-root - should exist after creation
         let mut request = NamespaceExistsRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.namespace_exists(request).await;
-        assert!(result.is_ok(), "Child namespace should exist after creation");
+        assert!(
+            result.is_ok(),
+            "Child namespace should exist after creation"
+        );
 
         // Test drop_namespace for non-root - should succeed
         let mut request = DropNamespaceRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.drop_namespace(request).await;
-        assert!(result.is_ok(), "Child namespace drop should succeed with manifest enabled");
+        assert!(
+            result.is_ok(),
+            "Child namespace drop should succeed with manifest enabled"
+        );
 
         // Verify namespace no longer exists
         let mut request = NamespaceExistsRequest::new();
         request.id = Some(vec!["child".to_string()]);
         let result = namespace.namespace_exists(request).await;
-        assert!(result.is_err(), "Child namespace should not exist after drop");
+        assert!(
+            result.is_err(),
+            "Child namespace should not exist after drop"
+        );
     }
 
     #[tokio::test]
@@ -1480,8 +1555,14 @@ mod tests {
         assert!(builder.storage_options.is_some());
 
         let storage_options = builder.storage_options.unwrap();
-        assert_eq!(storage_options.get("region"), Some(&"us-west-2".to_string()));
-        assert_eq!(storage_options.get("bucket"), Some(&"my-bucket".to_string()));
+        assert_eq!(
+            storage_options.get("region"),
+            Some(&"us-west-2".to_string())
+        );
+        assert_eq!(
+            storage_options.get("bucket"),
+            Some(&"my-bucket".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1895,7 +1976,10 @@ mod tests {
         let mut create_empty_req = CreateEmptyTableRequest::new();
         create_empty_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
         let result = namespace.create_empty_table(create_empty_req).await;
-        assert!(result.is_ok(), "Failed to create empty table in child namespace");
+        assert!(
+            result.is_ok(),
+            "Failed to create empty table in child namespace"
+        );
 
         // Verify table exists
         let mut exists_req = TableExistsRequest::new();
@@ -1938,7 +2022,10 @@ mod tests {
         let result = namespace
             .create_table(create_table_req, bytes::Bytes::from(ipc_data))
             .await;
-        assert!(result.is_ok(), "Failed to create table in deeply nested namespace");
+        assert!(
+            result.is_ok(),
+            "Failed to create table in deeply nested namespace"
+        );
 
         // Verify table exists
         let mut exists_req = TableExistsRequest::new();
@@ -2074,5 +2161,102 @@ mod tests {
         let mut exists_req = TableExistsRequest::new();
         exists_req.id = Some(vec!["ns2".to_string(), "table1".to_string()]);
         assert!(namespace.table_exists(exists_req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_directory_tables() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Step 1: Create tables in directory-only mode
+        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create some tables
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        for i in 1..=3 {
+            let mut create_req = CreateTableRequest::new();
+            create_req.id = Some(vec![format!("table{}", i)]);
+            dir_only_ns
+                .create_table(create_req, bytes::Bytes::from(ipc_data.clone()))
+                .await
+                .unwrap();
+        }
+
+        drop(dir_only_ns);
+
+        // Step 2: Create namespace with dual mode (manifest + directory listing)
+        let dual_mode_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Before migration, tables should be visible (via directory listing fallback)
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = dual_mode_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+
+        // Run migration
+        let migrated_count = dual_mode_ns.migrate().await.unwrap();
+        assert_eq!(migrated_count, 3, "Should migrate all 3 tables");
+
+        // Verify tables are now in manifest
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = dual_mode_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+
+        // Run migration again - should be idempotent
+        let migrated_count = dual_mode_ns.migrate().await.unwrap();
+        assert_eq!(
+            migrated_count, 0,
+            "Should not migrate already-migrated tables"
+        );
+
+        drop(dual_mode_ns);
+
+        // Step 3: Create namespace with manifest-only mode
+        let manifest_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Tables should still be accessible (now from manifest only)
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = manifest_only_ns.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables.len(), 3);
+        assert!(tables.contains(&"table1".to_string()));
+        assert!(tables.contains(&"table2".to_string()));
+        assert!(tables.contains(&"table3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_without_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace without manifest
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // migrate() should return 0 when manifest is not enabled
+        let migrated_count = namespace.migrate().await.unwrap();
+        assert_eq!(migrated_count, 0);
     }
 }

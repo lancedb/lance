@@ -189,7 +189,11 @@ async fn test_create_table_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create table in child namespace
     let create_table_req = CreateTableRequest {
@@ -204,7 +208,11 @@ async fn test_create_table_in_child_namespace() {
         .create_table(create_table_req, table_data)
         .await;
 
-    assert!(result.is_ok(), "Failed to create table in child namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to create table in child namespace: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
@@ -218,7 +226,11 @@ async fn test_list_tables_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create multiple tables in the namespace
     for i in 1..=3 {
@@ -261,7 +273,11 @@ async fn test_table_exists_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create table
     let create_table_req = CreateTableRequest {
@@ -294,7 +310,11 @@ async fn test_describe_table_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create table
     let create_table_req = CreateTableRequest {
@@ -314,7 +334,11 @@ async fn test_describe_table_in_child_namespace() {
     describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
     let result = fixture.client.describe_table(describe_req).await;
 
-    assert!(result.is_ok(), "Failed to describe table in child namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to describe table in child namespace: {:?}",
+        result.err()
+    );
     let response = result.unwrap();
     assert!(response.location.is_some());
 }
@@ -330,7 +354,11 @@ async fn test_drop_table_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create table
     let create_table_req = CreateTableRequest {
@@ -350,7 +378,11 @@ async fn test_drop_table_in_child_namespace() {
         id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
     };
     let result = fixture.client.drop_table(drop_req).await;
-    assert!(result.is_ok(), "Failed to drop table in child namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to drop table in child namespace: {:?}",
+        result.err()
+    );
 
     // Verify table no longer exists
     let mut exists_req = TableExistsRequest::new();
@@ -369,22 +401,39 @@ async fn test_create_empty_table_in_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create empty table
     let mut create_req = CreateEmptyTableRequest::new();
-    create_req.id = Some(vec!["test_namespace".to_string(), "empty_table".to_string()]);
+    create_req.id = Some(vec![
+        "test_namespace".to_string(),
+        "empty_table".to_string(),
+    ]);
 
     let result = fixture.client.create_empty_table(create_req).await;
-    assert!(result.is_ok(), "Failed to create empty table in child namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to create empty table in child namespace: {:?}",
+        result.err()
+    );
     let response = result.unwrap();
     assert!(response.location.is_some());
 
     // Verify the empty table exists
     let mut exists_req = TableExistsRequest::new();
-    exists_req.id = Some(vec!["test_namespace".to_string(), "empty_table".to_string()]);
+    exists_req.id = Some(vec![
+        "test_namespace".to_string(),
+        "empty_table".to_string(),
+    ]);
     let exists_result = fixture.client.table_exists(exists_req).await;
-    assert!(exists_result.is_ok(), "Empty table should exist in child namespace");
+    assert!(
+        exists_result.is_ok(),
+        "Empty table should exist in child namespace"
+    );
 }
 
 #[tokio::test]
@@ -436,7 +485,10 @@ async fn test_deeply_nested_namespace_with_table() {
         .create_table(create_table_req, table_data)
         .await;
 
-    assert!(result.is_ok(), "Failed to create table in deeply nested namespace");
+    assert!(
+        result.is_ok(),
+        "Failed to create table in deeply nested namespace"
+    );
 
     // Verify table exists
     let mut exists_req = TableExistsRequest::new();
@@ -447,7 +499,10 @@ async fn test_deeply_nested_namespace_with_table() {
         "deep_table".to_string(),
     ]);
     let result = fixture.client.table_exists(exists_req).await;
-    assert!(result.is_ok(), "Table should exist in deeply nested namespace");
+    assert!(
+        result.is_ok(),
+        "Table should exist in deeply nested namespace"
+    );
 }
 
 #[tokio::test]
@@ -522,7 +577,11 @@ async fn test_drop_namespace_with_tables_fails() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Create table in namespace
     let create_table_req = CreateTableRequest {
@@ -541,7 +600,10 @@ async fn test_drop_namespace_with_tables_fails() {
     let mut drop_req = DropNamespaceRequest::new();
     drop_req.id = Some(vec!["test_namespace".to_string()]);
     let result = fixture.client.drop_namespace(drop_req).await;
-    assert!(result.is_err(), "Should not be able to drop namespace with tables");
+    assert!(
+        result.is_err(),
+        "Should not be able to drop namespace with tables"
+    );
 }
 
 #[tokio::test]
@@ -554,13 +616,20 @@ async fn test_drop_empty_child_namespace() {
         properties: None,
         mode: None,
     };
-    fixture.client.create_namespace(create_ns_req).await.unwrap();
+    fixture
+        .client
+        .create_namespace(create_ns_req)
+        .await
+        .unwrap();
 
     // Drop empty namespace - should succeed
     let mut drop_req = DropNamespaceRequest::new();
     drop_req.id = Some(vec!["test_namespace".to_string()]);
     let result = fixture.client.drop_namespace(drop_req).await;
-    assert!(result.is_ok(), "Should be able to drop empty child namespace");
+    assert!(
+        result.is_ok(),
+        "Should be able to drop empty child namespace"
+    );
 
     // Verify namespace no longer exists
     let exists_req = NamespaceExistsRequest {
@@ -604,9 +673,7 @@ async fn test_root_namespace_operations() {
     let fixture = RestServerFixture::new(4014).await;
 
     // Root namespace should always exist
-    let exists_req = NamespaceExistsRequest {
-        id: Some(vec![]),
-    };
+    let exists_req = NamespaceExistsRequest { id: Some(vec![]) };
     let result = fixture.client.namespace_exists(exists_req).await;
     assert!(result.is_ok(), "Root namespace should exist");
 

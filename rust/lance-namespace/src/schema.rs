@@ -68,7 +68,11 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         DataType::LargeBinary => "large_binary",
         _ => {
             return Err(Error::Namespace {
-                source: format!("Unsupported Arrow type for JSON conversion: {:?}", data_type).into(),
+                source: format!(
+                    "Unsupported Arrow type for JSON conversion: {:?}",
+                    data_type
+                )
+                .into(),
                 location: Location::new(file!(), line!(), column!()),
             })
         }
