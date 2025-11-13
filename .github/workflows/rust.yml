@@ -53,7 +53,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
-        run: cargo clippy --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
+        run: cargo clippy --profile ci --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
 
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
@@ -98,7 +98,7 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -126,13 +126,13 @@ jobs:
       - name: Build tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --no-run
+          cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES}
+          cargo test --profile ci --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
@@ -153,7 +153,7 @@ jobs:
       - name: Build all
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo build --benches --features ${ALL_FEATURES} --tests
+          cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: "warp-macos-14-arm64-6x"
     timeout-minutes: 45
@@ -179,13 +179,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build tests
         run: |
-          cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
+          cargo test --profile ci --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo test --profile ci --features fp16kernels,cli,tensorflow,dynamodb,substrait
       - name: Check benchmarks
         run: |
-          cargo check --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo check --profile ci --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
   windows-build:
     runs-on: warp-windows-latest-x64-4x
     defaults:
@@ -204,11 +204,11 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
       - name: Build tests
-        run: cargo test --locked --no-run
+        run: cargo test --profile ci --locked --no-run
       - name: Run tests
-        run: cargo test
+        run: cargo test --profile ci
       - name: Check benchmarks
-        run: cargo check --benches
+        run: cargo check --profile ci --benches
 
   msrv:
     # Check the minimum supported Rust version
@@ -237,4 +237,4 @@ jobs:
       - name: cargo +${{ matrix.msrv }} check
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo check --workspace --tests --benches --features ${ALL_FEATURES}
+          cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}

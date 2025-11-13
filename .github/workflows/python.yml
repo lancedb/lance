@@ -23,7 +23,6 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  CARGO_PROFILE: ci
   RUST_BACKTRACE: "1"
   CI: "true"
   # Color output for pytest is off by default.
@@ -75,14 +74,14 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
+          cargo clippy  --profile ci --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
           pip install maturin
-          maturin develop --locked --extras tests,ray
+          maturin develop --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate
@@ -112,6 +111,8 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
       - name: Upload wheels as artifacts
         if: ${{ matrix.python-minor-version == '13' }}
@@ -177,6 +178,7 @@ jobs:
         with:
           arm-build: "true"
           manylinux: "2_28"
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
@@ -203,9 +205,9 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_mac_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
         with:
           skip-torch: "true"
@@ -227,6 +229,8 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_windows_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
@@ -249,6 +253,8 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           pip install ray[data]
