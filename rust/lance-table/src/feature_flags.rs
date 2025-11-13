@@ -20,11 +20,17 @@ pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
 pub const FLAG_TABLE_CONFIG: u64 = 8;
 /// Dataset uses multiple base paths (for shallow clones or multi-base datasets)
 pub const FLAG_BASE_PATHS: u64 = 16;
+/// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
+pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 32;
+pub const FLAG_UNKNOWN: u64 = 64;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
+pub fn apply_feature_flags(
+    manifest: &mut Manifest,
+    enable_stable_row_id: bool,
+    disable_transaction_file: bool,
+) -> Result<()> {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -70,6 +76,9 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
         manifest.writer_feature_flags |= FLAG_BASE_PATHS;
     }
 
+    if disable_transaction_file {
+        manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
+    }
     Ok(())
 }
 
@@ -98,6 +107,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
+        assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -114,6 +124,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
+        assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -145,7 +156,7 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(), // Empty base_paths
         );
-        apply_feature_flags(&mut normal_manifest, false).unwrap();
+        apply_feature_flags(&mut normal_manifest, false, false).unwrap();
         assert_eq!(normal_manifest.reader_feature_flags & FLAG_BASE_PATHS, 0);
         assert_eq!(normal_manifest.writer_feature_flags & FLAG_BASE_PATHS, 0);
         // Test 2: Dataset with base_paths (shallow clone or multi-base) should have FLAG_BASE_PATHS
@@ -165,7 +176,7 @@ mod tests {
             DataStorageFormat::default(),
             base_paths,
         );
-        apply_feature_flags(&mut multi_base_manifest, false).unwrap();
+        apply_feature_flags(&mut multi_base_manifest, false, false).unwrap();
         assert_ne!(
             multi_base_manifest.reader_feature_flags & FLAG_BASE_PATHS,
             0
