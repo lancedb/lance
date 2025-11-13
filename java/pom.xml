@@ -404,6 +404,38 @@
             </properties>
         </profile>
         <profile>
+            <id>ci</id>
+            <properties>
+                <rust.release.build>false</rust.release.build>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.questdb</groupId>
+                        <artifactId>rust-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>lance-jni</id>
+                                <configuration>
+                                    <extra-args>
+                                        <extra-arg>--profile=ci</extra-arg>
+                                    </extra-args>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>lance-jni-test</id>
+                                <configuration>
+                                    <extra-args>
+                                        <extra-arg>--profile=ci</extra-arg>
+                                    </extra-args>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
             <id>jdk11+</id>
             <activation>
                 <jdk>[11,)</jdk>
