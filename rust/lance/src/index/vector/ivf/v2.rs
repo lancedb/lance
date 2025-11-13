@@ -25,7 +25,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::{FileReader, FileReaderOptions};
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -640,10 +640,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
-    use lance_file::v2::{
-        reader::{FileReader, FileReaderOptions},
-        writer::FileWriter,
-    };
+    use lance_file::reader::{FileReader, FileReaderOptions};
+    use lance_file::writer::FileWriter;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;

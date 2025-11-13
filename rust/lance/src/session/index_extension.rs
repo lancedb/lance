@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::{vector::VectorIndex, IndexParams, IndexType};
 
 use crate::Dataset;
@@ -45,7 +45,7 @@ pub trait VectorIndexExtension: IndexExtension {
         dataset: Arc<Dataset>,
         column: &str,
         uuid: &str,
-        reader: FileReader,
+        reader: PreviousFileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
 
@@ -69,8 +69,10 @@ mod test {
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
+    use lance_file::previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    };
     use lance_file::version::LanceFileVersion;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         metrics::MetricsCollector,
@@ -265,9 +267,13 @@ mod test {
 
             let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
             let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
-            let mut writer: FileWriter<ManifestDescribing> =
-                FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())
-                    .unwrap();
+            let mut writer: PreviousFileWriter<ManifestDescribing> =
+                PreviousFileWriter::with_object_writer(
+                    writer,
+                    schema,
+                    &PreviousFileWriterOptions::default(),
+                )
+                .unwrap();
             writer.add_metadata(
                 INDEX_METADATA_SCHEMA_KEY,
                 json!(IndexMetadata {
@@ -295,7 +301,7 @@ mod test {
             _dataset: Arc<Dataset>,
             _column: &str,
             _uuid: &str,
-            _reader: FileReader,
+            _reader: PreviousFileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
                 .store(true, std::sync::atomic::Ordering::Release);

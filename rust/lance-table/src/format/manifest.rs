@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
@@ -1036,7 +1036,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for FileReader {
+impl SelfDescribingFileReader for PreviousFileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,

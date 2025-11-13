@@ -27,8 +27,6 @@ pub mod pbfile {
     include!(concat!(env!("OUT_DIR"), "/lance.file.v2.rs"));
 }
 
-pub mod metadata;
-
 /// These version/magic values are written at the end of Lance files (e.g. versions/1.version)
 pub const MAJOR_VERSION: i16 = 0;
 pub const MINOR_VERSION: i16 = 2;
