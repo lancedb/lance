@@ -609,7 +609,9 @@ impl<'a> BranchRelativePath<'a> {
             common_segments.push(*segment);
         }
         if !common_segments.is_empty() {
-            Some(BranchRelativePath { segments: common_segments })
+            Some(BranchRelativePath {
+                segments: common_segments,
+            })
         } else {
             None
         }
