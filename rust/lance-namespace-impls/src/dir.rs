@@ -715,7 +715,10 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(_) if self.dir_listing_enabled && request.id.as_ref().map_or(false, |id| id.len() == 1) => {
+                Err(_)
+                    if self.dir_listing_enabled
+                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
+                {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
