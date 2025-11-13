@@ -40,7 +40,7 @@ jobs:
         run: cargo fmt --check
       - name: Rust Clippy
         working-directory: java/lance-jni
-        run: cargo clippy --profile ci --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
     runs-on: ubuntu-24.04
@@ -96,4 +96,4 @@ jobs:
         env:
           LANCE_INTEGRATION_TEST: "1"
         run: |
-          mvn install -Pci
+          mvn install
