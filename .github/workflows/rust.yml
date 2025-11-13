@@ -21,10 +21,6 @@ env:
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
-  # CI builds are faster with incremental disabled.
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE: ci
 
 jobs:
   format:
