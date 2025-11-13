@@ -16,10 +16,8 @@ doctest:
 	uv run pytest --doctest-modules $(PYTEST_ARGS) python/lance
 .PHONY: doctest
 
-TORCH_TESTS = python/tests/torch_tests
-
 test-torch:
-	uv run --package pylance-torch-tests pytest $(PYTEST_ARGS) $(TORCH_TESTS)
+	cd python/tests/torch_tests && uv run pytest $(PYTEST_ARGS) .
 .PHONY: test-torch
 
 format: format-python

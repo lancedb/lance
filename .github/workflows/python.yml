@@ -211,7 +211,6 @@ jobs:
     name: Python Torch Tests (3.11 Linux)
     runs-on: "ubuntu-24.04"
     timeout-minutes: 45
-    needs: linux
     defaults:
       run:
         shell: bash
@@ -243,7 +242,7 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Sync torch environment
         run: |
-          uv sync --frozen --package pylance-torch-tests
+          uv sync --frozen --project python/tests/torch_tests
       - name: Run torch tests
         run: make test-torch
   mac:
