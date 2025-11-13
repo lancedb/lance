@@ -742,7 +742,12 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Try to load the dataset to get real information
         match Dataset::open(&table_uri).await {
-            Ok(dataset) => {
+            Ok(mut dataset) => {
+                // If a specific version is requested, checkout that version
+                if let Some(requested_version) = request.version {
+                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                }
+
                 let version = dataset.version().version;
                 let lance_schema = dataset.schema();
                 let arrow_schema: arrow_schema::Schema = lance_schema.into();

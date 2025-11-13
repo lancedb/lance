@@ -25,6 +25,7 @@ use lance_namespace::models::{
     ListNamespacesResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
     TableExistsRequest,
 };
+use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
 use object_store::path::Path;
 use snafu::location;
@@ -827,13 +828,39 @@ impl LanceNamespace for ManifestNamespace {
             Some(info) => {
                 // Construct full URI from dir_name
                 let table_uri = format!("{}/{}", self.root, info.location);
-                Ok(DescribeTableResponse {
-                    version: None,
-                    location: Some(table_uri),
-                    schema: None,
-                    properties: None,
-                    storage_options: self.storage_options.clone(),
-                })
+
+                // Try to open the dataset to get version and schema
+                match Dataset::open(&table_uri).await {
+                    Ok(mut dataset) => {
+                        // If a specific version is requested, checkout that version
+                        if let Some(requested_version) = request.version {
+                            dataset = dataset.checkout_version(requested_version as u64).await?;
+                        }
+
+                        let version = dataset.version().version;
+                        let lance_schema = dataset.schema();
+                        let arrow_schema: arrow_schema::Schema = lance_schema.into();
+                        let json_schema = arrow_schema_to_json(&arrow_schema)?;
+
+                        Ok(DescribeTableResponse {
+                            version: Some(version as i64),
+                            location: Some(table_uri),
+                            schema: Some(Box::new(json_schema)),
+                            properties: None,
+                            storage_options: self.storage_options.clone(),
+                        })
+                    }
+                    Err(_) => {
+                        // If dataset can't be opened (e.g., empty table), return minimal info
+                        Ok(DescribeTableResponse {
+                            version: None,
+                            location: Some(table_uri),
+                            schema: None,
+                            properties: None,
+                            storage_options: self.storage_options.clone(),
+                        })
+                    }
+                }
             }
             None => Err(Error::Namespace {
                 source: format!("Table '{}' not found", object_id).into(),
@@ -1282,16 +1309,16 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_path = self.base_path.child(dir_name.as_str());
-        let location = table_path.to_string();
+        let table_uri = format!("{}/{}", self.root, dir_name);
 
         // Validate location if provided
         if let Some(req_location) = &request.location {
             let req_location = req_location.trim_end_matches('/');
-            if req_location != location {
+            if req_location != table_uri {
                 return Err(Error::Namespace {
                     source: format!(
                         "Cannot create table {} at location {}, must be at location {}",
-                        table_name, req_location, location
+                        table_name, req_location, table_uri
                     )
                     .into(),
                     location: location!(),
@@ -1331,11 +1358,11 @@ impl LanceNamespace for ManifestNamespace {
         log::info!(
             "Created empty table '{}' in manifest at {}",
             table_name,
-            location
+            table_uri
         );
 
         Ok(CreateEmptyTableResponse {
-            location: Some(location),
+            location: Some(table_uri),
             properties: None,
             storage_options: self.storage_options.clone(),
         })
