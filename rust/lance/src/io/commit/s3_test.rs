@@ -180,8 +180,12 @@ async fn test_concurrent_writers() {
     let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
+    // We want to track IOs prior to creating the dataset, so need to explicitly create the tracker
+    let io_tracker = Arc::new(IOTracker::default());
+
     // Create a table
     let store_params = ObjectStoreParams {
+        object_store_wrapper: Some(io_tracker.clone()),
         storage_options: Some(
             CONFIG
                 .iter()
@@ -204,7 +208,7 @@ async fn test_concurrent_writers() {
         .unwrap();
 
     // 1 IOPS for uncommitted write
-    let io_stats = transaction.store.io_stats_incremental();
+    let io_stats = io_tracker.incremental_stats();
     assert_io_eq!(io_stats, write_iops, 1);
 
     let dataset = CommitBuilder::new(&uri)
@@ -261,8 +265,11 @@ async fn test_ddb_open_iops() {
     let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
+    let io_tracker = Arc::new(IOTracker::default());
+
     // Create a table
     let store_params = ObjectStoreParams {
+        object_store_wrapper: Some(io_tracker.clone()),
         storage_options: Some(
             CONFIG
                 .iter()
@@ -283,7 +290,7 @@ async fn test_ddb_open_iops() {
         .unwrap();
 
     // 1 IOPS for uncommitted write
-    let io_stats = transaction.store.io_stats_incremental();
+    let io_stats = io_tracker.incremental_stats();
     assert_io_eq!(io_stats, write_iops, 1);
 
     let committed_ds = CommitBuilder::new(&uri)
