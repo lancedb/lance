@@ -52,6 +52,7 @@ use lance_table::{
     },
 };
 use object_store::path::Path;
+use snafu::location;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -60,7 +61,7 @@ use std::{
 };
 use tracing::{info, instrument, Span};
 
-use super::refs::TagContents;
+use super::refs::{normalize_branch, TagContents};
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -94,7 +95,7 @@ struct CleanupTask<'a> {
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
-    old_manifests: Vec<Path>,
+    old_manifests: HashMap<Path, Manifest>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -117,20 +118,43 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<RemovalStats> {
-        // First we process all manifest files in parallel to figure
+        let mut final_stats = RemovalStats::default();
+        // First check if we need to clean referenced branches
+        // For cases that referenced branches never clean and the current cleanup cannot clean anything
+        // This must happen before cleaning the current branch if the setting is enabled.
+
+        let referenced_branches: Vec<(String, u64)> = self.find_referenced_branches().await?;
+        if self.policy.clean_referenced_branches {
+            self.clean_referenced_branches(&referenced_branches).await?;
+        }
+
+        // we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
 
         // get protected manifests first, and include those in process_manifests
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
-
         let tags = self.dataset.tags().list().await?;
+        let current_branch = &self.dataset.manifest.branch;
         let tagged_versions: HashSet<u64> = tags
             .values()
+            .filter(|tag| match (tag.branch.as_ref(), current_branch.as_ref()) {
+                (Some(branch_of_tag), Some(current_branch)) => {
+                    branch_of_tag == current_branch
+                        || referenced_branches
+                            .iter()
+                            .any(|(branch, _)| branch == branch_of_tag)
+                }
+                (Some(branch_of_tag), None) => referenced_branches
+                    .iter()
+                    .any(|(branch, _)| branch == branch_of_tag),
+                (None, Some(_)) => false,
+                (None, None) => true,
+            })
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let inspection = self.process_manifests(&tagged_versions).await?;
+        let mut inspection = self.process_manifests(&tagged_versions).await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -139,7 +163,16 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
-        self.delete_unreferenced_files(inspection).await
+        if !referenced_branches.is_empty() {
+            inspection = self
+                .retain_branch_lineage_files(inspection, &referenced_branches)
+                .await?
+        };
+
+        let stats = self.delete_unreferenced_files(inspection).await?;
+        final_stats.bytes_removed += stats.bytes_removed;
+        final_stats.old_versions += stats.old_versions;
+        Ok(final_stats)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -148,6 +181,7 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
+
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
@@ -155,6 +189,7 @@ impl<'a> CleanupTask<'a> {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
             .await?;
+
         Ok(inspection.into_inner().unwrap())
     }
 
@@ -169,7 +204,6 @@ impl<'a> CleanupTask<'a> {
         // to ignore a manifest error because if it is a temporary I/O error and we
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
-
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let dataset_version = self.dataset.version().version;
@@ -193,7 +227,9 @@ impl<'a> CleanupTask<'a> {
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         if !in_working_set {
-            inspection.old_manifests.push(location.path.clone());
+            inspection
+                .old_manifests
+                .insert(location.path.clone(), manifest);
         } else {
             let commit_ts = manifest.timestamp();
             if let Some(ts) = inspection.earliest_retained_manifest_time {
@@ -210,7 +246,7 @@ impl<'a> CleanupTask<'a> {
     fn process_manifest(
         &self,
         manifest: &Manifest,
-        indexes: &Vec<IndexMetadata>,
+        indexes: &[IndexMetadata],
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -261,10 +297,7 @@ impl<'a> CleanupTask<'a> {
         let unreferenced_paths = self
             .dataset
             .object_store
-            .read_dir_all(
-                &self.dataset.base,
-                inspection.earliest_retained_manifest_time,
-            )
+            .read_dir_all(&self.dataset.base, None)
             .try_filter_map(|obj_meta| {
                 // If a file is new-ish then it might be part of an ongoing operation and so we only
                 // delete it if we can verify it is part of an old version.
@@ -282,9 +315,9 @@ impl<'a> CleanupTask<'a> {
         let old_manifests = inspection.old_manifests.clone();
         let num_old_manifests = old_manifests.len();
 
-        // Ideally this collect shouldn't be needed here but it seems necessary
+        // Ideally this collect shouldn't be needed here but it sseems necessary
         // to avoid https://github.com/rust-lang/rust/issues/102211
-        let manifest_bytes_removed = stream::iter(&old_manifests)
+        let manifest_bytes_removed = stream::iter(old_manifests.keys())
             .map(|path| self.dataset.object_store.size(path))
             .collect::<Vec<_>>()
             .await;
@@ -293,7 +326,7 @@ impl<'a> CleanupTask<'a> {
             .try_fold(0, |acc, size| async move { Ok(acc + (size)) })
             .await;
 
-        let old_manifests_stream = stream::iter(old_manifests)
+        let old_manifests_stream = stream::iter(old_manifests.into_keys())
             .map(|path| {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.as_ref());
                 Ok(path)
@@ -441,6 +474,202 @@ impl<'a> CleanupTask<'a> {
             _ => Ok(None),
         }
     }
+
+    async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
+        let current_branch = &self.dataset.manifest.branch;
+        let branch_lineages = self.dataset.branches().collect_lineage().await?;
+
+        // branch name to the referenced version from the current branch
+        let mut referenced_versions: HashMap<&str, u64> = HashMap::new();
+        // We need to use vec so we can clean them in the correct order
+        let mut referenced_branches: Vec<(String, u64)> = Vec::new();
+        // Build referenced version map by traversing the branch lineage
+        for branch_lineage in branch_lineages.pre_order_iter_from(current_branch.as_deref())? {
+            let parent_branch = normalize_branch(branch_lineage.branch.as_deref());
+            for child_lineage in branch_lineage.children.iter() {
+                if let (Some(branch), Some(parent_version)) = (
+                    child_lineage.branch.as_ref(),
+                    child_lineage.parent_version_number,
+                ) {
+                    if let Some(ref_version) = referenced_versions.get(parent_branch.as_str()) {
+                        referenced_versions.insert(branch, *ref_version);
+                    } else {
+                        referenced_versions.insert(branch, parent_version);
+                    };
+                }
+            }
+        }
+
+        // Prone branches not necessary to be involved in the cleanup process
+        for branch_lineage in branch_lineages.post_order_iter_from(current_branch.as_deref())? {
+            if branch_lineage.deleted {
+                continue;
+            }
+            if let Some(branch) = branch_lineage.branch.as_ref() {
+                if Some(branch) == self.dataset.manifest.branch.as_ref() {
+                    continue;
+                }
+                if let Some(ref_version) = referenced_versions.get(branch.as_str()) {
+                    let manifest_location = self
+                        .dataset
+                        .commit_handler
+                        .resolve_version_location(
+                            &self.dataset.base,
+                            *ref_version,
+                            &self.dataset.object_store.inner,
+                        )
+                        .await?;
+                    let manifest = read_manifest(
+                        &self.dataset.object_store,
+                        &manifest_location.path,
+                        manifest_location.size,
+                    )
+                    .await;
+
+                    // If the parent manifest has been cleaned, or the parent manifest should be clean
+                    // we should check the referenced branch to make sure the referenced files could be retained
+                    if let Ok(manifest) = manifest {
+                        if self.policy.should_clean(&manifest) {
+                            referenced_branches.push((branch.clone(), *ref_version));
+                        }
+                    }
+                } else {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "Branch {} is not referenced by any version from {}",
+                            branch,
+                            normalize_branch(current_branch.as_deref())
+                        ),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
+        Ok(referenced_branches)
+    }
+
+    async fn clean_referenced_branches(
+        &self,
+        referenced_branches: &[(String, u64)],
+    ) -> Result<RemovalStats> {
+        let mut final_stats = RemovalStats::default();
+        for (branch, _) in referenced_branches {
+            let branch_name = branch.clone();
+            let branch_dataset = self
+                .dataset
+                .checkout_version((Some(branch_name), None))
+                .await?;
+            if let Some(stats) =
+                auto_cleanup_hook(&branch_dataset, branch_dataset.manifest.as_ref(), false).await?
+            {
+                final_stats.bytes_removed += stats.bytes_removed;
+                final_stats.old_versions += stats.old_versions;
+            }
+        }
+        Ok(final_stats)
+    }
+
+    // We need to retain the latest manifest that has the file referenced by descendants_branches
+    async fn retain_branch_lineage_files(
+        &self,
+        inspection: CleanupInspection,
+        referenced_branches: &[(String, u64)],
+    ) -> Result<CleanupInspection> {
+        let inspection = Mutex::new(inspection);
+        for (branch, root_version_number) in referenced_branches {
+            let branch = self
+                .dataset
+                .checkout_version((Some(branch.clone()), None))
+                .await?;
+            branch
+                .commit_handler
+                .list_manifest_locations(&branch.base, &self.dataset.object_store, false)
+                .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                    self.process_branch_referenced_manifests(
+                        location,
+                        *root_version_number,
+                        &inspection,
+                    )
+                })
+                .await?;
+        }
+        Ok(inspection.into_inner().unwrap())
+    }
+
+    async fn process_branch_referenced_manifests(
+        &self,
+        location: ManifestLocation,
+        referenced_version: u64,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<()> {
+        let manifest =
+            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        let indexes =
+            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let mut inspection = inspection.lock().unwrap();
+        let mut is_referenced = false;
+
+        for fragment in manifest.fragments.iter() {
+            for file in fragment.files.iter() {
+                if let Some(base_id) = file.base_id {
+                    let base_path = manifest.base_paths.get(&base_id);
+                    if let Some(base_path) = base_path {
+                        if base_path.path == self.dataset.uri {
+                            let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                            let relative_data_path =
+                                remove_prefix(&full_data_path, &self.dataset.base);
+                            inspection
+                                .verified_files
+                                .data_paths
+                                .remove(&relative_data_path);
+                            is_referenced = true;
+                        }
+                    }
+                }
+            }
+            if let Some(del_file) = fragment.deletion_file.as_ref() {
+                if let Some(base_id) = del_file.base_id {
+                    let base_path = manifest.base_paths.get(&base_id);
+                    if let Some(base_path) = base_path {
+                        let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
+                            deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
+                        });
+                        if base_path.path == self.dataset.uri {
+                            if let Some(deletion_path) = deletion_path {
+                                let relative_path =
+                                    remove_prefix(&deletion_path, &self.dataset.base);
+                                inspection
+                                    .verified_files
+                                    .delete_paths
+                                    .remove(&relative_path);
+                            }
+                            is_referenced = true;
+                        }
+                    }
+                }
+            }
+        }
+        for index in indexes {
+            if let Some(base_id) = index.base_id {
+                let base_path = manifest.base_paths.get(&base_id);
+                if let Some(base_path) = base_path {
+                    if base_path.path == self.dataset.uri {
+                        let uuid_str = index.uuid.to_string();
+                        inspection.verified_files.index_uuids.remove(&uuid_str);
+                        is_referenced = true;
+                    }
+                }
+            }
+        }
+        if is_referenced {
+            inspection
+                .old_manifests
+                .retain(|_path, manifest| manifest.version != referenced_version);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +682,8 @@ pub struct CleanupPolicy {
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
     pub error_if_tagged_old_versions: bool,
+    /// If clean the referenced branches
+    pub clean_referenced_branches: bool,
 }
 
 impl CleanupPolicy {
@@ -475,6 +706,7 @@ impl Default for CleanupPolicy {
             before_version: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
+            clean_referenced_branches: false,
         }
     }
 }
@@ -485,6 +717,12 @@ pub struct CleanupPolicyBuilder {
 }
 
 impl CleanupPolicyBuilder {
+    /// If auto clean referenced branches.
+    pub fn clean_referenced_branches(mut self, clean_referenced_branches: bool) -> Self {
+        self.policy.clean_referenced_branches = clean_referenced_branches;
+        self
+    }
+
     /// Cleanup all versions before the specified timestamp.
     pub fn before_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
         self.policy.before_timestamp = Some(timestamp);
@@ -554,6 +792,7 @@ pub async fn cleanup_old_versions(
 pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
+    by_commit: bool,
 ) -> Result<Option<RemovalStats>> {
     if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
         let interval: u64 = match interval.parse() {
@@ -564,17 +803,25 @@ pub async fn auto_cleanup_hook(
                         "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
                         e
                     ),
-                })
+                });
             }
         };
 
-        if manifest.version % interval != 0 {
+        if interval != 0 && manifest.version % interval != 0 {
             return Ok(None);
         }
     } else {
         return Ok(None);
     }
 
+    let mut policy = build_cleanup_policy(dataset, manifest).await?;
+    if !by_commit && policy.clean_referenced_branches {
+        policy.clean_referenced_branches = false;
+    }
+    Ok(Some(dataset.cleanup_with_policy(policy).await?))
+}
+
+pub async fn build_cleanup_policy(dataset: &Dataset, manifest: &Manifest) -> Result<CleanupPolicy> {
     let mut builder = CleanupPolicyBuilder::default();
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
@@ -582,10 +829,10 @@ pub async fn auto_cleanup_hook(
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                    "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
-                    e
-                ),
-                })
+                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
+                        e
+                    ),
+                });
             }
         };
         let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
@@ -597,16 +844,31 @@ pub async fn auto_cleanup_hook(
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                    "Error encountered while parsing lance.auto_cleanup.retain_versions as u64: {}",
-                    e
-                ),
-                })
+                        "Error encountered while parsing lance.auto_cleanup.retain_versions as u64: {}",
+                        e
+                    ),
+                });
             }
         };
         builder = builder.retain_n_versions(dataset, retain_versions).await?;
     }
+    if let Some(referenced_branch) = manifest.config.get("lance.auto_cleanup.referenced_branch") {
+        let clean_referenced: bool = match referenced_branch.parse() {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.referenced_branch as bool: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        // Map config to policy flag controlling whether referenced branches are cleaned
+        builder = builder.clean_referenced_branches(clean_referenced);
+    }
 
-    Ok(Some(dataset.cleanup_with_policy(builder.build()).await?))
+    Ok(builder.build())
 }
 
 fn tagged_old_versions_cleanup_error(
@@ -635,7 +897,10 @@ fn tagged_old_versions_cleanup_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use arrow_array::RecordBatchReader;
     use datafusion::common::assert_contains;
@@ -1042,7 +1307,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+        assert_contains!(
+            cleanup_error.to_string(),
+            "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:"
+        );
 
         dataset.tags().delete("old-tag").await.unwrap();
 
@@ -1051,7 +1319,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
+        assert_contains!(
+            cleanup_error.to_string(),
+            "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:"
+        );
 
         dataset.tags().delete("another-old-tag").await.unwrap();
 
@@ -1589,5 +1860,1100 @@ mod tests {
         );
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use crate::dataset::cleanup::{
+        cleanup_old_versions, CleanupPolicy, CleanupPolicyBuilder, RemovalStats,
+    };
+    use crate::dataset::{WriteMode, WriteParams};
+    use crate::Dataset;
+    use crate::Result;
+    use arrow::compute;
+    use arrow_array::UInt64Array;
+    use chrono::TimeDelta;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::testing::MockClock;
+    use lance_index::DatasetIndexExt;
+    use lance_io::object_store::ObjectStore;
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use object_store::path::Path;
+    use std::sync::Arc;
+
+    // Lineage overview with annotated base versions:
+    // - branch1 is created from main@v1
+    // - branch4 is created from main@v2 (after main receives a second write)
+    // - dev/branch2 is created from branch1@latest
+    // - feature/nathan/branch3 is created from dev/branch2@latest
+    //
+    // ASCII lineage with versions:
+    //    main:v1 ──▶ branch1:v1 ──▶ dev/branch2:v2 ──▶ feature/nathan/branch3:v3
+    //        │
+    //    (main:v2) ──▶ branch4:v2
+    //
+    // Cleanup policy focus (unless explicitly overridden in a test):
+    // - retain_n_versions = 1: keep the latest manifest per branch
+    // - referenced branches: when enabled, protect parent files referenced by descendants
+    // - file counts reported per branch:
+    //   manifest: number of manifest files under _versions
+    //   data: .lance files under data directory
+    //   tx: .txn files count under _transactions
+    //   delete: deletion files count under _deletions
+    //   index: index files count under _indices
+    //
+    // Note: branch2 is stored as "dev/branch2"; comments may refer to it as branch2 for brevity.
+    // Important: auto_cleanup_hook uses policy derived from manifest config; it does not flip
+    // clean_referenced_branches unless tests call cleanup_old_versions with a custom policy.
+    struct LineageSetup {
+        #[allow(dead_code)]
+        base_dir: TempStrDir,
+        main: DatasetWithCounts,
+        branch1: DatasetWithCounts,
+        branch2: DatasetWithCounts,
+        branch3: DatasetWithCounts,
+        branch4: DatasetWithCounts,
+        #[allow(dead_code)]
+        clock: MockClock<'static>,
+    }
+
+    impl LineageSetup {
+        pub async fn enable_auto_cleanup(&mut self) -> Result<()> {
+            let updates = [
+                ("lance.auto_cleanup.interval", "1"),
+                ("lance.auto_cleanup.retain_versions", "1"),
+                ("lance.auto_cleanup.referenced_branch", "true"),
+            ];
+            self.main.dataset.update_config(updates).await?;
+            self.branch1.dataset.update_config(updates).await?;
+            self.branch2.dataset.update_config(updates).await?;
+            self.branch3.dataset.update_config(updates).await?;
+            self.branch4.dataset.update_config(updates).await?;
+            self.main.refresh().await?;
+            self.branch1.refresh().await?;
+            self.branch2.refresh().await?;
+            self.branch3.refresh().await?;
+            self.branch4.refresh().await?;
+            Ok(())
+        }
+
+        pub async fn disable_auto_cleanup(&mut self) -> Result<()> {
+            let updates = [
+                ("lance.auto_cleanup.interval", None),
+                ("lance.auto_cleanup.retain_versions", None),
+                ("lance.auto_cleanup.older_than", None),
+            ];
+            self.main.dataset.update_config(updates).await?;
+            self.branch1.dataset.update_config(updates).await?;
+            self.branch2.dataset.update_config(updates).await?;
+            self.branch3.dataset.update_config(updates).await?;
+            self.branch4.dataset.update_config(updates).await?;
+            self.main.refresh().await?;
+            self.branch1.refresh().await?;
+            self.branch2.refresh().await?;
+            self.branch3.refresh().await?;
+            self.branch4.refresh().await?;
+            Ok(())
+        }
+    }
+
+    // Build the lineage and configure per-branch auto-cleanup to retain latest version.
+    async fn build_lineage_datasets() -> Result<LineageSetup> {
+        let clock = MockClock::new();
+        clock.set_system_time(TimeDelta::try_seconds(10).unwrap());
+        let base_dir = TempStrDir::default();
+        let base_uri = format!("{}/lineage_ds", base_dir.as_str());
+        // Add a text column so we can build a full-text index per branch/main.
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(IncrementingInt32::new().named("id".to_owned())))
+            .col(Box::new(IncrementingUtf8::new().prefix("t").named("text")));
+
+        // Create main (initial write)
+        let main_ds = Dataset::write(
+            data_gen.batch(50),
+            &base_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let mut main = DatasetWithCounts::new(main_ds);
+        // Initial index creation and refresh counts
+        main.create_text_index().await?;
+        main.write_data().await?;
+
+        // Create branch1 from main@v1, then do an initial append + deterministic delete
+        let branch1_ds = main
+            .dataset
+            .create_branch("branch1", (None, None), None)
+            .await?;
+        let mut branch1 = DatasetWithCounts::new(branch1_ds);
+        branch1.write_data().await?;
+
+        // Create branch2 from branch1@latest
+        let branch2_ds = branch1
+            .dataset
+            .create_branch("dev/branch2", ("branch1", None), None)
+            .await?;
+        let mut branch2 = DatasetWithCounts::new(branch2_ds);
+        branch2.write_data().await?;
+
+        // Create branch3 from branch2@latest, initial append + delete
+        let branch3_ds = branch2
+            .dataset
+            .create_branch("feature/nathan/branch3", ("dev/branch2", None), None)
+            .await?;
+        let mut branch3 = DatasetWithCounts::new(branch3_ds);
+        branch3.write_data().await?;
+
+        // Create branch4 from a new version in main
+        main.write_data().await?;
+        let branch4_ds = main
+            .dataset
+            .create_branch("branch4", (None, None), None)
+            .await?;
+        let mut branch4 = DatasetWithCounts::new(branch4_ds);
+        branch4.write_data().await?;
+
+        let mut lineage = LineageSetup {
+            base_dir,
+            main,
+            branch1,
+            branch2,
+            branch3,
+            branch4,
+            clock,
+        };
+
+        lineage.disable_auto_cleanup().await?;
+        Ok(lineage)
+    }
+
+    // Deterministic string generator for Utf8 column used in tests.
+    struct IncrementingUtf8 {
+        name: Option<String>,
+        current: i32,
+        step: i32,
+        prefix: String,
+    }
+
+    impl Default for IncrementingUtf8 {
+        fn default() -> Self {
+            Self {
+                name: None,
+                current: 0,
+                step: 1,
+                prefix: "text".to_string(),
+            }
+        }
+    }
+
+    impl IncrementingUtf8 {
+        fn new() -> Self {
+            Default::default()
+        }
+        #[allow(dead_code)]
+        fn start(mut self, start: i32) -> Self {
+            self.current = start;
+            self
+        }
+        #[allow(dead_code)]
+        fn step(mut self, step: i32) -> Self {
+            self.step = step;
+            self
+        }
+        fn prefix(mut self, p: &str) -> Self {
+            self.prefix = p.to_string();
+            self
+        }
+        fn named(mut self, name: impl Into<String>) -> Self {
+            self.name = Some(name.into());
+            self
+        }
+    }
+
+    impl lance_testing::datagen::ArrayGenerator for IncrementingUtf8 {
+        fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array> {
+            let mut values = Vec::with_capacity(length);
+            for _ in 0..length {
+                values.push(format!("{}_{}", self.prefix, self.current));
+                self.current += self.step;
+            }
+            Arc::new(arrow_array::StringArray::from(values))
+        }
+        fn data_type(&self) -> &arrow_schema::DataType {
+            &arrow_schema::DataType::Utf8
+        }
+        fn name(&self) -> Option<&str> {
+            self.name.as_deref()
+        }
+    }
+
+    struct DatasetWithCounts {
+        dataset: Dataset,
+        num_manifest_files: usize,
+        num_data_files: usize,
+        num_tx_files: usize,
+        num_delete_files: usize,
+        num_index_files: usize,
+    }
+
+    impl DatasetWithCounts {
+        fn new(dataset: Dataset) -> Self {
+            Self {
+                dataset,
+                num_manifest_files: 0,
+                num_data_files: 0,
+                num_tx_files: 0,
+                num_delete_files: 0,
+                num_index_files: 0,
+            }
+        }
+
+        // Create a full-text index (Inverted) on the "text" column once.
+        // We only create this on main during dataset creation. Branches inherit the index configuration.
+        async fn create_text_index(&mut self) -> Result<()> {
+            use lance_index::scalar::InvertedIndexParams;
+            use lance_index::{DatasetIndexExt, IndexType};
+            let params = InvertedIndexParams::default();
+            self.dataset
+                .create_index(&["text"], IndexType::Inverted, None, &params, true)
+                .await?;
+            Ok(())
+        }
+
+        // Append a batch, then read exactly one row and delete that row; finally optimize indices.
+        async fn append_delete_and_optimize_index(&mut self) -> Result<()> {
+            use crate::dataset::WriteParams;
+            // Append data
+            self.dataset
+                .append(
+                    {
+                        let mut gen = BatchGenerator::new()
+                            .col(Box::new(IncrementingInt32::new().named("id".to_owned())))
+                            .col(Box::new(IncrementingUtf8::new().prefix("t").named("text")));
+                        gen.batch(5)
+                    },
+                    Some(WriteParams {
+                        mode: WriteMode::Append,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            self.dataset.checkout_latest().await?;
+            let batch = self.dataset.scan().with_row_id().try_into_batch().await?;
+            if batch.num_rows() > 0 {
+                // Always delete the max_row_id to generate a new deletion file
+                let row_id_col = batch.column_by_name(lance_core::ROW_ID).unwrap();
+                let uint64_array = row_id_col.as_any().downcast_ref::<UInt64Array>().unwrap();
+                let max_row_id = compute::max(uint64_array).unwrap_or(0);
+                self.dataset
+                    .delete(&format!("_rowid = {}", max_row_id))
+                    .await?;
+            }
+            // Optimize indices after write and delete
+            use lance_index::optimize::OptimizeOptions;
+            self.dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await?;
+            Ok(())
+        }
+
+        // Update counters by listing authoritative branch directories instead of reading the latest manifest.
+        async fn refresh(&mut self) -> Result<()> {
+            use futures::TryStreamExt;
+            let branch_path = self.dataset.base.clone();
+
+            // Helper: count objects in a directory, optionally filtering by extension.
+            async fn count_dir_any(os: &ObjectStore, dir: &Path) -> Result<usize> {
+                let mut count = 0usize;
+                let mut s = os.read_dir_all(dir, None);
+                while let Some(_meta) = s.try_next().await? {
+                    count += 1;
+                }
+                Ok(count)
+            }
+            async fn count_dir_ext(os: &ObjectStore, dir: &Path, ext: &str) -> Result<usize> {
+                let mut count = 0usize;
+                let mut s = os.read_dir_all(dir, None);
+                while let Some(meta) = s.try_next().await? {
+                    if meta.location.extension() == Some(ext) {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            }
+            async fn count_dir_exts(os: &ObjectStore, dir: &Path, exts: &[&str]) -> Result<usize> {
+                let mut count = 0usize;
+                let mut s = os.read_dir_all(dir, None);
+                while let Some(meta) = s.try_next().await? {
+                    if let Some(e) = meta.location.extension() {
+                        if exts.contains(&e) {
+                            count += 1;
+                        }
+                    }
+                }
+                Ok(count)
+            }
+
+            let manifest_dir = branch_path.child("_versions");
+            self.num_manifest_files =
+                count_dir_ext(&self.dataset.object_store, &manifest_dir, "manifest")
+                    .await
+                    .unwrap_or(0);
+
+            // Transactions: count files under _transactions (extension .txn)
+            let txn_dir = branch_path.child("_transactions");
+            self.num_tx_files = count_dir_ext(&self.dataset.object_store, &txn_dir, "txn")
+                .await
+                .unwrap_or(0);
+
+            // Indices: count files under _indices
+            let idx_dir = branch_path.child(crate::dataset::INDICES_DIR);
+            self.num_index_files = count_dir_any(&self.dataset.object_store, &idx_dir)
+                .await
+                .unwrap_or(0);
+
+            // Deletions: count files under _deletions (extensions .arrow / .bin)
+            let del_dir = branch_path.child("_deletions");
+            self.num_delete_files =
+                count_dir_exts(&self.dataset.object_store, &del_dir, &["arrow", "bin"])
+                    .await
+                    .unwrap_or(0);
+
+            // Data files: count .lance files under data/
+            let data_dir = branch_path.child(crate::dataset::DATA_DIR);
+            self.num_data_files = count_dir_ext(&self.dataset.object_store, &data_dir, "lance")
+                .await
+                .unwrap_or(0);
+
+            Ok(())
+        }
+
+        async fn count_data(&self) -> Result<usize> {
+            use futures::TryStreamExt;
+            let mut count = 0usize;
+            let mut s = self.dataset.scan().try_into_stream().await?;
+            while let Some(_batch) = s.try_next().await? {
+                count += 1;
+            }
+            Ok(count)
+        }
+
+        // Strict equality assertion for all counters.
+        async fn assert_not_changed(&mut self) -> Result<()> {
+            let num_manifest_files = self.num_manifest_files;
+            let num_data_files = self.num_data_files;
+            let num_tx_files = self.num_tx_files;
+            let num_delete_files = self.num_delete_files;
+            let num_index_files = self.num_index_files;
+            let pre_data_count = self.count_data().await?;
+
+            self.refresh().await?;
+            assert_eq!(self.num_manifest_files, num_manifest_files);
+            assert_eq!(self.num_data_files, num_data_files);
+            assert_eq!(self.num_tx_files, num_tx_files);
+            assert_eq!(self.num_delete_files, num_delete_files);
+            assert_eq!(self.num_index_files, num_index_files);
+            assert_eq!(self.count_data().await?, pre_data_count);
+            Ok(())
+        }
+
+        // Append, delete top row, and optimize indices.
+        async fn write_data(&mut self) -> Result<()> {
+            self.append_delete_and_optimize_index().await?;
+            self.refresh().await
+        }
+
+        // Compact files for a given branch and optimize indices to stabilize index files.
+        async fn compact(&mut self) -> Result<()> {
+            use crate::dataset::optimize::{compact_files, CompactionOptions};
+            compact_files(&mut self.dataset, CompactionOptions::default(), None).await?;
+            self.refresh().await
+        }
+
+        async fn run_cleanup(&mut self) -> Result<RemovalStats> {
+            let policy = CleanupPolicyBuilder::default()
+                .retain_n_versions(&self.dataset, 1)
+                .await?
+                .build();
+            self.run_cleanup_inner(policy).await
+        }
+
+        async fn run_cleanup_with_referenced_branches(&mut self) -> Result<RemovalStats> {
+            let policy = CleanupPolicyBuilder::default()
+                .clean_referenced_branches(true)
+                .retain_n_versions(&self.dataset, 1)
+                .await?
+                .build();
+            self.run_cleanup_inner(policy).await
+        }
+
+        async fn run_cleanup_inner(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
+            let pre_count = self.count_data().await?;
+            self.dataset.checkout_latest().await?;
+            let stats = cleanup_old_versions(&self.dataset, policy).await;
+            self.refresh().await?;
+            // Assert data could be read again and did't change
+            assert_eq!(self.count_data().await?, pre_count);
+            stats
+        }
+    }
+
+    // ===================== Tests =====================
+    #[tokio::test]
+    async fn cleanup_lineage_branch1() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.branch1.write_data().await.unwrap();
+        setup.branch1.run_cleanup().await.unwrap();
+        // Branch2 and branch3 hold references from branch1:
+        // - 1 manifest file
+        // - 1 data file
+        // - 1 deletion file
+        // - 4 index files
+        // The left is the counts for the latest version of appending
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 2);
+        assert_eq!(setup.branch1.num_index_files, 8);
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.branch1.compact().await.unwrap();
+        setup.branch1.run_cleanup().await.unwrap();
+        // Branch2 and branch3 hold references from branch1:
+        // - 1 manifest file
+        // - 1 data file
+        // - 1 deletion file
+        // - 4 index files
+        // The left (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 1);
+        assert_eq!(setup.branch1.num_index_files, 8);
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        // Now we clean the referenced files of branch1 by branch2 and branch3
+        setup.branch2.compact().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup.branch3.run_cleanup().await.unwrap();
+        setup.branch2.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch1.run_cleanup().await.unwrap();
+
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.branch1.num_manifest_files, 1);
+        assert_eq!(setup.branch1.num_data_files, 1);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 0);
+        assert_eq!(setup.branch1.num_index_files, 4);
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_lineage_branch3() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.branch3.write_data().await.unwrap();
+        setup.branch3.run_cleanup().await.unwrap();
+        // Two writes produced:
+        // - 2 data files
+        // - 2 deletion files
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 2);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 2);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.branch2.compact().await.unwrap();
+        setup.branch2.run_cleanup().await.unwrap();
+        // Branch3 hold references from branch2:
+        // - 1 manifest file
+        // - 1 data file
+        // - 1 deletion file
+        // The left is the counts for the latest version of compaction
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 2);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 4);
+
+        setup.branch3.compact().await.unwrap();
+        setup.branch3.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.branch2.compact().await.unwrap();
+        setup.branch2.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+    }
+
+    #[tokio::test]
+    async fn cleanup_lineage_branch4() {
+        // Setup shared lineage and per-branch auto-clean config
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.branch4.write_data().await.unwrap();
+        setup.branch4.run_cleanup().await.unwrap();
+        // Two writes produced:
+        // - 2 data files
+        // - 2 deletion files
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 2);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 2);
+        assert_eq!(setup.branch4.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.main.compact().await.unwrap();
+        setup.main.run_cleanup().await.unwrap();
+        // Branch1-branch2 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // - 4 index files
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 1 deletion file
+        // - 4 index files
+        // The left(1, 1, 1, 0, 0) is the counts for the latest version of compaction
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+
+        setup.branch4.compact().await.unwrap();
+        setup.branch4.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.main.run_cleanup().await.unwrap();
+        // Branch1-branch2 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // - 4 index files
+        // The left(1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 3);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 1);
+        assert_eq!(setup.main.num_index_files, 8);
+    }
+
+    #[tokio::test]
+    async fn cleanup_lineage_main() {
+        // Setup shared lineage and per-branch auto-clean config
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.main.write_data().await.unwrap();
+        setup.main.run_cleanup().await.unwrap();
+        // Branch1-branch2 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // - 4 index files(only for branch1)
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 1 deletion file
+        // - 4 index files
+        // The left(1, 1, 1, 1, 4) is the counts for the latest version of compaction
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 3);
+        assert_eq!(setup.main.num_index_files, 12);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+
+        setup.main.compact().await.unwrap();
+        setup.main.run_cleanup().await.unwrap();
+        // Cleanup the deletion file
+        // Produce 1 datafile and cleanup 1
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 12);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch2.assert_not_changed().await.unwrap();
+        setup.branch3.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+
+        setup.branch1.write_data().await.unwrap();
+        setup.branch1.compact().await.unwrap();
+        setup.branch2.write_data().await.unwrap();
+        setup.branch2.compact().await.unwrap();
+        setup.branch2.run_cleanup().await.unwrap();
+        // Branch3 holds references from branch2:
+        // - 1 manifest file
+        // - 1 data files
+        // - 1 deletion file
+        // Branch3 holds reference from branch1:
+        // - 1 manifest file
+        // - 1 data files
+        // - 2 deletion files
+        // - 4 index files
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 2);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 8);
+        setup.branch1.run_cleanup().await.unwrap();
+        // Cleanup 4 index files referenced from branch2
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 1);
+        assert_eq!(setup.branch1.num_index_files, 4);
+
+        setup.main.run_cleanup().await.unwrap();
+        // Branch3 holds references from main:
+        // - 1 manifest file
+        // - 1 data files
+        // - 1 deletion file
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 2 deletion files
+        // - 4 index files
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+
+        setup.branch3.write_data().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup.branch3.run_cleanup().await.unwrap();
+        // Only the counts for the latest version
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+
+        setup.main.run_cleanup().await.unwrap();
+        // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+
+        // Cleanup doesn't take effect if we don't clean branch2 first
+        setup.branch1.run_cleanup().await.unwrap();
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 1);
+        assert_eq!(setup.branch1.num_index_files, 4);
+
+        setup.branch2.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+
+        setup.branch1.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.branch1.num_manifest_files, 1);
+        assert_eq!(setup.branch1.num_data_files, 1);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 0);
+        assert_eq!(setup.branch1.num_index_files, 4);
+
+        setup.main.run_cleanup().await.unwrap();
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 2 deletion files
+        // - 4 index files
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+
+        setup.branch4.write_data().await.unwrap();
+        setup.branch4.compact().await.unwrap();
+        setup.branch4.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+
+        setup.main.run_cleanup().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts for the latest version
+        assert_eq!(setup.main.num_manifest_files, 1);
+        assert_eq!(setup.main.num_data_files, 1);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 0);
+        assert_eq!(setup.main.num_index_files, 4);
+    }
+
+    #[tokio::test]
+    async fn auto_clean_referenced_branches_from_branch2() {
+        // Setup shared lineage and per-branch auto-clean config
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.branch3.write_data().await.unwrap();
+        setup
+            .branch2
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch3.refresh().await.unwrap();
+        // Branch3 holds references from branch2:
+        // - 1 manifest file
+        // - 1 data file
+        // - 1 deletion file
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        // After auto-clean: branch3
+        // 2 appends produced 2 data files
+        // 2 deletes produced 2 deletion files
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 2);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 2);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+
+        setup.disable_auto_cleanup().await.unwrap();
+        setup.branch2.write_data().await.unwrap();
+        setup.branch2.compact().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup.enable_auto_cleanup().await.unwrap();
+        setup
+            .branch2
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch3.refresh().await.unwrap();
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        // Only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch1.assert_not_changed().await.unwrap();
+        setup.branch4.assert_not_changed().await.unwrap();
+        setup.main.assert_not_changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_clean_referenced_branches_from_main() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.enable_auto_cleanup().await.unwrap();
+        setup.main.write_data().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        // Branch3, branch2 and branch1 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 1 deletion file
+        // - 4 index files
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 3);
+        assert_eq!(setup.main.num_index_files, 4);
+
+        setup.main.compact().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        // Branch3, branch2 and branch1 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // Branch4 holds references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 1 deletion file
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 4);
+
+        setup.branch4.compact().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch4.refresh().await.unwrap();
+        // Branch3, branch2 and branch1 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 3);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 1);
+        assert_eq!(setup.main.num_index_files, 4);
+        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+
+        setup.branch1.write_data().await.unwrap();
+        setup.branch1.compact().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch1.refresh().await.unwrap();
+        // Branch3 and branch2 still hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 3);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 1);
+        assert_eq!(setup.main.num_index_files, 4);
+        // Branch3 and branch2 still hold references from branch1:
+        // - 1 manifest file
+        // - 1 data files
+        // - 1 deletion file
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 1);
+        assert_eq!(setup.branch1.num_index_files, 4);
+
+        setup.branch2.write_data().await.unwrap();
+        setup.branch2.compact().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch2.refresh().await.unwrap();
+        // Branch3 still holds references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 3);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 1);
+        assert_eq!(setup.main.num_index_files, 4);
+        // Branch3 still holds references from branch1:
+        // - 1 manifest file
+        // - 1 data files
+        // - 1 deletion file
+        assert_eq!(setup.branch1.num_manifest_files, 2);
+        assert_eq!(setup.branch1.num_data_files, 2);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 1);
+        assert_eq!(setup.branch1.num_index_files, 4);
+        // Branch3 still holds references from branch2:
+        // - 1 manifest file
+        // - 1 data files
+        // - 1 deletion file
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 2);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 4);
+
+        setup.branch3.write_data().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch1.refresh().await.unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        // For all branches, only the latest manifest is retained.
+        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.main.num_manifest_files, 1);
+        assert_eq!(setup.main.num_data_files, 1);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 0);
+        assert_eq!(setup.main.num_index_files, 4);
+        assert_eq!(setup.branch1.num_manifest_files, 1);
+        assert_eq!(setup.branch1.num_data_files, 1);
+        assert_eq!(setup.branch1.num_tx_files, 1);
+        assert_eq!(setup.branch1.num_delete_files, 0);
+        assert_eq!(setup.branch1.num_index_files, 4);
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        setup.branch4.assert_not_changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_clean_referenced_branches_with_delete_branch1() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.branch2.compact().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup.branch4.compact().await.unwrap();
+        setup
+            .main
+            .dataset
+            .branches()
+            .delete("branch1", true)
+            .await
+            .unwrap();
+
+        setup.main.compact().await.unwrap();
+        setup.main.run_cleanup().await.unwrap();
+        // Branch2, branch3 and branch4 hold references from main:
+        // - 1 manifest file
+        // - 2 data files
+        // - 1 deletion file
+        // Branch4, branch3 and branch4 hold references from main:
+        // - 1 manifest file
+        // - 3 data files
+        // - 1 deletion file
+        // - 4 index files
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+
+        setup.enable_auto_cleanup().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        // All cleaned up
+        assert_eq!(setup.main.num_manifest_files, 1);
+        assert_eq!(setup.main.num_data_files, 1);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 0);
+        assert_eq!(setup.main.num_index_files, 4);
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
     }
 }

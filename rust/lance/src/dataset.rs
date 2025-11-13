@@ -57,6 +57,7 @@ use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
+mod branch_lineage;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
