@@ -41,6 +41,28 @@ impl IOTracker {
     pub fn stats(&self) -> IoStats {
         self.0.lock().unwrap().clone()
     }
+
+    /// Record a read operation for tracking.
+    ///
+    /// This is used by readers that bypass the ObjectStore layer (like LocalObjectReader)
+    /// to ensure their IO operations are still tracked.
+    pub fn record_read(
+        &self,
+        #[allow(unused_variables)] method: &'static str,
+        #[allow(unused_variables)] path: Path,
+        num_bytes: u64,
+        #[allow(unused_variables)] range: Option<Range<u64>>,
+    ) {
+        let mut stats = self.0.lock().unwrap();
+        stats.read_iops += 1;
+        stats.read_bytes += num_bytes;
+        #[cfg(feature = "test-util")]
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range,
+        });
+    }
 }
 
 impl WrappingObjectStore for IOTracker {

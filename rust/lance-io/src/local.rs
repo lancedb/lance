@@ -26,6 +26,7 @@ use tracing::instrument;
 
 use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::traits::{Reader, Writer};
+use crate::utils::tracking_store::IOTracker;
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
 pub fn to_local_path(path: &Path) -> String {
@@ -86,6 +87,9 @@ pub struct LocalObjectReader {
 
     /// Block size, in bytes.
     block_size: usize,
+
+    /// IO tracker for monitoring read operations.
+    io_tracker: Option<Arc<IOTracker>>,
 }
 
 impl DeepSizeOf for LocalObjectReader {
@@ -107,11 +111,24 @@ impl LocalObjectReader {
     }
 
     /// Open a local object reader, with default prefetch size.
+    ///
+    /// For backward compatibility with existing code that doesn't need tracking.
     #[instrument(level = "debug")]
     pub async fn open(
         path: &Path,
         block_size: usize,
         known_size: Option<usize>,
+    ) -> Result<Box<dyn Reader>> {
+        Self::open_with_tracker(path, block_size, known_size, None).await
+    }
+
+    /// Open a local object reader with optional IO tracking.
+    #[instrument(level = "debug")]
+    pub(crate) async fn open_with_tracker(
+        path: &Path,
+        block_size: usize,
+        known_size: Option<usize>,
+        io_tracker: Option<Arc<IOTracker>>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
@@ -129,6 +146,7 @@ impl LocalObjectReader {
                 block_size,
                 size,
                 path,
+                io_tracker,
             }) as Box<dyn Reader>)
         })
         .await?
@@ -171,7 +189,12 @@ impl Reader for LocalObjectReader {
     #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+        let num_bytes = range.len() as u64;
+        let range_u64 = (range.start as u64)..(range.end as u64);
+
+        let result = tokio::task::spawn_blocking(move || {
             let mut buf = BytesMut::with_capacity(range.len());
             // Safety: `buf` is set with appropriate capacity above. It is
             // written to below and we check all data is initialized at that point.
@@ -187,14 +210,24 @@ impl Reader for LocalObjectReader {
         .map_err(|err: std::io::Error| object_store::Error::Generic {
             store: "LocalFileSystem",
             source: err.into(),
-        })
+        });
+
+        // Record the read operation if tracking is enabled
+        if let (Ok(_), Some(tracker)) = (&result, io_tracker.as_ref()) {
+            tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+        }
+
+        result
     }
 
     /// Reads the entire file.
     #[instrument(level = "debug", skip(self))]
     async fn get_all(&self) -> object_store::Result<Bytes> {
         let mut file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
             let mut buf = Vec::new();
             file.read_to_end(buf.as_mut())?;
             Ok(Bytes::from(buf))
@@ -203,7 +236,14 @@ impl Reader for LocalObjectReader {
         .map_err(|err: std::io::Error| object_store::Error::Generic {
             store: "LocalFileSystem",
             source: err.into(),
-        })
+        });
+
+        // Record the read operation if tracking is enabled
+        if let (Ok(bytes), Some(tracker)) = (&result, io_tracker.as_ref()) {
+            tracker.record_read("get_all", path, bytes.len() as u64, None);
+        }
+
+        result
     }
 }
 
