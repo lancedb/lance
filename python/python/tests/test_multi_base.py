@@ -1092,3 +1092,62 @@ class TestWriteFragmentsWithTargetBases:
         result = dataset.to_table().to_pandas()
         assert len(result) == 50
         assert set(result["id"]) == set(range(50))
+
+    def test_write_fragments_overwrite_mode_with_target_bases(self):
+        """Test write_fragments in OVERWRITE mode with target_bases."""
+        # Create initial dataset
+        initial_data = pd.DataFrame({
+            "id": range(30),
+            "value": [f"initial_{i}" for i in range(30)],
+        })
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            max_rows_per_file=15,
+        )
+
+        assert len(dataset.to_table()) == 30
+
+        # Use write_fragments with mode="overwrite" to replace all data
+        overwrite_data = pd.DataFrame({
+            "id": range(100, 120),
+            "value": [f"overwrite_{i}" for i in range(100, 120)],
+        })
+
+        fragments = write_fragments(
+            pa.Table.from_pandas(overwrite_data),
+            dataset,
+            mode="overwrite",
+            target_bases=["base2"],  # Write to base2 this time
+            max_rows_per_file=10,
+        )
+
+        assert len(fragments) > 0
+
+        # Commit with Overwrite operation
+        operation = lance.LanceOperation.Overwrite(
+            pa.Table.from_pandas(overwrite_data).schema,
+            fragments
+        )
+        dataset = lance.LanceDataset.commit(
+            dataset.uri, operation, read_version=dataset.version
+        )
+
+        # Verify data was overwritten (only new data should exist)
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 20
+        assert set(result["id"]) == set(range(100, 120))
+        # Old data (0-29) should be gone
+        assert not any(result["id"] < 100)
+
+        # Verify fragments are in base2
+        base2_path = Path(self.base2_uri)
+        data_files = list(base2_path.glob("**/*.lance"))
+        assert len(data_files) > 0, "Expected data files in base2"
