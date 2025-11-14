@@ -12,10 +12,15 @@ use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::WriteParams;
 use lance::session::Session;
 use lance::{dataset::scanner::Scanner, Dataset};
 use lance_core::{box_error, Error, Result};
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_index::traits::DatasetIndexExt;
+use lance_index::IndexType;
 use lance_io::object_store::ObjectStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -41,6 +46,14 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DELIMITER: &str = "$";
+
+// Index names for the __manifest table
+/// BTREE index on the object_id column for fast lookups
+const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
+/// Bitmap index on the object_type column for filtering by type
+const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
+/// LabelList index on the base_objects column for materialized view dependencies
+const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +239,9 @@ pub struct ManifestNamespace {
     /// If true, root namespace tables use {table_name}.lance naming
     /// If false, they use namespace-prefixed names
     dir_listing_enabled: bool,
+    /// Whether to perform inline optimization (compaction and indexing) on the __manifest table
+    /// after every write. Defaults to true.
+    inline_optimization_enabled: bool,
 }
 
 impl ManifestNamespace {
@@ -237,6 +253,7 @@ impl ManifestNamespace {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
     ) -> Result<Self> {
         let manifest_dataset =
             Self::create_or_get_manifest(&root, object_store.clone(), session.clone()).await?;
@@ -249,6 +266,7 @@ impl ManifestNamespace {
             base_path,
             manifest_dataset,
             dir_listing_enabled,
+            inline_optimization_enabled,
         })
     }
 
@@ -331,6 +349,121 @@ impl ManifestNamespace {
             })?;
 
         Ok(full_url.to_string())
+    }
+
+    /// Perform inline optimization on the __manifest table.
+    ///
+    /// This method:
+    /// 1. Creates three indexes on the manifest table:
+    ///    - BTREE index on object_id for fast lookups
+    ///    - Bitmap index on object_type for filtering by type
+    ///    - LabelList index on base_objects for materialized view dependencies
+    /// 2. Runs file compaction to merge small files
+    /// 3. Optimizes existing indices
+    ///
+    /// This is called automatically after writes when inline_optimization_enabled is true.
+    async fn run_inline_optimization(&self) -> Result<()> {
+        if !self.inline_optimization_enabled {
+            return Ok(());
+        }
+
+        // Get a mutable reference to the dataset to perform optimization
+        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
+        let dataset: &mut Dataset = &mut *dataset_guard;
+
+        // Step 1: Create indexes if they don't already exist
+        let indices = dataset.load_indices().await.map_err(|e| Error::IO {
+            source: box_error(std::io::Error::other(format!("Failed to load indices: {}", e))),
+            location: location!(),
+        })?;
+
+        // Check which indexes already exist
+        let has_object_id_index = indices.iter().any(|idx| idx.name == OBJECT_ID_INDEX_NAME);
+        let has_object_type_index = indices.iter().any(|idx| idx.name == OBJECT_TYPE_INDEX_NAME);
+        let has_base_objects_index = indices.iter().any(|idx| idx.name == BASE_OBJECTS_INDEX_NAME);
+
+        // Create BTREE index on object_id
+        if !has_object_id_index {
+            log::info!("Creating BTREE index '{}' on object_id for __manifest table", OBJECT_ID_INDEX_NAME);
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+            dataset
+                .create_index(&["object_id"], IndexType::BTree, Some(OBJECT_ID_INDEX_NAME.to_string()), &params, true)
+                .await
+                .map_err(|e| Error::IO {
+                    source: box_error(std::io::Error::other(format!(
+                        "Failed to create BTREE index on object_id: {}",
+                        e
+                    ))),
+                    location: location!(),
+                })?;
+        }
+
+        // Create Bitmap index on object_type
+        if !has_object_type_index {
+            log::info!("Creating Bitmap index '{}' on object_type for __manifest table", OBJECT_TYPE_INDEX_NAME);
+            let params = ScalarIndexParams::default();
+            dataset
+                .create_index(&["object_type"], IndexType::Bitmap, Some(OBJECT_TYPE_INDEX_NAME.to_string()), &params, true)
+                .await
+                .map_err(|e| Error::IO {
+                    source: box_error(std::io::Error::other(format!(
+                        "Failed to create Bitmap index on object_type: {}",
+                        e
+                    ))),
+                    location: location!(),
+                })?;
+        }
+
+        // Create LabelList index on base_objects
+        if !has_base_objects_index {
+            log::info!("Creating LabelList index '{}' on base_objects for __manifest table", BASE_OBJECTS_INDEX_NAME);
+            let params = ScalarIndexParams::default();
+            dataset
+                .create_index(&["base_objects"], IndexType::LabelList, Some(BASE_OBJECTS_INDEX_NAME.to_string()), &params, true)
+                .await
+                .map_err(|e| Error::IO {
+                    source: box_error(std::io::Error::other(format!(
+                        "Failed to create LabelList index on base_objects: {}",
+                        e
+                    ))),
+                    location: location!(),
+                })?;
+        }
+
+        // Step 2: Run file compaction
+        log::debug!("Running file compaction on __manifest table");
+        let compaction_metrics = compact_files(dataset, CompactionOptions::default(), None)
+            .await
+            .map_err(|e| Error::IO {
+                source: box_error(std::io::Error::other(format!(
+                    "Failed to compact files: {}",
+                    e
+                ))),
+                location: location!(),
+            })?;
+
+        if compaction_metrics.fragments_removed > 0 {
+            log::info!(
+                "Compacted __manifest table: removed {} fragments, added {} fragments",
+                compaction_metrics.fragments_removed,
+                compaction_metrics.fragments_added
+            );
+        }
+
+        // Step 3: Optimize indices
+        log::debug!("Optimizing indices on __manifest table");
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .map_err(|e| Error::IO {
+                source: box_error(std::io::Error::other(format!(
+                    "Failed to optimize indices: {}",
+                    e
+                ))),
+                location: location!(),
+            })?;
+
+        Ok(())
     }
 
     /// Get the manifest schema
@@ -511,30 +644,43 @@ impl ManifestNamespace {
         object_type: ObjectType,
         location: Option<String>,
     ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(object_id, object_type, location, None)
+        self.insert_into_manifest_with_metadata(object_id, object_type, location, None, None)
             .await
     }
 
-    /// Insert an entry into the manifest table with metadata
+    /// Insert an entry into the manifest table with metadata and base_objects
     async fn insert_into_manifest_with_metadata(
         &self,
         object_id: String,
         object_type: ObjectType,
         location: Option<String>,
         metadata: Option<String>,
+        base_objects: Option<Vec<String>>,
     ) -> Result<()> {
         use arrow::array::builder::{ListBuilder, StringBuilder};
 
         let schema = Self::manifest_schema();
 
-        // Create empty base_objects array
+        // Create base_objects array from the provided list
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
             "object_id",
             DataType::Utf8,
             true,
         )));
-        list_builder.append_null();
+
+        match base_objects {
+            Some(objects) => {
+                for obj in objects {
+                    list_builder.values().append_value(obj);
+                }
+                list_builder.append(true);
+            }
+            None => {
+                list_builder.append_null();
+            }
+        }
+
         let base_objects_array = list_builder.finish();
 
         // Create arrays with optional values
@@ -621,6 +767,9 @@ impl ManifestNamespace {
         let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
         self.manifest_dataset.set_latest(new_dataset).await;
 
+        // Run inline optimization after write
+        self.run_inline_optimization().await?;
+
         Ok(())
     }
 
@@ -639,6 +788,10 @@ impl ManifestNamespace {
         } // Drop the guard here
 
         self.manifest_dataset.reload().await?;
+
+        // Run inline optimization after delete
+        self.run_inline_optimization().await?;
+
         Ok(())
     }
 
@@ -1194,7 +1347,7 @@ impl LanceNamespace for ManifestNamespace {
             }
         });
 
-        self.insert_into_manifest_with_metadata(object_id, ObjectType::Namespace, None, metadata)
+        self.insert_into_manifest_with_metadata(object_id, ObjectType::Namespace, None, metadata, None)
             .await?;
 
         Ok(CreateNamespaceResponse {
