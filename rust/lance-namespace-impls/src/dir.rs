@@ -1036,8 +1036,7 @@ mod tests {
     use lance::dataset::Dataset;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{
-        CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema,
-        ListTablesRequest,
+        CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;

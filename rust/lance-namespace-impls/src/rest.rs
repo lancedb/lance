@@ -374,6 +374,11 @@ impl RestNamespace {
             reqwest_config,
         }
     }
+
+    /// Get the base endpoint URL for this namespace
+    pub fn endpoint(&self) -> &str {
+        &self.reqwest_config.base_path
+    }
 }
 
 #[async_trait]

@@ -1750,9 +1750,9 @@ mod tests {
             // Re-register with a different name
             let location = create_response
                 .location
-                .unwrap()
-                .strip_prefix(&fixture.namespace.endpoint())
-                .unwrap_or(&create_response.location.unwrap())
+                .as_ref()
+                .and_then(|loc| loc.strip_prefix(fixture.namespace.endpoint()))
+                .unwrap_or(create_response.location.as_ref().unwrap())
                 .to_string();
 
             // Extract just the relative path for registration
@@ -1794,13 +1794,11 @@ mod tests {
             assert!(result.is_ok(), "Re-registered table should exist");
 
             // Verify both tables point to the same physical location
-            let describe_req = DescribeTableRequest {
-                id: Some(vec![
-                    "test_namespace".to_string(),
-                    "renamed_table".to_string(),
-                ]),
-                metadata: None,
-            };
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec![
+                "test_namespace".to_string(),
+                "renamed_table".to_string(),
+            ]);
             let describe_response = fixture
                 .namespace
                 .describe_table(describe_req)
@@ -1809,8 +1807,12 @@ mod tests {
 
             // Location should end with the physical table path
             assert!(
-                describe_response.location.ends_with("test_namespace/original_table.lance"),
-                "Renamed table should point to original physical location, got: {}",
+                describe_response
+                    .location
+                    .as_ref()
+                    .map(|loc| loc.ends_with("test_namespace/original_table.lance"))
+                    .unwrap_or(false),
+                "Renamed table should point to original physical location, got: {:?}",
                 describe_response.location
             );
         }
