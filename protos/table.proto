@@ -144,6 +144,11 @@ message Manifest {
   // and {uuid} is a hyphen-separated UUID.
   string transaction_file = 12;
 
+  // The file position of the transaction content. None if transaction is empty
+  // This transaction content begins with the transaction content length as u32
+  // If the transaction proto message has a length of `len`, the message ends at `len` + 4
+  optional uint64 transaction_section = 21;
+
   // The next unused row id. If zero, then the table does not have any rows.
   //
   // This is only used if the "stable_row_ids" feature flag is set.
@@ -183,12 +188,9 @@ message Manifest {
   // data itself and is attached to the output schema of scans.
   map<string, string> table_metadata = 19;
 
-  // The version of the blob dataset associated with this table.  Changes to
-  // blob fields will modify the blob dataset and update this version in the parent
-  // table.
-  //
-  // If this value is 0 then there are no blob fields.
-  uint64 blob_dataset_version = 17;
+  // Field number 17 (`blob_dataset_version`) was used for a secondary blob dataset.
+  reserved 17;
+  reserved "blob_dataset_version";
 
   // The base paths of data files.
   //

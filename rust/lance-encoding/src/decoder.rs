@@ -226,6 +226,7 @@ use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
+use lance_core::utils::futures::FinallyStreamExt;
 use log::{debug, trace, warn};
 use snafu::location;
 use tokio::sync::mpsc::error::SendError;
@@ -1977,6 +1978,8 @@ pub fn schedule_and_decode(
     // trying to read them has caused bugs in the past.
     let requested_rows = requested_rows.trim_empty_ranges();
 
+    let io = config.io.clone();
+
     // For convenience we really want this method to be a snchronous method where all
     // errors happen on the stream.  There is some async initialization that must happen
     // when creating a scheduler.  We wrap that all up in the very first task.
@@ -1988,8 +1991,10 @@ pub fn schedule_and_decode(
         target_schema,
         config,
     ) {
+        // Keep the io alive until the stream is dropped or finishes.  Otherwise the
+        // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
+        Ok(stream) => stream.finally(move || drop(io)).boxed(),
         // If the initialization failed make it look like a failed task
-        Ok(stream) => stream,
         Err(e) => stream::once(std::future::ready(ReadBatchTask {
             num_rows: 0,
             task: std::future::ready(Err(e)).boxed(),

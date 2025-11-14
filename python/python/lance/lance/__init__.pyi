@@ -342,7 +342,6 @@ class _Dataset:
     def commit(
         dest: str | _Dataset,
         operation: LanceOperation.BaseOperation,
-        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,

@@ -90,7 +90,6 @@ pub async fn create_mem_wal_generation(
             removed: vec![],
         },
         None,
-        None,
     );
 
     dataset
@@ -206,7 +205,6 @@ pub async fn advance_mem_wal_generation(
                 removed: removed_mem_wal.into_iter().collect(),
             },
             None,
-            None,
         )
     } else {
         // this is the first time the MemWAL index is created
@@ -231,7 +229,6 @@ pub async fn advance_mem_wal_generation(
                 updated: vec![],
                 removed: vec![],
             },
-            None,
             None,
         )
     };
@@ -478,7 +475,6 @@ pub async fn trim_mem_wal_index(dataset: &mut Dataset) -> Result<()> {
                 removed,
             },
             None,
-            None,
         );
 
         dataset
@@ -513,7 +509,6 @@ where
                         updated: vec![updated_mem_wal.clone()],
                         removed: vec![mem_wal.clone()],
                     },
-                    None,
                     None,
                 );
 

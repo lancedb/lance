@@ -350,6 +350,17 @@ impl DatagenExt for BatchGeneratorBuilder {
         rows_per_fragment: FragmentRowCount,
         write_params: Option<WriteParams>,
     ) -> lance_core::Result<Dataset> {
+        // Need to verify that max_rows_per_file has been set otherwise the frag_count won't be respected
+        if let Some(write_params) = &write_params {
+            if write_params.max_rows_per_file != rows_per_fragment.0 as usize {
+                panic!(
+                    "Max rows per file in write params does not match rows per fragment: {} != {}",
+                    write_params.max_rows_per_file, rows_per_fragment.0 as usize
+                );
+            }
+        } else {
+            panic!("Write params are not set, will not write correct # of fragments");
+        }
         let reader = self.into_reader_rows(
             RowCount::from(rows_per_fragment.0 as u64),
             BatchCount::from(frag_count.0),

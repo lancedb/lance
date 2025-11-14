@@ -81,10 +81,20 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -333,10 +343,20 @@ impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlatMatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlatMatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -491,10 +511,20 @@ impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "PhraseQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "PhraseQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }

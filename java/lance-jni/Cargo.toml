@@ -1,8 +1,8 @@
 [package]
 name = "lance-jni"
-version = "0.39.0"
+version = "1.0.0-beta.1"
 edition = "2021"
-authors = ["Lance Devs <dev@lancedb.com>"]
+authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
 license = "Apache-2.0"
 repository = "https://github.com/lancedb/lance"

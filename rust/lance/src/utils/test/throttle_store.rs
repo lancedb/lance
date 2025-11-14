@@ -15,11 +15,7 @@ pub struct ThrottledStoreWrapper {
 }
 
 impl WrappingObjectStore for ThrottledStoreWrapper {
-    fn wrap(
-        &self,
-        original: Arc<dyn ObjectStore>,
-        _storage_options: Option<&std::collections::HashMap<String, String>>,
-    ) -> Arc<dyn ObjectStore> {
+    fn wrap(&self, _prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         let throttle_store = ThrottledStore::new(original, self.config);
         Arc::new(throttle_store)
     }

@@ -32,11 +32,12 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::v2::LanceEncodingsIo;
+use lance_file::previous::reader::{
+    read_batch as previous_read_batch, FileReader as PreviousFileReader,
+};
+use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::version::LanceFileVersion;
-use lance_file::{determine_file_version, v2};
+use lance_file::{determine_file_version, LanceEncodingsIo};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
@@ -125,20 +126,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn is_legacy(&self) -> bool;
     // Return a reference to the legacy reader, panics if called on a v2
     // file.
-    fn as_legacy(&self) -> &FileReader {
+    fn as_legacy(&self) -> &PreviousFileReader {
         self.as_legacy_opt()
             .expect("legacy function called on v2 file")
     }
     // Return a reference to the legacy reader if this is a v1 reader and
     // return None otherwise
-    fn as_legacy_opt(&self) -> Option<&FileReader>;
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader>;
     // Return a mutable reference to the legacy reader if this is a v1 reader
     // and return None otherwise
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader>;
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader>;
 }
 
 fn ranges_to_tasks(
-    reader: &FileReader,
+    reader: &PreviousFileReader,
     ranges: Vec<(i32, Range<usize>)>,
     projection: Arc<Schema>,
 ) -> ReadBatchTaskStream {
@@ -149,7 +150,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                read_batch(
+                previous_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
@@ -169,12 +170,12 @@ fn ranges_to_tasks(
 
 #[derive(Clone, Debug)]
 struct V1Reader {
-    reader: FileReader,
+    reader: PreviousFileReader,
     projection: Arc<Schema>,
 }
 
 impl V1Reader {
-    fn new(reader: FileReader, projection: Arc<Schema>) -> Self {
+    fn new(reader: PreviousFileReader, projection: Arc<Schema>) -> Self {
         Self { reader, projection }
     }
 }
@@ -282,11 +283,11 @@ impl GenericFileReader for V1Reader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&FileReader> {
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
         Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
         Some(&mut self.reader)
     }
 }
@@ -298,7 +299,7 @@ mod v2_adapter {
 
     #[derive(Debug, Clone)]
     pub struct Reader {
-        reader: Arc<v2::reader::FileReader>,
+        reader: Arc<lance_file::reader::FileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
@@ -307,7 +308,7 @@ mod v2_adapter {
 
     impl Reader {
         pub fn new(
-            reader: Arc<v2::reader::FileReader>,
+            reader: Arc<lance_file::reader::FileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
@@ -481,11 +482,11 @@ mod v2_adapter {
             false
         }
 
-        fn as_legacy_opt(&self) -> Option<&FileReader> {
+        fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
             None
         }
 
-        fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
             None
         }
     }
@@ -590,11 +591,11 @@ impl GenericFileReader for NullReader {
         false
     }
 
-    fn as_legacy_opt(&self) -> Option<&FileReader> {
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
         None
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
         None
     }
 }
@@ -752,7 +753,7 @@ impl FileFragment {
             let file_scheduler = scheduler
                 .open_file(&filepath, &CachedFileSize::unknown())
                 .await?;
-            let reader = v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
@@ -764,7 +765,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::ReaderProjection::from_whole_schema(
+            let projection = lance_file::reader::ReaderProjection::from_whole_schema(
                 dataset.schema(),
                 reader.metadata().version(),
             );
@@ -939,7 +940,7 @@ impl FileFragment {
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                let reader = FileReader::try_new_with_fragment_id(
+                let reader = PreviousFileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
                     &path,
                     self.schema().clone(),
@@ -996,7 +997,7 @@ impl FileFragment {
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
-                v2::reader::FileReader::try_open_with_file_metadata(
+                lance_file::reader::FileReader::try_open_with_file_metadata(
                     Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
@@ -1347,7 +1348,7 @@ impl FileFragment {
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
-    pub(crate) async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
+    pub async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
         let Some(deletion_file) = self.metadata.deletion_file.as_ref() else {
             return Ok(None);
         };
@@ -1369,7 +1370,7 @@ impl FileFragment {
         let file_metadata = cache
             .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
-                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                    lance_file::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
             })
             .await?;
@@ -1474,13 +1475,6 @@ impl FileFragment {
                 }
             }
             schema = schema.project(&projection)?;
-        }
-
-        if schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "adding columns whose value depends on scanning non-default storage".into(),
-                location: location!(),
-            });
         }
 
         // If there is no projection, we at least need to read the row addresses
@@ -2609,6 +2603,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriterOptions;
     use lance_io::{
         assert_io_eq, assert_io_lt,
         object_store::{ObjectStore, ObjectStoreParams},
@@ -2616,7 +2611,6 @@ mod tests {
     };
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use v2::writer::FileWriterOptions;
 
     use super::*;
     use crate::{
@@ -3642,7 +3636,7 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = FileReader::try_new_with_fragment_id(
+        let file_reader = PreviousFileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .child("data")
@@ -3832,7 +3826,7 @@ mod tests {
         let file_path = dataset.data_dir().child("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer =
-            v2::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -3905,17 +3899,17 @@ mod tests {
             .unwrap();
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        // Assert file is small (< 4kb)
+        // Assert file is small (< 4300 bytes)
         {
             let stats = io_stats.incremental_stats();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4096);
+            assert_io_lt!(stats, write_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
         let projection = Schema::try_from(schema.as_ref())
             .unwrap()
-            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7], true);
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
         let reader = fragment
             .open(&projection, Default::default())
             .await

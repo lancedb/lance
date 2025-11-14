@@ -29,6 +29,7 @@ use pyo3::exceptions::PyValueError;
 
 use crate::reader::LanceReader;
 use crate::rt;
+use crate::schema::logical_arrow_schema;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
@@ -99,9 +100,11 @@ impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let scanner = self_.scanner.clone();
-        rt().spawn(Some(self_.py()), async move { scanner.schema().await })?
-            .map(|s| s.to_pyarrow(self_.py()))
-            .map_err(|err| PyValueError::new_err(err.to_string()))?
+        let schema = rt()
+            .spawn(Some(self_.py()), async move { scanner.schema().await })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let logical_schema = logical_arrow_schema(schema.as_ref());
+        logical_schema.to_pyarrow(self_.py())
     }
 
     #[pyo3(signature = (*, verbose = false))]

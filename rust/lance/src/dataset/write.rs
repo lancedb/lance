@@ -7,7 +7,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
-    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
+    BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tempfile::TempDir;
@@ -16,10 +16,11 @@ use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::{
+    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
+};
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::{FileWriter, ManifestProvider};
+use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
@@ -35,12 +36,19 @@ use tracing::{info, instrument};
 use crate::session::Session;
 use crate::Dataset;
 
-use super::blob::BlobStreamExt;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
+
+fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+    if storage_version >= LanceFileVersion::V2_2 {
+        BlobVersion::V2
+    } else {
+        BlobVersion::V1
+    }
+}
 
 mod commit;
 pub mod delete;
@@ -441,13 +449,6 @@ pub async fn do_write_fragments(
     Ok(fragments)
 }
 
-pub struct WrittenFragments {
-    /// The fragments written to the dataset (and the schema)
-    pub default: (Vec<Fragment>, Schema),
-    /// The fragments written to the blob dataset, if any
-    pub blob: Option<(Vec<Fragment>, Schema)>,
-}
-
 pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
@@ -571,7 +572,7 @@ pub async fn write_fragments_internal(
     data: SendableRecordBatchStream,
     mut params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-) -> Result<WrittenFragments> {
+) -> Result<(Vec<Fragment>, Schema)> {
     let adapter = SchemaAdapter::new(data.schema());
 
     let (data, converted_schema) = if adapter.requires_physical_conversion() {
@@ -588,7 +589,9 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let (schema, storage_version) = if let Some(dataset) = dataset {
+    let allow_blob_version_change =
+        dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
+    let (mut schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
@@ -604,7 +607,6 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
-                // Project from the dataset schema, because it has the correct field ids.
                 let write_schema = dataset.schema().project_by_schema(
                     &converted_schema,
                     OnMissing::Error,
@@ -636,67 +638,21 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    let data_schema = schema.project_by_schema(
-        data.schema().as_ref(),
-        OnMissing::Error,
-        OnTypeMismatch::Error,
-    )?;
+    let target_blob_version = blob_version_for(storage_version);
+    schema.apply_blob_version(target_blob_version, allow_blob_version_change)?;
 
-    let (data, blob_data) = data.extract_blob_stream(&data_schema);
-
-    // Some params we borrow from the normal write, some we override
-    let blob_write_params = WriteParams {
-        store_params: params.store_params.clone(),
-        commit_handler: params.commit_handler.clone(),
-        data_storage_version: params.data_storage_version,
-        enable_stable_row_ids: true,
-        // This shouldn't really matter since all commits are detached
-        enable_v2_manifest_paths: true,
-        max_bytes_per_file: params.max_bytes_per_file,
-        max_rows_per_file: params.max_rows_per_file,
-        ..Default::default()
-    };
-
-    if blob_data.is_some() && !params.enable_stable_row_ids {
-        return Err(Error::invalid_input(
-            "The blob storage class requires stable row ids",
-            location!(),
-        ));
-    }
-
-    let frag_schema = schema.retain_storage_class(StorageClass::Default);
-    let fragments_fut = do_write_fragments(
-        object_store.clone(),
+    let fragments = do_write_fragments(
+        object_store,
         base_dir,
-        &frag_schema,
+        &schema,
         data,
         params,
         storage_version,
         target_bases_info,
-    );
+    )
+    .await?;
 
-    let (default, blob) = if let Some(blob_data) = blob_data {
-        let blob_schema = schema.retain_storage_class(StorageClass::Blob);
-        let blobs_path = base_dir.child("_blobs");
-        let blob_fut = do_write_fragments(
-            object_store,
-            &blobs_path,
-            &blob_schema,
-            blob_data,
-            blob_write_params,
-            storage_version,
-            None, // Blobs don't use target_bases
-        );
-        let (fragments_res, blobs_res) = futures::join!(fragments_fut, blob_fut);
-        let fragments = fragments_res?;
-        let blobs = blobs_res?;
-        ((fragments, frag_schema), Some((blobs, blob_schema)))
-    } else {
-        let fragments = fragments_fut.await?;
-        ((fragments, frag_schema), None)
-    };
-
-    Ok(WrittenFragments { default, blob })
+    Ok((fragments, schema))
 }
 
 #[async_trait::async_trait]
@@ -714,9 +670,9 @@ pub trait GenericWriter: Send {
 
 struct V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
-    writer: FileWriter<M>,
+    writer: PreviousFileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -724,7 +680,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: ManifestProvider + Send + Sync,
+    M: PreviousManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
@@ -747,7 +703,7 @@ where
 }
 
 struct V2WriterAdapter {
-    writer: v2::writer::FileWriter,
+    writer: current_writer::FileWriter,
     path: String,
     base_id: Option<u32>,
 }
@@ -818,7 +774,7 @@ pub async fn open_writer_with_options(
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
-            writer: FileWriter::<ManifestDescribing>::try_new(
+            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
@@ -830,7 +786,7 @@ pub async fn open_writer_with_options(
         })
     } else {
         let writer = object_store.create(&full_path).await?;
-        let file_writer = v2::writer::FileWriter::try_new(
+        let file_writer = current_writer::FileWriter::try_new(
             writer,
             schema.clone(),
             FileWriterOptions {
@@ -1078,7 +1034,7 @@ mod tests {
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
-    use lance_file::reader::FileReader;
+    use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_io::traits::Reader;
 
     #[tokio::test]
@@ -1210,10 +1166,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );
 
-        let written = reader_to_frags(data_reader).await.unwrap();
-
-        assert!(written.blob.is_none());
-        let fragments = written.default.0;
+        let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
 
         assert_eq!(fragments.len(), 2);
     }
@@ -1257,7 +1210,7 @@ mod tests {
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
             let object_store = Arc::new(ObjectStore::memory());
-            let written = write_fragments_internal(
+            let (fragments, _) = write_fragments_internal(
                 None,
                 object_store,
                 &Path::from("test"),
@@ -1268,9 +1221,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-            assert!(written.blob.is_none());
-            let fragments = written.default.0;
 
             assert_eq!(fragments.len(), 1);
             let fragment = &fragments[0];
@@ -1335,7 +1285,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let written = write_fragments_internal(
+        let (fragments, _) = write_fragments_internal(
             None,
             object_store.clone(),
             &base_path,
@@ -1347,9 +1297,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(written.blob.is_none());
-        let fragments = written.default.0;
-
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
@@ -1359,7 +1306,7 @@ mod tests {
             .child(DATA_DIR)
             .child(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = FileReader::try_new_from_reader(
+        let reader = PreviousFileReader::try_new_from_reader(
             &path,
             file_reader,
             None,

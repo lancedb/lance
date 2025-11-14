@@ -43,7 +43,9 @@ use lance_core::{
 };
 use lance_file::{
     format::MAGIC,
-    writer::{FileWriter, FileWriterOptions},
+    previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    },
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -693,7 +695,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the HNSW writer
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -717,8 +723,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1730,7 +1739,11 @@ async fn write_ivf_hnsw_file(
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1758,8 +1771,11 @@ async fn write_ivf_hnsw_file(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -2381,7 +2397,6 @@ mod tests {
                 removed_indices: vec![],
             },
             None,
-            None,
         );
 
         // Apply the transaction to register the index
@@ -2483,7 +2498,6 @@ mod tests {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
             },
-            None,
             None,
         );
 

@@ -21,17 +21,12 @@ use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::ReaderProjection;
-use lance_file::v2::LanceEncodingsIo;
-use lance_file::{
-    v2::{
-        reader::{
-            BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-        },
-        writer::{FileWriter, FileWriterOptions},
-    },
-    version::LanceFileVersion,
+use lance_file::reader::{
+    BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+    ReaderProjection,
 };
+use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::{version::LanceFileVersion, LanceEncodingsIo};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -91,7 +86,7 @@ impl LancePageMetadata {
             .collect();
         Self {
             buffers,
-            encoding: lance_file::v2::reader::describe_encoding(inner),
+            encoding: lance_file::reader::describe_encoding(inner),
         }
     }
 }

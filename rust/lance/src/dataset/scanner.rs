@@ -44,7 +44,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
-    escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
+    escape_field_path_for_project, format_field_path, BlobHandling, Field, OnMissing, Projection,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -56,7 +56,7 @@ use lance_datafusion::exec::{
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
@@ -324,6 +324,7 @@ pub struct Scanner {
     /// - Dynamic expressions that are evaluated after the physical projection
     /// - The names of the output columns
     projection_plan: ProjectionPlan,
+    blob_handling: BlobHandling,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
@@ -599,9 +600,10 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
-        Self {
+        let mut scanner = Self {
             dataset,
             projection_plan,
+            blob_handling: BlobHandling::default(),
             prefilter: false,
             materialization_style: MaterializationStyle::Heuristic,
             filter: None,
@@ -627,7 +629,24 @@ impl Scanner {
             legacy_with_row_id: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
-        }
+        };
+        scanner.apply_blob_handling();
+        scanner
+    }
+
+    fn apply_blob_handling(&mut self) {
+        let projection = self
+            .projection_plan
+            .physical_projection
+            .clone()
+            .with_blob_handling(self.blob_handling.clone());
+        self.projection_plan.physical_projection = projection;
+    }
+
+    pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.blob_handling = blob_handling;
+        self.apply_blob_handling();
+        self
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
@@ -710,6 +729,7 @@ impl Scanner {
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
         }
+        self.apply_blob_handling();
         Ok(self)
     }
 
@@ -1047,7 +1067,7 @@ impl Scanner {
             k,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: 20,
+            minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -1080,6 +1100,21 @@ impl Scanner {
     ///
     /// This method is a convenience method that sets both [Self::minimum_nprobes] and
     /// [Self::maximum_nprobes] to the same value.
+    pub fn nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.minimum_nprobes = n;
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures how many partititions will be searched in the vector index.
+    ///
+    /// This method is a convenience method that sets both [Self::minimum_nprobes] and
+    /// [Self::maximum_nprobes] to the same value.
+    #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
@@ -1095,6 +1130,8 @@ impl Scanner {
     /// If we have found k matching results after searching this many partitions then
     /// the search will stop.  Increasing this number can increase recall but will increase
     /// latency on all queries.
+    ///
+    /// The default value is 1.
     pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
@@ -1456,7 +1493,7 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+    pub fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1606,12 +1643,6 @@ impl Scanner {
             .empty_projection()
             .union_columns(filter_columns, OnMissing::Error)?
             .into_schema();
-        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "non-default storage columns cannot be used as filters".into(),
-                location: location!(),
-            });
-        }
 
         // Start with the desired fields
         Ok(desired_projection
@@ -2054,6 +2085,10 @@ impl Scanner {
 
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
         let index_input = filter_plan.index_query.clone().map(|index_query| {
@@ -6835,7 +6870,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
@@ -6855,7 +6890,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
+                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
@@ -6899,7 +6934,7 @@ mod test {
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
+                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6920,7 +6955,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
@@ -6929,7 +6964,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
           row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
 "
@@ -6965,7 +7000,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 6),
@@ -6997,7 +7032,7 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
+                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
@@ -7026,7 +7061,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         FilterExec: i@0 > 10
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
@@ -7048,7 +7083,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
                           row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
         };
@@ -7079,7 +7114,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
             &dataset.dataset,
@@ -7100,7 +7135,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
@@ -7109,7 +7144,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=3, range_before=None, \
           range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
         };
@@ -7147,7 +7182,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
             &dataset.dataset,
@@ -7183,7 +7218,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx";
         dataset.make_scalar_index().await?;
         assert_plan_equals(
@@ -7348,7 +7383,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#;
+      MatchQuery: column=s, query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7364,7 +7399,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#;
+      PhraseQuery: column=s, query=hello world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7382,8 +7417,8 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: query=hello
-        MatchQuery: query=world"#;
+        MatchQuery: column=s, query=hello
+        MatchQuery: column=s, query=world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7405,7 +7440,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx
@@ -7416,7 +7451,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx"#
         };
@@ -7440,8 +7475,8 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
-            FlatMatchQuery: query=hello
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
@@ -7463,14 +7498,14 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
@@ -7480,10 +7515,10 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         };
@@ -7523,7 +7558,7 @@ mod test {
             },
             "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
-      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -7538,7 +7573,7 @@ mod test {
             },
             "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
-      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -7566,7 +7601,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -8382,5 +8417,54 @@ mod test {
                 "All rows created at version 1"
             );
         }
+    }
+
+    #[test_log::test(test)]
+    fn test_scan_finishes_all_tasks() {
+        // Need to use multi-threaded runtime otherwise tasks don't run unless someone is polling somewhere
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let ds = lance_datagen::gen_batch()
+                .col("id", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1000), FragmentRowCount::from(10))
+                .await
+                .unwrap();
+
+            // This scan with has a small I/O buffer size and batch size to mimic a real-world situation
+            // that required a lot of data.  Many fragments will be scheduled at low priority and the data
+            // buffer will fill up with data reads.  When the scan is abandoned, the tasks to read the fragment
+            // metadata were left behind and would never finish because the data was never decoded to drain the
+            // backpressure queue.
+            //
+            // The fix (that this test verifies) is to ensure we close the I/O scheduler when the scan is abandoned.
+            let mut stream = ds
+                .scan()
+                .fragment_readahead(1000)
+                .batch_size(1)
+                .io_buffer_size(1)
+                .batch_readahead(1)
+                .try_into_stream()
+                .await
+                .unwrap();
+            stream.next().await.unwrap().unwrap();
+        });
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if runtime.handle().metrics().num_alive_tasks() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            runtime.handle().metrics().num_alive_tasks() == 0,
+            "Tasks should have finished within 10 seconds but there are still {} tasks running",
+            runtime.handle().metrics().num_alive_tasks()
+        );
     }
 }

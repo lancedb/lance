@@ -72,7 +72,8 @@ jobs:
           command: check
 
   linux-build:
-    runs-on: "ubuntu-24.04"
+    # Make our CI happy until https://github.com/lancedb/lance/issues/5218 addressed.
+    runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 60
     strategy:
       matrix:

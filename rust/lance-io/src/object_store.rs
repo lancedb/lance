@@ -145,13 +145,9 @@ impl std::fmt::Display for ObjectStore {
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// Wrap an object store with additional functionality
     ///
-    /// The storage_options contain namespace information (e.g., azure_storage_account_name)
-    /// that wrappers may need for proper isolation
-    fn wrap(
-        &self,
-        original: Arc<dyn OSObjectStore>,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Arc<dyn OSObjectStore>;
+    /// The store_prefix is a string which uniquely identifies the object
+    /// store being wrapped.
+    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,14 +166,10 @@ impl ChainedWrappingObjectStore {
 }
 
 impl WrappingObjectStore for ChainedWrappingObjectStore {
-    fn wrap(
-        &self,
-        original: Arc<dyn OSObjectStore>,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Arc<dyn OSObjectStore> {
+    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         self.wrappers
             .iter()
-            .fold(original, |acc, wrapper| wrapper.wrap(acc, storage_options))
+            .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
     }
 }
 
@@ -291,7 +283,27 @@ impl PartialEq for ObjectStoreParams {
     }
 }
 
-fn uri_to_url(uri: &str) -> Result<Url> {
+/// Convert a URI string or local path to a URL
+///
+/// This function handles both proper URIs (with schemes like `file://`, `s3://`, etc.)
+/// and plain local filesystem paths. On Windows, it correctly handles drive letters
+/// that might be parsed as URL schemes.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_io::object_store::uri_to_url;
+/// // URIs are preserved
+/// let url = uri_to_url("s3://bucket/path").unwrap();
+/// assert_eq!(url.scheme(), "s3");
+///
+/// // Local paths are converted to file:// URIs
+/// # #[cfg(unix)]
+/// let url = uri_to_url("/tmp/data").unwrap();
+/// # #[cfg(unix)]
+/// assert_eq!(url.scheme(), "file");
+/// ```
+pub fn uri_to_url(uri: &str) -> Result<Url> {
     match Url::parse(uri) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
@@ -353,8 +365,10 @@ impl ObjectStore {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
+            let store_prefix =
+                registry.calculate_object_store_prefix(uri, params.storage_options.as_ref())?;
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(inner, params.storage_options.as_ref());
+                inner = wrapper.wrap(&store_prefix, inner);
             }
             let store = Self {
                 inner,
@@ -734,6 +748,9 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
+static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
+    std::sync::LazyLock::new(ObjectStoreRegistry::default);
+
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -751,7 +768,12 @@ impl ObjectStore {
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
 
         let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(store, storage_options),
+            Some(wrapper) => {
+                let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
+                    .calculate_object_store_prefix(location.as_ref(), storage_options)
+                    .unwrap();
+                wrapper.wrap(&store_prefix, store)
+            }
             None => store,
         };
 
@@ -984,8 +1006,8 @@ mod tests {
     impl WrappingObjectStore for TestWrapper {
         fn wrap(
             &self,
+            _store_prefix: &str,
             _original: Arc<dyn OSObjectStore>,
-            _storage_options: Option<&HashMap<String, String>>,
         ) -> Arc<dyn OSObjectStore> {
             self.called.store(true, Ordering::Relaxed);
 
