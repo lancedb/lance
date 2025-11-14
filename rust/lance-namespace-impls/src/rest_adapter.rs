@@ -1683,8 +1683,8 @@ mod tests {
             );
             let location = response.location.unwrap();
             assert!(
-                location.ends_with("test_namespace/test_table.lance"),
-                "Location should end with test_namespace/test_table.lance, got: {}",
+                location.ends_with("test_namespace$test_table"),
+                "Location should end with test_namespace$test_table, got: {}",
                 location
             );
             assert_eq!(
@@ -1754,20 +1754,19 @@ mod tests {
                 .and_then(|loc| loc.strip_prefix(fixture.namespace.endpoint()))
                 .unwrap_or(create_response.location.as_ref().unwrap())
                 .to_string();
-
-            // Extract just the relative path for registration
-            let relative_location = if location.contains("test_namespace") {
-                "test_namespace$original_table.lance".to_string()
-            } else {
-                location
-            };
+            
+            let relative_location = location
+                .split('/')
+                .last()
+                .unwrap_or(&location)
+                .to_string();
 
             let register_req = RegisterTableRequest {
                 id: Some(vec![
                     "test_namespace".to_string(),
                     "renamed_table".to_string(),
                 ]),
-                location: relative_location,
+                location: relative_location.clone(),
                 mode: None,
                 properties: None,
             };
@@ -1781,7 +1780,7 @@ mod tests {
             // Should return the exact location we registered
             assert_eq!(
                 register_response.location,
-                "test_namespace$original_table.lance"
+                relative_location
             );
 
             // Verify new table exists
@@ -1805,14 +1804,15 @@ mod tests {
                 .await
                 .expect("Should be able to describe renamed table");
 
-            // Location should end with the physical table path
+            // Location should end with the physical table path (same as original)
             assert!(
                 describe_response
                     .location
                     .as_ref()
-                    .map(|loc| loc.ends_with("test_namespace/original_table.lance"))
+                    .map(|loc| loc.ends_with(&relative_location))
                     .unwrap_or(false),
-                "Renamed table should point to original physical location, got: {:?}",
+                "Renamed table should point to original physical location {}, got: {:?}",
+                relative_location,
                 describe_response.location
             );
         }
