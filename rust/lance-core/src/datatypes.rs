@@ -19,8 +19,7 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
-    LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
+    BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
     escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
@@ -46,6 +45,32 @@ pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
+
+pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("kind", DataType::UInt8, false),
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+        ArrowField::new("blob_id", DataType::UInt32, true),
+        ArrowField::new("blob_uri", DataType::Utf8, true),
+    ])
+});
+
+pub static BLOB_V2_DESC_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_DESC_FIELDS.clone()));
+
+pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
+    ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), true).with_metadata(HashMap::from([
+        (lance_arrow::BLOB_META_KEY.to_string(), "true".to_string()),
+        (
+            lance_arrow::BLOB_VERSION_META_KEY.to_string(),
+            "2".to_string(),
+        ),
+    ]))
+});
+
+pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.

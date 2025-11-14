@@ -3,17 +3,17 @@
 
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Modern columnar data format for ML. Convert from Parquet in 2-lines of code for 100x faster random access, zero-cost schema evolution, rich secondary indices, versioning, and more.<br/>**
-**Compatible with Pandas, DuckDB, Polars, Pyarrow, and Ray with more integrations on the way.**
+**The Open Lakehouse Format for Multimodal AI**<br/>
+**High-performance vector search, full-text search, random access, and feature engineering capabilities for the lakehouse.**<br/>
+**Compatible with Pandas, DuckDB, Polars, PyArrow, Ray, Spark, and more integrations on the way.**
 
-<a href="https://lancedb.github.io/lance/">Documentation</a> •
-<a href="https://blog.lancedb.com/">Blog</a> •
-<a href="https://discord.gg/zMM32dvNtd">Discord</a> •
-<a href="https://x.com/lancedb">X</a>
+<a href="https://lance.org">Documentation</a> •
+<a href="https://lance.org/community">Community</a> •
+<a href="https://discord.gg/zMM32dvNtd">Discord</a>
 
 [CI]: https://github.com/lancedb/lance/actions/workflows/rust.yml
 [CI Badge]: https://github.com/lancedb/lance/actions/workflows/rust.yml/badge.svg
-[Docs]: https://lancedb.github.io/lance/
+[Docs]: https://lance.org
 [Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
 [crates.io]: https://crates.io/crates/lance
 [crates.io badge]: https://img.shields.io/crates/v/lance.svg
@@ -30,24 +30,30 @@
 
 <hr />
 
-Lance is a modern columnar data format that is optimized for ML workflows and datasets. Lance is perfect for:
+Lance is an open lakehouse format for multimodal AI. It contains a file format, table format, and catalog spec that allows you to build a complete lakehouse on top of object storage to power your AI workflows. Lance is perfect for:
 
-1. Building search engines and feature stores.
-2. Large-scale ML training requiring high performance IO and shuffles.
-3. Storing, querying, and inspecting deeply nested data for robotics or large blobs like images, point clouds, and more.
+1. Building search engines and feature stores with hybrid search capabilities.
+2. Large-scale ML training requiring high performance IO and random access.
+3. Storing, querying, and managing multimodal data including images, videos, audio, text, and embeddings.
 
 The key features of Lance include:
 
-* **High-performance random access:** 100x faster than Parquet without sacrificing scan performance.
+* **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
 
-* **Vector search:** find nearest neighbors in milliseconds and combine OLAP-queries with vector search.
+* **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
 
-* **Zero-copy, automatic versioning:** manage versions of your data without needing extra infrastructure.
+* **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
 
-* **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
+* **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
+
+* **Zero-copy versioning:** ACID transactions, time travel, and automatic versioning without needing extra infrastructure.
+
+* **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
+
+For more details, see the full [Lance format specification](https://lance.org/format).
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/docs/community/contributing) for more information.
 
 ## Quick Start
 
@@ -175,24 +181,6 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 | [java](./java)     | Java bindings (JNI)      |
 | [docs](./docs)     | Documentation source     |
 
-## What makes Lance different
-
-Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format).
-
-**Vector index**: Vector index for similarity search over embedding space.
-Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Apple Silicon (mps)``).
-
-**Encodings**: To achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
-
-**Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
-
-**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation. We can also create branches or tags on versions and manage them in Lance.
-
-**Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
-
-**Rich secondary indices**: Support `BTree`, `Bitmap`, `Full text search`, `Label list`,
-`NGrams`, and more.
-
 ## Benchmarks
 
 ### Vector search
@@ -213,9 +201,9 @@ We create a Lance dataset using the Oxford Pet dataset to do some preliminary pe
 
 ![](docs/src/images/lance_perf.png)
 
-## Why are you building yet another data format?!
+## Why Lance for AI/ML workflows?
 
-The machine learning development cycle involves the steps:
+The machine learning development cycle involves multiple stages:
 
 ```mermaid
 graph LR
@@ -230,20 +218,16 @@ graph LR
     H --> A;
 ```
 
-People use different data representations to varying stages for the performance or limited by the tooling available.
-Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
-is difficult to integrate into data infrastructure and slow to train over cloud storage.
-While industry uses data lakes (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouses (AWS Redshift
-or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
-as [Rikai](https://github.com/eto-ai/rikai)/[Petastorm](https://github.com/uber/petastorm)
-or [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
-Multiple single-purpose data transforms, as well as syncing copies between cloud storage to local training
-instances have become a common practice.
+Traditional lakehouse formats were designed for SQL analytics and struggle with AI/ML workloads that require:
+- **Vector search** for similarity and semantic retrieval
+- **Fast random access** for sampling and interactive exploration
+- **Multimodal data** storage (images, videos, audio alongside embeddings)
+- **Data evolution** for feature engineering without full table rewrites
+- **Hybrid search** combining vectors, full-text, and SQL predicates
 
-While each of the existing data formats excels at the workload it was originally designed for, we need a new data format
-tailored for multistage ML development cycles to reduce and data silos.
+While existing formats (Parquet, Iceberg, Delta Lake) excel at SQL analytics, they require additional specialized systems for AI capabilities. Lance brings these AI-first features directly into the lakehouse format.
 
-A comparison of different data formats in each stage of ML development cycle.
+A comparison of different formats across ML development stages:
 
 |                     | Lance | Parquet & ORC | JSON & XML | TFRecord | Database | Warehouse |
 |---------------------|-------|---------------|------------|----------|----------|-----------|
@@ -253,20 +237,3 @@ A comparison of different data formats in each stage of ML development cycle.
 | Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
 | Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
 
-## Community Highlights
-
-Lance is currently used in production by:
-* [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
-* [LanceDB Enterprise](https://docs.lancedb.com/enterprise/introduction), hyperscale LanceDB with enterprise SLA.
-* Leading multimodal Gen AI companies for training over petabyte-scale multimodal data.
-* Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
-* E-commerce company for billion-scale+ vector personalized search.
-* and more.
-
-## Presentations, Blogs and Talks
-
-* [Designing a Table Format for ML Workloads](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/), Feb 2025.
-* [Transforming Multimodal Data Management with LanceDB, Ray Summit](https://www.youtube.com/watch?v=xmTFEzAh8ho), Oct 2024.
-* [Lance v2: A columnar container format for modern data](https://blog.lancedb.com/lance-v2/), Apr 2024.
-* [Lance Deep Dive](https://drive.google.com/file/d/1Orh9rK0Mpj9zN_gnQF1eJJFpAc6lStGm/view?usp=drive_link). July 2023.
-* [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.

@@ -22,28 +22,25 @@ use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Proje
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
-    DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
+    TRACE_DATASET_EVENTS,
 };
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
-use lance_io::traits::WriteExt;
-use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
-    MAJOR_VERSION, MINOR_VERSION,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
+    CommitLock, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -98,7 +95,7 @@ use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, read_transaction_file,
+    detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -127,7 +124,6 @@ pub use write::{
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
-pub const BLOB_DIR: &str = "_blobs";
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -514,7 +510,7 @@ impl Dataset {
             ref_path: String::from(self.uri()),
             branch_name: Some(branch.to_string()),
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             .with_store_params(store_params.unwrap_or_default())
@@ -678,7 +674,7 @@ impl Dataset {
             });
         }
 
-        // If indices were also the last block, we can take the opportunity to
+        // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section {
             if manifest_size - index_offset <= last_block.len() {
@@ -701,6 +697,29 @@ impl Dataset {
                 };
                 ds_index_cache
                     .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
+            }
+        }
+
+        // If transaction is also in the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(transaction_offset) = manifest.transaction_section {
+            if manifest_size - transaction_offset <= last_block.len() {
+                let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
+                let message_len =
+                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
+                        as usize;
+                let message_data =
+                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+                let transaction: Transaction =
+                    lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
                     .await;
             }
         }
@@ -846,36 +865,6 @@ impl Dataset {
     }
 
     // TODO: Cache this
-    pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
-        if let Some(blobs_version) = self.manifest.blob_dataset_version {
-            let blobs_path = self.base.child(BLOB_DIR);
-            let blob_manifest_location = self
-                .commit_handler
-                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
-                .await?;
-            let manifest = read_manifest(
-                &self.object_store,
-                &blob_manifest_location.path,
-                blob_manifest_location.size,
-            )
-            .await?;
-            let blobs_dataset = Self::checkout_manifest(
-                self.object_store.clone(),
-                blobs_path,
-                format!("{}/{}", self.uri, BLOB_DIR),
-                Arc::new(manifest),
-                blob_manifest_location,
-                self.session.clone(),
-                self.commit_handler.clone(),
-                self.file_reader_options.clone(),
-                self.store_params.as_deref().cloned(),
-            )?;
-            Ok(Some(Arc::new(blobs_dataset)))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn is_legacy_storage(&self) -> bool {
         self.manifest
             .data_storage_format
@@ -914,7 +903,11 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((Arc::new(manifest), location))
+        let manifest_arc = Arc::new(manifest);
+        self.metadata_cache
+            .insert_with_key(&manifest_key, manifest_arc.clone())
+            .await;
+        Ok((manifest_arc, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -922,13 +915,41 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let path = match &self.manifest.transaction_file {
-            Some(path) => self.base.child("_transactions").child(path.as_str()),
-            None => return Ok(None),
+        let transaction_key = TransactionKey {
+            version: self.manifest.version,
         };
-        let data = self.object_store.inner.get(&path).await?.bytes().await?;
-        let transaction = lance_table::format::pb::Transaction::decode(data)?;
-        Transaction::try_from(transaction).map(Some)
+        if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
+            return Ok(Some((*transaction).clone()));
+        }
+
+        // Prefer inline transaction from manifest when available
+        let transaction = if let Some(pos) = self.manifest.transaction_section {
+            let reader = if let Some(size) = self.manifest_location.size {
+                self.object_store
+                    .open_with_size(&self.manifest_location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&self.manifest_location.path).await?
+            };
+
+            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            Transaction::try_from(tx).map(Some)?
+        } else if let Some(path) = &self.manifest.transaction_file {
+            // Fallback: read external transaction file if present
+            let path = self.base.child("_transactions").child(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            Transaction::try_from(transaction).map(Some)?
+        } else {
+            None
+        };
+
+        if let Some(tx) = transaction.as_ref() {
+            self.metadata_cache
+                .insert_with_key(&transaction_key, Arc::new(tx.clone()))
+                .await;
+        }
+        Ok(transaction)
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -992,7 +1013,6 @@ impl Dataset {
             Operation::Restore {
                 version: self.manifest.version,
             },
-            /*blobs_op=*/ None,
             None,
         );
 
@@ -1069,7 +1089,6 @@ impl Dataset {
     async fn do_commit(
         base_uri: WriteDestination<'_>,
         operation: Operation,
-        blobs_op: Option<Operation>,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -1088,7 +1107,7 @@ impl Dataset {
             Ok,
         )?;
 
-        let transaction = Transaction::new(read_version, operation, blobs_op, None);
+        let transaction = Transaction::new(read_version, operation, None);
 
         let mut builder = CommitBuilder::new(base_uri)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
@@ -1152,9 +1171,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1185,9 +1201,6 @@ impl Dataset {
         Self::do_commit(
             dest.into(),
             operation,
-            // TODO: Allow blob operations to be specified? (breaking change?)
-            /*blobs_op=*/
-            None,
             read_version,
             store_params,
             commit_handler,
@@ -1592,11 +1605,7 @@ impl Dataset {
         &self.manifest.schema
     }
 
-    /// Similar to [Self::schema], but only returns fields with the default storage class
-    pub fn local_schema(&self) -> &Schema {
-        &self.manifest.local_schema
-    }
-
+    /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())
@@ -1954,7 +1963,7 @@ impl Dataset {
             ref_path: self.uri.clone(),
             branch_name: None,
         };
-        let transaction = Transaction::new(version_number, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.unwrap_or_default())
@@ -1988,7 +1997,7 @@ impl Dataset {
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
-    pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
+    pub fn sql(&self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
     }
 
@@ -2096,20 +2105,16 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
                     )?;
-                    let object_store = dataset_version.object_store();
-                    let path = dataset_version
-                        .manifest
-                        .transaction_file
-                        .as_ref()
-                        .ok_or_else(|| Error::Internal {
-                            message: format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ),
-                            location: location!(),
-                        })?;
                     let loaded =
-                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                            Error::Internal {
+                                message: format!(
+                                    "Dataset version {} does not have a transaction file",
+                                    manifest_copy.version
+                                ),
+                                location: location!(),
+                            }
+                        })?);
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())
@@ -2273,9 +2278,6 @@ impl Dataset {
                 fragments: updated_fragments,
                 schema: new_schema,
             },
-            // It is not possible to add blob columns using merge
-            /*blobs_op=*/
-            None,
             None,
         );
 
@@ -2532,6 +2534,7 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    disable_transaction_file: bool,            // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -2540,13 +2543,21 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_stable_row_ids: false,
+            disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
         }
     }
 }
 
+impl ManifestWriteConfig {
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
@@ -2555,9 +2566,14 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
+    mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_stable_row_ids)?;
+        apply_feature_flags(
+            manifest,
+            config.use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2572,26 +2588,9 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
+            transaction.take().map(|tx| tx.into()),
         )
         .await
-}
-
-fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
-    manifest: &'a mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
-    path: &'a Path,
-) -> BoxFuture<'a, Result<WriteResult>> {
-    Box::pin(async {
-        let mut object_writer = ObjectWriter::new(object_store, path).await?;
-        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-        object_writer
-            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-            .await?;
-        let res = object_writer.shutdown().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(res)
-    })
 }
 
 impl Projectable for Dataset {
@@ -2625,19 +2624,18 @@ mod tests {
     };
     use arrow_array::{
         Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
-        StructArray, UInt64Array,
+        LargeBinaryArray, StructArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
-    use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriter;
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
@@ -3104,8 +3102,10 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                disable_transaction_file: false,
             },
             dataset.manifest_location.naming_scheme,
+            None,
         )
         .await
         .unwrap();
@@ -4308,7 +4308,7 @@ mod tests {
             initial_bases: None,
         };
         let test_uri = TempStrDir::default();
-        let read_version_0_transaction = Transaction::new(0, operation, None, None);
+        let read_version_0_transaction = Transaction::new(0, operation, None);
         let strict_builder = CommitBuilder::new(&test_uri).with_max_retries(0);
         let unstrict_builder = CommitBuilder::new(&test_uri).with_max_retries(1);
         strict_builder
@@ -5293,7 +5293,7 @@ mod tests {
         // let scan_fut = scan
         //     .nearest("vector", &query_vec, 2000)
         //     .unwrap()
-        //     .nprobs(4)
+        //     .nprobes(4)
         //     .prefilter(true)
         //     .try_into_stream()
         //     .await
@@ -5354,7 +5354,7 @@ mod tests {
         let batches = scan
             .nearest("vector", &query_vec, 2000)
             .unwrap()
-            .nprobs(4)
+            .nprobes(4)
             .prefilter(true)
             .try_into_stream()
             .await
@@ -6846,6 +6846,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
         // Looking at the fragments, there is no data file with the missing field
         let fragments = dataset.get_fragments();
@@ -6877,6 +6878,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         dataset.append(reader, None).await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
 
         // When reading back, only missing data is null, otherwise is filled in
         let data = dataset.scan().try_into_batch().await.unwrap();
@@ -7054,20 +7056,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_balanced_subschemas() {
-        // TODO: support this.
         let test_uri = TempStrDir::default();
 
         let field_a = ArrowField::new("a", DataType::Int32, true);
-        let field_b = ArrowField::new("b", DataType::Int64, true);
+        let field_b = ArrowField::new("b", DataType::LargeBinary, true);
         let schema = Arc::new(ArrowSchema::new(vec![
             field_a.clone(),
-            field_b.clone().with_metadata(
-                [(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                )]
-                .into(),
-            ),
+            field_b
+                .clone()
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
         ]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
@@ -7085,18 +7082,52 @@ mod tests {
         let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
 
         // Insert right side
         let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
-        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            just_b.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter(vec![Some(vec![2u8])]))],
+        )
+        .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
-        let result = dataset.append(reader, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].metadata.files.len(), 1);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+
+        let data = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["a"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.num_rows(), 2);
+        let a_column = data.column(0).as_primitive::<Int32Type>();
+        assert_eq!(a_column.value(0), 1);
+        assert!(a_column.is_null(1));
+
+        let blob_batch = dataset
+            .take(
+                &[0, 1],
+                ProjectionRequest::from_columns(["b"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        let blob_descriptions = blob_batch.column(0).as_struct();
+        assert!(blob_descriptions.is_null(0));
+        assert!(blob_descriptions.is_valid(1));
     }
 
     #[tokio::test]
@@ -8212,6 +8243,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_inverted_fuzziness_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().lance_tokenizer("json".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query with fuzziness
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Dursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(1)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,ABursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Dontent,str,Bursley".to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_fuzziness(Some(2)),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+    }
+
+    #[tokio::test]
     async fn test_json_inverted_match_query() {
         let (mut dataset, json_col) = prepare_json_dataset().await;
 
@@ -8682,6 +8837,126 @@ mod tests {
             results.column(0).as_any().downcast_ref::<T>().unwrap(),
             values
         )
+    }
+
+    // Test coverage:
+    // Case 1: delete external transaction file → read_transaction should prioritize inline and succeed.
+    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+    // Case 3: manifest does not contain inline → read_transaction should fall back to external transaction file and succeed.
+    #[tokio::test]
+    async fn test_inline_transaction() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        async fn create_dataset(rows: i32) -> Arc<Dataset> {
+            let dir = TempDir::default();
+            let uri = dir.path_str();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
+            Arc::new(ds)
+        }
+
+        fn make_tx(read_version: u64) -> Transaction {
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
+        }
+
+        async fn delete_external_tx_file(ds: &Dataset) {
+            if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
+                let tx_path = ds.base.child("_transactions").child(tx_file.as_str());
+                let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            }
+        }
+
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(IOTracker::default());
+
+        // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
+        let ds = create_dataset(5).await;
+        let read_version = ds.manifest().version;
+        let tx = make_tx(read_version);
+        let ds2 = CommitBuilder::new(ds.clone())
+            .execute(tx.clone())
+            .await
+            .unwrap();
+        delete_external_tx_file(&ds2).await;
+        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx.clone());
+
+        // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+        let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+            .with_session(session.clone())
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_tracker.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let stats = io_tracker.incremental_stats(); // Reset
+        assert!(stats.read_bytes < 64 * 1024);
+        // Because the manifest is so small, we should have opportunistically
+        // cached the transaction in memory already.
+        let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+        let stats = io_tracker.incremental_stats();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(inline_tx, tx);
+
+        // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
+        let ds = create_dataset(2).await;
+        let tx = make_tx(ds.manifest().version);
+        let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
+            .await
+            .unwrap();
+        let (mut manifest, indices) = tx
+            .build_manifest(
+                Some(ds.manifest.as_ref()),
+                ds.load_indices().await.unwrap().as_ref().clone(),
+                &tx_file,
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        let location = write_manifest_file(
+            ds.object_store(),
+            ds.commit_handler.as_ref(),
+            &ds.base,
+            &mut manifest,
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
+            &ManifestWriteConfig::default(),
+            ds.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        let ds_new = ds.checkout_version(location.version).await.unwrap();
+        assert!(ds_new.manifest.transaction_section.is_none());
+        assert!(ds_new.manifest.transaction_file.is_some());
+        let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx);
     }
 
     #[tokio::test]

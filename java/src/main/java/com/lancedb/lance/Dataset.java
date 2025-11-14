@@ -13,9 +13,13 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.cleanup.CleanupPolicy;
+import com.lancedb.lance.cleanup.RemovalStats;
 import com.lancedb.lance.compaction.CompactionOptions;
+import com.lancedb.lance.index.IndexOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.io.StorageOptionsProvider;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -207,7 +211,7 @@ public class Dataset implements Closeable {
    * @param options the open options
    * @return Dataset
    */
-  private static Dataset open(
+  static Dataset open(
       BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
@@ -220,7 +224,9 @@ public class Dataset implements Closeable {
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
-            options.getSerializedManifest());
+            options.getSerializedManifest(),
+            options.getStorageOptionsProvider(),
+            options.getS3CredentialsRefreshOffsetSeconds());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -233,7 +239,38 @@ public class Dataset implements Closeable {
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
-      Optional<ByteBuffer> serializedManifest);
+      Optional<ByteBuffer> serializedManifest,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+
+  /**
+   * Creates a builder for opening a dataset.
+   *
+   * <p>This builder supports opening datasets either directly from a URI or from a LanceNamespace.
+   *
+   * <p>Example usage with URI:
+   *
+   * <pre>{@code
+   * Dataset dataset = Dataset.open()
+   *     .uri("s3://bucket/table.lance")
+   *     .readOptions(options)
+   *     .build();
+   * }</pre>
+   *
+   * <p>Example usage with namespace:
+   *
+   * <pre>{@code
+   * Dataset dataset = Dataset.open()
+   *     .namespace(myNamespace)
+   *     .tableId(Arrays.asList("my_table"))
+   *     .build();
+   * }</pre>
+   *
+   * @return A new OpenDatasetBuilder instance
+   */
+  public static OpenDatasetBuilder open() {
+    return new OpenDatasetBuilder();
+  }
 
   /**
    * Create a new version of dataset. Use {@link Transaction} instead
@@ -615,23 +652,46 @@ public class Dataset implements Closeable {
   private native void nativeRestore();
 
   /**
-   * Creates a new index on the dataset. Only vector indexes are supported.
+   * Creates a new index on the dataset
    *
    * @param columns the columns to index from
    * @param indexType the index type
    * @param name the name of the created index
    * @param params index params
    * @param replace whether to replace the existing index
+   * @deprecated please use {@link Dataset#createIndex(IndexOptions)} instead.
    */
+  @Deprecated
   public void createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
       boolean replace) {
+    createIndex(
+        IndexOptions.builder(columns, indexType, params)
+            .replace(replace)
+            .withIndexName(name.orElse(null))
+            .build());
+  }
+
+  /**
+   * Creates a new index on the dataset.
+   *
+   * @param options options for building index
+   */
+  public void createIndex(IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
+      nativeCreateIndex(
+          options.getColumns(),
+          options.getIndexType().ordinal(),
+          options.getIndexName(),
+          options.getIndexParams(),
+          options.isReplace(),
+          options.isTrain(),
+          options.getFragmentIds(),
+          options.getIndexUUID());
     }
   }
 
@@ -640,7 +700,18 @@ public class Dataset implements Closeable {
       int indexTypeCode,
       Optional<String> name,
       IndexParams params,
-      boolean replace);
+      boolean replace,
+      boolean train,
+      Optional<List<Integer>> fragments,
+      Optional<String> indexUUID);
+
+  public void mergeIndexMetadata(
+      String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
+    innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+  }
+
+  private native void innerMergeIndexMetadata(
+      String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
   /**
    * Count the number of rows in the dataset.
@@ -1256,4 +1327,19 @@ public class Dataset implements Closeable {
 
   private native Dataset nativeShallowClone(
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
+
+  /**
+   * Cleanup dataset based on a specified policy.
+   *
+   * @param policy cleanup policy
+   * @return removal stats
+   */
+  public RemovalStats cleanupWithPolicy(CleanupPolicy policy) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCleanupWithPolicy(policy);
+    }
+  }
+
+  private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
 }

@@ -45,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -203,6 +204,21 @@ public class DatasetTest {
             assertEquals(3, dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
+
+            List<ManifestSummary> summaries =
+                versions.stream().map(Version::getManifestSummary).collect(Collectors.toList());
+            assertEquals(0, summaries.get(0).getTotalFragments());
+            assertEquals(0, summaries.get(0).getTotalDataFiles());
+            assertEquals(0, summaries.get(0).getTotalDataFileRows());
+            assertEquals(0, summaries.get(0).getTotalRows());
+            assertEquals(1, summaries.get(1).getTotalFragments());
+            assertEquals(1, summaries.get(1).getTotalDataFiles());
+            assertEquals(5, summaries.get(1).getTotalDataFileRows());
+            assertEquals(5, summaries.get(1).getTotalRows());
+            assertEquals(2, summaries.get(2).getTotalFragments());
+            assertEquals(2, summaries.get(2).getTotalDataFiles());
+            assertEquals(8, summaries.get(2).getTotalDataFileRows());
+            assertEquals(8, summaries.get(2).getTotalRows());
           }
         }
       }
@@ -356,7 +372,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException, URISyntaxException {
+  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException {
     Path datasetPath = tempDir.resolve("serialized_manifest");
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -365,24 +381,18 @@ public class DatasetTest {
       try (Dataset dataset1 = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset1.version());
         Path manifestPath = datasetPath.resolve("_versions");
-        Stream<Path> fileStream = Files.list(manifestPath);
-        assertEquals(1, fileStream.count());
-        Path filePath = manifestPath.resolve("1.manifest");
-        byte[] manifestBytes = Files.readAllBytes(filePath);
-        // Need to trim the magic number at end and message length at beginning
-        // https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96
-        byte[] trimmedManifest = Arrays.copyOfRange(manifestBytes, 4, manifestBytes.length - 16);
-        ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
-        manifestBuffer.put(trimmedManifest);
-        manifestBuffer.flip();
-        try (Dataset dataset2 = testDataset.write(1, 5)) {
-          assertEquals(2, dataset2.version());
-          assertEquals(2, dataset2.latestVersion());
-          // When reading from the serialized manifest, it shouldn't know about the second dataset
-          ReadOptions readOptions =
-              new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
-          Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
-          assertEquals(1, dataset1Manifest.version());
+        try (Stream<Path> fileStream = Files.list(manifestPath)) {
+          assertEquals(1, fileStream.count());
+          ByteBuffer manifestBuffer = readManifest(manifestPath.resolve("1.manifest"));
+          try (Dataset dataset2 = testDataset.write(1, 5)) {
+            assertEquals(2, dataset2.version());
+            assertEquals(2, dataset2.latestVersion());
+            // When reading from the serialized manifest, it shouldn't know about the second dataset
+            ReadOptions readOptions =
+                new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
+            Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
+            assertEquals(1, dataset1Manifest.version());
+          }
         }
       }
     }
@@ -1391,6 +1401,51 @@ public class DatasetTest {
         assertFalse(allOptions.getDeferIndexRemap().get());
       }
     }
+  }
+
+  /**
+   * This method must be aligned with the implementation in <a
+   * href="https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96">...</a>
+   */
+  public ByteBuffer readManifest(Path filePath) throws IOException {
+    byte[] fileBytes = Files.readAllBytes(filePath);
+    int fileSize = fileBytes.length;
+
+    // Basic file size validation
+    if (fileSize < 16) {
+      throw new IllegalArgumentException("File too small");
+    }
+
+    // Read the last 16 bytes of the file to get metadata
+    // Structure: [manifest_pos (8 bytes)][magic (8 bytes)]
+    ByteBuffer tailBuffer = ByteBuffer.wrap(fileBytes, fileSize - 16, 16);
+    tailBuffer.order(ByteOrder.LITTLE_ENDIAN);
+    long manifestPos = tailBuffer.getLong(); // Read manifest start position
+    // Magic number bytes are read but not validated, we simply skip over them
+    tailBuffer.getLong(); // This reads and skips the 8-byte magic number
+
+    // Remove strict validation since file_size can be larger than manifest_size
+    // due to index and transaction metadata at the beginning of the file
+    // Only ensure manifestPos is not negative and doesn't cause overflow
+    if (manifestPos < 0 || manifestPos >= Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("Invalid manifest position: " + manifestPos);
+    }
+
+    int manifestStart = (int) manifestPos;
+
+    // Verify we have enough data for the length field
+    if (manifestStart + 4 > fileSize) {
+      throw new IllegalArgumentException("Manifest position beyond file bounds");
+    }
+
+    // Calculate the actual length of the protobuf data
+    // The structure is: [4-byte length][protobuf data][8-byte manifest_pos][8-byte magic]
+    byte[] trimmedManifest =
+        Arrays.copyOfRange(fileBytes, manifestStart + 4, fileBytes.length - 16);
+    ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
+    manifestBuffer.put(trimmedManifest);
+    manifestBuffer.flip();
+    return manifestBuffer;
   }
 
   @Test

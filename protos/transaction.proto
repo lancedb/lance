@@ -298,9 +298,7 @@ message Transaction {
     UpdateBases update_bases = 114;
   }
 
-  // An operation to apply to the blob dataset
-  oneof blob_operation {
-    Append blob_append = 200;
-    Overwrite blob_overwrite = 202;
-  }  
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 200, 202;
+  reserved "blob_append", "blob_overwrite";
 }

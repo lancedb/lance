@@ -1,3 +1,8 @@
 nav:
   - index.md
+  - Versioning: versioning.md
+  - Transactions: transaction.md
+  - Layout: layout.md
+  - Branch & Tag: branch_tag.md
+  - Row ID & Lineage: row_id_lineage.md
   - index

@@ -37,21 +37,18 @@ public class Transaction {
   // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
-  private final Optional<Operation> blobOp;
 
   private Transaction(
       Dataset dataset,
       long readVersion,
       String uuid,
       Operation operation,
-      Operation blobOp,
       Map<String, String> writeParams,
       Map<String, String> transactionProperties) {
     this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
-    this.blobOp = Optional.ofNullable(blobOp);
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
     this.transactionProperties = Optional.ofNullable(transactionProperties);
   }
@@ -66,10 +63,6 @@ public class Transaction {
 
   public Operation operation() {
     return operation;
-  }
-
-  public Optional<Operation> blobsOperation() {
-    return blobOp;
   }
 
   public Map<String, String> writeParams() {
@@ -89,7 +82,6 @@ public class Transaction {
 
   public void release() {
     operation.release();
-    blobOp.ifPresent(Operation::release);
   }
 
   @Override
@@ -99,7 +91,6 @@ public class Transaction {
         .add("uuid", uuid)
         .add("operation", operation)
         .add("writeParams", writeParams)
-        .add("blobOp", blobOp)
         .add("transactionProperties", transactionProperties)
         .toString();
   }
@@ -116,7 +107,6 @@ public class Transaction {
     return readVersion == that.readVersion
         && uuid.equals(that.uuid)
         && Objects.equals(operation, that.operation)
-        && Objects.equals(blobOp, that.blobOp)
         && Objects.equals(writeParams, that.writeParams)
         && Objects.equals(transactionProperties, that.transactionProperties);
   }
@@ -126,7 +116,6 @@ public class Transaction {
     private final Dataset dataset;
     private long readVersion;
     private Operation operation;
-    private Operation blobOp;
     private Map<String, String> writeParams;
     private Map<String, String> transactionProperties;
 
@@ -156,11 +145,6 @@ public class Transaction {
       return this;
     }
 
-    public Builder blobsOperation(Operation blobOp) {
-      this.blobOp = blobOp;
-      return this;
-    }
-
     private void validateState() {
       if (operation != null) {
         throw new IllegalStateException(
@@ -171,7 +155,7 @@ public class Transaction {
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
       return new Transaction(
-          dataset, readVersion, uuid, operation, blobOp, writeParams, transactionProperties);
+          dataset, readVersion, uuid, operation, writeParams, transactionProperties);
     }
   }
 }

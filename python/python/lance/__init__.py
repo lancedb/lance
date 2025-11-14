@@ -6,9 +6,11 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-from . import log
+from lance_namespace import DescribeTableRequest, LanceNamespace
+
+from . import io, log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
@@ -32,6 +34,7 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
+from .namespace import LanceNamespaceStorageOptionsProvider
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -57,24 +60,26 @@ __all__ = [
     "LanceFragment",
     "LanceOperation",
     "LanceScanner",
+    "LanceNamespaceStorageOptionsProvider",
     "MergeInsertBuilder",
     "ScanStatistics",
     "Transaction",
     "__version__",
-    "bytes_read_counter",
-    "iops_counter",
-    "write_dataset",
-    "schema_to_json",
-    "json_to_schema",
-    "dataset",
     "batch_udf",
+    "bytes_read_counter",
+    "dataset",
+    "io",
+    "iops_counter",
+    "json_to_schema",
+    "schema_to_json",
     "set_logger",
+    "write_dataset",
     "FFILanceTableProvider",
 ]
 
 
 def dataset(
-    uri: Union[str, Path],
+    uri: Optional[Union[str, Path]] = None,
     version: Optional[int | str] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
@@ -86,15 +91,20 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
+    namespace: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
+    ignore_namespace_table_storage_options: bool = False,
+    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
 
     Parameters
     ----------
-    uri : str
+    uri : str, optional
         Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
         or a cloud object store URI, i.e., `s3://bucket/data.lance`.
+        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -143,7 +153,85 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
+    namespace : optional, LanceNamespace
+        A namespace instance from which to fetch table location and storage options.
+        Use lance_namespace.connect() from the lance_namespace package.
+        Must be provided together with `table_id`. Cannot be used with `uri`.
+        When provided, the table location will be fetched automatically from the
+        namespace via describe_table().
+    table_id : optional, List[str]
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace`. Cannot be used with `uri`.
+    ignore_namespace_table_storage_options : bool, default False
+        Only applicable when using `namespace` and `table_id`. If True, storage
+        options returned from the namespace's describe_table() will be ignored
+        (treated as None). If False (default), storage options from describe_table()
+        will be used and a dynamic storage options provider will be created to
+        automatically refresh credentials before they expire.
+    s3_credentials_refresh_offset_seconds : optional, int
+        The number of seconds before credential expiration to trigger a refresh.
+        Default is 60 seconds. Only applicable when using AWS S3 with temporary
+        credentials. For example, if set to 60, credentials will be refreshed
+        when they have less than 60 seconds remaining before expiration. This
+        should be set shorter than the credential lifetime to avoid using
+        expired credentials.
+
+    Notes
+    -----
+    When using `namespace` and `table_id`:
+    - The `uri` parameter is optional and will be fetched from the namespace
+    - Storage options from describe_table() will be used unless
+      `ignore_namespace_table_storage_options=True`
+    - Initial storage options from describe_table() will be merged with
+      any provided `storage_options`
     """
+    # Validate that user provides either uri OR (namespace + table_id), not both
+    has_uri = uri is not None
+    has_namespace = namespace is not None or table_id is not None
+
+    if has_uri and has_namespace:
+        raise ValueError(
+            "Cannot specify both 'uri' and 'namespace/table_id'. "
+            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+        )
+    elif not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+        )
+
+    # Handle namespace resolution in Python
+    storage_options_provider = None
+    if namespace is not None:
+        if table_id is None:
+            raise ValueError(
+                "Both 'namespace' and 'table_id' must be provided together."
+            )
+
+        request = DescribeTableRequest(id=table_id, version=version)
+        response = namespace.describe_table(request)
+
+        uri = response.location
+        if uri is None:
+            raise ValueError("Namespace did not return a 'location' for the table")
+
+        if ignore_namespace_table_storage_options:
+            namespace_storage_options = None
+        else:
+            namespace_storage_options = response.storage_options
+
+        if namespace_storage_options:
+            storage_options_provider = LanceNamespaceStorageOptionsProvider(
+                namespace=namespace, table_id=table_id
+            )
+            if storage_options is None:
+                storage_options = namespace_storage_options
+            else:
+                merged_options = dict(storage_options)
+                merged_options.update(namespace_storage_options)
+                storage_options = merged_options
+    elif table_id is not None:
+        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+
     ds = LanceDataset(
         uri,
         version,
@@ -156,6 +244,8 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
+        storage_options_provider=storage_options_provider,
+        s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -179,6 +269,8 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
+                storage_options_provider=storage_options_provider,
+                s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
             )
     else:
         return ds

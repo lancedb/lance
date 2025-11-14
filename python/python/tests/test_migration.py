@@ -73,12 +73,15 @@ def test_old_btree_bitmap_indices(tmp_path: Path):
     """
     ds = prep_dataset(tmp_path, "v0.20.0", "old_btree_bitmap_indices.lance")
 
-    assert ds.to_table(filter="bitmap > 2") == pa.table(
-        {"bitmap": [3, 4], "btree": [3, 4]}
-    )
-    assert ds.to_table(filter="btree > 2") == pa.table(
-        {"bitmap": [3, 4], "btree": [3, 4]}
-    )
+    def query(filt: str):
+        table = ds.to_table(filter=filt)
+        assert table == pa.table({"bitmap": [3, 4], "btree": [3, 4]})
+
+        explain = ds.scanner(filter=filt).explain_plan()
+        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+
+    query("bitmap > 2")
+    query("btree > 2")
 
 
 def test_index_no_details(tmp_path: Path):

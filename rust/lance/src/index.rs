@@ -20,9 +20,8 @@ use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
 };
-use lance_file::reader::FileReader;
-use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::reader::FileReaderOptions;
 use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::optimize::OptimizeOptions;
@@ -450,7 +449,6 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![],
                 removed_indices: indices.clone(),
             },
-            /*blobs_op= */ None,
             None,
         );
 
@@ -558,7 +556,6 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
-            /*blobs_op= */ None,
             None,
         );
 
@@ -686,7 +683,6 @@ impl DatasetIndexExt for Dataset {
                 new_indices,
                 removed_indices,
             },
-            /*blobs_op= */ None,
             None,
         );
 
@@ -1109,7 +1105,7 @@ impl DatasetIndexInternalExt for Dataset {
 
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = FileReader::try_new_self_described_from_reader(
+                let reader = PreviousFileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
@@ -1132,7 +1128,7 @@ impl DatasetIndexInternalExt for Dataset {
                 let file = scheduler
                     .open_file(&index_file, &CachedFileSize::unknown())
                     .await?;
-                let reader = v2::reader::FileReader::try_open(
+                let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
                     Default::default(),
@@ -1966,10 +1962,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[1]), vec![1]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 1, // merge the index with new data
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
 
@@ -1984,10 +1977,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0, 1]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats = get_stats(&dataset, "other_vec_idx").await;
@@ -2071,10 +2061,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
 
@@ -2087,10 +2074,7 @@ mod tests {
         assert_eq!(stats["num_indices"], 2);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
-                ..Default::default()
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats: serde_json::Value =
@@ -3486,7 +3470,7 @@ mod tests {
 
             // Optimize indices
             round_cloned_dataset
-                .optimize_indices(&OptimizeOptions::default())
+                .optimize_indices(&OptimizeOptions::merge(indices_before_optimize.len()))
                 .await
                 .unwrap();
 

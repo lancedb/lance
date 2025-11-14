@@ -80,6 +80,7 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 tracing.workspace = true
 humantime = { workspace = true }
 async_cell = "0.2.2"
+semver.workspace = true
 tokio-stream = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -104,6 +105,7 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }

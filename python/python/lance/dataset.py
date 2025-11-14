@@ -34,13 +34,13 @@ from typing import (
 
 import pyarrow as pa
 import pyarrow.dataset
+from lance_namespace import DescribeTableRequest, LanceNamespace
 from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
 from .blob import BlobFile
 from .dependencies import (
-    _check_for_hugging_face,
     _check_for_numpy,
     torch,
 )
@@ -417,6 +417,8 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
+        storage_options_provider: Optional[Any] = None,
+        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -447,6 +449,8 @@ class LanceDataset(pa.dataset.Dataset):
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
             session=session,
+            storage_options_provider=storage_options_provider,
+            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -712,7 +716,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "column": <embedding col name>,
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
@@ -975,7 +979,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
                     "metric": "cosine",
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
@@ -2241,7 +2245,7 @@ class LanceDataset(pa.dataset.Dataset):
         replace: bool = True,
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
-        fragment_uuid: Optional[str] = None,
+        index_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2336,7 +2340,7 @@ class LanceDataset(pa.dataset.Dataset):
             method returns an IndexMetadata object but does not commit the index
             to the dataset. The index can be committed later using the commit API.
             This parameter is passed via kwargs internally.
-        fragment_uuid : str, optional
+        index_uuid : str, optional
             A UUID to use for fragment-level distributed indexing
             multiple fragment-level indices need to share UUID for later merging.
             If not provided, a new UUID will be generated. This parameter is passed via
@@ -2502,11 +2506,11 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
-        # Add fragment_ids and fragment_uuid to kwargs if provided
+        # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
-        if fragment_uuid is not None:
-            kwargs["fragment_uuid"] = fragment_uuid
+        if index_uuid is not None:
+            kwargs["index_uuid"] = index_uuid
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -3055,7 +3059,6 @@ class LanceDataset(pa.dataset.Dataset):
     def commit(
         base_uri: Union[str, Path, LanceDataset],
         operation: Union[LanceOperation.BaseOperation, Transaction],
-        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -3196,7 +3199,6 @@ class LanceDataset(pa.dataset.Dataset):
             new_ds = _Dataset.commit(
                 base_uri,
                 operation,
-                blobs_op,
                 read_version,
                 commit_lock,
                 storage_options=storage_options,
@@ -3645,7 +3647,6 @@ class Transaction:
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
-    blobs_op: Optional[LanceOperation.BaseOperation] = None
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
@@ -4843,7 +4844,7 @@ class DatasetOptimizer:
 
         Parameters
         ----------
-        num_indices_to_merge: int, default 1
+        num_indices_to_merge: optional, int, default None
             The number of indices to merge.
             If set to 0, new delta index will be created.
         index_names: List[str], default None
@@ -5074,7 +5075,7 @@ class LanceStats:
 
 def write_dataset(
     data_obj: ReaderLike,
-    uri: Union[str, Path, LanceDataset],
+    uri: Optional[Union[str, Path, LanceDataset]] = None,
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
@@ -5095,6 +5096,8 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    namespace: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5104,9 +5107,10 @@ def write_dataset(
         The data to be written. Acceptable types are:
         - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
         - Huggingface dataset
-    uri: str, Path, or LanceDataset
+    uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,
         the session will be reused.
+        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
     schema: Schema, optional
         If specified and the input is a pandas DataFrame, use this schema
         instead of the default pandas to arrow table conversion.
@@ -5186,7 +5190,64 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    namespace : optional, LanceNamespace
+        A namespace instance from which to fetch table location and storage options.
+        Must be provided together with `table_id`. Cannot be used with `uri`.
+        When provided, the table location will be fetched automatically from the
+        namespace via describe_table(). Storage options will be automatically refreshed
+        before they expire.
+    table_id : optional, List[str]
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace`. Cannot be used with `uri`.
+
+    Notes
+    -----
+    When using `namespace` and `table_id`:
+    - The `uri` parameter is optional and will be fetched from the namespace
+    - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
+      storage options refresh
+    - Initial storage options from describe_table() will be merged with
+      any provided `storage_options`
     """
+    # Validate that user provides either uri OR (namespace + table_id), not both
+    has_uri = uri is not None
+    has_namespace = namespace is not None or table_id is not None
+
+    if has_uri and has_namespace:
+        raise ValueError(
+            "Cannot specify both 'uri' and 'namespace/table_id'. "
+            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+        )
+    elif not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+        )
+
+    # Handle namespace-based dataset writing
+    if namespace is not None:
+        if table_id is None:
+            raise ValueError(
+                "Both 'namespace' and 'table_id' must be provided together."
+            )
+
+        request = DescribeTableRequest(id=table_id, version=None)
+        response = namespace.describe_table(request)
+        uri = response.location
+        if not uri:
+            raise ValueError("Namespace did not return a table location")
+
+        namespace_storage_options = response.storage_options
+        if namespace_storage_options:
+            # TODO: support dynamic storage options provider
+            if storage_options is None:
+                storage_options = namespace_storage_options
+            else:
+                merged_options = dict(storage_options)
+                merged_options.update(namespace_storage_options)
+                storage_options = merged_options
+    elif table_id is not None:
+        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+
     if use_legacy_format is not None:
         warnings.warn(
             "use_legacy_format is deprecated, use data_storage_version instead",
@@ -5196,15 +5257,6 @@ def write_dataset(
             data_storage_version = "legacy"
         else:
             data_storage_version = "stable"
-
-    if _check_for_hugging_face(data_obj):
-        # Huggingface datasets
-        from .dependencies import datasets
-
-        if isinstance(data_obj, datasets.Dataset):
-            if schema is None:
-                schema = data_obj.features.arrow_schema
-            data_obj = data_obj.data.to_batches()
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)

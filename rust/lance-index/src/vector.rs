@@ -15,10 +15,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
-use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
-use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
@@ -88,7 +86,10 @@ pub struct Query {
     pub upper_bound: Option<f32>,
 
     /// The minimum number of probes to load and search.  More partitions
-    /// will only be loaded if we have not found k results.
+    /// will only be loaded if we have not found k results, or the the algorithm
+    /// determines more partitions are needed to satisfy recall requirements.
+    ///
+    /// The planner will always search at least this many partitions. Defaults to 1.
     pub minimum_nprobes: usize,
 
     /// The maximum number of probes to load and search.  If not set then
@@ -250,20 +251,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If an old row id is not in the mapping then it should be
     /// left alone.
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
-
-    /// Remap the index according to mapping
-    ///
-    /// write the remapped index to the index_dir
-    /// this is available for only v3 index
-    async fn remap_to(
-        self: Arc<Self>,
-        _store: ObjectStore,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _column: String,
-        _index_dir: Path,
-    ) -> Result<()> {
-        unimplemented!("only for v3 index")
-    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

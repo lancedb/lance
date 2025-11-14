@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
@@ -119,19 +124,66 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             download_retry_count,
         })
     }
+
+    fn calculate_object_store_prefix(
+        &self,
+        scheme: &str,
+        authority: &str,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let (container, account) = match authority.find("@") {
+            Some(at_index) => {
+                // The URI looks like 'az://container@account.dfs.core.windows.net/path-part/file',
+                // or possibly 'az://container@account/path-part/file'.
+                let container = &authority[..at_index];
+                let account = &authority[at_index + 1..];
+                (
+                    container,
+                    account.split(".").next().unwrap_or_default().to_string(),
+                )
+            }
+            None => {
+                // The URI looks like 'az://container/path-part/file'.
+                // We must look at the storage options to find the account.
+                let mut account = match storage_options {
+                    Some(opts) => StorageOptions::find_configured_storage_account(opts),
+                    None => None,
+                };
+                if account.is_none() {
+                    account = StorageOptions::find_configured_storage_account(&ENV_OPTIONS.0);
+                }
+                let account = account.ok_or(Error::invalid_input(
+                    "Unable to find object store prefix: no Azure account name in URI, and no storage account configured.",
+                    location!(),
+                ))?;
+                (authority, account)
+            }
+        };
+        Ok(format!("{}${}@{}", scheme, container, account))
+    }
 }
 
+static ENV_OPTIONS: LazyLock<StorageOptions> = LazyLock::new(StorageOptions::from_env);
+
 impl StorageOptions {
-    /// Add values from the environment to storage options
-    pub fn with_env_azure(&mut self) {
+    /// Iterate over all environment variables, looking for anything related to Azure.
+    fn from_env() -> Self {
+        let mut opts = HashMap::<String, String>::new();
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
                 if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
+                    opts.insert(config_key.as_ref().to_string(), value.to_string());
                 }
+            }
+        }
+        Self(opts)
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_azure(&mut self) {
+        for (os_key, os_value) in &ENV_OPTIONS.0 {
+            if !self.0.contains_key(os_key) {
+                self.0.insert(os_key.clone(), os_value.clone());
             }
         }
     }
@@ -145,6 +197,17 @@ impl StorageOptions {
                 Some((az_key, value.clone()))
             })
             .collect()
+    }
+
+    #[allow(clippy::manual_map)]
+    fn find_configured_storage_account(map: &HashMap<String, String>) -> Option<String> {
+        if let Some(account) = map.get("azure_storage_account_name") {
+            Some(account.clone())
+        } else if let Some(account) = map.get("account_name") {
+            Some(account.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -176,7 +239,10 @@ mod tests {
                     "endpoint".to_string(),
                     "https://test_account.blob.core.windows.net".to_string(),
                 ),
-                ("account_key".to_string(), "12345=".to_string()),
+                (
+                    "account_key".to_string(),
+                    "dGVzdF9hY2NvdW50X2tleQ==".to_string(),
+                ),
             ])),
             ..Default::default()
         };
@@ -186,5 +252,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "az");
+    }
+
+    #[test]
+    fn test_find_configured_storage_account() {
+        assert_eq!(
+            Some("myaccount".to_string()),
+            StorageOptions::find_configured_storage_account(&HashMap::from_iter(
+                [
+                    ("access_key".to_string(), "myaccesskey".to_string()),
+                    (
+                        "azure_storage_account_name".to_string(),
+                        "myaccount".to_string()
+                    )
+                ]
+                .into_iter()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_from_url_and_options() {
+        let provider = AzureBlobStoreProvider;
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        assert_eq!(
+            "az$container@bob",
+            provider
+                .calculate_object_store_prefix("az", "container", Some(&options))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_from_url_and_ignored_options() {
+        let provider = AzureBlobStoreProvider;
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        assert_eq!(
+            "az$container@account",
+            provider
+                .calculate_object_store_prefix(
+                    "az",
+                    "container@account.dfs.core.windows.net",
+                    Some(&options)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_fail_to_calculate_object_store_prefix_from_url() {
+        let provider = AzureBlobStoreProvider;
+        let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
+        let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
+        let result = provider
+            .calculate_object_store_prefix("az", "container", Some(&options))
+            .expect_err("expected error")
+            .to_string();
+        assert_eq!(expected, &result[..expected.len()]);
     }
 }

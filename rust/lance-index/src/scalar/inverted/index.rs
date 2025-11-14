@@ -7,10 +7,7 @@ use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-};
+use std::{collections::HashMap, ops::Range};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
@@ -232,7 +229,7 @@ impl InvertedIndex {
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
-        tokens: Arc<Vec<String>>,
+        tokens: Arc<Tokens>,
         params: Arc<FtsSearchParams>,
         operator: Operator,
         prefilter: Arc<dyn PreFilter>,
@@ -500,7 +497,7 @@ impl InvertedIndex {
 
         let (doc_ids, _) = self
             .bm25_search(
-                tokens.into(),
+                Arc::new(tokens),
                 params.into(),
                 Operator::And,
                 Arc::new(NoFilter),
@@ -679,7 +676,7 @@ impl InvertedPartition {
         self.tokens.get(token)
     }
 
-    pub fn expand_fuzzy(&self, tokens: &[String], params: &FtsSearchParams) -> Result<Vec<String>> {
+    pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
             let fuzziness = match params.fuzziness {
@@ -692,8 +689,9 @@ impl InvertedPartition {
                     location: location!(),
                 })?;
 
+            let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                match params.prefix_length {
+                match base_len + params.prefix_length {
                     0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
                     prefix_length => {
                         let prefix = &token[..min(prefix_length as usize, token.len())];
@@ -712,7 +710,7 @@ impl InvertedPartition {
                 });
             }
         }
-        Ok(new_tokens)
+        Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
     }
 
     // search the documents that contain the query
@@ -721,7 +719,7 @@ impl InvertedPartition {
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
-        tokens: &[String],
+        tokens: &Tokens,
         params: &FtsSearchParams,
         operator: Operator,
         mask: Arc<RowIdMask>,
@@ -731,7 +729,7 @@ impl InvertedPartition {
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens, params)?,
-            false => tokens.to_vec(),
+            false => tokens.clone(),
         };
         let mut token_ids = Vec::with_capacity(tokens.len());
         for token in tokens {
@@ -2337,9 +2335,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer, None)
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let query_tokens = collect_query_tokens(query, &mut tokenizer, None);
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -2361,7 +2357,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
-    query_tokens: &HashSet<String>,
+    query_tokens: &Tokens,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     scorer: &mut MemBM25Scorer,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
@@ -2389,7 +2385,7 @@ pub fn flat_bm25_search(
                 .or_insert(1);
         }
         let mut score = 0.0;
-        for token in query_tokens.iter() {
+        for token in query_tokens {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
 
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
@@ -2420,10 +2416,7 @@ pub fn flat_bm25_search_stream(
             .build(),
         )),
     };
-    let tokens = collect_query_tokens(&query, &mut tokenizer, None)
-        .into_iter()
-        .sorted_unstable()
-        .collect::<HashSet<_>>();
+    let tokens = collect_query_tokens(&query, &mut tokenizer, None);
 
     let mut bm25_scorer = match index {
         Some(index) => {
@@ -2473,6 +2466,7 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::inverted::lance_tokenizer::DocType;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
@@ -2671,7 +2665,7 @@ mod tests {
         // Prewarm the inverted index (this loads posting lists into cache)
         index.prewarm().await.unwrap();
 
-        let tokens = Arc::new(vec!["test".to_string()]);
+        let tokens = Arc::new(Tokens::new(vec!["test".to_string()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
         let prefilter = Arc::new(NoFilter);
         let metrics = Arc::new(NoOpMetricsCollector);

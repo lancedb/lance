@@ -18,10 +18,8 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::{
-    reader::{FileReader, FileReaderOptions},
-    writer::FileWriter,
-};
+use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::writer::FileWriter;
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -190,7 +188,6 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
-                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -282,7 +279,7 @@ impl ShuffleReader for IvfShufflerReader {
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
-        Ok(self.partition_sizes[partition_id])
+        Ok(self.partition_sizes.get(partition_id).copied().unwrap_or(0))
     }
 
     fn total_loss(&self) -> Option<f64> {
