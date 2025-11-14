@@ -2424,7 +2424,10 @@ mod tests {
         );
         let location = response.location.as_ref().unwrap();
         // Location should be a proper file:// URI with the temp path
-        let expected_prefix = format!("file://{}", temp_path);
+        // Use uri_to_url to normalize the temp path to a URL for comparison
+        let expected_url = lance_io::object_store::uri_to_url(temp_path)
+            .expect("Failed to convert temp path to URL");
+        let expected_prefix = expected_url.to_string();
         assert!(
             location.starts_with(&expected_prefix),
             "Location should start with '{}', got: {}",
@@ -2492,7 +2495,10 @@ mod tests {
         );
         let location = response.location.as_ref().unwrap();
         // Location should be a proper file:// URI with the temp path
-        let expected_prefix = format!("file://{}", temp_path);
+        // Use uri_to_url to normalize the temp path to a URL for comparison
+        let expected_url = lance_io::object_store::uri_to_url(temp_path)
+            .expect("Failed to convert temp path to URL");
+        let expected_prefix = expected_url.to_string();
         assert!(
             location.starts_with(&expected_prefix),
             "Location should start with '{}', got: {}",

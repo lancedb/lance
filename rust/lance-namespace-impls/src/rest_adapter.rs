@@ -413,7 +413,7 @@ async fn create_empty_table(
 
 /// Parse object ID from path string using delimiter
 fn parse_id(id_str: &str, delimiter: Option<&str>) -> Vec<String> {
-    let delimiter = delimiter.unwrap_or(".");
+    let delimiter = delimiter.unwrap_or("$");
 
     // Special case: if ID equals delimiter, it represents root namespace (empty vec)
     if id_str == delimiter {
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_parse_id_default_delimiter() {
-        let id = parse_id("ns1.ns2.table", None);
+        let id = parse_id("ns1$ns2$table", None);
         assert_eq!(id, vec!["ns1", "ns2", "table"]);
     }
 
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_parse_id_root_namespace() {
         // When ID equals delimiter, it represents root namespace
-        let id = parse_id(".", None);
+        let id = parse_id("$", None);
         assert_eq!(id, Vec::<String>::new());
 
         let id = parse_id("/", Some("/"));
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn test_parse_id_filters_empty() {
         // Filter out empty strings from split results
-        let id = parse_id("..table..", None);
+        let id = parse_id("$$table$$", None);
         assert_eq!(id, vec!["table"]);
     }
 

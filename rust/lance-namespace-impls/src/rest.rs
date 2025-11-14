@@ -62,7 +62,7 @@ pub struct RestNamespaceBuilder {
 
 impl RestNamespaceBuilder {
     /// Default delimiter for object identifiers
-    const DEFAULT_DELIMITER: &'static str = ".";
+    const DEFAULT_DELIMITER: &'static str = "$";
 
     /// Create a new RestNamespaceBuilder with the specified URI.
     ///
@@ -801,7 +801,7 @@ mod tests {
             .expect("Failed to create namespace builder")
             .build();
 
-        // The default delimiter should be "." - test passes if no panic
+        // The default delimiter should be "$" - test passes if no panic
     }
 
     #[test]
@@ -902,7 +902,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -941,7 +941,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -961,8 +961,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/namespace/test$newnamespace/create".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/namespace/test.newnamespace/create"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "namespace": {
                     "identifier": ["test", "newnamespace"],
@@ -976,7 +977,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
@@ -987,7 +988,7 @@ mod tests {
         let result = namespace.create_namespace(request).await;
 
         // Should succeed with mock server
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
 
     #[tokio::test]
@@ -996,8 +997,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/table/test$namespace$table/create".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/table/test.namespace.table/create"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "table": {
                     "identifier": ["test", "namespace", "table"],
@@ -1012,7 +1014,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -1038,8 +1040,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/table/test$namespace$table/insert".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/table/test.namespace.table/insert"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "version": 2
             })))
@@ -1050,7 +1053,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = InsertIntoTableRequest {
             id: Some(vec![
