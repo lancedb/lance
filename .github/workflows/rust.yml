@@ -103,11 +103,13 @@ jobs:
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo llvm-cov nextest  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -127,6 +129,7 @@ jobs:
           rustup toolchain install stable
           rustup default stable
       - uses: rui314/setup-mold@v1
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
@@ -144,7 +147,7 @@ jobs:
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES}
+          cargo nextest run --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: warp-ubuntu-2404-x64-8x
     timeout-minutes: 30
@@ -158,6 +161,7 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@v1
+      - uses: taiki-e/install-action@nextest
       - name: Install dependencies
         run: |
           sudo apt update
@@ -185,6 +189,7 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
         run: brew install protobuf
+      - uses: taiki-e/install-action@nextest
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
@@ -197,7 +202,7 @@ jobs:
           cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo nextest run --features fp16kernels,cli,tensorflow,dynamodb,substrait
       - name: Check benchmarks
         run: |
           cargo check --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
@@ -221,10 +226,11 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - uses: taiki-e/install-action@nextest
       - name: Build tests
         run: cargo test --locked --no-run
       - name: Run tests
-        run: cargo test
+        run: cargo nextest run
       - name: Check benchmarks
         run: cargo check --benches
 
