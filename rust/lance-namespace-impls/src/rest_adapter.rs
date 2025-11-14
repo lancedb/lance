@@ -26,14 +26,14 @@ use lance_namespace::LanceNamespace;
 
 /// Configuration for the REST server
 #[derive(Debug, Clone)]
-pub struct RestServerConfig {
+pub struct RestAdapterConfig {
     /// Host address to bind to
     pub host: String,
     /// Port to listen on
     pub port: u16,
 }
 
-impl Default for RestServerConfig {
+impl Default for RestAdapterConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
@@ -43,14 +43,14 @@ impl Default for RestServerConfig {
 }
 
 /// REST server adapter that wraps a Lance Namespace implementation
-pub struct RestServer {
+pub struct RestAdapter {
     backend: Arc<dyn LanceNamespace>,
-    config: RestServerConfig,
+    config: RestAdapterConfig,
 }
 
-impl RestServer {
+impl RestAdapter {
     /// Create a new REST server with the given backend namespace
-    pub fn new(backend: Arc<dyn LanceNamespace>, config: RestServerConfig) -> Self {
+    pub fn new(backend: Arc<dyn LanceNamespace>, config: RestAdapterConfig) -> Self {
         Self { backend, config }
     }
 

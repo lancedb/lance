@@ -74,5 +74,8 @@ url = "2.5.0"
 bytes = "1.4"
 
 [features]
+default = ["rest", "rest-adapter"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+rest = ["lance-namespace-impls/rest"]
+rest-adapter = ["lance-namespace-impls/rest-adapter"]

@@ -58,16 +58,22 @@ def table_to_ipc_bytes(table):
 @pytest.fixture
 def temp_namespace():
     """Create a temporary DirectoryNamespace for testing."""
+    import lance_namespace
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        ns = lance.namespace.DirectoryNamespace(f"file://{tmpdir}")
+        # Use lance_namespace.connect() for consistency
+        ns = lance_namespace.connect("dir", {"root": f"file://{tmpdir}"})
         yield ns
 
 
 @pytest.fixture
 def memory_namespace():
     """Create a memory-based DirectoryNamespace for testing."""
+    import lance_namespace
+
     unique_id = uuid.uuid4().hex[:8]
-    ns = lance.namespace.DirectoryNamespace(f"memory://test_{unique_id}")
+    # Use lance_namespace.connect() for consistency
+    ns = lance_namespace.connect("dir", {"root": f"memory://test_{unique_id}"})
     yield ns
 
 
@@ -667,3 +673,57 @@ class TestBasicNamespaceOperations:
         assert response is not None
         # Should find the child namespaces
         assert len(response.namespaces) >= 2
+
+
+class TestLanceNamespaceConnect:
+    """Tests for lance_namespace.connect integration."""
+
+    def test_connect_with_properties(self):
+        """Test creating DirectoryNamespace via lance_namespace.connect()."""
+        import uuid
+
+        import lance_namespace
+
+        unique_id = uuid.uuid4().hex[:8]
+        properties = {
+            "root": f"memory://test_connect_{unique_id}",
+            "manifest_enabled": "true",
+            "dir_listing_enabled": "true",
+        }
+
+        # Connect via lance_namespace.connect
+        # should use lance.namespace.DirectoryNamespace
+        ns = lance_namespace.connect("dir", properties)
+
+        # Verify it's a DirectoryNamespace instance
+        assert isinstance(ns, lance.namespace.DirectoryNamespace)
+
+        # Verify it works
+        create_req = CreateTableRequest(id=["test_table"])
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        response = ns.create_table(create_req, ipc_data)
+        assert response is not None
+
+        # Verify we can list the table
+        list_req = ListTablesRequest(id=[])
+        list_response = ns.list_tables(list_req)
+        assert len(list_response.tables) == 1
+        # tables is a list of strings
+        assert list_response.tables[0] == "test_table"
+
+    def test_connect_with_storage_options(self):
+        """Test creating DirectoryNamespace with storage options via connect()."""
+        import uuid
+
+        import lance_namespace
+
+        unique_id = uuid.uuid4().hex[:8]
+        properties = {
+            "root": f"memory://test_storage_{unique_id}",
+            "storage.some_option": "value",  # Test storage.* prefix
+        }
+
+        # This should work without errors
+        ns = lance_namespace.connect("dir", properties)
+        assert isinstance(ns, lance.namespace.DirectoryNamespace)
