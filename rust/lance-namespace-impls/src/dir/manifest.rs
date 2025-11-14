@@ -404,7 +404,7 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create BTREE index on object_id for __manifest table: {}. Query performance may be impacted.", e);
+                log::warn!("Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.", e);
             } else {
                 log::info!(
                     "Created BTREE index '{}' on object_id for __manifest table",
@@ -430,7 +430,7 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {}. Query performance may be impacted.", e);
+                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.", e);
             } else {
                 log::info!(
                     "Created Bitmap index '{}' on object_type for __manifest table",
@@ -456,7 +456,7 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {}. Query performance may be impacted.", e);
+                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.", e);
             } else {
                 log::info!(
                     "Created LabelList index '{}' on base_objects for __manifest table",
@@ -478,7 +478,7 @@ impl ManifestNamespace {
                 }
             }
             Err(e) => {
-                log::warn!("Failed to compact files for __manifest table: {}. Continuing with optimization.", e);
+                log::warn!("Failed to compact files for __manifest table: {:?}. Continuing with optimization.", e);
             }
         }
 
@@ -490,7 +490,7 @@ impl ManifestNamespace {
             }
             Err(e) => {
                 log::warn!(
-                    "Failed to optimize indices on __manifest table: {}. Continuing anyway.",
+                    "Failed to optimize indices on __manifest table: {:?}. Continuing anyway.",
                     e
                 );
             }
