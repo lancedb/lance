@@ -309,9 +309,12 @@ class TestTableOperations:
         deregister_req = DeregisterTableRequest(id=["workspace", "test_table"])
         response = temp_namespace.deregister_table(deregister_req)
         assert response is not None
-        # Should return full URI to deregistered table (use endswith to handle path canonicalization)
-        assert response.location.endswith("/workspace/physical_table.lance"), \
-            f"Expected location to end with '/workspace/physical_table.lance', got {response.location}"
+        # Should return full URI to deregistered table
+        # (use endswith to handle path canonicalization)
+        assert response.location.endswith("/workspace/physical_table.lance"), (
+            f"Expected location to end with '/workspace/physical_table.lance', "
+            f"got {response.location}"
+        )
         assert response.id == ["workspace", "test_table"]
 
     def test_register_table(self, temp_namespace):
@@ -350,9 +353,14 @@ class TestTableOperations:
         describe_req = DescribeTableRequest(id=["workspace", "registered_table"])
         desc_response = temp_namespace.describe_table(describe_req)
         assert desc_response is not None
-        # Should point to the same physical location (use endswith to handle path canonicalization)
-        assert desc_response.location.endswith("/workspace/physical_table.lance"), \
-            f"Expected location to end with '/workspace/physical_table.lance', got {desc_response.location}"
+        # Should point to the same physical location
+        # (use endswith to handle path canonicalization)
+        assert desc_response.location.endswith(
+            "/workspace/physical_table.lance"
+        ), (
+            f"Expected location to end with '/workspace/physical_table.lance', "
+            f"got {desc_response.location}"
+        )
 
     def test_register_table_rejects_absolute_uri(self, temp_namespace):
         """Test that register_table rejects absolute URIs."""

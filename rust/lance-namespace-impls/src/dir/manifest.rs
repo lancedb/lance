@@ -319,14 +319,16 @@ impl ManifestNamespace {
     /// Construct a full URI from root and relative location
     fn construct_full_uri(&self, relative_location: &str) -> Result<String> {
         let base_url = lance_io::object_store::uri_to_url(&self.root)?;
-        let full_url = base_url.join(relative_location).map_err(|e| Error::InvalidInput {
-            source: format!(
-                "Failed to join URI '{}' with '{}': {}",
-                self.root, relative_location, e
-            )
-            .into(),
-            location: location!(),
-        })?;
+        let full_url = base_url
+            .join(relative_location)
+            .map_err(|e| Error::InvalidInput {
+                source: format!(
+                    "Failed to join URI '{}' with '{}': {}",
+                    self.root, relative_location, e
+                )
+                .into(),
+                location: location!(),
+            })?;
 
         Ok(full_url.to_string())
     }
