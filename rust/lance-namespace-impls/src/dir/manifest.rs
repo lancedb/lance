@@ -19,11 +19,12 @@ use lance_core::{box_error, Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
-    ListNamespacesResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
-    TableExistsRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeregisterTableRequest,
+    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableRequest, DropTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest,
+    RegisterTableResponse, TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
@@ -624,7 +625,7 @@ impl ManifestNamespace {
         Ok(())
     }
 
-    /// Register a table in the manifest without creating the physical table
+    /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
         if self.manifest_contains_object(&object_id).await? {
@@ -1365,6 +1366,125 @@ impl LanceNamespace for ManifestNamespace {
             location: Some(table_uri),
             properties: None,
             storage_options: self.storage_options.clone(),
+        })
+    }
+
+    async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Table ID is required".into(),
+            location: location!(),
+        })?;
+
+        if table_id.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "Table ID cannot be empty".into(),
+                location: location!(),
+            });
+        }
+
+        let location = request.location.clone();
+
+        // Validate that location is a relative path within the root directory
+        // We don't allow absolute URIs or paths that escape the root
+        if location.contains("://") {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Absolute URIs are not allowed for register_table. Location must be a relative path within the root directory: {}",
+                    location
+                ).into(),
+                location: location!(),
+            });
+        }
+
+        if location.starts_with('/') {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Absolute paths are not allowed for register_table. Location must be a relative path within the root directory: {}",
+                    location
+                ).into(),
+                location: location!(),
+            });
+        }
+
+        // Check for path traversal attempts
+        if location.contains("..") {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Path traversal is not allowed. Location must be a relative path within the root directory: {}",
+                    location
+                ).into(),
+                location: location!(),
+            });
+        }
+
+        let (namespace, table_name) = Self::split_object_id(table_id);
+        let object_id = Self::build_object_id(&namespace, &table_name);
+
+        // Validate that parent namespaces exist (if not root)
+        if !namespace.is_empty() {
+            self.validate_namespace_levels_exist(&namespace).await?;
+        }
+
+        // Check if table already exists
+        if self.manifest_contains_object(&object_id).await? {
+            return Err(Error::Namespace {
+                source: format!("Table '{}' already exists", object_id).into(),
+                location: location!(),
+            });
+        }
+
+        // Register the table with its location in the manifest
+        self.insert_into_manifest(object_id, ObjectType::Table, Some(location.clone()))
+            .await?;
+
+        Ok(RegisterTableResponse {
+            location,
+            properties: None,
+        })
+    }
+
+    async fn deregister_table(
+        &self,
+        request: DeregisterTableRequest,
+    ) -> Result<DeregisterTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Table ID is required".into(),
+            location: location!(),
+        })?;
+
+        if table_id.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "Table ID cannot be empty".into(),
+                location: location!(),
+            });
+        }
+
+        let (namespace, table_name) = Self::split_object_id(table_id);
+        let object_id = Self::build_object_id(&namespace, &table_name);
+
+        // Get table info before deleting
+        let table_info = self.query_manifest_for_table(&object_id).await?;
+
+        let table_uri = match table_info {
+            Some(info) => {
+                // Delete from manifest only (leave physical data intact)
+                self.delete_from_manifest(&object_id).await?;
+
+                // Return the full URI
+                format!("{}/{}", self.root, info.location)
+            }
+            None => {
+                return Err(Error::Namespace {
+                    source: format!("Table '{}' not found", object_id).into(),
+                    location: location!(),
+                });
+            }
+        };
+
+        Ok(DeregisterTableResponse {
+            id: request.id.clone(),
+            location: Some(table_uri),
+            properties: None,
         })
     }
 }

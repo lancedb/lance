@@ -1491,5 +1491,328 @@ mod tests {
                 err_msg
             );
         }
+
+        #[tokio::test]
+        async fn test_register_table() {
+            let fixture = RestServerFixture::new(4019).await;
+            let table_data = create_test_arrow_data();
+
+            // Create child namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create a physical table using create_table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "physical_table".to_string(),
+                ]),
+                location: None,
+                mode: Some(create_table_request::Mode::Create),
+                properties: None,
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Register another table pointing to a relative path
+            let register_req = RegisterTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "registered_table".to_string(),
+                ]),
+                location: "test_namespace$physical_table.lance".to_string(),
+                mode: None,
+                properties: None,
+            };
+
+            let result = fixture.namespace.register_table(register_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to register table: {:?}",
+                result.err()
+            );
+
+            let response = result.unwrap();
+            assert_eq!(response.location, "test_namespace$physical_table.lance");
+
+            // Verify registered table exists
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(vec![
+                "test_namespace".to_string(),
+                "registered_table".to_string(),
+            ]);
+            let result = fixture.namespace.table_exists(exists_req).await;
+            assert!(result.is_ok(), "Registered table should exist");
+        }
+
+        #[tokio::test]
+        async fn test_register_table_rejects_absolute_uri() {
+            let fixture = RestServerFixture::new(4020).await;
+
+            // Create child namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Try to register with absolute URI - should fail
+            let register_req = RegisterTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "bad_table".to_string()]),
+                location: "s3://bucket/table.lance".to_string(),
+                mode: None,
+                properties: None,
+            };
+
+            let result = fixture.namespace.register_table(register_req).await;
+            assert!(result.is_err(), "Should reject absolute URI");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Absolute URIs are not allowed"),
+                "Error should mention absolute URIs, got: {}",
+                err_msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_table_rejects_path_traversal() {
+            let fixture = RestServerFixture::new(4021).await;
+
+            // Create child namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Try to register with path traversal - should fail
+            let register_req = RegisterTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "bad_table".to_string()]),
+                location: "../outside/table.lance".to_string(),
+                mode: None,
+                properties: None,
+            };
+
+            let result = fixture.namespace.register_table(register_req).await;
+            assert!(result.is_err(), "Should reject path traversal");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Path traversal is not allowed"),
+                "Error should mention path traversal, got: {}",
+                err_msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_deregister_table() {
+            let fixture = RestServerFixture::new(4022).await;
+            let table_data = create_test_arrow_data();
+
+            // Create child namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create a table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+                location: None,
+                mode: Some(create_table_request::Mode::Create),
+                properties: None,
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Verify table exists
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
+            assert!(fixture
+                .namespace
+                .table_exists(exists_req.clone())
+                .await
+                .is_ok());
+
+            // Deregister the table
+            let deregister_req = DeregisterTableRequest {
+                id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
+            };
+            let result = fixture.namespace.deregister_table(deregister_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to deregister table: {:?}",
+                result.err()
+            );
+
+            let response = result.unwrap();
+
+            // Should return exact location and id
+            assert!(
+                response.location.is_some(),
+                "Deregister response should include location"
+            );
+            let location = response.location.unwrap();
+            assert!(
+                location.ends_with("test_namespace/test_table.lance"),
+                "Location should end with test_namespace/test_table.lance, got: {}",
+                location
+            );
+            assert_eq!(
+                response.id,
+                Some(vec!["test_namespace".to_string(), "test_table".to_string()])
+            );
+
+            // Verify physical data still exists at the location
+            let dataset = lance::Dataset::open(&location).await;
+            assert!(
+                dataset.is_ok(),
+                "Physical table data should still exist at {}",
+                location
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_deregister_round_trip() {
+            let fixture = RestServerFixture::new(4023).await;
+            let table_data = create_test_arrow_data();
+
+            // Create child namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create a physical table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "original_table".to_string(),
+                ]),
+                location: None,
+                mode: Some(create_table_request::Mode::Create),
+                properties: None,
+            };
+            let create_response = fixture
+                .namespace
+                .create_table(create_table_req, table_data.clone())
+                .await
+                .unwrap();
+
+            // Deregister it
+            let deregister_req = DeregisterTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "original_table".to_string(),
+                ]),
+            };
+            fixture
+                .namespace
+                .deregister_table(deregister_req)
+                .await
+                .unwrap();
+
+            // Re-register with a different name
+            let location = create_response
+                .location
+                .unwrap()
+                .strip_prefix(&fixture.namespace.endpoint())
+                .unwrap_or(&create_response.location.unwrap())
+                .to_string();
+
+            // Extract just the relative path for registration
+            let relative_location = if location.contains("test_namespace") {
+                "test_namespace$original_table.lance".to_string()
+            } else {
+                location
+            };
+
+            let register_req = RegisterTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "renamed_table".to_string(),
+                ]),
+                location: relative_location,
+                mode: None,
+                properties: None,
+            };
+
+            let register_response = fixture
+                .namespace
+                .register_table(register_req)
+                .await
+                .expect("Failed to re-register table with new name");
+
+            // Should return the exact location we registered
+            assert_eq!(
+                register_response.location,
+                "test_namespace$original_table.lance"
+            );
+
+            // Verify new table exists
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(vec![
+                "test_namespace".to_string(),
+                "renamed_table".to_string(),
+            ]);
+            let result = fixture.namespace.table_exists(exists_req).await;
+            assert!(result.is_ok(), "Re-registered table should exist");
+
+            // Verify both tables point to the same physical location
+            let describe_req = DescribeTableRequest {
+                id: Some(vec![
+                    "test_namespace".to_string(),
+                    "renamed_table".to_string(),
+                ]),
+                metadata: None,
+            };
+            let describe_response = fixture
+                .namespace
+                .describe_table(describe_req)
+                .await
+                .expect("Should be able to describe renamed table");
+
+            // Location should end with the physical table path
+            assert!(
+                describe_response.location.ends_with("test_namespace/original_table.lance"),
+                "Renamed table should point to original physical location, got: {}",
+                describe_response.location
+            );
+        }
     }
 }

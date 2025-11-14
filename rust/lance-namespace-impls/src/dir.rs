@@ -992,6 +992,38 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn register_table(
+        &self,
+        request: lance_namespace::models::RegisterTableRequest,
+    ) -> Result<lance_namespace::models::RegisterTableResponse> {
+        // If manifest is enabled, delegate to manifest namespace
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return LanceNamespace::register_table(manifest_ns.as_ref(), request).await;
+        }
+
+        // Without manifest, register_table is not supported
+        Err(Error::NotSupported {
+            source: "register_table is only supported when manifest mode is enabled".into(),
+            location: snafu::location!(),
+        })
+    }
+
+    async fn deregister_table(
+        &self,
+        request: lance_namespace::models::DeregisterTableRequest,
+    ) -> Result<lance_namespace::models::DeregisterTableResponse> {
+        // If manifest is enabled, delegate to manifest namespace
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
+        }
+
+        // Without manifest, deregister_table is not supported
+        Err(Error::NotSupported {
+            source: "deregister_table is only supported when manifest mode is enabled".into(),
+            location: snafu::location!(),
+        })
+    }
+
     fn namespace_id(&self) -> String {
         format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
@@ -1000,9 +1032,15 @@ impl LanceNamespace for DirectoryNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_ipc::reader::StreamReader;
+    use lance::dataset::Dataset;
     use lance_core::utils::tempfile::TempStdDir;
-    use lance_namespace::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
+    use lance_namespace::models::{
+        CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema,
+        ListTablesRequest,
+    };
     use lance_namespace::schema::convert_json_arrow_schema;
+    use std::io::Cursor;
     use std::sync::Arc;
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
@@ -2266,5 +2304,307 @@ mod tests {
         // migrate() should return 0 when manifest is not enabled
         let migrated_count = namespace.migrate().await.unwrap();
         assert_eq!(migrated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_table() {
+        use lance_namespace::models::{RegisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a physical table first using lance directly
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let table_uri = format!("{}/external_table.lance", temp_path);
+        let cursor = Cursor::new(ipc_data);
+        let stream_reader = StreamReader::try_new(cursor, None).unwrap();
+        let batches: Vec<_> = stream_reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let schema = batches[0].schema();
+        let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+        let reader = RecordBatchIterator::new(batch_results, schema);
+        Dataset::write(Box::new(reader), &table_uri, None)
+            .await
+            .unwrap();
+
+        // Register the table
+        let mut register_req = RegisterTableRequest::new("external_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+
+        let response = namespace.register_table(register_req).await.unwrap();
+        assert_eq!(response.location, "external_table.lance");
+
+        // Verify table exists in namespace
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["registered_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_ok());
+
+        // Verify we can list the table
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let tables = namespace.list_tables(list_req).await.unwrap();
+        assert!(tables.tables.contains(&"registered_table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_duplicate_fails() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Register a table
+        let mut register_req = RegisterTableRequest::new("test_table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+
+        namespace
+            .register_table(register_req.clone())
+            .await
+            .unwrap();
+
+        // Try to register again - should fail
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table() {
+        use lance_namespace::models::{DeregisterTableRequest, TableExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace with manifest-only mode (no directory listing fallback)
+        // This ensures deregistered tables are truly invisible
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Verify table exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req.clone()).await.is_ok());
+
+        // Deregister the table
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Should return location and id
+        assert!(
+            response.location.is_some(),
+            "Deregister should return location"
+        );
+        let location = response.location.as_ref().unwrap();
+        assert!(
+            location.starts_with(temp_path),
+            "Location should be within temp directory: {}",
+            location
+        );
+        assert!(
+            location.contains("test_table"),
+            "Location should contain table name: {}",
+            location
+        );
+        assert_eq!(response.id, Some(vec!["test_table".to_string()]));
+
+        // Verify table no longer exists in namespace (removed from manifest)
+        assert!(namespace.table_exists(exists_req).await.is_err());
+
+        // Verify physical data still exists at the returned location
+        let dataset = Dataset::open(location).await;
+        assert!(
+            dataset.is_ok(),
+            "Physical table data should still exist at {}",
+            location
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_in_child_namespace() {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DeregisterTableRequest, TableExistsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Create child namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table in the child namespace
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Deregister the table
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        let response = namespace.deregister_table(deregister_req).await.unwrap();
+
+        // Should return location and id in child namespace
+        assert!(
+            response.location.is_some(),
+            "Deregister should return location"
+        );
+        let location = response.location.as_ref().unwrap();
+        assert!(
+            location.starts_with(temp_path),
+            "Location should be within temp directory: {}",
+            location
+        );
+        assert!(
+            location.contains("test_ns") && location.contains("test_table"),
+            "Location should contain namespace and table name: {}",
+            location
+        );
+        assert_eq!(
+            response.id,
+            Some(vec!["test_ns".to_string(), "test_table".to_string()])
+        );
+
+        // Verify table no longer exists
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "test_table".to_string()]);
+        assert!(namespace.table_exists(exists_req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_deregister_without_manifest_fails() {
+        use lance_namespace::models::{DeregisterTableRequest, RegisterTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create namespace without manifest
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register - should fail
+        let mut register_req = RegisterTableRequest::new("test_table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("manifest mode is enabled"));
+
+        // Try to deregister - should fail
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.deregister_table(deregister_req).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("manifest mode is enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_absolute_uri() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with absolute URI - should fail
+        let mut register_req = RegisterTableRequest::new("s3://bucket/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Absolute URIs are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_absolute_path() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with absolute path - should fail
+        let mut register_req = RegisterTableRequest::new("/tmp/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_path_traversal() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // Try to register with path traversal - should fail
+        let mut register_req = RegisterTableRequest::new("../outside/table.lance".to_string());
+        register_req.id = Some(vec!["test_table".to_string()]);
+        let result = namespace.register_table(register_req).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Path traversal is not allowed"));
     }
 }

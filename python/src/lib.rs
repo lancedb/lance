@@ -72,6 +72,7 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+pub(crate) mod namespace;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -271,6 +272,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
+    m.add_class::<namespace::PyDirectoryNamespace>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
