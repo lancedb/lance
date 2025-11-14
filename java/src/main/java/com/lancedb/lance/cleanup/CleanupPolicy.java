@@ -107,7 +107,11 @@ public class CleanupPolicy {
 
     public CleanupPolicy build() {
       return new CleanupPolicy(
-          beforeTimestampMillis, beforeVersion, deleteUnverified, errorIfTaggedOldVersions, cleanReferencedBranches);
+          beforeTimestampMillis,
+          beforeVersion,
+          deleteUnverified,
+          errorIfTaggedOldVersions,
+          cleanReferencedBranches);
     }
   }
 }
