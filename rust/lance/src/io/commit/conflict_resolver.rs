@@ -685,8 +685,24 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::DataReplacement { .. } | Operation::Merge { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
+                Operation::DataReplacement { replacements } => {
+                    // These conflict if the rewrite touches any of the fragments being replaced.
+                    for replacement in replacements {
+                        for group in groups {
+                            for old_fragment in &group.old_fragments {
+                                if replacement.0 == old_fragment.id {
+                                    return Err(self.incompatible_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                        location!(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
                 Operation::CreateIndex {
@@ -884,21 +900,46 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Rewrite { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ))
+                Operation::Rewrite { groups, .. } => {
+                    // These conflict if the rewrite touches any of the fragments being replaced.
+                    for replacement in replacements {
+                        for group in groups {
+                            for old_fragment in &group.old_fragments {
+                                if replacement.0 == old_fragment.id {
+                                    return Err(self.incompatible_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                        location!(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
                 }
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check cell conflicts
-                    Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ))
+                Operation::DataReplacement {
+                    replacements: other_replacements,
+                } => {
+                    // These conflict if there is overlap in fragment id && fields.
+                    for replacement in replacements {
+                        for other_replacement in other_replacements {
+                            if replacement.0 != other_replacement.0 {
+                                continue;
+                            }
+
+                            for field in &replacement.1.fields {
+                                if other_replacement.1.fields.contains(field) {
+                                    return Err(self.incompatible_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                        location!(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
@@ -2993,5 +3034,14 @@ mod tests {
                 Box::new(replacements.iter().map(|r| r.0))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_conflicts_data_replacement() {
+        // Test: two data replacements on different fragments should be compatible
+        // Test: two data replacements on same fragment but different fields should be compatible
+        // Test: two data replacements on same fragment and same fields should be retryable
+        // Test: a data replacement and rewrite on same fragment should be retryable
+        // Test: a data replacement and write on different fragments should be compatible
     }
 }
