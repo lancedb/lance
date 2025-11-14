@@ -569,6 +569,7 @@ impl Branches<'_> {
         if let Some(branch) = related_branches.first() {
             if branch.is_child(&deleted_branch) || branch == &deleted_branch {
                 // There are children of the deleted branch, we can't delete any directory for now
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
                 return Ok(None);
             } else {
                 // We pick the longest common directory between the deleted branch and the remaining branches
