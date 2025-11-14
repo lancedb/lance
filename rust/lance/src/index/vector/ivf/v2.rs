@@ -672,7 +672,6 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
-    const PARTITION_SPLIT_APPEND_ROWS: usize = 50_000;
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
@@ -730,32 +729,6 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         dataset.append(batches, None).await.unwrap();
         vectors
-    }
-
-    async fn append_identical_vectors(dataset: &mut Dataset, num_rows: usize, vector: &[f32]) {
-        assert_eq!(
-            vector.len(),
-            DIM,
-            "vector length ({}) must match DIM ({})",
-            vector.len(),
-            DIM
-        );
-        let start_id = dataset.count_all_rows().await.unwrap() as u64;
-        let ids: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-            start_id..start_id + num_rows as u64,
-        ));
-        let mut values = Vec::with_capacity(num_rows * DIM);
-        for _ in 0..num_rows {
-            values.extend_from_slice(vector);
-        }
-        let vectors: ArrayRef = Arc::new(
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
-                .unwrap(),
-        );
-        let schema = Arc::new(Schema::from(dataset.schema()));
-        let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors]).unwrap();
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        dataset.append(batches, None).await.unwrap();
     }
 
     fn generate_batch<T: ArrowPrimitiveType>(
@@ -996,6 +969,7 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_and_verify_append_phase(
         dataset: &mut Dataset,
         index_name: &str,
@@ -1076,7 +1050,7 @@ mod tests {
         }
 
         assert_eq!(
-            dataset.count_all_rows().await.unwrap() as usize,
+            dataset.count_all_rows().await.unwrap(),
             expected_total_rows,
             "Dataset row count mismatch after append"
         );
@@ -2504,7 +2478,7 @@ mod tests {
                 shrink_smallest_partition(&mut dataset, INDEX_NAME, expected_after).await;
             expected_rows -= deleted_rows;
             assert_eq!(
-                dataset.count_all_rows().await.unwrap() as usize,
+                dataset.count_all_rows().await.unwrap(),
                 expected_rows,
                 "Row count mismatch after join"
             );
