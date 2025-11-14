@@ -316,6 +316,21 @@ impl ManifestNamespace {
         format!("{:08x}_{}", (hash & 0xFFFFFFFF) as u32, object_id)
     }
 
+    /// Construct a full URI from root and relative location
+    fn construct_full_uri(&self, relative_location: &str) -> Result<String> {
+        let base_url = lance_io::object_store::uri_to_url(&self.root)?;
+        let full_url = base_url.join(relative_location).map_err(|e| Error::InvalidInput {
+            source: format!(
+                "Failed to join URI '{}' with '{}': {}",
+                self.root, relative_location, e
+            )
+            .into(),
+            location: location!(),
+        })?;
+
+        Ok(full_url.to_string())
+    }
+
     /// Get the manifest schema
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -827,8 +842,8 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
-                // Construct full URI from dir_name
-                let table_uri = format!("{}/{}", self.root, info.location);
+                // Construct full URI from relative location
+                let table_uri = self.construct_full_uri(&info.location)?;
 
                 // Try to open the dataset to get version and schema
                 match Dataset::open(&table_uri).await {
@@ -934,7 +949,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_uri = format!("{}/{}", self.root, dir_name);
+        let table_uri = self.construct_full_uri(&dir_name)?;
 
         // Validate that request_data is provided
         if data.is_empty() {
@@ -1030,7 +1045,7 @@ impl LanceNamespace for ManifestNamespace {
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.child(info.location.as_str());
-                let table_uri = format!("{}/{}", self.root, info.location);
+                let table_uri = self.construct_full_uri(&info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -1310,7 +1325,7 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_path = self.base_path.child(dir_name.as_str());
-        let table_uri = format!("{}/{}", self.root, dir_name);
+        let table_uri = self.construct_full_uri(&dir_name)?;
 
         // Validate location if provided
         if let Some(req_location) = &request.location {
@@ -1470,8 +1485,8 @@ impl LanceNamespace for ManifestNamespace {
                 // Delete from manifest only (leave physical data intact)
                 self.delete_from_manifest(&object_id).await?;
 
-                // Return the full URI
-                format!("{}/{}", self.root, info.location)
+                // Construct the full URI using helper function
+                self.construct_full_uri(&info.location)?
             }
             None => {
                 return Err(Error::Namespace {

@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-rest = ["dep:reqwest", "dep:url"]
+rest = ["dep:reqwest"]
 rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp"]
@@ -34,9 +34,8 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "stream",
     "rustls-tls-native-roots"
 ] }
-url = { workspace = true, optional = true }
-
 # Directory implementation dependencies (always enabled)
+url = { workspace = true }
 lance = { workspace = true }
 lance-io = { workspace = true }
 object_store = { workspace = true }

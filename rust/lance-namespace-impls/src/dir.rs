@@ -2423,9 +2423,12 @@ mod tests {
             "Deregister should return location"
         );
         let location = response.location.as_ref().unwrap();
+        // Location should be a proper file:// URI with the temp path
+        let expected_prefix = format!("file://{}", temp_path);
         assert!(
-            location.starts_with(temp_path),
-            "Location should be within temp directory: {}",
+            location.starts_with(&expected_prefix),
+            "Location should start with '{}', got: {}",
+            expected_prefix,
             location
         );
         assert!(
@@ -2488,9 +2491,12 @@ mod tests {
             "Deregister should return location"
         );
         let location = response.location.as_ref().unwrap();
+        // Location should be a proper file:// URI with the temp path
+        let expected_prefix = format!("file://{}", temp_path);
         assert!(
-            location.starts_with(temp_path),
-            "Location should be within temp directory: {}",
+            location.starts_with(&expected_prefix),
+            "Location should start with '{}', got: {}",
+            expected_prefix,
             location
         );
         assert!(
