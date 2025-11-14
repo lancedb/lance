@@ -372,13 +372,7 @@ impl ManifestNamespace {
         let dataset: &mut Dataset = &mut dataset_guard;
 
         // Step 1: Create indexes if they don't already exist
-        let indices = dataset.load_indices().await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to load indices: {}",
-                e
-            ))),
-            location: location!(),
-        })?;
+        let indices = dataset.load_indices().await?;
 
         // Check which indexes already exist
         let has_object_id_index = indices.iter().any(|idx| idx.name == OBJECT_ID_INDEX_NAME);
@@ -801,7 +795,12 @@ impl ManifestNamespace {
         self.manifest_dataset.set_latest(new_dataset).await;
 
         // Run inline optimization after write
-        self.run_inline_optimization().await?;
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
 
         Ok(())
     }
@@ -823,7 +822,12 @@ impl ManifestNamespace {
         self.manifest_dataset.reload().await?;
 
         // Run inline optimization after delete
-        self.run_inline_optimization().await?;
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
 
         Ok(())
     }
