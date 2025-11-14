@@ -18,6 +18,8 @@ use std::{any::Any, ops::Bound, sync::Arc};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
+use futures::{FutureExt, Stream};
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -196,6 +198,53 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+}
+
+/// A stream that reads the original training data back out of the index
+///
+/// This is used for updating the index
+pub struct IndexReaderStream {
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    num_batches: u32,
+    batch_idx: u32,
+}
+
+impl IndexReaderStream {
+    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
+        let num_batches = reader.num_batches(batch_size).await;
+        Self {
+            reader,
+            batch_size,
+            num_batches,
+            batch_idx: 0,
+        }
+    }
+}
+
+impl Stream for IndexReaderStream {
+    type Item = BoxFuture<'static, Result<RecordBatch>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.batch_idx >= this.num_batches {
+            return std::task::Poll::Ready(None);
+        }
+        let batch_num = this.batch_idx;
+        this.batch_idx += 1;
+        let reader_copy = this.reader.clone();
+        let batch_size = this.batch_size;
+        let read_task = async move {
+            reader_copy
+                .read_record_batch(batch_num as u64, batch_size)
+                .await
+        }
+        .boxed();
+        std::task::Poll::Ready(Some(read_task))
+    }
 }
 
 /// Trait abstracting I/O away from index logic
