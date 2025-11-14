@@ -250,7 +250,7 @@ pub trait DatasetIndexExt {
     ///
     /// More detailed information may be available from [`index_statistics`] but that will require
     /// loading the index into memory.
-    async fn describe_indexes<'a, 'b>(
+    async fn describe_indices<'a, 'b>(
         &'a self,
         criteria: Option<IndexCriteria<'b>>,
     ) -> Result<Vec<Arc<dyn IndexDescription>>>;
