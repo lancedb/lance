@@ -355,9 +355,7 @@ class TestTableOperations:
         assert desc_response is not None
         # Should point to the same physical location
         # (use endswith to handle path canonicalization)
-        assert desc_response.location.endswith(
-            "/workspace/physical_table.lance"
-        ), (
+        assert desc_response.location.endswith("/workspace/physical_table.lance"), (
             f"Expected location to end with '/workspace/physical_table.lance', "
             f"got {desc_response.location}"
         )
