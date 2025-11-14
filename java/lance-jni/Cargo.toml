@@ -42,3 +42,16 @@ prost = "0.13.5"
 roaring = "0.10.1"
 prost-types = "0.13.5"
 chrono = "0.4.41"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# This rule applies to every package except workspace members (dependencies
+# such as `arrow` and `tokio`). It disables debug info and related features on
+# dependencies so their binaries stay smaller, improving cache reuse.
+[profile.dev.package."*"]
+debug = false
+debug-assertions = false
+strip = "debuginfo"
+incremental = false
