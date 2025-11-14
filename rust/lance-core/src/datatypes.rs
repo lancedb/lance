@@ -68,6 +68,8 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
+pub const BLOB_LOGICAL_TYPE: &str = "blob";
+
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -90,6 +92,10 @@ impl LogicalType {
 
     fn is_struct(&self) -> bool {
         self.0 == "struct"
+    }
+
+    fn is_blob(&self) -> bool {
+        self.0 == BLOB_LOGICAL_TYPE
     }
 }
 
@@ -224,6 +230,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            BLOB_LOGICAL_TYPE => Some(LargeBinary),
             "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
