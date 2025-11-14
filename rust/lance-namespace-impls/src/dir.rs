@@ -90,7 +90,7 @@ impl DirectoryNamespaceBuilder {
             session: None,
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
-            inline_optimization_enabled: true, // Default to enabled
+            inline_optimization_enabled: true,
         }
     }
 
