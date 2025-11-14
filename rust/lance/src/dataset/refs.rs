@@ -566,8 +566,8 @@ impl Branches<'_> {
         }
 
         related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
-        for branch in related_branches {
-            if branch.is_child(&deleted_branch) || branch == deleted_branch {
+        if let Some(branch) = related_branches.first() {
+            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
                 return Ok(None);
             } else {
                 relative_dir = format!(
@@ -575,7 +575,6 @@ impl Branches<'_> {
                     branch.segments.join("/"),
                     deleted_branch.segments[branch.segments.len()]
                 );
-                break;
             }
         }
 
@@ -600,7 +599,7 @@ impl<'a> BranchRelativePath<'a> {
         Self { segments }
     }
 
-    fn find_common_prefix(&self, other: &Self) -> Option<BranchRelativePath<'a>> {
+    fn find_common_prefix(&self, other: &Self) -> Option<Self> {
         let mut common_segments = Vec::new();
         for (i, segment) in self.segments.iter().enumerate() {
             if other.segments[i] != *segment {

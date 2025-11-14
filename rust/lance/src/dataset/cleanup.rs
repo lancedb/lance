@@ -1875,10 +1875,10 @@ mod lineage_tests {
     use arrow_array::UInt64Array;
     use chrono::TimeDelta;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::utils::testing::MockClock;
     use lance_index::DatasetIndexExt;
     use lance_io::object_store::ObjectStore;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::Arc;
 
@@ -1914,8 +1914,6 @@ mod lineage_tests {
         branch2: DatasetWithCounts,
         branch3: DatasetWithCounts,
         branch4: DatasetWithCounts,
-        #[allow(dead_code)]
-        clock: MockClock<'static>,
     }
 
     impl LineageSetup {
@@ -1960,8 +1958,7 @@ mod lineage_tests {
 
     // Build the lineage and configure per-branch auto-cleanup to retain latest version.
     async fn build_lineage_datasets() -> Result<LineageSetup> {
-        let clock = MockClock::new();
-        clock.set_system_time(TimeDelta::try_seconds(10).unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
         let base_dir = TempStrDir::default();
         let base_uri = format!("{}/lineage_ds", base_dir.as_str());
         // Add a text column so we can build a full-text index per branch/main.
@@ -2024,7 +2021,6 @@ mod lineage_tests {
             branch2,
             branch3,
             branch4,
-            clock,
         };
 
         lineage.disable_auto_cleanup().await?;
@@ -2053,16 +2049,6 @@ mod lineage_tests {
     impl IncrementingUtf8 {
         fn new() -> Self {
             Default::default()
-        }
-        #[allow(dead_code)]
-        fn start(mut self, start: i32) -> Self {
-            self.current = start;
-            self
-        }
-        #[allow(dead_code)]
-        fn step(mut self, step: i32) -> Self {
-            self.step = step;
-            self
         }
         fn prefix(mut self, p: &str) -> Self {
             self.prefix = p.to_string();
@@ -2669,6 +2655,7 @@ mod lineage_tests {
         let mut setup = build_lineage_datasets().await.unwrap();
 
         setup.branch3.write_data().await.unwrap();
+        setup.enable_auto_cleanup().await.unwrap();
         setup
             .branch2
             .run_cleanup_with_referenced_branches()

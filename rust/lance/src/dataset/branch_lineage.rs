@@ -216,6 +216,7 @@ pub fn collect_lineage_from(
     Ok(main_lineage)
 }
 
+#[cfg(test)]
 mod tests {
     use crate::dataset::branch_lineage::collect_lineage_from;
     use crate::dataset::refs::BranchContents;
@@ -234,7 +235,7 @@ mod tests {
     /// - The "main" root is virtual (no BranchContents entry).
     /// - Version numbers are representative and monotonically increasing along the chain.
     /// - Tests reuse this builder to ensure consistent lineage and deterministic assertions.
-    pub fn build_mock_branch_contents() -> HashMap<String, BranchContents> {
+    fn build_mock_branch_contents() -> HashMap<String, BranchContents> {
         fn build(
             parent_name: Option<&str>,
             parent_lineage: Option<&BranchContents>,
