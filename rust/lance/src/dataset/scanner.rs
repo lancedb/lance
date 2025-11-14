@@ -713,6 +713,25 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Set the projection from a schema.
+    ///
+    /// This projection will have no complex expressions, the schema must be a subset of the dataset schema.
+    ///
+    /// With this approach it is possible to refer to portions of nested fields.
+    ///
+    /// See [`ProjectionPlan::from_schema`] for more information.
+    pub fn project_from_schema(&mut self, projection: &Schema) -> Result<&mut Self> {
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_schema(self.dataset.clone(), projection)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
+        Ok(self)
+    }
+
     /// Should the filter run before the vector index is applied
     ///
     /// If true then the filter will be applied before the vector index.  This
