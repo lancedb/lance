@@ -4008,7 +4008,7 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-def test_describe_indexes(tmp_path):
+def test_describe_indices(tmp_path):
     data = pa.table(
         {
             "id": range(100),
@@ -4025,7 +4025,7 @@ def test_describe_indexes(tmp_path):
     )
     ds = lance.write_dataset(data, tmp_path)
     ds.create_scalar_index("text", index_type="INVERTED")
-    indices = ds.describe_indexes()
+    indices = ds.describe_indices()
     assert len(indices) == 1
 
     assert indices[0].name == "text_idx"
@@ -4071,7 +4071,7 @@ def test_describe_indexes(tmp_path):
     ds.create_scalar_index("ngram", index_type="NGRAM")
     ds.create_scalar_index("zonemap", index_type="ZONEMAP")
 
-    indices = ds.describe_indexes()
+    indices = ds.describe_indices()
     # Skip text index since it is already asserted above
     indices = [index for index in indices if index.name != "text_idx"]
     indices.sort(key=lambda x: x.name)

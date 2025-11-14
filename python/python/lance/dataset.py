@@ -649,21 +649,22 @@ class LanceDataset(pa.dataset.Dataset):
         Returns index information for all indices in the dataset.
 
         This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  Instead use describe_indexes() to
+        which can be a very expensive operation.  Instead use describe_indices() to
         list index information and index_statistics() to get the statistics for
         individual indexes of interest.
         """
-        warnings.warn(
-            "The 'list_indices' method is deprecated.  It may be removed in a future"
-            "version.  Use describe_indexes() instead.",
-            DeprecationWarning,
-        )
+        # TODO: https://github.com/lancedb/lance/issues/5237 deprecate this method
+        # warnings.warn(
+        #     "The 'list_indices' method is deprecated.  It may be removed in a future"
+        #     "version.  Use describe_indices() instead.",
+        #     DeprecationWarning,
+        # )
 
         return self._ds.load_indices()
 
-    def describe_indexes(self) -> List[IndexDescription]:
+    def describe_indices(self) -> List[IndexDescription]:
         """Returns index information for all indices in the dataset."""
-        return self._ds.describe_indexes()
+        return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(

@@ -603,7 +603,7 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn describe_indexes<'a, 'b>(
+    async fn describe_indices<'a, 'b>(
         &'a self,
         criteria: Option<IndexCriteria<'b>>,
     ) -> Result<Vec<Arc<dyn IndexDescription>>> {
@@ -611,7 +611,7 @@ impl DatasetIndexExt for Dataset {
         let mut indices = if let Some(criteria) = criteria {
             indices.iter().filter(|idx| {
                 if idx.index_details.is_none() {
-                    log::warn!("The method describe_indexes does not support indexes without index details.  Please retrain the index {}", idx.name);
+                    log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
                     return false;
                 }
                 let fields = idx

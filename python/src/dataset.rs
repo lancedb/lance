@@ -2572,10 +2572,10 @@ impl Dataset {
     }
 
     #[pyo3(signature=())]
-    fn describe_indexes(&self, py: Python<'_>) -> PyResult<Vec<PyIndexDescription>> {
+    fn describe_indices(&self, py: Python<'_>) -> PyResult<Vec<PyIndexDescription>> {
         let new_self = self.ds.as_ref().clone();
         let indices = rt()
-            .block_on(Some(py), new_self.describe_indexes(None))?
+            .block_on(Some(py), new_self.describe_indices(None))?
             .infer_error()?;
         Ok(indices
             .into_iter()
