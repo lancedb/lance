@@ -580,7 +580,7 @@ impl Branches<'_> {
                     deleted_branch.segments[branch.segments.len()]
                 );
             }
-        } else if deleted_branch.segments.len() >= 1 {
+        } else if !deleted_branch.segments.is_empty() {
             // There are no common directories between the deleted branch and the remaining branches
             // We need to delete the entire directory
             // Example: deleted_branch = "a/b/c", remaining_branches = [], we need to delete "a"
