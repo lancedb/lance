@@ -1033,6 +1033,10 @@ impl VectorIndex for IVFIndex {
         unimplemented!("only for v2 IVFIndex")
     }
 
+    fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         unimplemented!("only for v2 IVFIndex")

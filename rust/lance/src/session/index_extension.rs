@@ -194,7 +194,12 @@ mod test {
         fn ivf_model(&self) -> &IvfModel {
             unimplemented!()
         }
+
         fn quantizer(&self) -> Quantizer {
+            unimplemented!()
+        }
+
+        fn partition_size(&self, _: usize) -> usize {
             unimplemented!()
         }
 

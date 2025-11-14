@@ -590,6 +590,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.storage.quantizer().unwrap()
     }
 
+    fn partition_size(&self, part_id: usize) -> usize {
+        self.storage.partition_size(part_id)
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         (S::name().try_into().unwrap(), Q::quantization_type())
@@ -883,6 +887,173 @@ mod tests {
             "Expected partition split to increase partitions from 2 to 3 for {}, got stats: {}",
             description,
             final_ctx.stats_json()
+        );
+    }
+
+    async fn shrink_smallest_partition(
+        dataset: &mut Dataset,
+        index_name: &str,
+        expected_after_join: usize,
+    ) -> usize {
+        let index_ctx = load_vector_index_context(dataset, "vector", index_name).await;
+        let partitions = index_ctx.stats()["indices"][0]["partitions"]
+            .as_array()
+            .expect("partitions should be present");
+        let (partition_idx, size) = partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, part)| part["size"].as_u64().map(|size| (idx, size)))
+            .min_by_key(|(_, size)| *size)
+            .expect("should have at least one partition");
+        assert!(
+            size > 1,
+            "Partition {} must contain at least two rows to trigger join",
+            partition_idx
+        );
+
+        let row_ids = load_partition_row_ids(index_ctx.ivf(), partition_idx).await;
+        assert!(
+            row_ids.len() > 1,
+            "Partition {} should have removable rows",
+            partition_idx
+        );
+
+        let rows = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let ids = rows["id"].as_primitive::<UInt64Type>().values();
+
+        delete_ids(dataset, &ids[1..]).await;
+        compact_after_deletions(dataset).await;
+
+        let post_ctx = load_vector_index_context(dataset, "vector", index_name).await;
+        assert_eq!(
+            post_ctx.num_partitions(),
+            expected_after_join,
+            "Expected partitions to decrease to {} after join, got stats: {}",
+            expected_after_join,
+            post_ctx.stats_json()
+        );
+
+        row_ids.len() - 1
+    }
+
+    async fn append_constant_vector(dataset: &mut Dataset, rows: usize, template: &[f32]) {
+        assert_eq!(
+            template.len(),
+            DIM,
+            "Template vector should have {} dimensions",
+            DIM
+        );
+
+        let start_id = dataset.count_all_rows().await.unwrap() as u64;
+        let ids = Arc::new(UInt64Array::from_iter_values(
+            start_id..start_id + rows as u64,
+        ));
+        let mut appended_values = Vec::with_capacity(rows * DIM);
+        for _ in 0..rows {
+            appended_values.extend_from_slice(template);
+        }
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(appended_values),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        dataset.append(batches, None).await.unwrap();
+    }
+
+    async fn append_and_verify_append_phase(
+        dataset: &mut Dataset,
+        index_name: &str,
+        template: &[f32],
+        rows_to_append: usize,
+        expected_partitions: usize,
+        expected_total_rows: usize,
+        expected_index_count: usize,
+        expect_split: bool,
+    ) {
+        append_constant_vector(dataset, rows_to_append, template).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let stats_json = dataset.index_statistics(index_name).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+
+        let indices = stats["indices"]
+            .as_array()
+            .expect("indices array should exist");
+        assert_eq!(
+            indices.len(),
+            expected_index_count,
+            "Expected {} index entries, got {}, stats: {}",
+            expected_index_count,
+            indices.len(),
+            stats
+        );
+        assert_eq!(
+            stats["num_indices"].as_u64().unwrap() as usize,
+            expected_index_count,
+            "num_indices mismatch in stats"
+        );
+        assert_eq!(
+            stats["num_indexed_rows"].as_u64().unwrap() as usize,
+            expected_total_rows,
+            "Total indexed rows mismatch after append"
+        );
+
+        let base_index = indices
+            .iter()
+            .max_by_key(|entry| entry["num_partitions"].as_u64().unwrap_or(0))
+            .expect("at least one index entry should exist");
+        assert_eq!(
+            base_index["num_partitions"].as_u64().unwrap() as usize,
+            expected_partitions,
+            "Partition count mismatch after append"
+        );
+
+        if expected_index_count == 1 {
+            let partitions = base_index["partitions"]
+                .as_array()
+                .expect("partitions should exist");
+            assert_eq!(
+                partitions.len(),
+                expected_partitions,
+                "Expected {} partitions, found {}",
+                expected_partitions,
+                partitions.len()
+            );
+            let partition_sizes: Vec<usize> = partitions
+                .iter()
+                .map(|part| part["size"].as_u64().unwrap() as usize)
+                .collect();
+            let total_partition_rows: usize = partition_sizes.iter().sum();
+            assert_eq!(
+                total_partition_rows, expected_total_rows,
+                "Partition sizes should sum to total rows: {:?}",
+                partition_sizes
+            );
+        } else {
+            assert!(
+                !expect_split,
+                "Split should result in a single merged index"
+            );
+        }
+
+        assert_eq!(
+            dataset.count_all_rows().await.unwrap() as usize,
+            expected_total_rows,
+            "Dataset row count mismatch after append"
         );
     }
 
@@ -2160,59 +2331,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_partition_split_on_append() {
-        // This test verifies that when we append enough data to a partition
-        // such that it exceeds MAX_PARTITION_SIZE_FACTOR * target_partition_size,
-        // the partition will be split into 2 partitions.
+    async fn test_spfresh_join_split() {
+        // Two join cycles followed by three append cycles:
+        // 1. Each deletion shrinks the smallest partition and verifies the partition count.
+        // 2. Append #1 (10k rows) creates a delta index without splitting.
+        // 3. Append #2 and #3 (40k rows each) trigger splits, forcing merges and validating partition sizes.
+
+        const INDEX_NAME: &str = "vector_idx";
+        const NLIST: usize = 3;
+        const FIRST_APPEND_ROWS: usize = 10_000;
+        const SECOND_APPEND_ROWS: usize = 30_000;
+        const THIRD_APPEND_ROWS: usize = 35_000;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        // Create initial dataset with just enough rows for 2 partitions
-        // Using a small initial dataset to avoid long test times
-        let (dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-
-        // Create an IVF-PQ index with 2 partitions
-        // For IvfPq, target_partition_size = 8192
-        // Split triggers when partition_size > 4 * 8192 = 32,768
-        let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::L2, 50);
-        verify_partition_split_after_append(dataset, test_uri, params, "scalar vector data").await;
-    }
-
-    #[tokio::test]
-    async fn test_join_partition_on_delete() {
-        // This test verifies that partition join works correctly when partitions become
-        // too small after deletions.
-        //
-        // The test uses deterministic data with predefined centroids to ensure:
-        // 1. Predictable partition sizes
-        // 2. Reliable triggering of partition join when size < threshold
-        // 3. Correct handling of small partitions
-        //
-        // Join threshold: MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100
-        //               = 25 * 8192 / 100 = 2048 rows
-
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        // Create deterministic test data with 3 clusters
-        // Cluster 0: 100 rows (will be deleted to trigger join)
-        // Cluster 1: 3000 rows
-        // Cluster 2: 3000 rows
-        let nlist = 3;
-        let cluster_sizes = [100, 3000, 3000];
+        // Two small clusters (for joins) and two large clusters (for splits).
+        let cluster_sizes = [100, 4_000, 4_000];
         let total_rows: usize = cluster_sizes.iter().sum();
 
-        // Generate 3 well-separated centroids in DIM-dimensional space
         let mut centroid_values = Vec::new();
-        for i in 0..nlist {
+        for i in 0..NLIST {
             for j in 0..DIM {
-                // Place centroids far apart to ensure clear cluster separation
-                centroid_values.push(if j == 0 {
-                    (i as f32) * 10.0 // Separate along first dimension
-                } else {
-                    0.0
-                });
+                centroid_values.push(if j == 0 { (i as f32) * 10.0 } else { 0.0 });
             }
         }
         let centroids = Arc::new(
@@ -2223,21 +2364,17 @@ mod tests {
             .unwrap(),
         );
 
-        // Generate vectors clustered around each centroid
         let mut ids = Vec::new();
         let mut vector_values = Vec::new();
         let mut current_id = 0u64;
-
         for (cluster_idx, &size) in cluster_sizes.iter().enumerate() {
             let centroid_base = (cluster_idx as f32) * 10.0;
             for _ in 0..size {
                 ids.push(current_id);
                 current_id += 1;
-
-                // Generate vector close to centroid (within 0.5 radius)
                 for j in 0..DIM {
                     vector_values.push(if j == 0 {
-                        centroid_base + (current_id % 100) as f32 * 0.005 // Small variation
+                        centroid_base + (current_id % 100) as f32 * 0.005
                     } else {
                         (current_id % 50) as f32 * 0.01
                     });
@@ -2250,12 +2387,10 @@ mod tests {
             FixedSizeListArray::try_new_from_values(Float32Array::from(vector_values), DIM as i32)
                 .unwrap(),
         );
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
             Field::new("vector", vectors.data_type().clone(), false),
         ]));
-
         let batch = RecordBatch::try_new(schema.clone(), vec![ids_array, vectors]).unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
 
@@ -2270,142 +2405,102 @@ mod tests {
         .await
         .unwrap();
 
-        // Create IVF-PQ index with predefined centroids
-        let ivf_params = IvfBuildParams::try_with_centroids(nlist, centroids).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
             PQBuildParams::default(),
         );
-
         dataset
             .create_index(
                 &["vector"],
                 IndexType::Vector,
-                Some("vector_idx".to_string()),
+                Some(INDEX_NAME.to_string()),
                 &params,
                 true,
             )
             .await
             .unwrap();
 
-        // Verify initial partition count
-        let index_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
-        assert_eq!(index_ctx.num_partitions(), nlist);
-
-        // Verify partition sizes match expected (approximately, due to potential edge cases)
-        let partitions = index_ctx.stats()["indices"][0]["partitions"]
-            .as_array()
-            .unwrap();
-        let partition_0_size = partitions[0]["size"].as_u64().unwrap();
-        assert!(
-            (50..=150).contains(&partition_0_size),
-            "Partition 0 should have ~100 rows, got {}",
-            partition_0_size
-        );
-
-        // Delete most rows from partition 0, keeping only 1 row
-        // This should bring it well below the 2048 threshold
-        let row_ids = load_partition_row_ids(index_ctx.ivf(), 0).await;
-
-        assert!(!row_ids.is_empty(), "Partition 0 should not be empty");
-
-        let res = dataset
-            .take_rows(&row_ids, dataset.schema().clone())
+        // Template vector from the first large cluster for deterministic appends.
+        let template_id = (cluster_sizes[0] + cluster_sizes[1]) as u64;
+        let template_batch = dataset
+            .take_rows(&[template_id], dataset.schema().clone())
             .await
             .unwrap();
-        let ids = res["id"].as_primitive::<UInt64Type>().values();
-        let retained_id = ids[0]; // Save the ID of the row we're keeping
-        let first_vector = res["vector"].as_fixed_size_list().value(0);
-
-        // Delete all but the first row in partition 0
-        delete_ids(&mut dataset, &ids[1..]).await;
-
-        // Compact to trigger partition join
-        compact_after_deletions(&mut dataset).await;
-
-        // Verify partition was joined (should have nlist-1 partitions now)
-        let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
-        let final_num_partitions = final_ctx.num_partitions();
+        let template_values = template_batch["vector"]
+            .as_fixed_size_list()
+            .value(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
         assert_eq!(
-            final_num_partitions,
-            nlist - 1,
-            "Expected partition join to decrease partitions from {} to {}, got stats: {}",
-            nlist,
-            nlist - 1,
-            final_ctx.stats_json()
+            template_values.len(),
+            DIM,
+            "Template vector should match DIM"
         );
 
-        // Verify that vector search still works after partition join
-        let result = dataset
-            .scan()
-            .nearest("vector", &first_vector, 10)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert!(
-            result.num_rows() > 0,
-            "Search should return results after partition join"
-        );
+        let mut expected_partitions = NLIST;
+        let mut expected_rows = total_rows;
 
-        // Verify the retained row still exists in the dataset by filtering by ID
-        let retained_row_result = dataset
-            .scan()
-            .filter(&format!("id = {}", retained_id))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(
-            retained_row_result.num_rows(),
-            1,
-            "The retained row (id={}) should still exist in the dataset",
-            retained_id
-        );
-        assert_eq!(
-            retained_row_result["id"]
-                .as_primitive::<UInt64Type>()
-                .value(0),
-            retained_id,
-            "The filtered result should match the retained ID"
-        );
-
-        // Verify total row count
-        let remaining_rows = dataset.count_all_rows().await.unwrap();
-        let expected_rows = total_rows - cluster_sizes[0] + 1; // Deleted all but 1 from cluster 0
-        assert_eq!(
-            remaining_rows, expected_rows,
-            "Should have {} rows remaining",
-            expected_rows
-        );
-
-        // Verify the index is still functional by searching for different vectors
-        for cluster_idx in 1..nlist {
-            let test_vector_values: Vec<f32> = (0..DIM)
-                .map(|j| {
-                    if j == 0 {
-                        (cluster_idx as f32) * 10.0
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            let test_vector = Float32Array::from(test_vector_values);
-
-            let result = dataset
-                .scan()
-                .nearest("vector", &test_vector, 5)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            assert!(
-                result.num_rows() > 0,
-                "Search for cluster {} should return results",
-                cluster_idx
+        // Two join cycles.
+        for expected_after in [NLIST - 1, NLIST - 2] {
+            let deleted_rows =
+                shrink_smallest_partition(&mut dataset, INDEX_NAME, expected_after).await;
+            expected_rows -= deleted_rows;
+            assert_eq!(
+                dataset.count_all_rows().await.unwrap() as usize,
+                expected_rows,
+                "Row count mismatch after join"
             );
+            expected_partitions = expected_after;
         }
+
+        // Append #1: no split, expect a delta index.
+        let rows = FIRST_APPEND_ROWS;
+        append_and_verify_append_phase(
+            &mut dataset,
+            INDEX_NAME,
+            &template_values,
+            rows,
+            expected_partitions,
+            expected_rows + rows,
+            2,
+            false,
+        )
+        .await;
+        expected_rows += rows;
+
+        // Append #2: triggers split and merge.
+        expected_partitions += 1;
+        let rows = SECOND_APPEND_ROWS;
+        append_and_verify_append_phase(
+            &mut dataset,
+            INDEX_NAME,
+            &template_values,
+            rows,
+            expected_partitions,
+            expected_rows + rows,
+            1,
+            true,
+        )
+        .await;
+        expected_rows += rows;
+
+        // Append #3: triggers another split, remains a single merged index.
+        expected_partitions += 1;
+        let rows = THIRD_APPEND_ROWS;
+        append_and_verify_append_phase(
+            &mut dataset,
+            INDEX_NAME,
+            &template_values,
+            rows,
+            expected_partitions,
+            expected_rows + rows,
+            1,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
