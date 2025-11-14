@@ -372,36 +372,36 @@ fn vector_index_details() -> prost_types::Any {
 struct IndexDescriptionImpl {
     name: String,
     field_ids: Vec<u32>,
-    shards: Vec<IndexMetadata>,
+    segments: Vec<IndexMetadata>,
     index_type: String,
     details: IndexDetails,
     rows_indexed: u64,
 }
 
 impl IndexDescriptionImpl {
-    fn try_new(shards: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
-        if shards.is_empty() {
+    fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
+        if segments.is_empty() {
             return Err(Error::Index {
                 message: "Index metadata is empty".to_string(),
                 location: location!(),
             });
         }
 
-        // We assume the type URL and details are the same for all shards
-        let example_metadata = &shards[0];
+        // We assume the type URL and details are the same for all segments
+        let example_metadata = &segments[0];
 
         let name = example_metadata.name.clone();
-        if !shards.iter().all(|shard| shard.name == name) {
+        if !segments.iter().all(|shard| shard.name == name) {
             return Err(Error::Index {
-                message: "Index name should be identical across all shards".to_string(),
+                message: "Index name should be identical across all segments".to_string(),
                 location: location!(),
             });
         }
 
         let field_ids = &example_metadata.fields;
-        if !shards.iter().all(|shard| shard.fields == *field_ids) {
+        if !segments.iter().all(|shard| shard.fields == *field_ids) {
             return Err(Error::Index {
-                message: "Index fields should be identical across all shards".to_string(),
+                message: "Index fields should be identical across all segments".to_string(),
                 location: location!(),
             });
         }
@@ -415,7 +415,7 @@ impl IndexDescriptionImpl {
             location: location!(),
         })?;
         let type_url = &index_details.type_url;
-        if !shards.iter().all(|shard| {
+        if !segments.iter().all(|shard| {
             shard
                 .index_details
                 .as_ref()
@@ -423,7 +423,7 @@ impl IndexDescriptionImpl {
                 .unwrap_or(false)
         }) {
             return Err(Error::Index {
-                message: "Index type URL should be present and identical across all shards"
+                message: "Index type URL should be present and identical across all segments"
                     .to_string(),
                 location: location!(),
             });
@@ -437,7 +437,7 @@ impl IndexDescriptionImpl {
             .map(|p| p.name().to_string())
             .unwrap_or_else(|_| "Unknown".to_string());
 
-        for shard in &shards {
+        for shard in &segments {
             let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
@@ -457,7 +457,7 @@ impl IndexDescriptionImpl {
             name,
             field_ids,
             index_type,
-            shards,
+            segments,
             details,
             rows_indexed,
         })
@@ -478,7 +478,7 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn metadata(&self) -> &[IndexMetadata] {
-        &self.shards
+        &self.segments
     }
 
     fn type_url(&self) -> &str {
@@ -636,9 +636,9 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .chunk_by(|idx| &idx.name)
             .into_iter()
-            .map(|(_, shards)| {
-                let shards = shards.cloned().collect::<Vec<_>>();
-                let desc = IndexDescriptionImpl::try_new(shards, self)?;
+            .map(|(_, segments)| {
+                let segments = segments.cloned().collect::<Vec<_>>();
+                let desc = IndexDescriptionImpl::try_new(segments, self)?;
                 Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
             })
             .collect::<Result<Vec<_>>>()

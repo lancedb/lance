@@ -465,9 +465,9 @@ pub fn load_shuffled_vectors(
     )?
 }
 
-#[pyclass(name = "IndexShardDescription", module = "lance.indices", get_all)]
+#[pyclass(name = "IndexSegmentDescription", module = "lance.indices", get_all)]
 #[derive(Clone)]
-pub struct PyIndexShardDescription {
+pub struct PyIndexSegmentDescription {
     pub uuid: String,
     pub dataset_version: u64,
     pub fragment_ids: Vec<u32>,
@@ -475,9 +475,9 @@ pub struct PyIndexShardDescription {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-impl PyIndexShardDescription {
+impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexShardDescription(uuid={}, dataset_version={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version, self.fragment_ids, self.index_version, self.created_at)
+        format!("IndexSegmentDescription(uuid={}, dataset_version={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version, self.fragment_ids, self.index_version, self.created_at)
     }
 }
 
@@ -490,7 +490,7 @@ pub struct PyIndexDescription {
     pub field_names: Vec<String>,
     pub num_rows_indexed: u64,
     pub details: String,
-    pub shards: Vec<PyIndexShardDescription>,
+    pub segments: Vec<PyIndexSegmentDescription>,
 }
 
 impl PyIndexDescription {
@@ -507,21 +507,21 @@ impl PyIndexDescription {
             })
             .collect();
 
-        let shards = index
+        let segments = index
             .metadata()
             .iter()
-            .map(|shard| {
-                let fragment_ids = shard
+            .map(|segment| {
+                let fragment_ids = segment
                     .fragment_bitmap
                     .as_ref()
                     .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
                     .unwrap_or_default();
-                PyIndexShardDescription {
-                    uuid: shard.uuid.to_string(),
-                    dataset_version: shard.dataset_version,
+                PyIndexSegmentDescription {
+                    uuid: segment.uuid.to_string(),
+                    dataset_version: segment.dataset_version,
                     fragment_ids,
-                    index_version: shard.index_version,
-                    created_at: shard.created_at,
+                    index_version: segment.index_version,
+                    created_at: segment.created_at,
                 }
             })
             .collect();
@@ -535,7 +535,7 @@ impl PyIndexDescription {
             fields: index.field_ids().to_vec(),
             field_names,
             index_type: index.index_type().to_string(),
-            shards,
+            segments,
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
             details,
@@ -546,7 +546,7 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_shards={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.shards.len())
+        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len())
     }
 }
 
@@ -560,6 +560,7 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
     indices.add_class::<PyIndexDescription>()?;
+    indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())
