@@ -61,14 +61,14 @@ pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
 
 /// Additional information about an index
 ///
-/// Note that a single index might consist of multiple shards.  Each shard has its own
+/// Note that a single index might consist of multiple segments.  Each segment has its own
 /// UUID and collection of files and covers some subset of the data fragments.
 ///
-/// All shards in an index should have the same index type and index details.
+/// All segments in an index should have the same index type and index details.
 pub trait IndexDescription: Send + Sync {
     /// Returns the index name
     ///
-    /// This is the user-defined name of the index.  It is shared by all shards of the index
+    /// This is the user-defined name of the index.  It is shared by all segments of the index
     /// and is what is used to refer to the index in the API.  It is guaranteed to be unique
     /// within the dataset.
     fn name(&self) -> &str;
@@ -76,7 +76,7 @@ pub trait IndexDescription: Send + Sync {
     /// Returns the index metadata
     ///
     /// This is the raw metadata information stored in the manifest.  There is one
-    /// IndexMetadata for each shard of the index.
+    /// IndexMetadata for each segment of the index.
     fn metadata(&self) -> &[IndexMetadata];
 
     /// Returns the index type URL
@@ -93,7 +93,7 @@ pub trait IndexDescription: Send + Sync {
     /// for the type URL.
     fn index_type(&self) -> &str;
 
-    /// Returns the number of rows indexed by the index, across all shards.
+    /// Returns the number of rows indexed by the index, across all segments.
     ///
     /// This is an approximate count and may include rows that have been
     /// deleted.

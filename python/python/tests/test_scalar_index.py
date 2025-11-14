@@ -4034,13 +4034,13 @@ def test_describe_indices(tmp_path):
     assert indices[0].num_rows_indexed == 100
     assert indices[0].fields == [1]
     assert indices[0].field_names == ["text"]
-    assert len(indices[0].shards) == 1
-    assert indices[0].shards[0].uuid is not None
-    assert indices[0].shards[0].fragment_ids == [0]
-    assert indices[0].shards[0].dataset_version == 1
-    assert indices[0].shards[0].index_version == 1
-    assert indices[0].shards[0].created_at is not None
-    assert isinstance(indices[0].shards[0].created_at, datetime)
+    assert len(indices[0].segments) == 1
+    assert indices[0].segments[0].uuid is not None
+    assert indices[0].segments[0].fragment_ids == [0]
+    assert indices[0].segments[0].dataset_version == 1
+    assert indices[0].segments[0].index_version == 1
+    assert indices[0].segments[0].created_at is not None
+    assert isinstance(indices[0].segments[0].created_at, datetime)
 
     details = indices[0].details
     assert details is not None and len(details) > 0
@@ -4116,10 +4116,10 @@ def test_describe_indices(tmp_path):
         assert indices[i].num_rows_indexed == 100
         assert indices[i].fields == [i + 2]
         assert indices[i].field_names == [data.column_names[i + 2]]
-        assert len(indices[i].shards) == 1
-        assert indices[i].shards[0].fragment_ids == [0]
-        assert indices[i].shards[0].dataset_version == i + 2
-        assert indices[i].shards[0].index_version == 0
-        assert indices[i].shards[0].created_at is not None
-        assert isinstance(indices[i].shards[0].created_at, datetime)
+        assert len(indices[i].segments) == 1
+        assert indices[i].segments[0].fragment_ids == [0]
+        assert indices[i].segments[0].dataset_version == i + 2
+        assert indices[i].segments[0].index_version == 0
+        assert indices[i].segments[0].created_at is not None
+        assert isinstance(indices[i].segments[0].created_at, datetime)
         assert indices[i].details == details[i]
