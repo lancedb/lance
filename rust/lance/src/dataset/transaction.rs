@@ -46,6 +46,7 @@
 //!
 
 use super::ManifestWriteConfig;
+use crate::dataset::conflict_detection::PrimaryKeyFilterModel;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -90,6 +91,8 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Optional primary key filter for conflict detection
+    pub primary_key_filter: Option<PrimaryKeyFilterModel>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1428,6 +1431,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    primary_key_filter: Option<PrimaryKeyFilterModel>,
 }
 
 impl TransactionBuilder {
@@ -1438,6 +1442,7 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            primary_key_filter: None,
         }
     }
 
@@ -1459,6 +1464,11 @@ impl TransactionBuilder {
         self
     }
 
+    pub fn primary_key_filter(mut self, filter: Option<PrimaryKeyFilterModel>) -> Self {
+        self.primary_key_filter = filter;
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1469,6 +1479,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            primary_key_filter: self.primary_key_filter,
         }
     }
 }
@@ -3036,6 +3047,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            primary_key_filter: message
+                .primary_key_filter
+                .as_ref()
+                .map(PrimaryKeyFilterModel::from_pb)
+                .transpose()?,
         })
     }
 }
@@ -3305,6 +3321,7 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            primary_key_filter: value.primary_key_filter.as_ref().map(|m| m.to_pb()),
         }
     }
 }

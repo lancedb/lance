@@ -346,6 +346,30 @@ impl<'a> TransactionRebase<'a> {
             mem_wal_to_merge, ..
         } = &self.transaction.operation
         {
+            // Pre-check using primary key filters (Bloom/Exact) for duplicate detection
+            // Only evaluate when both transactions are merge/update style operations carrying a PK filter.
+            // This guard avoids misclassifying normal upsert overlap with already committed data as a commit-time conflict.
+            if let (Some(self_pk), Some(other_pk)) = (
+                &self.transaction.primary_key_filter,
+                &other_transaction.primary_key_filter,
+            ) {
+                match &other_transaction.operation {
+                    Operation::Update { .. } | Operation::Merge { .. } => {
+                        if self_pk.columns == other_pk.columns {
+                            let (has_intersection, _maybe_fp) = self_pk.intersects(other_pk);
+                            if has_intersection {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
@@ -925,19 +949,44 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
 
-            Operation::Update { .. }
-            | Operation::Append { .. }
-            | Operation::Delete { .. }
-            | Operation::Rewrite { .. }
-            | Operation::Merge { .. }
-            | Operation::DataReplacement { .. } => {
-                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
-            }
-            Operation::Overwrite { .. }
-            | Operation::Restore { .. }
-            | Operation::Project { .. }
-            | Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+            // PK filter based duplicate detection
+            _ => {
+                if let (Some(self_pk), Some(other_pk)) = (
+                    &self.transaction.primary_key_filter,
+                    &other_transaction.primary_key_filter,
+                ) {
+                    if self_pk.columns == other_pk.columns {
+                        let (has_intersection, _maybe_fp) = self_pk.intersects(other_pk);
+                        if has_intersection {
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                    }
+                }
+                match &other_transaction.operation {
+                    Operation::Update { .. }
+                    | Operation::Append { .. }
+                    | Operation::Delete { .. }
+                    | Operation::Rewrite { .. }
+                    | Operation::Merge { .. }
+                    | Operation::DataReplacement { .. } => Err(self.retryable_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    )),
+                    Operation::Overwrite { .. }
+                    | Operation::Restore { .. }
+                    | Operation::Project { .. }
+                    | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
+                        other_transaction,
+                        other_version,
+                        location!(),
+                    )),
+                    _ => Ok(()),
+                }
             }
         }
     }

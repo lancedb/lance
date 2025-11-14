@@ -19,6 +19,7 @@ fn main() -> Result<()> {
             "./protos/table.proto",
             "./protos/transaction.proto",
             "./protos/rowids.proto",
+            "./protos/primary_key_filter.proto",
         ],
         &["./protos"],
     )?;
