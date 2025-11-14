@@ -2083,7 +2083,8 @@ pub mod array {
     use arrow_array::{
         ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
         Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
@@ -2518,7 +2519,7 @@ pub mod array {
                 ))
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                Box::new(FnGen::<i64, TimestampMillisecondArray, _>::new_known_size(
                     data_type, sample_fn, 1, width,
                 ))
             }

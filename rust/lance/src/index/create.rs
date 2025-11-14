@@ -229,7 +229,16 @@ impl<'a> CreateIndexBuilder<'a> {
                 )
                 .await?
             }
-            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
+            (
+                IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq,
+                LANCE_VECTOR_INDEX,
+            ) => {
                 // Vector index params.
                 let vec_params = self
                     .params

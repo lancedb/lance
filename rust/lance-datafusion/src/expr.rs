@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{cast::AsArray, ArrayRef};
+use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
 
@@ -116,6 +117,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             // See above warning about lossy float conversion
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
             _ => None,
         },
         ScalarValue::UInt8(val) => match ty {
