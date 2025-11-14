@@ -126,13 +126,11 @@ jobs:
           name: linux-wheels
           path: python/target/wheels/pylance-*.whl
 
-  forward-compat:
+  compat:
     needs: linux
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
-    name: Forward Compatibility Tests (${{ matrix.lance-version }})
-    strategy:
-      matrix:
-        lance-version: ["0.16.0", "0.30.0", "0.36.0"]
+    name: Compatibility Tests
     defaults:
       run:
         shell: bash
@@ -154,16 +152,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install $(ls wheels/pylance-*.whl)[tests,ray]
-      - name: Generate forward compatibility files
-        env:
-          PYTHONPATH: python/tests
-        run: python -m forward_compat.datagen
-      - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
+      - name: Run compatibility tests
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pytest pylance==${{ matrix.lance-version }}
-          pytest python/tests/forward_compat --run-forward
+          make compattest
+        env:
+          COMPAT_TEMP_VENV: 1
 
   linux-arm:
     timeout-minutes: 45

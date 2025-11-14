@@ -16,6 +16,10 @@ doctest:
 	pytest --doctest-modules $(PYTEST_ARGS) python/lance
 .PHONY: doctest
 
+compattest:
+	pytest --run-compat $(PYTEST_ARGS)  python/tests/compat
+.PHONY: compattest
+
 format: format-python
 	cargo fmt
 .PHONY: format
@@ -23,10 +27,6 @@ format: format-python
 build:
 	maturin develop
 .PHONY: build
-
-clean:
-	rm -rf ./target
-.PHONY: clean
 
 format-python:
 	ruff format python

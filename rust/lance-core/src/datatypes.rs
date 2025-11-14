@@ -22,8 +22,8 @@ pub use field::{
     BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
-    Projectable, Projection, Schema,
+    escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,
+    OnMissing, Projectable, Projection, Schema,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
