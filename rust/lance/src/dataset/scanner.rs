@@ -44,7 +44,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
-    escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
+    escape_field_path_for_project, format_field_path, BlobHandling, Field, OnMissing, Projection,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -324,6 +324,7 @@ pub struct Scanner {
     /// - Dynamic expressions that are evaluated after the physical projection
     /// - The names of the output columns
     projection_plan: ProjectionPlan,
+    blob_handling: BlobHandling,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
@@ -599,9 +600,10 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
-        Self {
+        let mut scanner = Self {
             dataset,
             projection_plan,
+            blob_handling: BlobHandling::default(),
             prefilter: false,
             materialization_style: MaterializationStyle::Heuristic,
             filter: None,
@@ -627,7 +629,24 @@ impl Scanner {
             legacy_with_row_id: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
-        }
+        };
+        scanner.apply_blob_handling();
+        scanner
+    }
+
+    fn apply_blob_handling(&mut self) {
+        let projection = self
+            .projection_plan
+            .physical_projection
+            .clone()
+            .with_blob_handling(self.blob_handling.clone());
+        self.projection_plan.physical_projection = projection;
+    }
+
+    pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.blob_handling = blob_handling;
+        self.apply_blob_handling();
+        self
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
@@ -710,6 +729,7 @@ impl Scanner {
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
         }
+        self.apply_blob_handling();
         Ok(self)
     }
 
