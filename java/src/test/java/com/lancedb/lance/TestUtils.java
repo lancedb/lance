@@ -125,6 +125,36 @@ public class TestUtils {
       return fragmentMetas;
     }
 
+    public List<FragmentMetadata> createNewFragmentWithId(int rowCount, int fragmentId) {
+      return createNewFragmentWithId(rowCount, fragmentId, Integer.MAX_VALUE);
+    }
+
+    public List<FragmentMetadata> createNewFragmentWithId(
+        int rowCount, int fragmentId, int maxRowsPerFile) {
+      List<FragmentMetadata> fragmentMetas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
+        root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        for (int i = 0; i < rowCount; i++) {
+          int id = i;
+          idVector.setSafe(i, id);
+          String name = "Person " + i;
+          nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+        }
+        root.setRowCount(rowCount);
+
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                Optional.of(fragmentId),
+                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+      }
+      return fragmentMetas;
+    }
+
     public Dataset write(long version, int rowCount) {
       FragmentMetadata metadata = createNewFragment(rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata));
