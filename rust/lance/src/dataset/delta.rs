@@ -7,11 +7,11 @@ use crate::Dataset;
 use crate::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::Error;
 use lance_core::ROW_CREATED_AT_VERSION;
 use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
+use lance_core::{Error, ROW_DELETED_AT_VERSION};
 use snafu::location;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
@@ -276,6 +276,34 @@ impl DatasetDelta {
 
         scanner.try_into_stream().await
     }
+
+    /// Get deleted rows between the two versions.
+    ///
+    /// Returns rows deleted in the version range where `_row_deleted_at_version` > `begin_version`
+    /// and `_row_deleted_at_version` <= `end_version`.
+    ///
+    /// The result includes:
+    /// - `_rowid`: Row ID
+    /// - `_row_deleted_at_version`: Version when the row was deleted
+    /// - All other columns from the dataset
+    pub async fn get_deleted_rows(&self) -> Result<DatasetRecordBatchStream> {
+        let mut scanner = self.base_dataset.scan();
+
+        // Include deleted rows so that rows that were removed logically can still be surfaced
+        scanner.include_deleted_rows();
+
+        // Project only required meta columns to avoid late materialization issues
+        scanner.project(&[ROW_ID, ROW_DELETED_AT_VERSION])?;
+
+        // Filter for rows deleted in the version range
+        let filter = format!(
+            "_row_deleted_at_version > {} AND _row_deleted_at_version <= {}",
+            self.begin_version, self.end_version
+        );
+        scanner.filter(&filter)?;
+
+        scanner.try_into_stream().await
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +414,94 @@ mod tests {
             }
             _ => panic!("Expected VersionNotFound error."),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_deleted_rows_basic() {
+        // Create dataset with stable row IDs enabled
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("value".to_string()))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut ds = Dataset::write(data, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(ds.version().version, 1);
+
+        // Delete some rows in v2
+        ds.delete("key < 5").await.unwrap();
+        assert_eq!(ds.version().version, 2);
+
+        // Delete some other rows in v3
+        ds.delete("key >= 10 AND key < 15").await.unwrap();
+        assert_eq!(ds.version().version, 3);
+
+        // Delta for deletions in v2
+        let delta = ds
+            .delta()
+            .with_begin_version(1)
+            .with_end_version(2)
+            .build()
+            .unwrap();
+        let mut stream = delta.get_deleted_rows().await.unwrap();
+        use std::collections::HashMap;
+        let mut per_frag: HashMap<u32, usize> = HashMap::new();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            // All deleted rows in v2 should have _row_deleted_at_version = 2
+            let deleted_at = batch[lance_core::ROW_DELETED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .values();
+            let row_ids = batch[lance_core::ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values();
+            let mut batch_frag_counts: HashMap<u32, usize> = HashMap::new();
+            for (i, v) in deleted_at.iter().enumerate() {
+                assert_eq!(*v, 2);
+                let rid = row_ids[i];
+                let frag_id = (rid >> 32) as u32;
+                *batch_frag_counts.entry(frag_id).or_default() += 1;
+                *per_frag.entry(frag_id).or_default() += 1;
+            }
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
+
+        // Delta for deletions in v3
+        let delta = ds
+            .delta()
+            .with_begin_version(2)
+            .with_end_version(3)
+            .build()
+            .unwrap();
+        let mut stream = delta.get_deleted_rows().await.unwrap();
+        use std::collections::HashMap as _HashMap;
+        let mut per_frag3: _HashMap<u32, usize> = _HashMap::new();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let deleted_at = batch[lance_core::ROW_DELETED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .values();
+            let row_ids = batch[lance_core::ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values();
+            let mut batch_frag_counts: _HashMap<u32, usize> = _HashMap::new();
+            for (i, v) in deleted_at.iter().enumerate() {
+                assert_eq!(*v, 3);
+                let rid = row_ids[i];
+                let frag_id = (rid >> 32) as u32;
+                *batch_frag_counts.entry(frag_id).or_default() += 1;
+                *per_frag3.entry(frag_id).or_default() += 1;
+            }
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
     }
 
     #[tokio::test]

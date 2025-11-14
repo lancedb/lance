@@ -284,6 +284,26 @@ pub fn created_at_version_meta_to_pb(
     })
 }
 
+/// Helper function to convert RowDatasetVersionMeta to protobuf format for delete_at
+pub fn deleted_at_version_meta_to_pb(
+    meta: &Option<RowDatasetVersionMeta>,
+) -> Option<pb::data_fragment::DeletedAtVersionSequence> {
+    meta.as_ref().map(|m| match m {
+        RowDatasetVersionMeta::Inline(data) => {
+            pb::data_fragment::DeletedAtVersionSequence::InlineDeletedAtVersions(data.clone())
+        }
+        RowDatasetVersionMeta::External(file) => {
+            pb::data_fragment::DeletedAtVersionSequence::ExternalDeletedAtVersions(
+                pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                },
+            )
+        }
+    })
+}
+
 /// Serialize a dataset version sequence to a buffer (following RowIdSequence pattern)
 pub fn write_dataset_versions(sequence: &RowDatasetVersionSequence) -> Vec<u8> {
     // Convert to protobuf sequence
@@ -592,6 +612,25 @@ impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionM
                 Ok(Self::Inline(data))
             }
             pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
+                Ok(Self::External(ExternalFile {
+                    path: file.path,
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+}
+
+impl TryFrom<pb::data_fragment::DeletedAtVersionSequence> for RowDatasetVersionMeta {
+    type Error = Error;
+
+    fn try_from(value: pb::data_fragment::DeletedAtVersionSequence) -> Result<Self> {
+        match value {
+            pb::data_fragment::DeletedAtVersionSequence::InlineDeletedAtVersions(data) => {
+                Ok(Self::Inline(data))
+            }
+            pb::data_fragment::DeletedAtVersionSequence::ExternalDeletedAtVersions(file) => {
                 Ok(Self::External(ExternalFile {
                     path: file.path,
                     offset: file.offset,

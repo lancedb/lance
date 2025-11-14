@@ -319,6 +319,13 @@ message DataFragment {
     ExternalFile external_created_at_versions = 10;
   } // created_at_version_sequence
 
+  oneof deleted_at_version_sequence {
+    // If small (< 200KB), the row deleted at versions are stored inline.
+    bytes inline_deleted_at_versions = 21;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_deleted_at_versions = 22;
+  } // deleted_at_version_sequence
+
   // Number of original rows in the fragment, this includes rows that are now marked with
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.

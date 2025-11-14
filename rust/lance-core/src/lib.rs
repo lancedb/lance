@@ -25,6 +25,8 @@ pub const ROW_OFFSET: &str = "_rowoffset";
 pub const ROW_LAST_UPDATED_AT_VERSION: &str = "_row_last_updated_at_version";
 /// Column name for the row's created at dataset version.
 pub const ROW_CREATED_AT_VERSION: &str = "_row_created_at_version";
+/// Column name for the row's deleted at dataset version.
+pub const ROW_DELETED_AT_VERSION: &str = "_row_deleted_at_version";
 
 /// Row ID field. This is nullable because its validity bitmap is sometimes used
 /// as a selection vector.
@@ -44,6 +46,9 @@ pub static ROW_LAST_UPDATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 /// Row created at version field.
 pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
     LazyLock::new(|| ArrowField::new(ROW_CREATED_AT_VERSION, DataType::UInt64, true));
+/// Row deleted at version field.
+pub static ROW_DELETED_AT_VERSION_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_DELETED_AT_VERSION, DataType::UInt64, true));
 
 /// Check if a column name is a system column.
 ///
@@ -57,6 +62,11 @@ pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 pub fn is_system_column(column_name: &str) -> bool {
     matches!(
         column_name,
-        ROW_ID | ROW_ADDR | ROW_OFFSET | ROW_LAST_UPDATED_AT_VERSION | ROW_CREATED_AT_VERSION
+        ROW_ID
+            | ROW_ADDR
+            | ROW_OFFSET
+            | ROW_LAST_UPDATED_AT_VERSION
+            | ROW_CREATED_AT_VERSION
+            | ROW_DELETED_AT_VERSION
     )
 }

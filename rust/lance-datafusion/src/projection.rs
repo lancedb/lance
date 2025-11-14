@@ -15,8 +15,8 @@ use std::{
 
 use lance_core::{
     datatypes::{OnMissing, Projectable, Projection, Schema},
-    Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
-    ROW_OFFSET, WILDCARD,
+    Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_DELETED_AT_VERSION, ROW_ID,
+    ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET, WILDCARD,
 };
 
 use crate::{
@@ -35,6 +35,7 @@ struct ProjectionBuilder {
     needs_row_addr: bool,
     needs_row_last_updated_at: bool,
     needs_row_created_at: bool,
+    needs_row_deleted_at: bool,
     must_add_row_offset: bool,
     has_wildcard: bool,
 }
@@ -56,6 +57,7 @@ impl ProjectionBuilder {
             needs_row_addr: false,
             needs_row_created_at: false,
             needs_row_last_updated_at: false,
+            needs_row_deleted_at: false,
             must_add_row_offset: false,
             has_wildcard: false,
         }
@@ -93,6 +95,8 @@ impl ProjectionBuilder {
                 self.needs_row_last_updated_at = true;
             } else if name == ROW_CREATED_AT_VERSION {
                 self.needs_row_created_at = true;
+            } else if name == ROW_DELETED_AT_VERSION {
+                self.needs_row_deleted_at = true;
             }
         }
 
@@ -150,6 +154,7 @@ impl ProjectionBuilder {
         physical_projection.with_row_addr = self.needs_row_addr || self.must_add_row_offset;
         physical_projection.with_row_last_updated_at_version = self.needs_row_last_updated_at;
         physical_projection.with_row_created_at_version = self.needs_row_created_at;
+        physical_projection.with_row_deleted_at_version = self.needs_row_deleted_at;
 
         Ok(ProjectionPlan {
             physical_projection,
@@ -194,6 +199,9 @@ impl ProjectionPlan {
         ));
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
+        ));
+        fields.push(Arc::new(
+            (*lance_core::ROW_DELETED_AT_VERSION_FIELD).clone(),
         ));
         ArrowSchema::new(fields)
     }

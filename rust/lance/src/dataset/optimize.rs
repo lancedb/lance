@@ -1134,6 +1134,7 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
