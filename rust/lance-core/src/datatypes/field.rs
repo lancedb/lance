@@ -1051,9 +1051,7 @@ impl From<&Field> for ArrowField {
                 ARROW_EXT_NAME_KEY.to_string(),
                 lance_arrow::BLOB_V2_EXT_NAME.to_string(),
             );
-            metadata
-                .entry(ARROW_EXT_META_KEY.to_string())
-                .or_default();
+            metadata.entry(ARROW_EXT_META_KEY.to_string()).or_default();
             metadata
                 .entry(BLOB_META_KEY.to_string())
                 .or_insert_with(|| "true".to_string());
