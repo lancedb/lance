@@ -380,7 +380,7 @@ pub async fn do_write_fragments(
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
-    params: WriteParams,
+    mut params: WriteParams,
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
@@ -388,6 +388,9 @@ pub async fn do_write_fragments(
     let data = adapter.to_physical_stream(data);
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
+        // Make sure the max rows per group is not larger than the max rows per file
+        params.max_rows_per_group =
+            std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
     } else {
@@ -570,7 +573,7 @@ pub async fn write_fragments_internal(
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
-    mut params: WriteParams,
+    params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let adapter = SchemaAdapter::new(data.schema());
@@ -585,9 +588,6 @@ pub async fn write_fragments_internal(
         // No conversion needed, use original schema to preserve dictionary info
         (data, schema)
     };
-
-    // Make sure the max rows per group is not larger than the max rows per file
-    params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
     let allow_blob_version_change =
         dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
