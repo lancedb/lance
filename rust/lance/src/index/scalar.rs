@@ -273,6 +273,7 @@ pub(super) async fn build_scalar_index(
     params: &ScalarIndexParams,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    preprocessed_data: Option<SendableRecordBatchStream>,
 ) -> Result<CreatedIndex> {
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -286,15 +287,19 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    let training_data = load_training_data(
-        dataset,
-        column,
-        training_request.criteria(),
-        None,
-        train,
-        fragment_ids.clone(),
-    )
-    .await?;
+    let training_data = if preprocessed_data.is_none() {
+        load_training_data(
+            dataset,
+            column,
+            training_request.criteria(),
+            None,
+            train,
+            fragment_ids.clone(),
+        )
+        .await?
+    } else {
+        preprocessed_data.unwrap()
+    };
 
     plugin
         .train_index(training_data, &index_store, training_request, fragment_ids)
@@ -785,6 +790,7 @@ mod tests {
 
         let btree_params = BTreeParameters {
             zone_size: Some(50),
+            range_id: None,
         };
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =

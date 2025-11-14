@@ -353,6 +353,7 @@ pub mod tests {
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         let params = BTreeParameters {
             zone_size: Some(batch_size),
+            range_id: None,
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
@@ -862,6 +863,7 @@ pub mod tests {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
             None,
         )
         .await
