@@ -8,7 +8,7 @@
 //! ## Features
 //!
 //! - `rest`: REST API-based namespace implementation
-//! - `rest-server`: REST server adapter that exposes any namespace via HTTP
+//! - `rest-adapter`: REST server adapter that exposes any namespace via HTTP
 //! - `dir-aws`, `dir-azure`, `dir-gcp`, `dir-oss`: Cloud storage backend support for directory namespace (via lance-io)
 //!
 //! ## Implementations
@@ -37,7 +37,7 @@ pub mod dir;
 #[cfg(feature = "rest")]
 pub mod rest;
 
-#[cfg(feature = "rest-server")]
+#[cfg(feature = "rest-adapter")]
 pub mod rest_adapter;
 
 // Re-export connect builder
@@ -47,5 +47,5 @@ pub use dir::{manifest::ManifestNamespace, DirectoryNamespace, DirectoryNamespac
 #[cfg(feature = "rest")]
 pub use rest::{RestNamespace, RestNamespaceBuilder};
 
-#[cfg(feature = "rest-server")]
+#[cfg(feature = "rest-adapter")]
 pub use rest_adapter::{RestServer, RestServerConfig};

@@ -1755,7 +1755,11 @@ mod tests {
                 .unwrap_or(create_response.location.as_ref().unwrap())
                 .to_string();
 
-            let relative_location = location.split('/').last().unwrap_or(&location).to_string();
+            let relative_location = location
+                .split('/')
+                .next_back()
+                .unwrap_or(&location)
+                .to_string();
 
             let register_req = RegisterTableRequest {
                 id: Some(vec![

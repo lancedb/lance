@@ -14,7 +14,7 @@ rust-version.workspace = true
 [features]
 default = []
 rest = ["dep:reqwest", "dep:url"]
-rest-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp"]
 dir-aws = ["lance-io/aws"]
@@ -44,7 +44,7 @@ arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 
-# REST server implementation dependencies (optional, enabled by "rest-server" feature)
+# REST adapter implementation dependencies (optional, enabled by "rest-adapter" feature)
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true, features = ["trace", "cors"] }
