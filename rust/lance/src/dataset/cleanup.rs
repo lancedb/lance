@@ -623,6 +623,10 @@ impl<'a> CleanupTask<'a> {
                                 .verified_files
                                 .data_paths
                                 .remove(&relative_data_path);
+                            inspection
+                                .referenced_files
+                                .data_paths
+                                .insert(relative_data_path);
                             is_referenced = true;
                         }
                     }
@@ -637,12 +641,16 @@ impl<'a> CleanupTask<'a> {
                         });
                         if base_path.path == self.dataset.uri {
                             if let Some(deletion_path) = deletion_path {
-                                let relative_path =
+                                let relative_del_path =
                                     remove_prefix(&deletion_path, &self.dataset.base);
                                 inspection
                                     .verified_files
                                     .delete_paths
-                                    .remove(&relative_path);
+                                    .remove(&relative_del_path);
+                                inspection
+                                    .referenced_files
+                                    .data_paths
+                                    .insert(relative_del_path);
                             }
                             is_referenced = true;
                         }
@@ -657,6 +665,7 @@ impl<'a> CleanupTask<'a> {
                     if base_path.path == self.dataset.uri {
                         let uuid_str = index.uuid.to_string();
                         inspection.verified_files.index_uuids.remove(&uuid_str);
+                        inspection.referenced_files.index_uuids.insert(uuid_str);
                         is_referenced = true;
                     }
                 }

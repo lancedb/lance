@@ -199,7 +199,7 @@ impl BlockingDataset {
     }
 
     pub fn list_branches(&self) -> Result<HashMap<String, lance::dataset::refs::BranchContents>> {
-        let branches = RT.block_on(self.inner.list_branches())?;
+        let branches = RT.block_on(self.inner.branches().list())?;
         Ok(branches)
     }
 
@@ -218,7 +218,7 @@ impl BlockingDataset {
     }
 
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        RT.block_on(self.inner.delete_branch(branch))?;
+        RT.block_on(self.inner.branches().delete(branch, true))?;
         Ok(())
     }
 

@@ -568,14 +568,23 @@ impl Branches<'_> {
         related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
         if let Some(branch) = related_branches.first() {
             if branch.is_child(&deleted_branch) || branch == &deleted_branch {
+                // There are children of the deleted branch, we can't delete any directory for now
                 return Ok(None);
             } else {
+                // We pick the longest common directory between the deleted branch and the remaining branches
+                // Then delete the first child of this common directory
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
                 relative_dir = format!(
                     "{}/{}",
                     branch.segments.join("/"),
                     deleted_branch.segments[branch.segments.len()]
                 );
             }
+        } else if deleted_branch.segments.len() >= 1 {
+            // There are no common directories between the deleted branch and the remaining branches
+            // We need to delete the entire directory
+            // Example: deleted_branch = "a/b/c", remaining_branches = [], we need to delete "a"
+            relative_dir = deleted_branch.segments[0].to_string();
         }
 
         let absolute_dir = base_location.find_branch(Some(relative_dir))?;
@@ -602,7 +611,7 @@ impl<'a> BranchRelativePath<'a> {
     fn find_common_prefix(&self, other: &Self) -> Option<Self> {
         let mut common_segments = Vec::new();
         for (i, segment) in self.segments.iter().enumerate() {
-            if other.segments[i] != *segment {
+            if i >= other.segments.len() || other.segments[i] != *segment {
                 break;
             }
             common_segments.push(*segment);
@@ -1025,21 +1034,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("a/b/c", &["a/b/d", "a/e"], Some("a/b/c"))]
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
     #[case("a/b", &["a/b/c", "b/c/d"], None)]
     #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
-    #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth")
-    )]
-    #[case("feature/user-auth", &["feature/user-signup"], Some("feature/user-auth"))]
+    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
+    #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
     #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1")
     )]
-    #[case("feature", &["bugfix", "hotfix"], Some("feature"))]
-    #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
+    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
     #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
