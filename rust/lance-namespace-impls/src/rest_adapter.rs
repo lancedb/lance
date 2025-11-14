@@ -499,12 +499,12 @@ mod tests {
                 let backend = Arc::new(backend);
 
                 // Start REST server
-                let config = RestServerConfig {
+                let config = RestAdapterConfig {
                     host: "127.0.0.1".to_string(),
                     port,
                 };
 
-                let server = RestServer::new(backend.clone(), config);
+                let server = RestAdapter::new(backend.clone(), config);
                 let server_handle = tokio::spawn(async move {
                     server.serve().await.unwrap();
                 });
