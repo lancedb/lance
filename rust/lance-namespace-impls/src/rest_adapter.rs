@@ -1754,12 +1754,8 @@ mod tests {
                 .and_then(|loc| loc.strip_prefix(fixture.namespace.endpoint()))
                 .unwrap_or(create_response.location.as_ref().unwrap())
                 .to_string();
-            
-            let relative_location = location
-                .split('/')
-                .last()
-                .unwrap_or(&location)
-                .to_string();
+
+            let relative_location = location.split('/').last().unwrap_or(&location).to_string();
 
             let register_req = RegisterTableRequest {
                 id: Some(vec![
@@ -1778,10 +1774,7 @@ mod tests {
                 .expect("Failed to re-register table with new name");
 
             // Should return the exact location we registered
-            assert_eq!(
-                register_response.location,
-                relative_location
-            );
+            assert_eq!(register_response.location, relative_location);
 
             // Verify new table exists
             let mut exists_req = TableExistsRequest::new();
