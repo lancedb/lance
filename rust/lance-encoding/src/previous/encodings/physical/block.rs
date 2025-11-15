@@ -67,7 +67,7 @@ mod tests {
         let encoded_array_result = encoder.encode(data, &DataType::Int64, &mut buffer_index);
         assert!(encoded_array_result.is_ok(), "{:?}", encoded_array_result);
         let encoded_array = encoded_array_result.unwrap();
-        assert_eq!(encoded_array.data.num_values(), 8);
+        assert_eq!(encoded_array.data.num_values().unwrap(), 8);
         let buffers = encoded_array.data.into_buffers();
         assert_eq!(buffers.len(), 1);
         assert!(buffers[0].len() < 64 * 8);

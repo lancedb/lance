@@ -269,8 +269,8 @@ impl ValueEncoder {
         )
     }
 
-    fn miniblock_fsl(data: DataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
-        let num_rows = data.num_values();
+    fn miniblock_fsl(data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        let num_rows = data.num_values()?;
         let fsl = data.as_fixed_size_list().unwrap();
         let mut layers = Vec::new();
         let mut child = *fsl.child;
@@ -294,7 +294,7 @@ impl ValueEncoder {
                 }
                 DataBlock::FixedWidth(inner) => {
                     layers.push(cur_layer);
-                    return Self::chunk_fsl(inner, layers, num_rows);
+                    return Ok(Self::chunk_fsl(inner, layers, num_rows));
                 }
                 _ => unreachable!("Unexpected data block type in value encoder's miniblock_fsl"),
             }
@@ -339,10 +339,12 @@ impl ValueEncoder {
         ProtobufUtils21::fsl(fsl.dimension, has_validity, inner_encoding)
     }
 
-    fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
+    fn simple_per_value_fsl(
+        fsl: FixedSizeListBlock,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         // The simple case is zero-copy, we just return the flattened inner buffer
         let encoding = Self::fsl_to_encoding(&fsl);
-        let num_values = fsl.num_values();
+        let num_values = fsl.num_values()?;
         let mut child = *fsl.child;
         let mut cum_dim = 1;
         loop {
@@ -361,7 +363,7 @@ impl ValueEncoder {
                         data: inner.data,
                         block_info: BlockInfo::new(),
                     };
-                    return (PerValueDataBlock::Fixed(data), encoding);
+                    return Ok((PerValueDataBlock::Fixed(data), encoding));
                 }
                 _ => unreachable!(
                     "Unexpected data block type in value encoder's simple_per_value_fsl"
@@ -370,10 +372,12 @@ impl ValueEncoder {
         }
     }
 
-    fn nullable_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
+    fn nullable_per_value_fsl(
+        fsl: FixedSizeListBlock,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         // If there are nullable inner values then we need to zip the validity with the values
         let encoding = Self::fsl_to_encoding(&fsl);
-        let num_values = fsl.num_values();
+        let num_values = fsl.num_values()?;
         let mut bytes_per_row = 0;
         let mut cum_dim = 1;
         let mut current = fsl;
@@ -440,10 +444,10 @@ impl ValueEncoder {
             data: zipped,
             block_info: BlockInfo::new(),
         });
-        (data, encoding)
+        Ok((data, encoding))
     }
 
-    fn per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
+    fn per_value_fsl(fsl: FixedSizeListBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         if !fsl.child.is_nullable() {
             Self::simple_per_value_fsl(fsl)
         } else {
@@ -472,7 +476,7 @@ impl MiniBlockCompressor for ValueEncoder {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
-            DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
+            DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)?),
             _ => Err(Error::InvalidInput {
                 source: format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -569,7 +573,7 @@ impl ValueDecompressor {
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         let block = self.buffer_to_block(data, num_values);
-        assert_eq!(block.num_values(), num_values);
+        assert_eq!(block.num_values()?, num_values);
         Ok(block)
     }
 }
@@ -599,7 +603,7 @@ impl MiniBlockDecompressor for ValueDecompressor {
             })
         }
 
-        assert_eq!(lists.num_values(), num_values);
+        assert_eq!(lists.num_values()?, num_values);
         Ok(lists)
     }
 }
@@ -617,7 +621,7 @@ impl ValueDecompressor {
     }
 
     // If there is no validity then decompression is zero-copy, we just need to restore any FSL layers
-    fn simple_decompress(&self, data: FixedWidthDataBlock, num_rows: u64) -> DataBlock {
+    fn simple_decompress(&self, data: FixedWidthDataBlock, num_rows: u64) -> Result<DataBlock> {
         let mut cum_dim = 1;
         for layer in &self.layers {
             cum_dim *= layer.dimension;
@@ -635,12 +639,12 @@ impl ValueDecompressor {
                 dimension: layer.dimension,
             });
         }
-        debug_assert_eq!(num_rows, block.num_values());
-        block
+        debug_assert_eq!(num_rows, block.num_values()?);
+        Ok(block)
     }
 
     // If there is validity then it has been zipped in with the values and we must unzip it
-    fn unzip_decompress(&self, data: FixedWidthDataBlock, num_rows: usize) -> DataBlock {
+    fn unzip_decompress(&self, data: FixedWidthDataBlock, num_rows: usize) -> Result<DataBlock> {
         // No support for full-zip on per-value encodings
         assert_eq!(self.bits_per_item % 8, 0);
         let bytes_per_item = self.bits_per_item / 8;
@@ -712,18 +716,18 @@ impl ValueDecompressor {
             });
         }
 
-        assert_eq!(num_rows, block.num_values() as usize);
+        assert_eq!(num_rows, block.num_values()? as usize);
 
-        block
+        Ok(block)
     }
 }
 
 impl FixedPerValueDecompressor for ValueDecompressor {
     fn decompress(&self, data: FixedWidthDataBlock, num_rows: u64) -> Result<DataBlock> {
         if self.has_validity() {
-            Ok(self.unzip_decompress(data, num_rows as usize))
+            Ok(self.unzip_decompress(data, num_rows as usize)?)
         } else {
-            Ok(self.simple_decompress(data, num_rows))
+            Ok(self.simple_decompress(data, num_rows)?)
         }
     }
 
@@ -734,18 +738,17 @@ impl FixedPerValueDecompressor for ValueDecompressor {
 
 impl PerValueCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
-        let (data, encoding) = match data {
+        match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
-                (PerValueDataBlock::Fixed(fixed_width), encoding)
+                Ok((PerValueDataBlock::Fixed(fixed_width), encoding))
             }
             DataBlock::FixedSizeList(fixed_size_list) => Self::per_value_fsl(fixed_size_list),
             _ => unimplemented!(
                 "Cannot compress block of type {} with ValueEncoder",
                 data.name()
             ),
-        };
-        Ok((data, encoding))
+        }
     }
 }
 
