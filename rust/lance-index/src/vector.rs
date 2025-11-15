@@ -22,6 +22,7 @@ use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
 pub mod bq;
+pub mod distributed;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;

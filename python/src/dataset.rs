@@ -1989,8 +1989,19 @@ impl Dataset {
                     )
                     .await
                 }
-                _ => Err(Error::InvalidInput {
-                    source: format!("Index type {} is not supported.", index_type).into(),
+                "VECTOR" => {
+                    // Merge distributed vector index partials into unified auxiliary.idx
+                    lance_index::vector::distributed::index_merger::merge_vector_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                    )
+                    .await
+                }
+                _ => Err(lance::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Unsupported index type: {}", index_type),
+                    )),
                     location: location!(),
                 }),
             }
