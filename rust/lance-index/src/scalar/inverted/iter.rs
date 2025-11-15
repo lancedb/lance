@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::hash_map;
+use std::borrow::Cow;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
 use fst::Streamer;
+
+use crate::scalar::inverted::token_set::AppendableTokenSetIterator;
 
 use super::{
     builder::BLOCK_SIZE,
@@ -14,9 +16,10 @@ use super::{
 };
 
 pub enum TokenSource<'a> {
-    HashMap(hash_map::Iter<'a, String, u32>),
+    Appendable(AppendableTokenSetIterator<'a>),
     Fst(fst::map::Stream<'a>),
 }
+
 pub struct TokenIterator<'a> {
     source: TokenSource<'a>,
 }
@@ -27,16 +30,21 @@ impl<'a> TokenIterator<'a> {
     }
 }
 
-impl Iterator for TokenIterator<'_> {
-    type Item = (String, u32);
+impl<'a> Iterator for TokenIterator<'a> {
+    type Item = (Cow<'a, str>, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.source {
-            TokenSource::HashMap(iter) => iter
+            TokenSource::Appendable(iter) => iter
                 .next()
-                .map(|(token, token_id)| (token.clone(), *token_id)),
+                .map(|(token, token_id)| (Cow::Borrowed(token), token_id)),
             TokenSource::Fst(iter) => iter.next().map(|(token, token_id)| {
-                (String::from_utf8_lossy(token).into_owned(), token_id as u32)
+                // FST tokens are &[u8], so we must allocate a String.
+                // TODO: we should be able to avoid this allocation
+                (
+                    Cow::Owned(String::from_utf8_lossy(token).into_owned()),
+                    token_id as u32,
+                )
             }),
         }
     }

@@ -11,6 +11,7 @@ use std::{collections::HashMap, ops::Range};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
+use crate::scalar::inverted::index::token_set::AppendableTokenSet;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
@@ -30,7 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use fst::{Automaton, IntoStreamer, Streamer};
+use fst::{Automaton, Streamer};
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
@@ -79,6 +80,8 @@ use crate::scalar::{
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
+
+pub(crate) mod token_set;
 
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat (new default, incompatible clients < 0.38)
@@ -805,20 +808,20 @@ impl InvertedPartition {
 // at searching, we use fst::Map because it's more efficient
 #[derive(Debug, Clone)]
 pub enum TokenMap {
-    HashMap(HashMap<String, u32>),
+    Appendable(AppendableTokenSet),
     Fst(fst::Map<Vec<u8>>),
 }
 
 impl Default for TokenMap {
     fn default() -> Self {
-        Self::HashMap(HashMap::new())
+        Self::Appendable(AppendableTokenSet::new())
     }
 }
 
 impl DeepSizeOf for TokenMap {
     fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
         match self {
-            Self::HashMap(map) => map.deep_size_of_children(ctx),
+            Self::Appendable(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
         }
     }
@@ -827,7 +830,7 @@ impl DeepSizeOf for TokenMap {
 impl TokenMap {
     pub fn len(&self) -> usize {
         match self {
-            Self::HashMap(map) => map.len(),
+            Self::Appendable(map) => map.len(),
             Self::Fst(map) => map.len(),
         }
     }
@@ -849,20 +852,12 @@ pub struct TokenSet {
 impl TokenSet {
     pub fn into_mut(self) -> Self {
         let tokens = match self.tokens {
-            TokenMap::HashMap(map) => map,
-            TokenMap::Fst(map) => {
-                let mut new_map = HashMap::with_capacity(map.len());
-                let mut stream = map.into_stream();
-                while let Some((token, token_id)) = stream.next() {
-                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
-                }
-
-                new_map
-            }
+            TokenMap::Appendable(map) => map,
+            TokenMap::Fst(map) => map.into(),
         };
 
         Self {
-            tokens: TokenMap::HashMap(tokens),
+            tokens: TokenMap::Appendable(tokens),
             next_id: self.next_id,
             total_length: self.total_length,
         }
@@ -878,7 +873,7 @@ impl TokenSet {
 
     pub(crate) fn iter(&self) -> TokenIterator<'_> {
         TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
+            TokenMap::Appendable(map) => TokenSource::Appendable(map.iter()),
             TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
         })
     }
@@ -891,27 +886,20 @@ impl TokenSet {
     }
 
     fn into_arrow_batch(self) -> Result<RecordBatch> {
-        let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
-        let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
-
-        match self.tokens {
+        let (token_col, token_id_col) = match self.tokens {
             TokenMap::Fst(map) => {
+                let mut token_builder = StringBuilder::with_capacity(map.len(), self.total_length);
+                let mut token_id_builder = UInt32Builder::with_capacity(map.len());
                 let mut stream = map.stream();
                 while let Some((token, token_id)) = stream.next() {
                     token_builder.append_value(String::from_utf8_lossy(token));
                     token_id_builder.append_value(token_id as u32);
                 }
-            }
-            TokenMap::HashMap(map) => {
-                for (token, token_id) in map.into_iter().sorted_unstable() {
-                    token_builder.append_value(token);
-                    token_id_builder.append_value(token_id);
-                }
-            }
-        }
 
-        let token_col = token_builder.finish();
-        let token_id_col = token_id_builder.finish();
+                (token_builder.finish(), token_id_builder.finish())
+            }
+            TokenMap::Appendable(map) => map.into_arrow(),
+        };
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
@@ -931,7 +919,7 @@ impl TokenSet {
     fn into_fst_batch(mut self) -> Result<RecordBatch> {
         let fst_map = match std::mem::take(&mut self.tokens) {
             TokenMap::Fst(map) => map,
-            TokenMap::HashMap(map) => Self::build_fst_from_map(map)?,
+            TokenMap::Appendable(map) => map.into(),
         };
         let bytes = fst_map.into_fst().into_inner();
 
@@ -962,21 +950,6 @@ impl TokenSet {
             ],
         )?;
         Ok(batch)
-    }
-
-    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Vec<u8>>> {
-        let mut entries: Vec<_> = map.into_iter().collect();
-        entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-        let mut builder = fst::MapBuilder::memory();
-        for (token, token_id) in entries {
-            builder
-                .insert(&token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
-                    location: location!(),
-                })?;
-        }
-        Ok(builder.into_map())
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
@@ -1071,26 +1044,26 @@ impl TokenSet {
         })
     }
 
-    pub fn add(&mut self, token: String) -> u32 {
-        let next_id = self.next_id();
-        let len = token.len();
-        let token_id = match self.tokens {
-            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
+    pub fn add(&mut self, token: &str) -> u32 {
+        let map = match self.tokens {
+            TokenMap::Appendable(ref mut map) => map,
             _ => unreachable!("tokens must be HashMap while indexing"),
         };
 
-        // add token if it doesn't exist
-        if token_id == next_id {
-            self.next_id += 1;
-            self.total_length += len;
+        if let Some(token_id) = map.get(token) {
+            token_id
+        } else {
+            // Safety: we just verified the key doesn't exist, and have exclusive access to the map
+            let token_id = unsafe { map.insert_unchecked(token) };
+            self.next_id = token_id + 1;
+            self.total_length += token.len();
+            token_id
         }
-
-        token_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
         match self.tokens {
-            TokenMap::HashMap(ref map) => map.get(token).copied(),
+            TokenMap::Appendable(ref map) => map.get(token),
             TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
         }
     }
@@ -1101,30 +1074,27 @@ impl TokenSet {
             return;
         }
 
-        let mut map = match std::mem::take(&mut self.tokens) {
-            TokenMap::HashMap(map) => map,
-            TokenMap::Fst(map) => {
-                let mut new_map = HashMap::with_capacity(map.len());
-                let mut stream = map.into_stream();
-                while let Some((token, token_id)) = stream.next() {
-                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+        let expected_len = self.len() - removed_token_ids.len();
+
+        let mut new_map = AppendableTokenSet::with_capacity(expected_len);
+        self.iter()
+            .filter(
+                |(_, token_id)| match removed_token_ids.binary_search(token_id) {
+                    Ok(_) => false,
+                    Err(_) => true,
+                },
+            )
+            .for_each(|(token, _old_token_id)| {
+                // Safety: we are only removing tokens, so there should be no duplicates
+                // and we have exclusive access to the map.
+                // insert_unchecked will assign sequential token IDs starting from 0
+                unsafe {
+                    new_map.insert_unchecked(&token);
                 }
+            });
 
-                new_map
-            }
-        };
-
-        map.retain(
-            |_, token_id| match removed_token_ids.binary_search(token_id) {
-                Ok(_) => false,
-                Err(index) => {
-                    *token_id -= index as u32;
-                    true
-                }
-            },
-        );
-
-        self.tokens = TokenMap::HashMap(map);
+        self.next_id = new_map.len() as u32;
+        self.tokens = TokenMap::Appendable(new_map);
     }
 
     pub fn next_id(&self) -> u32 {
@@ -2533,8 +2503,8 @@ mod tests {
         // 0: lance
         // 1: lake lake
         // 2: lake lake lake
-        builder.tokens.add("lance".to_owned());
-        builder.tokens.add("lake".to_owned());
+        builder.tokens.add("lance");
+        builder.tokens.add("lake");
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -2592,7 +2562,7 @@ mod tests {
 
         // Create first partition with one token and posting list length 1
         let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
-        builder1.tokens.add("test".to_owned());
+        builder1.tokens.add("test");
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
         builder1.docs.append(100, 1); // row_id=100, num_tokens=1
@@ -2600,7 +2570,7 @@ mod tests {
 
         // Create second partition with one token and posting list length 4
         let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
-        builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+        builder2.tokens.add("test"); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
         builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
         builder2.posting_lists[0].add(1, PositionRecorder::Count(1));

@@ -4711,6 +4711,7 @@ dependencies = [
  "fst",
  "futures",
  "half",
+ "hashbrown 0.15.5",
  "itertools 0.13.0",
  "jieba-rs",
  "jsonb",
