@@ -99,6 +99,10 @@ dataset = lance.dataset("/tmp/test.lance")
 assert isinstance(dataset, pa.dataset.Dataset)
 ```
 
+**Tags and branches**
+
+Use branches to manage parallel dataset evolution. You can write to branches, create global tags on versions of branches, and check out the branch you want by a tag or a version tuple.
+
 **Pandas**
 ```python
 df = dataset.to_table().to_pandas()
