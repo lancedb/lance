@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -50,7 +51,11 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
+use lance_core::{
+    ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+};
+#[cfg(feature = "substrait")]
+use lance_datafusion::exec::get_session_context;
 use lance_datafusion::exec::{
     analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
 };
@@ -78,7 +83,7 @@ use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{AdaptiveColumnConfig, FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -127,6 +132,13 @@ pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
         .map(|val| val.parse().unwrap())
         .unwrap_or(2 * 1024 * 1024 * 1024)
 });
+
+/// Selectivity threshold for late materialization in filtered KNN searches.
+/// If the filter selects fewer than this percentage of the table's rows, we use late
+/// materialization to avoid fetching vector data for rows that will be filtered out.
+/// If the filter selects this percentage or more rows, we do a single scan with vectors
+/// to avoid the random access overhead of the take operation.
+pub const LATE_MATERIALIZE_SELECTIVITY_THRESHOLD: f64 = 0.005; // 0.5%
 
 /// Defines an ordering for a single column
 ///
@@ -227,6 +239,21 @@ struct PlannedFilteredScan {
     filter_pushed_down: bool,
 }
 
+/// Empty index info provider for cases where scalar indices are not used
+struct EmptyIndexInfo;
+
+impl lance_index::scalar::expression::IndexInformationProvider for EmptyIndexInfo {
+    fn get_index(
+        &self,
+        _col: &str,
+    ) -> Option<(
+        &arrow_schema::DataType,
+        &dyn lance_index::scalar::expression::ScalarQueryParser,
+    )> {
+        None
+    }
+}
+
 /// Filter for filtering rows
 #[derive(Debug, Clone)]
 pub enum LanceFilter {
@@ -275,8 +302,6 @@ impl LanceFilter {
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
-
                 let ctx = get_session_context(&LanceExecutionOptions::default());
                 let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
@@ -407,6 +432,9 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    /// Selectivity threshold for late materialization in filtered KNN searches.
+    late_materialize_selectivity_threshold: Option<f64>,
 
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
@@ -625,6 +653,7 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            late_materialize_selectivity_threshold: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -874,6 +903,59 @@ impl Scanner {
     pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
         self.io_buffer_size = Some(size);
         self
+    }
+
+    /// Set the selectivity threshold for late materialization in filtered KNN searches.
+    ///
+    /// When a filter is present in a KNN search, we execute it first to measure selectivity.
+    /// If the filter selects fewer than this percentage of rows, we use late materialization
+    /// (scan scalars first, then take vectors for filtered rows only). If the filter selects
+    /// this percentage or more rows, we do a single scan with both filter and vector columns to avoid the
+    /// random access overhead of the take operation.
+    ///
+    /// The optimal value depends on your storage medium:
+    /// - **Object storage (S3, GCS, Azure)**: Use a low threshold like 0.005 (0.5%) since
+    ///   random access is very expensive
+    /// - **Local SSD**: Can use a higher threshold like 0.05 (5%) since random access is cheaper
+    /// - **NVMe**: Can use even higher thresholds like 0.1 (10%)
+    ///
+    /// The default is 0.005 (0.5%), which is conservative for object storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` - The selectivity threshold as a fraction (e.g., 0.005 for 0.5%)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // For local SSD, use a higher threshold
+    /// scanner.late_materialize_selectivity_threshold(0.05)?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the threshold is not finite or is outside the range [0.0, 1.0].
+    pub fn late_materialize_selectivity_threshold(&mut self, threshold: f64) -> Result<&mut Self> {
+        if !threshold.is_finite() {
+            return Err(Error::invalid_input(
+                format!(
+                    "late_materialize_selectivity_threshold must be a finite value, got {}",
+                    threshold
+                ),
+                location!(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&threshold) {
+            return Err(Error::invalid_input(
+                format!(
+                    "late_materialize_selectivity_threshold must be between 0.0 and 1.0 (inclusive), got {}",
+                    threshold
+                ),
+                location!(),
+            ));
+        }
+        self.late_materialize_selectivity_threshold = Some(threshold);
+        Ok(self)
     }
 
     /// Set the prefetch size.
@@ -1941,8 +2023,6 @@ impl Scanner {
 
     // Check if a filter plan references version columns
     fn filter_references_version_columns(&self, filter_plan: &FilterPlan) -> bool {
-        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-
         if let Some(refine_expr) = &filter_plan.refine_expr {
             let column_names = Planner::column_names_in_expr(refine_expr);
             for col_name in column_names {
@@ -2852,94 +2932,161 @@ impl Scanner {
             ));
         };
 
-        // Sanity check
         let (vector_type, _) = get_vector_type(self.dataset.schema(), &q.column)?;
-
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
+
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
             Arc::new(vec![])
         };
-        if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
-            log::trace!("index found for vector search");
-            // There is an index built for the column.
-            // We will use the index.
-            if matches!(q.refine_factor, Some(0)) {
-                return Err(Error::invalid_input(
-                    "Refine factor cannot be zero".to_string(),
-                    location!(),
-                ));
+
+        match indices.iter().find(|i| i.fields.contains(&column_id)) {
+            Some(index) => {
+                log::trace!("index found for vector search");
+                self.vector_search_with_vector_index(q, index, vector_type, filter_plan)
+                    .await
             }
-
-            // Find all deltas with the same index name.
-            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
-                _ => unreachable!(),
-            };
-
-            let mut knn_node = if q.refine_factor.is_some() {
-                let vector_projection = self
-                    .dataset
-                    .empty_projection()
-                    .union_column(&q.column, OnMissing::Error)
-                    .unwrap();
-                let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                // TODO: now we just open an index to get its metric type.
-                let idx = self
-                    .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                let mut q = q.clone();
-                q.metric_type = idx.metric_type();
-                self.flat_knn(knn_node_with_vector, &q)?
-            } else {
-                ann_node
-            }; // vector, _distance, _rowid
-
-            if !self.fast_search {
-                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
-            }
-
-            Ok(knn_node)
-        } else {
-            // No index found. use flat search.
-            let mut columns = vec![q.column.clone()];
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-                columns.extend(Planner::column_names_in_expr(refine_expr));
-            }
-            let mut vector_scan_projection = self
-                .dataset
-                .empty_projection()
-                .with_row_id()
-                .union_columns(&columns, OnMissing::Error)?;
-
-            vector_scan_projection.with_row_addr =
-                self.projection_plan.physical_projection.with_row_addr;
-
-            let PlannedFilteredScan { mut plan, .. } = self
-                .filtered_read(
-                    filter_plan,
-                    vector_scan_projection,
-                    /*include_deleted_rows=*/ true,
-                    None,
-                    None,
-                    /*is_prefilter= */ true,
-                )
-                .await?;
-
-            if let Some(refine_expr) = &filter_plan.refine_expr {
-                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
-            }
-            Ok(self.flat_knn(plan, q)?)
+            None => self.vector_search_flat(q, filter_plan).await,
         }
+    }
+
+    /// Index-based vector search (ANN)
+    ///
+    /// Uses a vector index to perform approximate nearest neighbor search.
+    async fn vector_search_with_vector_index(
+        &self,
+        q: &Query,
+        index: &IndexMetadata,
+        vector_type: DataType,
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if matches!(q.refine_factor, Some(0)) {
+            return Err(Error::invalid_input(
+                "Refine factor cannot be zero".to_string(),
+                location!(),
+            ));
+        }
+
+        // Find all deltas with the same index name
+        let deltas = self.dataset.load_indices_by_name(&index.name).await?;
+        let ann_plan = match vector_type {
+            DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
+            DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
+            _ => unreachable!(),
+        };
+
+        let mut plan = if q.refine_factor.is_some() {
+            self.apply_vector_refinement(ann_plan, q, index).await?
+        } else {
+            ann_plan
+        };
+
+        if !self.fast_search {
+            plan = self.knn_combined(q, index, plan, filter_plan).await?;
+        }
+
+        Ok(plan)
+    }
+
+    /// Flat (non-indexed) vector search
+    ///
+    /// Performs brute-force KNN search by scanning all data and computing distances.
+    async fn vector_search_flat(
+        &self,
+        q: &Query,
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let has_filter = filter_plan.full_expr.is_some() || filter_plan.refine_expr.is_some();
+        let has_scalar_index = filter_plan.index_query.is_some();
+
+        let plan = if has_filter && !has_scalar_index {
+            // Use adaptive late materialization for filters without scalar indices
+            self.adaptive_column_scan(filter_plan, None, &q.column, false)
+                .await?
+        } else {
+            // Direct scan when no filter or when scalar index is present
+            self.build_direct_vector_scan(q, filter_plan, None, /*include_deleted_rows=*/ true)
+                .await?
+        };
+
+        self.flat_knn(plan, q)
+    }
+
+    /// Build a direct scan plan for vector search
+    ///
+    /// Performs a direct filtered read when no filter is present or when scalar indices are used.
+    /// Scalar indices use MaterializeIndex which already optimizes I/O.
+    async fn build_direct_vector_scan(
+        &self,
+        q: &Query,
+        filter_plan: &FilterPlan,
+        fragments: Option<Arc<Vec<Fragment>>>,
+        include_deleted_rows: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_column(&q.column, OnMissing::Error)?;
+
+        // Include columns referenced by refine expression
+        if let Some(ref refine_expr) = filter_plan.refine_expr {
+            let refine_cols = Planner::column_names_in_expr(refine_expr);
+            scan_projection = scan_projection.union_columns(refine_cols, OnMissing::Error)?;
+        }
+
+        scan_projection.with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+
+        let PlannedFilteredScan { plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                scan_projection,
+                include_deleted_rows,
+                fragments,
+                None,
+                /*is_prefilter=*/ true,
+            )
+            .await?;
+
+        // Apply refine filter if present
+        if let Some(ref refine_expr) = filter_plan.refine_expr {
+            Ok(Arc::new(LanceFilterExec::try_new(
+                refine_expr.clone(),
+                plan,
+            )?))
+        } else {
+            Ok(plan)
+        }
+    }
+
+    /// Apply refinement to ANN results by fetching vectors and recomputing distances
+    async fn apply_vector_refinement(
+        &self,
+        ann_node: Arc<dyn ExecutionPlan>,
+        q: &Query,
+        index: &IndexMetadata,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let vector_projection = self
+            .dataset
+            .empty_projection()
+            .union_column(&q.column, OnMissing::Error)?;
+        let knn_node_with_vector = self.take(ann_node, vector_projection)?;
+
+        // Open index to get its metric type
+        let idx = self
+            .dataset
+            .open_vector_index(
+                q.column.as_str(),
+                &index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await?;
+
+        let mut q = q.clone();
+        q.metric_type = idx.metric_type();
+        self.flat_knn(knn_node_with_vector, &q)
     }
 
     /// Combine ANN results with KNN results for data appended after index creation
@@ -2977,36 +3124,41 @@ impl Scanner {
                 knn_node = self.take(knn_node, vector_projection)?;
             }
 
-            let mut columns = vec![q.column.clone()];
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(expr);
-                columns.extend(filter_columns);
-            }
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
-            // most common case is that fragments that are newer than the vector index are going to be newer
-            // than the scalar indices anyways
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
-                vector_scan_projection,
-                Arc::new(unindexed_fragments),
-                // Can't pushdown limit/offset in an ANN search
-                None,
-                // We are re-ordering anyways, so no need to get data in data
-                // in a deterministic order.
-                false,
-            );
+            // Create a filter plan without scalar indices since they don't cover this fragment subset.
+            let unindexed_filter_plan = if let Some(expr) = filter_plan.full_expr.clone() {
+                let filter_schema = self.filterable_schema()?;
+                let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
-                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-            }
-            // first we do flat search on just the new data
-            let topk_appended = self.flat_knn(scan_node, &q)?;
+                planner.create_filter_plan(expr, &EmptyIndexInfo, false)?
+            } else {
+                FilterPlan::empty()
+            };
+
+            let has_filter = unindexed_filter_plan.full_expr.is_some()
+                || unindexed_filter_plan.refine_expr.is_some();
+            let has_scalar_index = unindexed_filter_plan.index_query.is_some();
+
+            let plan = if has_filter && !has_scalar_index {
+                // Adaptive late materialization when there's a filter without scalar index
+                self.adaptive_column_scan(
+                    &unindexed_filter_plan,
+                    Some(Arc::new(unindexed_fragments.clone())),
+                    &q.column,
+                    unindexed_filter_plan.skip_recheck,
+                )
+                .await?
+            } else {
+                // Direct scan when no filter or scalar index is present
+                self.build_direct_vector_scan(
+                    &q,
+                    &unindexed_filter_plan,
+                    Some(Arc::new(unindexed_fragments.clone())),
+                    /*include_deleted_rows=*/ false,
+                )
+                .await?
+            };
+
+            let topk_appended = self.flat_knn(plan, &q)?;
 
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
@@ -3638,6 +3790,158 @@ impl Scanner {
         }
     }
 
+    /// Helper: performs a full scan with filter and vector columns together
+    async fn full_scan_with_filter(
+        &self,
+        filter_plan: &FilterPlan,
+        frags: Option<Arc<Vec<Fragment>>>,
+        expensive_col: &str,
+        filter_cols: Vec<String>,
+        skip_recheck: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Deduplicate columns to avoid issues if vector_column is in filter_columns
+        let mut cols: BTreeSet<String> = filter_cols.into_iter().collect();
+        cols.insert(expensive_col.to_string());
+        let cols: Vec<String> = cols.into_iter().collect();
+
+        let mut projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&cols, OnMissing::Error)?;
+
+        projection.with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+
+        let PlannedFilteredScan { plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                projection,
+                /*include_deleted_rows=*/ false,
+                frags,
+                None,
+                /*is_prefilter= */ true,
+            )
+            .await?;
+
+        if !skip_recheck {
+            if let Some(refine_expr) = &filter_plan.refine_expr {
+                return Ok(Arc::new(LanceFilterExec::try_new(
+                    refine_expr.clone(),
+                    plan,
+                )?));
+            }
+        }
+
+        Ok(plan)
+    }
+
+    /// Get the total row count from the given fragments, or fall back to scanner/dataset fragments.
+    fn get_total_row_count(&self, fragments: Option<&Arc<Vec<Fragment>>>) -> usize {
+        if let Some(frags) = fragments {
+            frags.iter().filter_map(|f| f.num_rows()).sum()
+        } else {
+            let frags = if let Some(scanner_frags) = self.fragments.as_ref() {
+                scanner_frags
+            } else {
+                self.dataset.fragments().as_ref()
+            };
+            frags.iter().filter_map(|f| f.num_rows()).sum()
+        }
+    }
+
+    /// Adaptive late materialization for filtered vector scans.
+    ///
+    /// When a filter is present, this method:
+    /// 1. Scans with scalar columns first to check selectivity
+    /// 2. If selective (< threshold): uses late materialization (collect row IDs, then take vectors)
+    /// 3. If not selective (>= threshold): does a full scan with both filter and vector columns
+    ///
+    /// This avoids expensive random access for non-selective filters while benefiting
+    /// from late materialization for selective ones.
+    async fn adaptive_column_scan(
+        &self,
+        filter_plan: &FilterPlan,
+        frags: Option<Arc<Vec<Fragment>>>,
+        take_column: &str,
+        skip_recheck: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // FilteredRead doesn't support v1/legacy files, so fall back for legacy datasets
+        if self.dataset.is_legacy_storage() {
+            let mut filter_cols: BTreeSet<String> = BTreeSet::new();
+            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+                filter_cols.extend(Planner::column_names_in_expr(refine_expr));
+            }
+            if let Some(full_expr) = filter_plan.full_expr.as_ref() {
+                filter_cols.extend(Planner::column_names_in_expr(full_expr));
+            }
+            let mut filter_cols: Vec<String> = filter_cols.into_iter().collect();
+            filter_cols.sort();
+            return self
+                .full_scan_with_filter(filter_plan, frags, take_column, filter_cols, skip_recheck)
+                .await;
+        }
+
+        // Build full projection (filter columns + vector column)
+        let mut filter_cols: BTreeSet<String> = BTreeSet::new();
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            filter_cols.extend(Planner::column_names_in_expr(refine_expr));
+        }
+        if let Some(full_expr) = filter_plan.full_expr.as_ref() {
+            filter_cols.extend(Planner::column_names_in_expr(full_expr));
+        }
+        let mut filter_cols: Vec<String> = filter_cols.into_iter().collect();
+        filter_cols.sort();
+        let mut full_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&filter_cols, OnMissing::Error)?
+            .union_column(take_column, OnMissing::Error)?;
+        full_projection.with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+
+        // Use new_filtered_read but add adaptive config
+        let threshold = self
+            .late_materialize_selectivity_threshold
+            .unwrap_or(LATE_MATERIALIZE_SELECTIVITY_THRESHOLD);
+
+        let total_count = self.get_total_row_count(frags.as_ref());
+
+        let mut plan = self
+            .new_filtered_read(
+                filter_plan,
+                full_projection,
+                /*make_deletions_null=*/ false,
+                frags.clone(),
+                /*scan_range=*/ None,
+            )
+            .await?;
+
+        // Unwrap FilteredReadExec to add adaptive config
+        if let Some(filtered_exec) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+            let mut opts = filtered_exec.options().clone();
+            opts.adaptive_expensive_column = Some(AdaptiveColumnConfig {
+                expensive_column: take_column.to_string(),
+                threshold,
+                total_row_count: total_count,
+            });
+
+            plan = Arc::new(FilteredReadExec::try_new(
+                filtered_exec.dataset().clone(),
+                opts,
+                filtered_exec.index_input().cloned(),
+            )?);
+        }
+
+        // Apply refine filter if needed
+        if !skip_recheck {
+            if let Some(refine_expr) = &filter_plan.refine_expr {
+                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            }
+        }
+
+        Ok(plan)
+    }
+
     /// Global offset-limit of the result of the input plan
     fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalLimitExec::new(
@@ -3897,7 +4201,6 @@ pub mod test_dataset {
 #[cfg(test)]
 mod test {
 
-    use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
     use std::vec;
 
@@ -4071,6 +4374,166 @@ mod test {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_late_materialize_selectivity_threshold() {
+        use super::test_dataset::TestVectorDataset;
+
+        // Create a test dataset with vectors and a filter column (NO INDICES)
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        let dataset = &test_ds.dataset;
+
+        // Use a very selective filter "i < 2" which matches only 2/400 rows (0.5% selectivity)
+        let q = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+
+        // Test 1: With default threshold (0.005 = 0.5%)
+        // Adaptive late materialization is enabled internally in FilteredReadExec
+        let plan_str_default = dataset
+            .scan()
+            .nearest("vec", &q, 5)
+            .unwrap()
+            .filter("i < 2")
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Test 2: With very high threshold (0.99 = 99%)
+        let plan_str_high = dataset
+            .scan()
+            .late_materialize_selectivity_threshold(0.99)
+            .unwrap()
+            .nearest("vec", &q, 5)
+            .unwrap()
+            .filter("i < 2")
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Test 3: With zero threshold (0.0)
+        let plan_str_zero = dataset
+            .scan()
+            .late_materialize_selectivity_threshold(0.0)
+            .unwrap()
+            .nearest("vec", &q, 5)
+            .unwrap()
+            .filter("i < 2")
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // All three should successfully build plans with LanceRead
+        // The adaptive behavior is internal to FilteredReadExec, not visible in the plan
+        assert!(
+            plan_str_default.contains("LanceRead"),
+            "Default threshold should build plan with LanceRead, but plan was:\n{}",
+            plan_str_default
+        );
+
+        assert!(
+            plan_str_high.contains("LanceRead"),
+            "High threshold should build plan with LanceRead, but plan was:\n{}",
+            plan_str_high
+        );
+
+        assert!(
+            plan_str_zero.contains("LanceRead"),
+            "Zero threshold should build plan with LanceRead, but plan was:\n{}",
+            plan_str_zero
+        );
+    }
+
+    /// Verifies that filters referencing the vector column skip late materialization
+    #[tokio::test]
+    async fn test_late_mat_skipped_when_filter_uses_vector() {
+        use super::test_dataset::TestVectorDataset;
+
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        let dataset = &test_ds.dataset;
+        let q = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+
+        // Filter references vector column - should skip late materialization
+        let plan_vector_filter = dataset
+            .scan()
+            .late_materialize_selectivity_threshold(0.99)
+            .unwrap() // High threshold
+            .nearest("vec", &q, 10)
+            .unwrap()
+            .filter("vec[0] > 0.0") // Filter uses vector column
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Should NOT use late materialization even with high threshold
+        assert!(
+            !plan_vector_filter.contains("AdaptiveColumnScan"),
+            "Should skip late materialization when filter references vector column"
+        );
+    }
+
+    /// Verifies threshold configuration: both plans use AdaptiveColumnScanExec with different thresholds
+    #[tokio::test]
+    async fn test_late_mat_threshold_short_circuit() {
+        use super::test_dataset::TestVectorDataset;
+
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+
+        let dataset = &test_ds.dataset;
+        let q = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+
+        // 1% threshold with 50% selectivity → FilteredReadExec will choose full scan at runtime
+        let plan_low_threshold = dataset
+            .scan()
+            .late_materialize_selectivity_threshold(0.01)
+            .unwrap()
+            .nearest("vec", &q, 10)
+            .unwrap()
+            .filter("i < 200")
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // 99% threshold with 50% selectivity → FilteredReadExec will choose late materialization at runtime
+        let plan_high_threshold = dataset
+            .scan()
+            .late_materialize_selectivity_threshold(0.99)
+            .unwrap()
+            .nearest("vec", &q, 10)
+            .unwrap()
+            .filter("i < 200")
+            .unwrap()
+            .prefilter(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Both should successfully build plans with LanceRead
+        assert!(plan_low_threshold.contains("LanceRead"));
+        assert!(plan_high_threshold.contains("LanceRead"));
+
+        // The plans should show adaptive configuration
+        assert!(plan_low_threshold.contains("adaptive_column=vec"));
+        assert!(plan_high_threshold.contains("adaptive_column=vec"));
+        assert!(plan_low_threshold.contains("threshold=0.01"));
+        assert!(plan_high_threshold.contains("threshold=0.99"));
     }
 
     #[cfg(not(windows))]
@@ -6898,13 +7361,13 @@ mod test {
         )
         .await?;
 
-        // use_index = False -> same plan as KNN
+        // use_index = False -> same plan as KNN without late materialization (no filter)
         log::info!("Test case: ANN with index disabled");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
+      FilterExec: _distance@2 IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
           KNNVectorDistance: metric=l2
             LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
@@ -6912,7 +7375,7 @@ mod test {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
+      FilterExec: _distance@2 IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
           KNNVectorDistance: metric=l2
             LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
@@ -6983,24 +7446,45 @@ mod test {
 
         dataset.append_new_data().await?;
         log::info!("Test case: Combined KNN/ANN");
-        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=6), expr=...
+        SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
                 ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=6), expr=...
+                    SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
                       KNNVectorDistance: metric=l2
                         LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=6), expr=...
+                    SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        } else {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
+                      KNNVectorDistance: metric=l2
+                        LanceRead: uri=..., projection=[vec], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+                Take: columns=\"_distance, _rowid, (vec)\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=6), expr=..., preserve_partitioning=...
+                      ANNSubIndex: name=..., k=6, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        };
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 6),
@@ -7010,9 +7494,10 @@ mod test {
         )
         .await?;
 
-        // new data and with filter
+        // new data and with filter (postfilter - no late materialization)
         log::info!("Test case: Combined KNN/ANN with postfilter");
-        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@3 > 10
@@ -7032,7 +7517,30 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1";
+                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        } else {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, i, (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: i@3 > 10
+        Take: columns=\"_rowid, vec, _distance, (i)\"
+          CoalesceBatchesExec: target_batch_size=8192
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=15), expr=...
+                KNNVectorDistance: metric=l2
+                  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                    UnionExec
+                      ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                        FilterExec: _distance@... IS NOT NULL
+                          SortExec: TopK(fetch=15), expr=...
+                            KNNVectorDistance: metric=l2
+                              LanceRead: uri=..., projection=[vec], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+                      Take: columns=\"_distance, _rowid, (vec)\"
+                        CoalesceBatchesExec: target_batch_size=8192
+                          SortExec: TopK(fetch=15), expr=...
+                            ANNSubIndex: name=..., k=15, deltas=1
+                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+        };
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
@@ -7040,7 +7548,7 @@ mod test {
         )
         .await?;
 
-        // new data and with prefilter
+        // new data and with prefilter (filter has 97% selectivity, so no late materialization)
         log::info!("Test case: Combined KNN/ANN with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
@@ -7051,12 +7559,12 @@ mod test {
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=5), expr=...
                       KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                        FilterExec: i@0 > 10
+                          LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
@@ -7073,18 +7581,18 @@ mod test {
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=5), expr=...
                       KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                        LanceRead: uri=..., projection=[i, vec], num_fragments=..., range_before=None, range_after=None, \
+                          row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10), adaptive_column=vec, threshold=...
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
+                        LanceRead: uri=..., projection=[], num_fragments=..., range_before=None, range_after=None, \
                           row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
         };
         assert_plan_equals(
@@ -7163,8 +7671,9 @@ mod test {
 
         dataset.append_new_data().await?;
 
-        log::info!("Test case: Combined KNN/ANN with scalar index");
-        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        log::info!("Test case: Combined KNN/ANN with scalar index (filter has 97% selectivity, so no late materialization)");
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -7172,18 +7681,40 @@ mod test {
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=8), expr=...
                       KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                        FilterExec: i@0 > 10
+                          LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx";
+                        ScalarIndexQuery: query=[i > 10]@i_idx"
+        } else {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=8), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=8), expr=...
+                      KNNVectorDistance: metric=l2
+                        LanceRead: uri=..., projection=[i, vec], num_fragments=..., range_before=None, range_after=None, \
+                          row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10), adaptive_column=vec, threshold=...
+                Take: columns=\"_distance, _rowid, (vec)\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=8), expr=...
+                      ANNSubIndex: name=..., k=8, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                        ScalarIndexQuery: query=[i > 10]@i_idx"
+        };
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7198,9 +7729,10 @@ mod test {
 
         // Update scalar index but not vector index
         log::info!(
-            "Test case: Combined KNN/ANN with updated scalar index and outdated vector index"
+            "Test case: Combined KNN/ANN with updated scalar index and outdated vector index (filter has 97% selectivity, so no late materialization)"
         );
-        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -7208,18 +7740,40 @@ mod test {
           KNNVectorDistance: metric=l2
             RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
               UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
                   FilterExec: _distance@... IS NOT NULL
                     SortExec: TopK(fetch=11), expr=...
                       KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                        FilterExec: i@0 > 10
+                          LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
                 Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx";
+                        ScalarIndexQuery: query=[i > 10]@i_idx"
+        } else {
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=11), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=11), expr=...
+                      KNNVectorDistance: metric=l2
+                        LanceRead: uri=..., projection=[i, vec], num_fragments=..., range_before=None, range_after=None, \
+                          row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10), adaptive_column=vec, threshold=...
+                Take: columns=\"_distance, _rowid, (vec)\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=11), expr=...
+                      ANNSubIndex: name=..., k=11, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                        ScalarIndexQuery: query=[i > 10]@i_idx"
+        };
         dataset.make_scalar_index().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -7596,7 +8150,8 @@ mod test {
               FilterExec: _distance@2 IS NOT NULL
                 SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
-                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+                    LanceRead: uri=..., projection=[vec], num_fragments=..., range_before=None, range_after=None, \
+                      row_id=true, row_addr=false, full_filter=--, refine_filter=--
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
@@ -8416,6 +8971,93 @@ mod test {
                 1,
                 "All rows created at version 1"
             );
+        }
+    }
+
+    /// Test vector search with filter on nested struct field to ensure column name handling is robust
+    #[tokio::test]
+    async fn test_vector_search_with_nested_struct_filter() {
+        use lance_arrow::FixedSizeListArrayExt;
+
+        // Create minimal dataset with nested struct + vector
+        let category = StringArray::from(vec!["urgent", "normal", "urgent", "low"]);
+        let priority = Int32Array::from(vec![10, 50, 20, 80]);
+        let metadata = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("category", DataType::Utf8, false)),
+                Arc::new(category) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("priority", DataType::Int32, false)),
+                Arc::new(priority) as ArrayRef,
+            ),
+        ]);
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..32).map(|v| v as f32)),
+            8,
+        )
+        .unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("metadata", metadata.data_type().clone(), false),
+            ArrowField::new("vector", vectors.data_type().clone(), false),
+        ]));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(metadata), Arc::new(vectors)])
+                .unwrap();
+
+        let tmp_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let dataset = Dataset::write(reader, &tmp_dir, None).await.unwrap();
+
+        let query_vec = Float32Array::from_iter_values((0..8).map(|v| v as f32));
+
+        // Test 1: Filter on nested string field
+        let results = dataset
+            .scan()
+            .nearest("vector", &query_vec, 10)
+            .unwrap()
+            .filter("metadata.category = 'urgent'")
+            .unwrap()
+            .prefilter(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Should return 2 rows (indices 0 and 2 have category='urgent')
+        assert_eq!(results.num_rows(), 2);
+        let metadata_col = results.column_by_name("metadata").unwrap().as_struct();
+        let category_col = metadata_col
+            .column_by_name("category")
+            .unwrap()
+            .as_string::<i32>();
+        for i in 0..results.num_rows() {
+            assert_eq!(category_col.value(i), "urgent");
+        }
+
+        // Test 2: Filter on nested int field
+        let results2 = dataset
+            .scan()
+            .nearest("vector", &query_vec, 10)
+            .unwrap()
+            .filter("metadata.priority >= 50")
+            .unwrap()
+            .prefilter(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Should return 2 rows (indices 1 and 3 have priority >= 50)
+        assert_eq!(results2.num_rows(), 2);
+        let metadata_col2 = results2.column_by_name("metadata").unwrap().as_struct();
+        let priority_col = metadata_col2
+            .column_by_name("priority")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        for i in 0..results2.num_rows() {
+            assert!(priority_col.value(i) >= 50);
         }
     }
 
