@@ -152,7 +152,7 @@
           allowing you to build a complete open lakehouse on top of object storage to power your AI workflows.
           Lance brings high-performance vector search, full-text search, random access, and feature
           engineering capabilities to the lakehouse, while you can still get all the existing lakehouse benefits
-          like SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, Trino, DuckDB, etc.)
+          like SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, PyTorch, Trino, DuckDB, etc.)
           and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore, etc.)
         </p>
         <a href="quickstart" class="md-button md-button--primary">Learn More</a>
@@ -169,7 +169,7 @@
           <p>
             Lance enables powerful hybrid search combining vector similarity, full-text search,
             and SQL analytics on the same dataset. All query types are accelerated by corresponding
-            secondary indices as part of the Lance specification.
+            secondary indexes as part of the Lance specification.
           </p>
           <p>
             Run semantic search on embeddings, BM25 search on keywords, and apply complex SQL predicates -
@@ -191,13 +191,14 @@
         <div class="lance-feature-text">
           <h2>Lightning-fast Random Access</h2>
           <p>
-            Lance delivers 100x faster random access compared to Parquet or Iceberg. With efficient
-            row-addressing, you can access individual records across multiple files instantly,
-            making it perfect for real-time ML serving, random sampling, and interactive applications.
+            Lance delivers 100x faster random access compared to Parquet or Iceberg.
+            Unlike traditional formats, Lance maintains high performance even when
+            randomly accessing scattered rows across your entire dataset.
           </p>
           <p>
-            Unlike traditional columnar formats, Lance maintains high performance even when
-            randomly accessing scattered rows across your entire dataset.
+            With a highly optimized file format plus efficient row-addressing and secondary indexes at table level,
+            you can access individual records across multiple files instantly,
+            making it perfect for real-time ML serving, random sampling, and interactive applications.
           </p>
           <a href="guide/read_and_write#random-access" class="md-button">Learn More</a>
         </div>
@@ -215,13 +216,13 @@
         <div class="lance-feature-text">
           <h2>Native Multimodal Data Support</h2>
           <p>
-            Store images, videos, audio, text, and embeddings in a single unified format.
+            Store images, videos, audio, text, and embeddings alongside your traditional tabular data in a single unified format.
             Lance's blob encoding efficiently handles large binary objects with lazy loading,
             while optimized vector storage accelerates similarity search.
           </p>
           <p>
-            Perfect for AI/ML workloads where you need to store raw data alongside embeddings
-            for multimodal retrieval and generation workflows.
+            Perfect for AI/ML workloads where you need to store raw data, ML features, generated captions and embeddings
+            all together for multimodal retrieval and genAI workflows.
           </p>
           <a href="guide/blob" class="md-button">Learn More</a>
         </div>
@@ -241,7 +242,7 @@
           <p>
             Schema evolution in most open table formats are metadata only and fast.
             But when trying to backfill column values in existing rows, a full table rewrite is typically required.
-            Lance supports efficient schema evolution with backfill, making it perfect for ML
+            Lance supports data evolution (efficient schema evolution with backfill), making it perfect for ML
             feature engineering, embedding and media content management.
           </p>
           <p>
@@ -265,11 +266,13 @@
           <h2>Rich Ecosystem Integrations</h2>
           <p>
             As an open format, Lance integrates seamlessly with the Python data ecosystem and modern data platforms.
-            Work with your favorite tools including Pandas, Polars, and PyTorch for data processing and machine learning.
+            Work with your favorite tools including Pandas, Polars, Ray and PyTorch for data processing and machine learning.
+          </p>
+          <p>
             Connect with leading query engines like Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink/Fluss
             to run SQL analytics and distributed processing on your Lance datasets.
           </p>
-          <a href="integrations/" class="md-button">View Integrations</a>
+          <a href="integrations/datafusion" class="md-button">View Integrations</a>
         </div>
         <div class="lance-feature-demo">
           <img src="assets/images/ecosystem-integrations.png" alt="Lance Ecosystem Integrations" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
