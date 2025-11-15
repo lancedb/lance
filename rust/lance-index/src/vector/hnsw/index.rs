@@ -331,6 +331,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         self.partition_storage.quantizer().clone()
     }
 
+    fn partition_size(&self, _: usize) -> usize {
+        unimplemented!("only for IVF")
+    }
+
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         (
             SubIndexType::Hnsw,

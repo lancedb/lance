@@ -257,6 +257,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
+    fn partition_size(&self, part_id: usize) -> usize;
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);

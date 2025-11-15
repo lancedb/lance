@@ -711,7 +711,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // if no partitions to split, we just create a new delta index,
         // otherwise, we need to merge all existing indices and split large partitions.
         let reader = reader.clone();
-        let (assign_batches, merge_indices) =
+        let (assign_batches, merge_indices, replaced_partition) =
             match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
                 Some(partition) => {
                     // Perform split and record the fact for downstream build/merge
@@ -731,6 +731,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     (
                         split_results.assign_batches,
                         Arc::new(self.existing_indices.clone()),
+                        Some(partition),
                     )
                 }
                 None => {
@@ -752,7 +753,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         [self.existing_indices.len().saturating_sub(num_to_merge)..]
                         .to_vec();
 
-                    (vec![None; ivf.num_partitions()], Arc::new(indices_to_merge))
+                    (
+                        vec![None; ivf.num_partitions()],
+                        Arc::new(indices_to_merge),
+                        None,
+                    )
                 }
             };
         self.merged_num = merge_indices.len();
@@ -777,13 +782,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let sub_index_params = sub_index_params.clone();
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
+                    let skip_existing_batches = replaced_partition == Some(partition);
                     async move {
-                        let (mut batches, loss) = Self::take_partition_batches(
-                            partition,
-                            indices.as_ref(),
-                            Some(reader.as_ref()),
-                        )
-                        .await?;
+                        let (mut batches, loss) = if skip_existing_batches {
+                            (Vec::new(), 0.0)
+                        } else {
+                            Self::take_partition_batches(
+                                partition,
+                                indices.as_ref(),
+                                Some(reader.as_ref()),
+                            )
+                            .await?
+                        };
 
                         if let Some((assign_batch, deleted_row_ids)) = assign_batch {
                             if !deleted_row_ids.is_empty() {
@@ -1163,7 +1173,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         for partition in 0..ivf.num_partitions() {
             let mut num_rows = reader.partition_size(partition)?;
             for index in existing_indices.iter() {
-                num_rows += index.ivf_model().partition_size(partition);
+                num_rows += index.partition_size(partition);
             }
             if num_rows > max_partition_size
                 && num_rows > MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size()
@@ -1760,17 +1770,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         reassign_candidate_centroids: &FixedSizeListArray,
     ) -> Result<ReassignPartition> {
         let dists = self.distance_type.arrow_batch_func()(vector, reassign_candidate_centroids)?;
-        let min_dist_idx = dists
-            .values()
-            .iter()
-            .position_min_by(|a, b| a.total_cmp(b))
-            .unwrap();
-        let min_dist = dists.value(min_dist_idx);
+        let min_dist_idx = dists.values().iter().position_min_by(|a, b| a.total_cmp(b));
+        let min_dist = min_dist_idx
+            .map(|idx| dists.value(idx))
+            .unwrap_or(f32::INFINITY);
         match split_centroids_dists {
             Some((d1, d2)) => {
                 if min_dist <= d1 && min_dist <= d2 {
                     Ok(ReassignPartition::ReassignCandidate(
-                        reassign_candidate_ids.value(min_dist_idx),
+                        reassign_candidate_ids.value(min_dist_idx.unwrap()),
                     ))
                 } else if d1 <= d2 {
                     Ok(ReassignPartition::NewCentroid1)
@@ -1779,7 +1787,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
             }
             None => Ok(ReassignPartition::ReassignCandidate(
-                reassign_candidate_ids.value(min_dist_idx),
+                reassign_candidate_ids.value(min_dist_idx.unwrap()),
             )),
         }
     }
