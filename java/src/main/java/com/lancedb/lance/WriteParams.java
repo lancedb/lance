@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.io.StorageOptionsProvider;
+
 import com.google.common.base.MoreObjects;
 
 import java.util.HashMap;
@@ -56,6 +58,7 @@ public class WriteParams {
   private final Optional<Boolean> enableStableRowIds;
   private final Optional<LanceFileVersion> dataStorageVersion;
   private Map<String, String> storageOptions = new HashMap<>();
+  private final Optional<StorageOptionsProvider> storageOptionsProvider;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -64,7 +67,8 @@ public class WriteParams {
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<LanceFileVersion> dataStorageVersion,
-      Map<String, String> storageOptions) {
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -72,6 +76,7 @@ public class WriteParams {
     this.enableStableRowIds = enableStableRowIds;
     this.dataStorageVersion = dataStorageVersion;
     this.storageOptions = storageOptions;
+    this.storageOptionsProvider = storageOptionsProvider;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -107,6 +112,10 @@ public class WriteParams {
     return storageOptions;
   }
 
+  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
+    return storageOptionsProvider;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -127,6 +136,7 @@ public class WriteParams {
     private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
+    private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -163,6 +173,17 @@ public class WriteParams {
       return this;
     }
 
+    /**
+     * Set a storage options provider for dynamic credential refresh.
+     *
+     * @param storageOptionsProvider the provider to use for fetching credentials
+     * @return this builder
+     */
+    public Builder withStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
+      this.storageOptionsProvider = Optional.of(storageOptionsProvider);
+      return this;
+    }
+
     public WriteParams build() {
       return new WriteParams(
           maxRowsPerFile,
@@ -171,7 +192,8 @@ public class WriteParams {
           mode,
           enableStableRowIds,
           dataStorageVersion,
-          storageOptions);
+          storageOptions,
+          storageOptionsProvider);
     }
   }
 }

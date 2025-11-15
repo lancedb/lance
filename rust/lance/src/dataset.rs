@@ -31,7 +31,8 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams};
+use lance_namespace::LanceNamespace;
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -107,6 +108,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -770,6 +772,128 @@ impl Dataset {
         }
         Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
+    }
+
+    /// Write into a namespace-managed table with automatic credential vending.
+    ///
+    /// For CREATE mode, calls create_empty_table() to initialize the table.
+    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `batches` - The record batches to write
+    /// * `namespace` - The namespace to use for table management
+    /// * `table_id` - The table identifier
+    /// * `params` - Write parameters
+    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
+    ///   by the namespace and only use the storage options in params. The storage options
+    ///   provider will not be created, so credentials will not be automatically refreshed.
+    pub async fn write_into_namespace(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        mut params: Option<WriteParams>,
+        ignore_namespace_table_storage_options: bool,
+    ) -> Result<Self> {
+        let mut write_params = params.take().unwrap_or_default();
+
+        match write_params.mode {
+            WriteMode::Create => {
+                let request = CreateEmptyTableRequest {
+                    id: Some(table_id.clone()),
+                    location: None,
+                    properties: None,
+                };
+                let response = namespace
+                    .create_empty_table(request)
+                    .await
+                    .map_err(|e| Error::Namespace {
+                        source: Box::new(e),
+                        location: location!(),
+                    })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in create_empty_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace,
+                            table_id,
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                Self::write(batches, uri.as_str(), Some(write_params)).await
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    version: None,
+                };
+                let response = namespace
+                    .describe_table(request)
+                    .await
+                    .map_err(|e| Error::Namespace {
+                        source: Box::new(e),
+                        location: location!(),
+                    })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in describe_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace.clone(),
+                            table_id.clone(),
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                Self::write(batches, uri.as_str(), Some(write_params)).await
+            }
+        }
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -9670,5 +9794,570 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(1, batch.num_rows());
+    }
+
+    // Mock namespace implementation for testing
+    #[derive(Debug)]
+    struct MockLanceNamespace {
+        bucket_name: String,
+        base_storage_options: HashMap<String, String>,
+        credential_expires_in_seconds: u64,
+        describe_call_count: Arc<std::sync::Mutex<u32>>,
+        create_call_count: Arc<std::sync::Mutex<u32>>,
+        tables: Arc<std::sync::Mutex<HashMap<Vec<String>, String>>>,
+    }
+
+    impl MockLanceNamespace {
+        fn new(bucket_name: String, base_storage_options: HashMap<String, String>) -> Self {
+            Self {
+                bucket_name,
+                base_storage_options,
+                credential_expires_in_seconds: 60,
+                describe_call_count: Arc::new(std::sync::Mutex::new(0)),
+                create_call_count: Arc::new(std::sync::Mutex::new(0)),
+                tables: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn get_describe_call_count(&self) -> u32 {
+            *self.describe_call_count.lock().unwrap()
+        }
+
+        fn get_create_call_count(&self) -> u32 {
+            *self.create_call_count.lock().unwrap()
+        }
+
+        fn register_table(&self, table_id: Vec<String>, location: String) {
+            self.tables.lock().unwrap().insert(table_id, location);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl lance_namespace::LanceNamespace for MockLanceNamespace {
+        async fn create_empty_table(
+            &self,
+            request: lance_namespace::models::CreateEmptyTableRequest,
+        ) -> lance_core::Result<lance_namespace::models::CreateEmptyTableResponse> {
+            let table_id = request.id.ok_or_else(|| Error::InvalidInput {
+                source: "table_id is required".into(),
+                location: location!(),
+            })?;
+
+            let mut count = self.create_call_count.lock().unwrap();
+            *count += 1;
+            let current_count = *count;
+            drop(count);
+
+            // Check if table already exists
+            {
+                let tables = self.tables.lock().unwrap();
+                if tables.contains_key(&table_id) {
+                    return Err(Error::InvalidInput {
+                        source: format!("Table already exists: {:?}", table_id).into(),
+                        location: location!(),
+                    });
+                }
+            }
+
+            // Generate location for the new table
+            let table_key = table_id.join("/");
+            let location = format!("memory://{}/{}.lance", self.bucket_name, table_key);
+
+            // Register the table
+            self.register_table(table_id.clone(), location.clone());
+
+            // Create storage options with incrementing credentials
+            let mut storage_options = self.base_storage_options.clone();
+            storage_options.insert("aws_access_key_id".to_string(), format!("AKID_{}", current_count));
+            storage_options.insert("aws_secret_access_key".to_string(), format!("SECRET_{}", current_count));
+            storage_options.insert("aws_session_token".to_string(), format!("TOKEN_{}", current_count));
+
+            // Add expiration timestamp
+            let expires_at_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + (self.credential_expires_in_seconds * 1000);
+            storage_options.insert("expires_at_millis".to_string(), expires_at_millis.to_string());
+
+            Ok(lance_namespace::models::CreateEmptyTableResponse {
+                location: Some(location),
+                storage_options: Some(storage_options),
+                properties: None,
+            })
+        }
+
+        async fn describe_table(
+            &self,
+            request: lance_namespace::models::DescribeTableRequest,
+        ) -> lance_core::Result<lance_namespace::models::DescribeTableResponse> {
+            let table_id = request.id.ok_or_else(|| Error::InvalidInput {
+                source: "table_id is required".into(),
+                location: location!(),
+            })?;
+
+            let mut count = self.describe_call_count.lock().unwrap();
+            *count += 1;
+            let current_count = *count;
+            drop(count);
+
+            // Get table location
+            let location = {
+                let tables = self.tables.lock().unwrap();
+                tables.get(&table_id).cloned().ok_or_else(|| Error::InvalidInput {
+                    source: format!("Table not found: {:?}", table_id).into(),
+                    location: location!(),
+                })?
+            };
+
+            // Create storage options with incrementing credentials
+            let mut storage_options = self.base_storage_options.clone();
+            storage_options.insert("aws_access_key_id".to_string(), format!("AKID_{}", current_count));
+            storage_options.insert("aws_secret_access_key".to_string(), format!("SECRET_{}", current_count));
+            storage_options.insert("aws_session_token".to_string(), format!("TOKEN_{}", current_count));
+
+            // Add expiration timestamp
+            let expires_at_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + (self.credential_expires_in_seconds * 1000);
+            storage_options.insert("expires_at_millis".to_string(), expires_at_millis.to_string());
+
+            Ok(lance_namespace::models::DescribeTableResponse {
+                location: Some(location),
+                storage_options: Some(storage_options),
+                ..Default::default()
+            })
+        }
+
+        fn namespace_id(&self) -> String {
+            "MockLanceNamespace { }".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_namespace_distributed_write() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+
+        // Test the high-level write_into_namespace API
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3, 10, 30, 100])),
+                Arc::new(Int32Array::from(vec![2, 4, 20, 40, 200])),
+            ],
+        )
+        .unwrap();
+
+        let batches = vec![data];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        // Use write_into_namespace which will call create_empty_table for CREATE mode
+        let dataset = Dataset::write_into_namespace(
+            reader,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false, // don't ignore namespace storage options
+        )
+        .await
+        .unwrap();
+
+        // Verify create_empty_table was called once
+        assert_eq!(namespace.get_create_call_count(), 1);
+        assert_eq!(namespace.get_describe_call_count(), 0);
+
+        // Verify the table was created with data
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+        assert_eq!(dataset.versions().await.unwrap().len(), 1);
+
+        // Verify data is correct
+        let result = dataset
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_write_create_mode() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+        // Test CREATE mode
+        let dataset = Dataset::write_into_namespace(
+            reader,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Verify create_empty_table was called
+        assert_eq!(namespace.get_create_call_count(), 1);
+        assert_eq!(namespace.get_describe_call_count(), 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(dataset.version().version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_write_append_mode() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        // Initial write in CREATE mode
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
+        let _dataset = Dataset::write_into_namespace(
+            reader1,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Second write in APPEND mode
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let mut params = WriteParams::default();
+        params.mode = WriteMode::Append;
+
+        let reader2 = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader2,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            Some(params),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Verify describe_table was called for APPEND mode (not create_empty_table)
+        assert_eq!(namespace.get_create_call_count(), 1); // Only from initial CREATE
+        assert_eq!(namespace.get_describe_call_count(), 1); // One for APPEND
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+        assert_eq!(dataset.version().version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_write_overwrite_mode() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        // Initial write in CREATE mode
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
+        let _dataset = Dataset::write_into_namespace(
+            reader1,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Second write in OVERWRITE mode
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(Int32Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+
+        let mut params = WriteParams::default();
+        params.mode = WriteMode::Overwrite;
+
+        let reader2 = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader2,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            Some(params),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Verify describe_table was called for OVERWRITE mode (not create_empty_table)
+        assert_eq!(namespace.get_create_call_count(), 1); // Only from initial CREATE
+        assert_eq!(namespace.get_describe_call_count(), 1); // One for OVERWRITE
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(dataset.version().version, 2);
+
+        // Verify old data was replaced
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let a_col = result
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_col.values(), &[100, 200]);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_delete() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write_into_namespace(
+            reader,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Delete rows where a > 3
+        dataset.delete("a > 3").await.unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(dataset.version().version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_update() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write_into_namespace(
+            reader,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Update b = b * 10 where a <= 2
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a <= 2")
+            .unwrap()
+            .set("b", "b * 10")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(update_result.new_dataset.version().version, 2);
+
+        let result = update_result.new_dataset.scan().try_into_batch().await.unwrap();
+        let b_col = result
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(b_col.values(), &[100, 200, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_namespace_merge_insert() {
+        // Create mock namespace
+        let namespace = Arc::new(MockLanceNamespace::new(
+            "test-bucket".to_string(),
+            HashMap::new(),
+        ));
+
+        let table_id = vec!["test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        // Initial data
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write_into_namespace(
+            reader1,
+            namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // New data to merge
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])), // 2 exists, 4 is new
+                Arc::new(Int32Array::from(vec![200, 40])),
+            ],
+        )
+        .unwrap();
+
+        let new_data = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+
+        let merge_result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(Box::new(new_data))
+            .await
+            .unwrap();
+
+        assert_eq!(merge_result.new_dataset.version().version, 2);
+        assert_eq!(merge_result.new_dataset.count_rows(None).await.unwrap(), 4);
+
+        let result = merge_result.new_dataset.scan().project(&["a", "b"]).unwrap().try_into_batch().await.unwrap();
+        let a_col = result
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b_col = result
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // Should have [1,2,3,4] for a and [10,200,30,40] for b
+        let mut a_vals: Vec<i32> = a_col.values().to_vec();
+        let mut indices: Vec<usize> = (0..a_vals.len()).collect();
+        indices.sort_by_key(|&i| a_vals[i]);
+        a_vals.sort();
+        let b_vals: Vec<i32> = indices.iter().map(|&i| b_col.value(i)).collect();
+
+        assert_eq!(a_vals, vec![1, 2, 3, 4]);
+        assert_eq!(b_vals, vec![10, 200, 30, 40]);
     }
 }

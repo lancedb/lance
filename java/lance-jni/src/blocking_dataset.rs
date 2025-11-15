@@ -334,6 +334,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -347,7 +348,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             mode,
             enable_stable_row_ids,
             data_storage_version,
-            storage_options_obj
+            storage_options_obj,
+            storage_options_provider_obj
         )
     )
 }
@@ -364,6 +366,7 @@ fn inner_create_with_ffi_schema<'local>(
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -380,6 +383,7 @@ fn inner_create_with_ffi_schema<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        storage_options_provider_obj,
         reader,
     )
 }
@@ -411,6 +415,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -424,7 +429,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             mode,
             enable_stable_row_ids,
             data_storage_version,
-            storage_options_obj
+            storage_options_obj,
+            storage_options_provider_obj
         )
     )
 }
@@ -441,6 +447,7 @@ fn inner_create_with_ffi_stream<'local>(
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -454,6 +461,7 @@ fn inner_create_with_ffi_stream<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        storage_options_provider_obj,
         reader,
     )
 }
@@ -469,6 +477,7 @@ fn create_dataset<'local>(
     enable_stable_row_ids: JObject,
     data_storage_version: JObject,
     storage_options_obj: JObject,
+    storage_options_provider_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
@@ -482,6 +491,7 @@ fn create_dataset<'local>(
         &enable_stable_row_ids,
         &data_storage_version,
         &storage_options_obj,
+        &storage_options_provider_obj,
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;

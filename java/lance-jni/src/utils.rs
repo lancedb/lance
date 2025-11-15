@@ -45,6 +45,7 @@ pub fn extract_write_params(
     enable_stable_row_ids: &JObject,
     data_storage_version: &JObject,
     storage_options_obj: &JObject,
+    storage_options_provider_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -71,10 +72,32 @@ pub fn extract_write_params(
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
+    let storage_options_provider = if !storage_options_provider_obj.is_null() {
+        use crate::storage_options::JavaStorageOptionsProvider;
+        let provider = if env.call_method(storage_options_provider_obj, "isPresent", "()Z", &[])?.z()? {
+            let provider_obj = env
+                .call_method(
+                    storage_options_provider_obj,
+                    "get",
+                    "()Ljava/lang/Object;",
+                    &[],
+                )?
+                .l()?;
+            Some(JavaStorageOptionsProvider::new(env, provider_obj)?)
+        } else {
+            None
+        };
+        provider.map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn lance_io::object_store::StorageOptionsProvider>)
+    } else {
+        None
+    };
+
     write_params.store_params = Some(ObjectStoreParams {
         storage_options: Some(storage_options),
+        storage_options_provider,
         ..Default::default()
     });
+
     Ok(write_params)
 }
 

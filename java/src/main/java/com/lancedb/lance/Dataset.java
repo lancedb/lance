@@ -102,7 +102,8 @@ public class Dataset implements Closeable {
               params.getMode(),
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
-              params.getStorageOptions());
+              params.getStorageOptions(),
+              params.getStorageOptionsProvider());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -133,7 +134,8 @@ public class Dataset implements Closeable {
             params.getMode(),
             params.getEnableStableRowIds(),
             params.getDataStorageVersion(),
-            params.getStorageOptions());
+            params.getStorageOptions(),
+            params.getStorageOptionsProvider());
     dataset.allocator = allocator;
     return dataset;
   }
@@ -147,7 +149,8 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
@@ -158,7 +161,8 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   /**
    * Open a dataset from the specified path.

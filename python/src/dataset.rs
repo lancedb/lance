@@ -2073,13 +2073,14 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2099,6 +2100,7 @@ impl Dataset {
             PyLance(transaction),
             commit_lock,
             storage_options,
+            storage_options_provider,
             enable_v2_manifest_paths,
             detached,
             max_retries,
@@ -2107,23 +2109,36 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
+        let provider = storage_options_provider.and_then(|py_obj| {
+            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                .ok()
+                .map(|py_provider| {
+                    Arc::new(crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider))
+                        as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                })
+        });
+
         let object_store_params =
-            storage_options
-                .as_ref()
-                .map(|storage_options| ObjectStoreParams {
-                    storage_options: Some(storage_options.clone()),
+            if storage_options.is_some() || provider.is_some() {
+                Some(ObjectStoreParams {
+                    storage_options: storage_options.clone(),
+                    storage_options_provider: provider,
                     ..Default::default()
-                });
+                })
+            } else {
+                None
+            };
 
         let commit_handler = commit_lock
             .as_ref()
@@ -2162,23 +2177,36 @@ impl Dataset {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
+        let provider = storage_options_provider.and_then(|py_obj| {
+            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                .ok()
+                .map(|py_provider| {
+                    Arc::new(crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider))
+                        as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                })
+        });
+
         let object_store_params =
-            storage_options
-                .as_ref()
-                .map(|storage_options| ObjectStoreParams {
-                    storage_options: Some(storage_options.clone()),
+            if storage_options.is_some() || provider.is_some() {
+                Some(ObjectStoreParams {
+                    storage_options: storage_options.clone(),
+                    storage_options_provider: provider,
                     ..Default::default()
-                });
+                })
+            } else {
+                None
+            };
 
         let commit_handler = commit_lock
             .map(|commit_lock| {
@@ -2887,11 +2915,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
         }
 
-        if let Some(storage_options) =
-            get_dict_opt::<HashMap<String, String>>(options, "storage_options")?
-        {
+        let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
+        let storage_options_provider = get_dict_opt::<PyObject>(options, "storage_options_provider")?
+            .and_then(|py_obj| {
+                crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                    .ok()
+                    .map(|py_provider| {
+                        Arc::new(crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider))
+                            as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                    })
+            });
+
+        if storage_options.is_some() || storage_options_provider.is_some() {
             p.store_params = Some(ObjectStoreParams {
-                storage_options: Some(storage_options),
+                storage_options,
+                storage_options_provider,
                 ..Default::default()
             });
         }
