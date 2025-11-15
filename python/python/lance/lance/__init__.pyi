@@ -59,6 +59,7 @@ from .fragment import (
 from .fragment import (
     RowIdMeta as RowIdMeta,
 )
+from .indices import IndexDescription as IndexDescription
 from .optimize import (
     Compaction as Compaction,
 )
@@ -213,6 +214,7 @@ class _Dataset:
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
     def load_indices(self) -> List[Index]: ...
+    def describe_indices(self) -> List[IndexDescription]: ...
     def scanner(
         self,
         columns: Optional[List[str]] = None,

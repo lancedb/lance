@@ -92,7 +92,7 @@ use lance_datafusion::{
 use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
@@ -564,7 +564,7 @@ impl MergeInsertJob {
             let col = &self.params.on[0];
             self.dataset
                 .load_scalar_index(
-                    ScalarIndexCriteria::default()
+                    IndexCriteria::default()
                         .for_column(col)
                         // Unclear if this would work if the index does not support exact equality
                         .supports_exact_equality(),
@@ -3669,7 +3669,7 @@ mod tests {
 
         let check_indices = async |dataset: &Dataset, id_frags: &[u32], value_frags: &[u32]| {
             let id_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("id_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("id_idx"))
                 .await
                 .unwrap();
 
@@ -3686,7 +3686,7 @@ mod tests {
             }
 
             let value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("value_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("value_idx"))
                 .await
                 .unwrap();
 
@@ -3703,7 +3703,7 @@ mod tests {
             }
 
             let other_value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("other_value_idx"))
+                .load_scalar_index(IndexCriteria::default().with_name("other_value_idx"))
                 .await
                 .unwrap()
                 .unwrap();

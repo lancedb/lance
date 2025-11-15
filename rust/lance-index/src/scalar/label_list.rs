@@ -354,6 +354,10 @@ pub struct LabelListIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn name(&self) -> &str {
+        "LabelList"
+    }
+
     fn new_training_request(
         &self,
         _params: &str,

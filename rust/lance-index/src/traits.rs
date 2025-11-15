@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
-pub struct ScalarIndexCriteria<'a> {
+pub struct IndexCriteria<'a> {
     /// Only consider indices for this column (this also means the index
     /// maps to a single column)
     pub for_column: Option<&'a str>,
@@ -26,7 +26,7 @@ pub struct ScalarIndexCriteria<'a> {
     pub must_support_exact_equality: bool,
 }
 
-impl<'a> ScalarIndexCriteria<'a> {
+impl<'a> IndexCriteria<'a> {
     /// Only consider indices for this column (this also means the index
     /// maps to a single column)
     pub fn for_column(mut self, column: &'a str) -> Self {
@@ -54,6 +54,68 @@ impl<'a> ScalarIndexCriteria<'a> {
         self.must_support_exact_equality = true;
         self
     }
+}
+
+#[deprecated(since = "0.39.0", note = "Use IndexCriteria instead")]
+pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
+
+/// Additional information about an index
+///
+/// Note that a single index might consist of multiple segments.  Each segment has its own
+/// UUID and collection of files and covers some subset of the data fragments.
+///
+/// All segments in an index should have the same index type and index details.
+pub trait IndexDescription: Send + Sync {
+    /// Returns the index name
+    ///
+    /// This is the user-defined name of the index.  It is shared by all segments of the index
+    /// and is what is used to refer to the index in the API.  It is guaranteed to be unique
+    /// within the dataset.
+    fn name(&self) -> &str;
+
+    /// Returns the index metadata
+    ///
+    /// This is the raw metadata information stored in the manifest.  There is one
+    /// IndexMetadata for each segment of the index.
+    fn metadata(&self) -> &[IndexMetadata];
+
+    /// Returns the index type URL
+    ///
+    /// This is extracted from the type url of the index details
+    fn type_url(&self) -> &str;
+
+    /// Returns the index type
+    ///
+    /// This is a short string identifier that is friendlier than the type URL but not
+    /// guaranteed to be unique.
+    ///
+    /// This is calculated by the plugin and will be "Unknown" if no plugin could be found
+    /// for the type URL.
+    fn index_type(&self) -> &str;
+
+    /// Returns the number of rows indexed by the index, across all segments.
+    ///
+    /// This is an approximate count and may include rows that have been
+    /// deleted.
+    fn rows_indexed(&self) -> u64;
+
+    /// Returns the ids of the fields that the index is built on.
+    fn field_ids(&self) -> &[u32];
+
+    /// Returns a JSON string representation of the index details
+    ///
+    /// The format of these details will vary depending on the index type and
+    /// since indexes can be provided by plugins we cannot fully define it here.
+    ///
+    /// However, plugins should do their best to maintain backwards compatibility
+    /// and consider this method part of the public API.
+    ///
+    /// See individual index plugins for more description of the expected format.
+    ///
+    /// The conversion from Any to JSON is controlled by the index
+    /// plugin.  As a result, this method may fail if there is no plugin
+    /// available for the index.
+    fn details(&self) -> Result<String>;
 }
 
 // Extends Lance Dataset with secondary index.
@@ -182,10 +244,21 @@ pub trait DatasetIndexExt {
         }
     }
 
+    /// Describes indexes in a dataset
+    ///
+    /// This method should only access the index metadata and should not load the index into memory.
+    ///
+    /// More detailed information may be available from [`index_statistics`] but that will require
+    /// loading the index into memory.
+    async fn describe_indices<'a, 'b>(
+        &'a self,
+        criteria: Option<IndexCriteria<'b>>,
+    ) -> Result<Vec<Arc<dyn IndexDescription>>>;
+
     /// Loads a specific index with the given index name.
     async fn load_scalar_index<'a, 'b>(
         &'a self,
-        criteria: ScalarIndexCriteria<'b>,
+        criteria: IndexCriteria<'b>,
     ) -> Result<Option<IndexMetadata>>;
 
     /// Optimize indices.

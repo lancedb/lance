@@ -1146,6 +1146,10 @@ impl BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn name(&self) -> &str {
+        "BloomFilter"
+    }
+
     fn new_training_request(
         &self,
         params: &str,
