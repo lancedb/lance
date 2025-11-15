@@ -922,7 +922,7 @@ mod tests {
             .load_partition(partition_idx)
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .copied()
             .collect()
     }
@@ -1196,8 +1196,8 @@ mod tests {
             recall,
             recall_requirement - f32::EPSILON,
             "num_rows: {}, intersection: {}, recall: {}",
-            row_ids.len(),
-            row_ids.intersection(&gt).count(),
+            row_addrs.len(),
+            row_addrs.intersection(&gt).count(),
             recall
         );
 
