@@ -25,7 +25,7 @@ resolver = "2"
 
 
 [workspace.package]
-version = "0.40.0-beta.2"
+version = "1.0.0-beta.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -49,22 +49,22 @@ rust-version = "1.82.0"
 
 [workspace.dependencies]
 libc = "0.2.176"
-lance = { version = "=0.40.0-beta.2", path = "./rust/lance" }
-lance-arrow = { version = "=0.40.0-beta.2", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.40.0-beta.2", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.40.0-beta.2", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.40.0-beta.2", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.40.0-beta.2", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.40.0-beta.2", path = "./rust/lance-file" }
-lance-index = { version = "=0.40.0-beta.2", path = "./rust/lance-index" }
-lance-io = { version = "=0.40.0-beta.2", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=0.40.0-beta.2", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=0.40.0-beta.2", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=0.40.0-beta.2", path = "./rust/lance-namespace-impls" }
+lance = { version = "=1.0.0-beta.1", path = "./rust/lance" }
+lance-arrow = { version = "=1.0.0-beta.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=1.0.0-beta.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=1.0.0-beta.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=1.0.0-beta.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=1.0.0-beta.1", path = "./rust/lance-encoding" }
+lance-file = { version = "=1.0.0-beta.1", path = "./rust/lance-file" }
+lance-index = { version = "=1.0.0-beta.1", path = "./rust/lance-index" }
+lance-io = { version = "=1.0.0-beta.1", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=1.0.0-beta.1", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=1.0.0-beta.1", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=1.0.0-beta.1", path = "./rust/lance-namespace-impls" }
 lance-namespace-reqwest-client = "0.0.18"
-lance-table = { version = "=0.40.0-beta.2", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.40.0-beta.2", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.40.0-beta.2", path = "./rust/lance-testing" }
+lance-table = { version = "=1.0.0-beta.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=1.0.0-beta.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=1.0.0-beta.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "56.1", optional = false, features = ["prettyprint"] }
@@ -80,6 +80,7 @@ arrow-schema = "56.1"
 arrow-select = "56.1"
 async-recursion = "1.0"
 async-trait = "0.1"
+axum = "0.7"
 aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
 aws-sdk-dynamodb = "1.38.0"
@@ -88,7 +89,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance-bitpacking = { version = "=0.40.0-beta.2", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=1.0.0-beta.1", path = "./rust/compression/bitpacking" }
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
@@ -127,7 +128,7 @@ deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.40.0-beta.2", path = "./rust/compression/fsst" }
+fsst = { version = "=1.0.0-beta.1", path = "./rust/compression/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
@@ -179,6 +180,8 @@ tokio = { version = "1.23", features = [
 ] }
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10" }
+tower = "0.5"
+tower-http = "0.5"
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
@@ -189,6 +192,20 @@ pretty_assertions = "1.4.0"
 opt-level = 3
 debug = true
 strip = false
+
+[profile.ci]
+debug = "line-tables-only"
+inherits = "dev"
+incremental = false
+
+# This rule applies to every package except workspace members (dependencies
+# such as `arrow` and `tokio`). It disables debug info and related features on
+# dependencies so their binaries stay smaller, improving cache reuse.
+[profile.ci.package."*"]
+debug = false
+debug-assertions = false
+strip = "debuginfo"
+incremental = false
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

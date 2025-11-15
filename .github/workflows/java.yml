@@ -14,14 +14,7 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
-  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
-  # CI builds are faster with incremental disabled.
-  CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_JOBS: "1"
 
 jobs:
   rust-clippy-fmt:
@@ -88,8 +81,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:

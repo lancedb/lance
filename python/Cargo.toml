@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.40.0-beta.2"
+version = "1.0.0-beta.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
@@ -58,6 +58,7 @@ pyo3 = { version = "0.25", features = [
     "py-clone",
     "chrono",
 ] }
+pythonize = "0.25"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 uuid = "1.3.0"
 regex = "1"
@@ -73,5 +74,22 @@ url = "2.5.0"
 bytes = "1.4"
 
 [features]
+default = ["rest", "rest-adapter"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+rest = ["lance-namespace-impls/rest"]
+rest-adapter = ["lance-namespace-impls/rest-adapter"]
+
+[profile.ci]
+debug = "line-tables-only"
+inherits = "dev"
+incremental = false
+
+# This rule applies to every package except workspace members (dependencies
+# such as `arrow` and `tokio`). It disables debug info and related features on
+# dependencies so their binaries stay smaller, improving cache reuse.
+[profile.ci.package."*"]
+debug = false
+debug-assertions = false
+strip = "debuginfo"
+incremental = false
