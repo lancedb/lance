@@ -96,10 +96,12 @@ use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
+use self::io_stats::IoStats;
 
 pub mod blob;
 pub mod cleanup;
 pub mod commit;
+pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
@@ -2043,6 +2045,68 @@ impl Dataset {
 
     fn session(&self) -> Session {
         Session::new(self.ds.session())
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters
+    ///
+    /// Returns the current IO statistics without modifying the internal state.
+    /// Use this when you need to check stats without resetting them.
+    ///
+    /// Returns
+    /// -------
+    /// IOStats
+    ///     Statistics about read/write operations including:
+    ///     - read_iops: Number of read operations
+    ///     - read_bytes: Total bytes read
+    ///     - write_iops: Number of write operations
+    ///     - write_bytes: Total bytes written
+    ///     - num_hops: Number of disjoint IO periods (lower means more parallelism)
+    ///
+    /// Examples
+    /// --------
+    /// >>> import lance
+    /// >>> dataset = lance.dataset("my_dataset")
+    /// >>> result = dataset.to_table()
+    /// >>> # Check stats without resetting
+    /// >>> stats = dataset.io_stats_snapshot()
+    /// >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+    /// >>> # Can check again and see the same values
+    /// >>> stats2 = dataset.io_stats_snapshot()
+    /// >>> assert stats.read_bytes == stats2.read_bytes
+    fn io_stats_snapshot(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_snapshot();
+        IoStats::from_lance(stats)
+    }
+
+    /// Get incremental IO statistics for this dataset
+    ///
+    /// Returns the accumulated IO statistics since the last call to this method
+    /// and resets the internal counters (incremental stats pattern). This is useful
+    /// for tracking IO operations between different stages of processing.
+    ///
+    /// Returns
+    /// -------
+    /// IOStats
+    ///     Statistics about read/write operations including:
+    ///     - read_iops: Number of read operations
+    ///     - read_bytes: Total bytes read
+    ///     - write_iops: Number of write operations
+    ///     - write_bytes: Total bytes written
+    ///     - num_hops: Number of disjoint IO periods (lower means more parallelism)
+    ///
+    /// Examples
+    /// --------
+    /// >>> import lance
+    /// >>> dataset = lance.dataset("my_dataset")
+    /// >>> # Perform some operations...
+    /// >>> stats = dataset.io_stats_incremental()
+    /// >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+    /// >>> # Next call returns only new stats since last call
+    /// >>> more_data = dataset.to_table()
+    /// >>> stats2 = dataset.io_stats_incremental()
+    fn io_stats_incremental(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_incremental();
+        IoStats::from_lance(stats)
     }
 
     #[staticmethod]

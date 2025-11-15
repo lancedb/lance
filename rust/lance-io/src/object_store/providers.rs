@@ -10,6 +10,8 @@ use object_store::path::Path;
 use snafu::location;
 use url::Url;
 
+use crate::object_store::WrappingObjectStore;
+
 use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
@@ -209,6 +211,9 @@ impl ObjectStoreRegistry {
         if let Some(wrapper) = &params.object_store_wrapper {
             store.inner = wrapper.wrap(&cache_path, store.inner);
         }
+
+        // Always wrap with IO tracking
+        store.inner = store.io_tracker.wrap("", store.inner);
 
         let store = Arc::new(store);
 
