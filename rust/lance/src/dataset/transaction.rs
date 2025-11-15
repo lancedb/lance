@@ -45,12 +45,12 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use super::ManifestWriteConfig;
+use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{datatypes::BlobVersion, datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
@@ -2184,12 +2184,19 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            Manifest::new(
+            let mut manifest = Manifest::new(
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
                 reference_paths,
-            )
+            );
+            if manifest.data_storage_format.lance_file_version()? >= LanceFileVersion::V2_2 {
+                manifest.config_mut().insert(
+                    BLOB_VERSION_CONFIG_KEY.to_string(),
+                    BlobVersion::V2.config_value().to_string(),
+                );
+            }
+            manifest
         };
 
         manifest.tag.clone_from(&self.tag);
@@ -2786,9 +2793,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 initial_bases,
             })) => {
                 let config_upsert_option = if config_upsert_values.is_empty() {
-                    Some(config_upsert_values)
-                } else {
                     None
+                } else {
+                    Some(config_upsert_values)
                 };
 
                 Operation::Overwrite {

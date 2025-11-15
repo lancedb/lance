@@ -13,12 +13,15 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
+use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{
+    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
+};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -56,7 +59,7 @@ use std::sync::Arc;
 use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
-mod blob;
+pub(crate) mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -1608,12 +1611,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone())
+        Projection::empty(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone())
+        Projection::full(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Get fragments.
@@ -2330,6 +2333,10 @@ impl Dataset {
     /// Get the dataset config from manifest
     pub fn config(&self) -> &HashMap<String, String> {
         &self.manifest.config
+    }
+
+    pub(crate) fn blob_version(&self) -> BlobVersion {
+        blob_version_from_config(&self.manifest.config)
     }
 
     /// Delete keys from the config.
