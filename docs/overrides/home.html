@@ -36,6 +36,23 @@
     .md-main__inner {
       margin: 0;
     }
+
+    /* Style Learn More and View Integrations links */
+    .lance-feature-section .md-button,
+    .lance-intro-section .md-button:not(.md-button--primary) {
+      background-color: transparent;
+      color: #625EFF;
+      text-decoration: underline;
+      border: none;
+      box-shadow: none;
+    }
+
+    .lance-feature-section .md-button:hover,
+    .lance-intro-section .md-button:not(.md-button--primary):hover {
+      background-color: transparent;
+      color: #757575;
+      text-decoration: underline;
+    }
   </style>
 
   <!-- Hero Section -->
@@ -102,19 +119,7 @@
           <a href="quickstart/vector-search" class="md-button">Learn More</a>
         </div>
         <div class="lance-feature-demo">
-          <div id="termynal-hybrid-search"
-            data-termynal=""
-            data-ty-startdelay="500"
-            data-ty-typedelay="40"
-            data-ty-linedelay="700"
-            style="width: 500px;">
-            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
-            <span data-ty="input" data-ty-prompt=">>>">ds = lance.dataset("s3://my-bucket/docs")</span>
-            <span data-ty="input" data-ty-prompt=">>>">ds.to_table(full_text_query="machine learning")</span>
-            <span data-ty="input" data-ty-prompt=">>>">ds.to_table(</span>
-            <span data-ty="input" data-ty-prompt="...">  nearest={"column": "embedding", "q": query_vec, "k": 10},</span>
-            <span data-ty="input" data-ty-prompt="...">  filter="year > 2020")</span>
-          </div>
+          <img src="assets/images/hybrid-search.png" alt="Hybrid Search Example" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
         </div>
       </div>
     </div>
@@ -138,17 +143,7 @@
           <a href="guide/read_and_write#random-access" class="md-button">Learn More</a>
         </div>
         <div class="lance-feature-demo">
-          <div id="termynal-random-access"
-            data-termynal=""
-            data-ty-startdelay="1500"
-            data-ty-typedelay="40"
-            data-ty-linedelay="700"
-            style="width: 500px;">
-            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
-            <span data-ty="input" data-ty-prompt=">>>">dataset = lance.dataset("s3://my-bucket/embeddings")</span>
-            <span data-ty="input" data-ty-prompt=">>>">table = dataset.take([100, 5000, 1000000])</span>
-            <span data-ty="input" data-ty-prompt=">>>">dataset.take([0, 1], columns=["id", "vector"])</span>
-          </div>
+          <img src="assets/images/random-access.png" alt="Random Access Example" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
         </div>
       </div>
     </div>
@@ -172,20 +167,7 @@
           <a href="guide/blob" class="md-button">Learn More</a>
         </div>
         <div class="lance-feature-demo">
-          <div id="termynal-multimodal"
-            data-termynal=""
-            data-ty-startdelay="2500"
-            data-ty-typedelay="40"
-            data-ty-linedelay="700"
-            style="width: 500px;">
-            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
-            <span data-ty="input" data-ty-prompt=">>>">import pyarrow as pa</span>
-            <span data-ty="input" data-ty-prompt=">>>">schema = pa.schema([</span>
-            <span data-ty="input" data-ty-prompt="...">  pa.field("video", pa.large_binary(),</span>
-            <span data-ty="input" data-ty-prompt="...">    metadata={"lance-encoding:blob": "true"}),</span>
-            <span data-ty="input" data-ty-prompt="...">  pa.field("embedding", pa.list_(pa.float32(), 128))])</span>
-            <span data-ty="input" data-ty-prompt=">>>">lance.write_dataset(table, "multimodal.lance", schema=schema)</span>
-          </div>
+          <img src="assets/images/multimodal-data.png" alt="Multimodal Data Example" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
         </div>
       </div>
     </div>
@@ -210,20 +192,7 @@
           <a href="guide/data_evolution" class="md-button">Learn More</a>
         </div>
         <div class="lance-feature-demo">
-          <div id="termynal-evolution"
-            data-termynal=""
-            data-ty-startdelay="3500"
-            data-ty-typedelay="40"
-            data-ty-linedelay="700"
-            style="width: 500px;">
-            <span data-ty="input" data-ty-prompt=">>>">import lance</span>
-            <span data-ty="input" data-ty-prompt=">>>">dataset = lance.dataset("my_data.lance")</span>
-            <span data-ty="input" data-ty-prompt=">>>">@lance.batch_udf()</span>
-            <span data-ty="input" data-ty-prompt="...">def add_embeddings(batch):</span>
-            <span data-ty="input" data-ty-prompt="...">  vectors = model.encode(batch["text"])</span>
-            <span data-ty="input" data-ty-prompt="...">  return {"embedding": vectors}</span>
-            <span data-ty="input" data-ty-prompt=">>>">dataset.add_columns(add_embeddings)</span>
-          </div>
+          <img src="assets/images/data-evolution.png" alt="Data Evolution Example" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
         </div>
       </div>
     </div>
@@ -241,7 +210,7 @@
             Connect with leading query engines like Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink/Fluss
             to run SQL analytics and distributed processing on your Lance datasets.
           </p>
-          <a href="integrations/duckdb" class="md-button">View Integrations</a>
+          <a href="integrations/" class="md-button">View Integrations</a>
         </div>
         <div class="lance-feature-demo">
           <img src="assets/images/ecosystem-integrations.png" alt="Lance Ecosystem Integrations" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
@@ -250,10 +219,6 @@
     </div>
   </section>
 
-  <script
-    src="assets/javascript/termynal.js"
-    data-termynal-container="#termynal-hybrid-search|#termynal-random-access|#termynal-multimodal|#termynal-evolution">
-  </script>
 
 {% endblock %}
 

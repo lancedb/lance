@@ -67,6 +67,7 @@ plugins:
       proto_dir: ../protos
 
 extra:
+  generator: false
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/lancedb/lance
