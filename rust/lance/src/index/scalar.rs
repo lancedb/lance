@@ -1169,4 +1169,435 @@ mod tests {
         let rows_per_zone = stats["rows_per_zone"].as_u64().unwrap();
         assert_eq!(rows_per_zone, 200, "ZoneMap rows_per_zone should be 200");
     }
+
+    #[tokio::test]
+    async fn test_zonemap_deletion_then_index() {
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows in two fragments: alternating boolean values
+        // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_bool(vec![true, false]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Delete rows where value=false (rows 1, 3, 5, 7, 9)
+        ds.delete("NOT value").await.unwrap();
+
+        // Verify data before index creation: should have 5 rows with value=true
+        let before_index = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_ids = before_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_ids,
+            &[0, 2, 4, 6, 8],
+            "Before index: should have 5 rows"
+        );
+
+        // Create zonemap index on "value" column
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let after_index = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_ids: Vec<u64> = after_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+
+        // This assertion will FAIL if bug #4758 is present
+        assert_eq!(
+            after_ids.len(),
+            5,
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            after_ids.len(),
+            after_ids
+        );
+        assert_eq!(
+            after_ids,
+            vec![0, 2, 4, 6, 8],
+            "Zonemap index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_index_then_deletion() {
+        // Tests the opposite scenario: create index FIRST, then perform deletions
+        // Verifies that zonemap index properly handles deletions that occur after index creation
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating boolean values
+        // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_bool(vec![true, false]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Verify initial data: should have 10 rows
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
+
+        let initial_count: usize = initial_data["id"].len();
+        assert_eq!(initial_count, 10, "Should start with 10 rows");
+
+        // CREATE INDEX FIRST (before deletion)
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Query with index before deletion - should return all 5 rows with value=true
+        let before_deletion = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_deletion_ids = before_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "Before deletion: should return 5 rows with value=true"
+        );
+
+        // NOW DELETE rows where value=false (rows 1, 3, 5, 7, 9)
+        ds.delete("NOT value").await.unwrap();
+
+        // Query after deletion - should still return 5 rows with value=true
+        let after_deletion = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_deletion_ids = after_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // Verify we get the correct data after deletion
+        assert_eq!(
+            after_deletion_ids.len(),
+            5,
+            "After deletion: Expected 5 rows, got {}",
+            after_deletion_ids.len()
+        );
+        assert_eq!(
+            after_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "After deletion: Should return rows [0, 2, 4, 6, 8] with value=true"
+        );
+
+        // Verify the actual values are correct
+        let after_deletion_values: Vec<bool> = after_deletion["value"]
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            after_deletion_values,
+            vec![true, true, true, true, true],
+            "All returned rows should have value=true"
+        );
+
+        // Count rows matching "value = true"
+        let count_true = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_true_rows: usize = count_true.num_rows();
+
+        // Count rows matching "value = false" (should be 0 after deletion)
+        let count_false = ds
+            .scan()
+            .filter("NOT value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_false_rows: usize = count_false.num_rows();
+
+        // The key assertions: filtered queries should return correct data
+        assert_eq!(
+            count_true_rows, 5,
+            "Should have exactly 5 rows with value=true"
+        );
+        assert_eq!(
+            count_false_rows, 0,
+            "Should have 0 rows with value=false after deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_deletion_then_index() {
+        // Reproduces the same bug as #4758 but for bloom filter indexes
+        // After deleting rows and creating a bloom filter index, queries return fewer results than expected
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Delete rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Verify data before index creation: should have 5 rows with value="apple"
+        let before_index = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_ids = before_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_ids,
+            &[0, 2, 4, 6, 8],
+            "Before index: should have 5 rows"
+        );
+
+        // Create bloom filter index on "value" column with small zone size to ensure the bug is triggered
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let after_index = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_ids = after_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // This assertion verifies the fix works
+        assert_eq!(
+            after_ids.len(),
+            5,
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            after_ids.len(),
+            after_ids
+        );
+        assert_eq!(
+            after_ids,
+            &[0, 2, 4, 6, 8],
+            "Bloom filter index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_index_then_deletion() {
+        // Tests the opposite scenario: create bloom filter index FIRST, then perform deletions
+        // Verifies that bloom filter index properly handles deletions that occur after index creation
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Verify initial data: should have 10 rows
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
+
+        let initial_count: usize = initial_data.num_rows();
+        assert_eq!(initial_count, 10, "Should start with 10 rows");
+
+        // CREATE INDEX FIRST (before deletion)
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Query with index before deletion - should return all 5 rows with value="apple"
+        let before_deletion = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_deletion_ids = before_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "Before deletion: should return 5 rows with value='apple'"
+        );
+
+        // NOW DELETE rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Query after deletion - should still return 5 rows with value="apple"
+        let after_deletion = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_deletion_ids = after_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // Verify we get the correct data after deletion
+        assert_eq!(
+            after_deletion_ids.len(),
+            5,
+            "After deletion: Expected 5 rows, got {}",
+            after_deletion_ids.len()
+        );
+        assert_eq!(
+            after_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "After deletion: Should return rows [0, 2, 4, 6, 8] with value='apple'"
+        );
+
+        // Verify the actual values are correct
+        let after_deletion_values: Vec<&str> = after_deletion["value"]
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            after_deletion_values,
+            vec!["apple", "apple", "apple", "apple", "apple"],
+            "All returned rows should have value='apple'"
+        );
+
+        // Count rows matching "value = 'apple'"
+        let count_apple = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_apple_rows: usize = count_apple.num_rows();
+
+        // Count rows matching "value = 'banana'" (should be 0 after deletion)
+        let count_banana = ds
+            .scan()
+            .filter("value = 'banana'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_banana_rows: usize = count_banana.num_rows();
+
+        // The key assertions: filtered queries should return correct data
+        assert_eq!(
+            count_apple_rows, 5,
+            "Should have exactly 5 rows with value='apple'"
+        );
+        assert_eq!(
+            count_banana_rows, 0,
+            "Should have 0 rows with value='banana' after deletion"
+        );
+    }
 }
