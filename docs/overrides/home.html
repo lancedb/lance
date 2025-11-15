@@ -55,6 +55,65 @@
     }
   </style>
 
+  <script>
+    // Fix palette toggle jumping to bottom of page
+    (function() {
+      // Store scroll position
+      let savedScrollY = 0;
+      let isTogglingPalette = false;
+
+      // Prevent hash-based scrolling for palette changes
+      if ('scrollRestoration' in history) {
+        history.scrollRestoration = 'manual';
+      }
+
+      // Intercept scroll attempts during palette toggle
+      const preventScroll = function() {
+        if (isTogglingPalette) {
+          window.scrollTo(0, savedScrollY);
+        }
+      };
+
+      // Save scroll position and intercept clicks on palette toggle
+      document.addEventListener('click', function(e) {
+        const paletteLabel = e.target.closest('[for^="__palette"]');
+        if (paletteLabel) {
+          savedScrollY = window.scrollY;
+          isTogglingPalette = true;
+
+          // Prevent any scrolling for a brief moment
+          window.addEventListener('scroll', preventScroll, { passive: false });
+
+          setTimeout(function() {
+            isTogglingPalette = false;
+            window.removeEventListener('scroll', preventScroll);
+          }, 100);
+        }
+      }, true);
+
+      // Listen for hash changes from palette toggle
+      window.addEventListener('hashchange', function(e) {
+        if (window.location.hash.startsWith('#__palette')) {
+          e.preventDefault();
+          // Immediately restore scroll position
+          window.scrollTo(0, savedScrollY);
+          // Clean up hash without triggering another hashchange
+          history.replaceState(null, null, window.location.pathname);
+        }
+      }, false);
+
+      // Also handle palette input changes directly
+      document.addEventListener('DOMContentLoaded', function() {
+        const paletteInputs = document.querySelectorAll('input[name="__palette"]');
+        paletteInputs.forEach(function(input) {
+          input.addEventListener('change', function() {
+            window.scrollTo(0, savedScrollY);
+          });
+        });
+      });
+    })();
+  </script>
+
   <!-- Hero Section -->
   <section class="mdx-container">
     <div class="container">
