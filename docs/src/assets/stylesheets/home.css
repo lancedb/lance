@@ -1,5 +1,14 @@
 /* Lance Homepage Styles */
 
+/* Override with custom color #625EFF site-wide */
+:root > * {
+  --md-primary-fg-color: #625EFF;
+  --md-primary-fg-color--light: #8481FF;
+  --md-primary-fg-color--dark: #4A46CC;
+  --md-accent-fg-color: #625EFF;
+  --md-accent-fg-color--transparent: rgba(98, 94, 255, 0.1);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -108,7 +117,7 @@
 }
 
 .intro-message .md-button--primary:hover {
-  box-shadow: 0 8px 20px rgba(102, 126, 234, 0.5);
+  box-shadow: 0 8px 20px rgba(98, 94, 255, 0.5);
 }
 
 .intro-message .md-button:not(.md-button--primary):hover {
