@@ -891,7 +891,21 @@ impl Dataset {
                     }
                 }
 
-                Self::write(batches, uri.as_str(), Some(write_params)).await
+                // For APPEND/OVERWRITE modes, we must open the existing dataset first
+                // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
+                // assumes no dataset exists and converts the mode to CREATE.
+                let mut builder = DatasetBuilder::from_uri(uri.as_str());
+                if let Some(ref store_params) = write_params.store_params {
+                    if let Some(ref storage_options) = store_params.storage_options {
+                        builder = builder.with_storage_options(storage_options.clone());
+                    }
+                    if let Some(ref provider) = store_params.storage_options_provider {
+                        builder = builder.with_storage_options_provider(provider.clone());
+                    }
+                }
+                let dataset = Arc::new(builder.load().await?);
+
+                Self::write(batches, dataset, Some(write_params)).await
             }
         }
     }
@@ -2735,6 +2749,7 @@ mod tests {
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
+    use lance_datafusion::utils::reader_to_stream;
     use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
@@ -9799,7 +9814,7 @@ mod tests {
     // Mock namespace implementation for testing
     #[derive(Debug)]
     struct MockLanceNamespace {
-        bucket_name: String,
+        base_dir: String,
         base_storage_options: HashMap<String, String>,
         credential_expires_in_seconds: u64,
         describe_call_count: Arc<std::sync::Mutex<u32>>,
@@ -9808,9 +9823,9 @@ mod tests {
     }
 
     impl MockLanceNamespace {
-        fn new(bucket_name: String, base_storage_options: HashMap<String, String>) -> Self {
+        fn new(base_dir: String, base_storage_options: HashMap<String, String>) -> Self {
             Self {
-                bucket_name,
+                base_dir,
                 base_storage_options,
                 credential_expires_in_seconds: 60,
                 describe_call_count: Arc::new(std::sync::Mutex::new(0)),
@@ -9860,8 +9875,8 @@ mod tests {
             }
 
             // Generate location for the new table
-            let table_key = table_id.join("/");
-            let location = format!("memory://{}/{}.lance", self.bucket_name, table_key);
+            let table_key = table_id.join("_");
+            let location = format!("{}/{}.lance", self.base_dir, table_key);
 
             // Register the table
             self.register_table(table_id.clone(), location.clone());
@@ -9938,9 +9953,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_distributed_write() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -9994,9 +10010,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_write_create_mode() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10037,9 +10054,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_write_append_mode() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10095,17 +10113,22 @@ mod tests {
         .unwrap();
 
         // Verify describe_table was called for APPEND mode (not create_empty_table)
-        assert_eq!(namespace.get_create_call_count(), 1); // Only from initial CREATE
-        assert_eq!(namespace.get_describe_call_count(), 1); // One for APPEND
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
-        assert_eq!(dataset.version().version, 2);
+        let create_count = namespace.get_create_call_count();
+        let describe_count = namespace.get_describe_call_count();
+        assert_eq!(create_count, 1); // Only from initial CREATE
+        assert_eq!(describe_count, 1); // One for APPEND
+        let row_count = dataset.count_rows(None).await.unwrap();
+        let version = dataset.version().version;
+        assert_eq!(row_count, 5);
+        assert_eq!(version, 2);
     }
 
     #[tokio::test]
     async fn test_namespace_write_overwrite_mode() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10179,9 +10202,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_delete() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10220,9 +10244,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_update() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10242,7 +10267,7 @@ mod tests {
         .unwrap();
 
         let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write_into_namespace(
+        let dataset = Dataset::write_into_namespace(
             reader,
             namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
             table_id.clone(),
@@ -10267,20 +10292,35 @@ mod tests {
         assert_eq!(update_result.new_dataset.version().version, 2);
 
         let result = update_result.new_dataset.scan().try_into_batch().await.unwrap();
+        let a_col = result
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let b_col = result
             .column_by_name("b")
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(b_col.values(), &[100, 200, 30]);
+
+        // Collect (a, b) pairs and sort by a
+        let mut pairs: Vec<(i32, i32)> = a_col.values().iter().zip(b_col.values().iter())
+            .map(|(&a, &b)| (a, b))
+            .collect();
+        pairs.sort_by_key(|(a, _)| *a);
+        let sorted_b: Vec<i32> = pairs.iter().map(|(_, b)| *b).collect();
+
+        assert_eq!(sorted_b, vec![100, 200, 30]);
     }
 
     #[tokio::test]
     async fn test_namespace_merge_insert() {
+        let test_dir = TempDir::default();
         // Create mock namespace
         let namespace = Arc::new(MockLanceNamespace::new(
-            "test-bucket".to_string(),
+            test_dir.path_str().to_string(),
             HashMap::new(),
         ));
 
@@ -10301,7 +10341,7 @@ mod tests {
         .unwrap();
 
         let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write_into_namespace(
+        let dataset = Dataset::write_into_namespace(
             reader1,
             namespace.clone() as Arc<dyn lance_namespace::LanceNamespace>,
             table_id.clone(),
@@ -10321,22 +10361,23 @@ mod tests {
         )
         .unwrap();
 
-        let new_data = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+        let new_reader = Box::new(RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
 
-        let merge_result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".to_string()])
+        let (merged_dataset, _merge_stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::InsertAll)
             .try_build()
             .unwrap()
-            .execute(Box::new(new_data))
+            .execute(new_stream)
             .await
             .unwrap();
 
-        assert_eq!(merge_result.new_dataset.version().version, 2);
-        assert_eq!(merge_result.new_dataset.count_rows(None).await.unwrap(), 4);
+        assert_eq!(merged_dataset.version().version, 2);
+        assert_eq!(merged_dataset.count_rows(None).await.unwrap(), 4);
 
-        let result = merge_result.new_dataset.scan().project(&["a", "b"]).unwrap().try_into_batch().await.unwrap();
+        let result = merged_dataset.scan().project(&["a", "b"]).unwrap().try_into_batch().await.unwrap();
         let a_col = result
             .column_by_name("a")
             .unwrap()
