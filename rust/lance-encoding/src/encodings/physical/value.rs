@@ -65,7 +65,7 @@ impl ValueEncoder {
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
-        let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+        let bytes_per_chunk = u32::try_from(bytes_per_chunk).unwrap();
         debug_assert!(bytes_per_chunk > 0);
 
         let data_buffer = data.data;
@@ -86,7 +86,7 @@ impl ValueEncoder {
             } else if row_offset < data.num_values {
                 // Final chunk, special values
                 let num_bytes = data_buffer.len() as u64 - bytes_counter;
-                let num_bytes = u16::try_from(num_bytes).unwrap();
+                let num_bytes = u32::try_from(num_bytes).unwrap();
                 chunks.push(MiniBlockChunk {
                     log_num_values: 0,
                     buffer_sizes: vec![num_bytes],
@@ -147,7 +147,7 @@ impl ValueEncoder {
         row_offset: usize,
         num_rows: usize,
         validity_buffers: &mut [Vec<u8>],
-    ) -> Vec<u16> {
+    ) -> Vec<u32> {
         let mut row_offset = row_offset;
         let mut num_values = num_rows;
         let mut buffer_counter = 0;
@@ -160,14 +160,14 @@ impl ValueEncoder {
                     .clone()
                     .bit_slice_le_with_length(row_offset, num_values);
                 validity_buffers[buffer_counter].extend_from_slice(&validity_slice);
-                buffer_sizes.push(validity_slice.len() as u16);
+                buffer_sizes.push(validity_slice.len() as u32);
                 buffer_counter += 1;
             }
         }
 
         let bits_in_chunk = data.bits_per_value * num_values as u64;
         let bytes_in_chunk = bits_in_chunk.div_ceil(8);
-        let bytes_in_chunk = u16::try_from(bytes_in_chunk).unwrap();
+        let bytes_in_chunk = u32::try_from(bytes_in_chunk).unwrap();
         debug_assert!(bytes_in_chunk > 0);
         buffer_sizes.push(bytes_in_chunk);
 

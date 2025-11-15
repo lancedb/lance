@@ -45,13 +45,6 @@ const PRIMITIVE_TYPES: &[DataType] = &[
 // schema doesn't yet parse them in the context of a fixed size list.
 const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[DataType::Int8, DataType::Float32];
 
-const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
-    cache_bytes_per_column: 8 * 1024 * 1024,
-    max_page_bytes: 32 * 1024 * 1024,
-    keep_original_array: true,
-    buffer_alignment: 64,
-};
-
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -73,7 +66,7 @@ fn bench_decode(c: &mut Criterion) {
                     &data,
                     lance_schema,
                     encoding_strategy.as_ref(),
-                    &ENCODING_OPTIONS,
+                    &EncodingOptions::default(),
                 ))
                 .unwrap();
 
@@ -138,7 +131,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                                 &data,
                                 lance_schema,
                                 encoding_strategy.as_ref(),
-                                &ENCODING_OPTIONS,
+                                &EncodingOptions::default(),
                             ))
                             .unwrap();
                         b.iter(|| {
@@ -204,7 +197,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                 &data,
                 lance_schema,
                 encoding_strategy.as_ref(),
-                &ENCODING_OPTIONS,
+                &EncodingOptions::default(),
             ))
             .unwrap();
         b.iter(|| {
@@ -279,7 +272,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                 &data,
                 lance_schema,
                 encoding_strategy.as_ref(),
-                &ENCODING_OPTIONS,
+                &EncodingOptions::default(),
             ))
             .unwrap();
 
@@ -336,7 +329,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                 &data,
                 lance_schema,
                 encoding_strategy.as_ref(),
-                &ENCODING_OPTIONS,
+                &EncodingOptions::default(),
             ))
             .unwrap();
         b.iter(|| {

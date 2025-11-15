@@ -307,7 +307,7 @@ impl DefaultCompressionStrategy {
     }
 
     /// Parse compression parameters from field metadata
-    fn parse_field_metadata(field: &Field) -> CompressionFieldParams {
+    fn parse_field_metadata(field: &Field, version: &LanceFileVersion) -> CompressionFieldParams {
         let mut params = CompressionFieldParams::default();
 
         // Parse compression method
@@ -332,6 +332,27 @@ impl DefaultCompressionStrategy {
                 None => {
                     log::warn!("Invalid BSS mode '{}', using default", bss_str);
                 }
+            }
+        }
+
+        // Parse minichunk size
+        if let Some(minichunk_size_str) = field
+            .metadata
+            .get(super::constants::MINICHUNK_SIZE_META_KEY)
+        {
+            if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
+                // for lance v2.1, only 32kb or smaller is supported
+                if minichunk_size >= 32 * 1024 && *version <= LanceFileVersion::V2_1 {
+                    log::warn!(
+                        "minichunk_size '{}' too large for version '{}', using default",
+                        minichunk_size,
+                        version
+                    );
+                } else {
+                    params.minichunk_size = Some(minichunk_size);
+                }
+            } else {
+                log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
             }
         }
 
@@ -377,12 +398,12 @@ impl DefaultCompressionStrategy {
 
         // 1. Check for explicit "none" compression
         if params.compression.as_deref() == Some("none") {
-            return Ok(Box::new(BinaryMiniBlockEncoder::default()));
+            return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 2. Check for explicit "fsst" compression
         if params.compression.as_deref() == Some("fsst") {
-            return Ok(Box::new(FsstMiniBlockEncoder::default()));
+            return Ok(Box::new(FsstMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 3. Choose base encoder (FSST or Binary) based on data characteristics
@@ -390,9 +411,9 @@ impl DefaultCompressionStrategy {
             >= FSST_LEAST_INPUT_MAX_LENGTH
             && data_size >= FSST_LEAST_INPUT_SIZE as u64
         {
-            Box::new(FsstMiniBlockEncoder::default())
+            Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
         } else {
-            Box::new(BinaryMiniBlockEncoder::default())
+            Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
         };
 
         // 4. Apply general compression if configured
@@ -415,7 +436,7 @@ impl DefaultCompressionStrategy {
             .get_field_params(&field.name, &field.data_type());
 
         // Override with field metadata if present (highest priority)
-        let metadata_params = Self::parse_field_metadata(field);
+        let metadata_params = Self::parse_field_metadata(field, &self.version);
         field_params.merge(&metadata_params);
 
         field_params
@@ -1105,6 +1126,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                minichunk_size: None,
             },
         );
 
@@ -1136,6 +1158,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                minichunk_size: None,
             },
         );
 
@@ -1259,6 +1282,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                minichunk_size: None,
             },
         );
 
@@ -1401,6 +1425,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                minichunk_size: None,
             },
         );
 
