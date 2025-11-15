@@ -12,10 +12,15 @@ use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::WriteParams;
 use lance::session::Session;
 use lance::{dataset::scanner::Scanner, Dataset};
 use lance_core::{box_error, Error, Result};
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_index::traits::DatasetIndexExt;
+use lance_index::IndexType;
 use lance_io::object_store::ObjectStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
@@ -41,6 +46,14 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DELIMITER: &str = "$";
+
+// Index names for the __manifest table
+/// BTREE index on the object_id column for fast lookups
+const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
+/// Bitmap index on the object_type column for filtering by type
+const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
+/// LabelList index on the base_objects column for view dependencies
+const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +239,9 @@ pub struct ManifestNamespace {
     /// If true, root namespace tables use {table_name}.lance naming
     /// If false, they use namespace-prefixed names
     dir_listing_enabled: bool,
+    /// Whether to perform inline optimization (compaction and indexing) on the __manifest table
+    /// after every write. Defaults to true.
+    inline_optimization_enabled: bool,
 }
 
 impl ManifestNamespace {
@@ -237,6 +253,7 @@ impl ManifestNamespace {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
     ) -> Result<Self> {
         let manifest_dataset =
             Self::create_or_get_manifest(&root, object_store.clone(), session.clone()).await?;
@@ -249,6 +266,7 @@ impl ManifestNamespace {
             base_path,
             manifest_dataset,
             dir_listing_enabled,
+            inline_optimization_enabled,
         })
     }
 
@@ -333,18 +351,160 @@ impl ManifestNamespace {
         Ok(full_url.to_string())
     }
 
+    /// Perform inline optimization on the __manifest table.
+    ///
+    /// This method:
+    /// 1. Creates three indexes on the manifest table:
+    ///    - BTREE index on object_id for fast lookups
+    ///    - Bitmap index on object_type for filtering by type
+    ///    - LabelList index on base_objects for view dependencies
+    /// 2. Runs file compaction to merge small files
+    /// 3. Optimizes existing indices
+    ///
+    /// This is called automatically after writes when inline_optimization_enabled is true.
+    async fn run_inline_optimization(&self) -> Result<()> {
+        if !self.inline_optimization_enabled {
+            return Ok(());
+        }
+
+        // Get a mutable reference to the dataset to perform optimization
+        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
+        let dataset: &mut Dataset = &mut dataset_guard;
+
+        // Step 1: Create indexes if they don't already exist
+        let indices = dataset.load_indices().await?;
+
+        // Check which indexes already exist
+        let has_object_id_index = indices.iter().any(|idx| idx.name == OBJECT_ID_INDEX_NAME);
+        let has_object_type_index = indices.iter().any(|idx| idx.name == OBJECT_TYPE_INDEX_NAME);
+        let has_base_objects_index = indices
+            .iter()
+            .any(|idx| idx.name == BASE_OBJECTS_INDEX_NAME);
+
+        // Create BTREE index on object_id
+        if !has_object_id_index {
+            log::debug!(
+                "Creating BTREE index '{}' on object_id for __manifest table",
+                OBJECT_ID_INDEX_NAME
+            );
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+            if let Err(e) = dataset
+                .create_index(
+                    &["object_id"],
+                    IndexType::BTree,
+                    Some(OBJECT_ID_INDEX_NAME.to_string()),
+                    &params,
+                    true,
+                )
+                .await
+            {
+                log::warn!("Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.", e);
+            } else {
+                log::info!(
+                    "Created BTREE index '{}' on object_id for __manifest table",
+                    OBJECT_ID_INDEX_NAME
+                );
+            }
+        }
+
+        // Create Bitmap index on object_type
+        if !has_object_type_index {
+            log::debug!(
+                "Creating Bitmap index '{}' on object_type for __manifest table",
+                OBJECT_TYPE_INDEX_NAME
+            );
+            let params = ScalarIndexParams::default();
+            if let Err(e) = dataset
+                .create_index(
+                    &["object_type"],
+                    IndexType::Bitmap,
+                    Some(OBJECT_TYPE_INDEX_NAME.to_string()),
+                    &params,
+                    true,
+                )
+                .await
+            {
+                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.", e);
+            } else {
+                log::info!(
+                    "Created Bitmap index '{}' on object_type for __manifest table",
+                    OBJECT_TYPE_INDEX_NAME
+                );
+            }
+        }
+
+        // Create LabelList index on base_objects
+        if !has_base_objects_index {
+            log::debug!(
+                "Creating LabelList index '{}' on base_objects for __manifest table",
+                BASE_OBJECTS_INDEX_NAME
+            );
+            let params = ScalarIndexParams::default();
+            if let Err(e) = dataset
+                .create_index(
+                    &["base_objects"],
+                    IndexType::LabelList,
+                    Some(BASE_OBJECTS_INDEX_NAME.to_string()),
+                    &params,
+                    true,
+                )
+                .await
+            {
+                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.", e);
+            } else {
+                log::info!(
+                    "Created LabelList index '{}' on base_objects for __manifest table",
+                    BASE_OBJECTS_INDEX_NAME
+                );
+            }
+        }
+
+        // Step 2: Run file compaction
+        log::debug!("Running file compaction on __manifest table");
+        match compact_files(dataset, CompactionOptions::default(), None).await {
+            Ok(compaction_metrics) => {
+                if compaction_metrics.fragments_removed > 0 {
+                    log::info!(
+                        "Compacted __manifest table: removed {} fragments, added {} fragments",
+                        compaction_metrics.fragments_removed,
+                        compaction_metrics.fragments_added
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to compact files for __manifest table: {:?}. Continuing with optimization.", e);
+            }
+        }
+
+        // Step 3: Optimize indices
+        log::debug!("Optimizing indices on __manifest table");
+        match dataset.optimize_indices(&OptimizeOptions::default()).await {
+            Ok(_) => {
+                log::info!("Successfully optimized indices on __manifest table");
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to optimize indices on __manifest table: {:?}. Continuing anyway.",
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the manifest schema
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             Field::new("object_id", DataType::Utf8, false),
             Field::new("object_type", DataType::Utf8, false),
-            Field::new("location", DataType::Utf8, true), // Optional: namespaces don't have location
-            Field::new("metadata", DataType::Utf8, true), // Optional: tables don't have metadata
+            Field::new("location", DataType::Utf8, true),
+            Field::new("metadata", DataType::Utf8, true),
             Field::new(
                 "base_objects",
                 DataType::List(Arc::new(Field::new("object_id", DataType::Utf8, true))),
                 true,
-            ), // Optional: mainly for objects like view to record dependency
+            ),
         ]))
     }
 
@@ -511,30 +671,43 @@ impl ManifestNamespace {
         object_type: ObjectType,
         location: Option<String>,
     ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(object_id, object_type, location, None)
+        self.insert_into_manifest_with_metadata(object_id, object_type, location, None, None)
             .await
     }
 
-    /// Insert an entry into the manifest table with metadata
+    /// Insert an entry into the manifest table with metadata and base_objects
     async fn insert_into_manifest_with_metadata(
         &self,
         object_id: String,
         object_type: ObjectType,
         location: Option<String>,
         metadata: Option<String>,
+        base_objects: Option<Vec<String>>,
     ) -> Result<()> {
         use arrow::array::builder::{ListBuilder, StringBuilder};
 
         let schema = Self::manifest_schema();
 
-        // Create empty base_objects array
+        // Create base_objects array from the provided list
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
             "object_id",
             DataType::Utf8,
             true,
         )));
-        list_builder.append_null();
+
+        match base_objects {
+            Some(objects) => {
+                for obj in objects {
+                    list_builder.values().append_value(obj);
+                }
+                list_builder.append(true);
+            }
+            None => {
+                list_builder.append_null();
+            }
+        }
+
         let base_objects_array = list_builder.finish();
 
         // Create arrays with optional values
@@ -621,6 +794,14 @@ impl ManifestNamespace {
         let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
         self.manifest_dataset.set_latest(new_dataset).await;
 
+        // Run inline optimization after write
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -639,6 +820,15 @@ impl ManifestNamespace {
         } // Drop the guard here
 
         self.manifest_dataset.reload().await?;
+
+        // Run inline optimization after delete
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -1194,8 +1384,14 @@ impl LanceNamespace for ManifestNamespace {
             }
         });
 
-        self.insert_into_manifest_with_metadata(object_id, ObjectType::Namespace, None, metadata)
-            .await?;
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Namespace,
+            None,
+            metadata,
+            None,
+        )
+        .await?;
 
         Ok(CreateNamespaceResponse {
             properties: request.properties,
@@ -1516,6 +1712,7 @@ mod tests {
         TableExistsRequest,
     };
     use lance_namespace::LanceNamespace;
+    use rstest::rstest;
 
     fn create_test_ipc_data() -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
@@ -1547,13 +1744,17 @@ mod tests {
         buffer
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_namespace_basic_create_and_list() {
+    async fn test_manifest_namespace_basic_create_and_list(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         // Create a DirectoryNamespace with manifest enabled (default)
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1582,12 +1783,16 @@ mod tests {
         assert_eq!(response.tables[0], "test_table");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_namespace_table_exists() {
+    async fn test_manifest_namespace_table_exists(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1614,12 +1819,16 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_namespace_describe_table() {
+    async fn test_manifest_namespace_describe_table(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1647,12 +1856,16 @@ mod tests {
         assert!(response.location.unwrap().contains("test_table"));
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_namespace_drop_table() {
+    async fn test_manifest_namespace_drop_table(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1684,12 +1897,16 @@ mod tests {
         assert_eq!(response.tables.len(), 0);
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_namespace_multiple_tables() {
+    async fn test_manifest_namespace_multiple_tables(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1715,14 +1932,18 @@ mod tests {
         assert!(response.tables.contains(&"table3".to_string()));
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_directory_only_mode() {
+    async fn test_directory_only_mode(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         // Create a DirectoryNamespace with manifest disabled
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
             .manifest_enabled(false)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1752,8 +1973,11 @@ mod tests {
         assert_eq!(response.tables[0], "test_table");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_dual_mode_merge() {
+    async fn test_dual_mode_merge(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
@@ -1761,6 +1985,7 @@ mod tests {
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
             .manifest_enabled(true)
             .dir_listing_enabled(true)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1782,8 +2007,11 @@ mod tests {
         assert_eq!(response.tables[0], "table1");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_manifest_only_mode() {
+    async fn test_manifest_only_mode(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
@@ -1791,6 +2019,7 @@ mod tests {
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
             .manifest_enabled(true)
             .dir_listing_enabled(false)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1812,12 +2041,16 @@ mod tests {
         assert_eq!(response.tables[0], "test_table");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_drop_nonexistent_table() {
+    async fn test_drop_nonexistent_table(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1829,12 +2062,16 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_create_duplicate_table_fails() {
+    async fn test_create_duplicate_table_fails(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1857,8 +2094,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_create_child_namespace() {
+    async fn test_create_child_namespace(#[case] inline_optimization: bool) {
         use lance_namespace::models::{
             CreateNamespaceRequest, ListNamespacesRequest, NamespaceExistsRequest,
         };
@@ -1867,6 +2107,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1901,8 +2142,11 @@ mod tests {
         assert_eq!(namespaces.namespaces[0], "ns1");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_create_nested_namespace() {
+    async fn test_create_nested_namespace(#[case] inline_optimization: bool) {
         use lance_namespace::models::{
             CreateNamespaceRequest, ListNamespacesRequest, NamespaceExistsRequest,
         };
@@ -1911,6 +2155,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1950,14 +2195,18 @@ mod tests {
         assert_eq!(namespaces.namespaces[0], "child");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_create_namespace_without_parent_fails() {
+    async fn test_create_namespace_without_parent_fails(#[case] inline_optimization: bool) {
         use lance_namespace::models::CreateNamespaceRequest;
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -1969,8 +2218,11 @@ mod tests {
         assert!(result.is_err(), "Should fail when parent doesn't exist");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_drop_child_namespace() {
+    async fn test_drop_child_namespace(#[case] inline_optimization: bool) {
         use lance_namespace::models::{
             CreateNamespaceRequest, DropNamespaceRequest, NamespaceExistsRequest,
         };
@@ -1979,6 +2231,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -2006,14 +2259,18 @@ mod tests {
         assert!(result.is_err(), "Namespace should not exist after drop");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_drop_namespace_with_children_fails() {
+    async fn test_drop_namespace_with_children_fails(#[case] inline_optimization: bool) {
         use lance_namespace::models::{CreateNamespaceRequest, DropNamespaceRequest};
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -2034,8 +2291,11 @@ mod tests {
         assert!(result.is_err(), "Should fail when namespace has children");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_create_table_in_child_namespace() {
+    async fn test_create_table_in_child_namespace(#[case] inline_optimization: bool) {
         use lance_namespace::models::{
             CreateNamespaceRequest, CreateTableRequest, ListTablesRequest,
         };
@@ -2044,6 +2304,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();
@@ -2079,14 +2340,18 @@ mod tests {
         assert_eq!(tables.tables[0], "table1");
     }
 
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
     #[tokio::test]
-    async fn test_describe_child_namespace() {
+    async fn test_describe_child_namespace(#[case] inline_optimization: bool) {
         use lance_namespace::models::{CreateNamespaceRequest, DescribeNamespaceRequest};
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
             .build()
             .await
             .unwrap();

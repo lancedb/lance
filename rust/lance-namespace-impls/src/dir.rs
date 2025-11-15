@@ -74,6 +74,7 @@ pub struct DirectoryNamespaceBuilder {
     session: Option<Arc<Session>>,
     manifest_enabled: bool,
     dir_listing_enabled: bool,
+    inline_optimization_enabled: bool,
 }
 
 impl DirectoryNamespaceBuilder {
@@ -89,6 +90,7 @@ impl DirectoryNamespaceBuilder {
             session: None,
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
+            inline_optimization_enabled: true,
         }
     }
 
@@ -110,6 +112,16 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
+    /// Enable or disable inline optimization of the __manifest table.
+    ///
+    /// When enabled (default), performs compaction and indexing on the __manifest table
+    /// after every write operation to maintain optimal performance.
+    /// When disabled, manual optimization must be performed separately.
+    pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
+        self.inline_optimization_enabled = enabled;
+        self
+    }
+
     /// Create a DirectoryNamespaceBuilder from properties HashMap.
     ///
     /// This method parses a properties map into builder configuration.
@@ -117,6 +129,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable inline optimization of __manifest table (optional, default: true)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// # Arguments
@@ -190,12 +203,19 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
+        // Extract inline_optimization_enabled (default: true)
+        let inline_optimization_enabled = properties
+            .get("inline_optimization_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
             storage_options,
             session,
             manifest_enabled,
             dir_listing_enabled,
+            inline_optimization_enabled,
         })
     }
 
@@ -262,6 +282,7 @@ impl DirectoryNamespaceBuilder {
                 object_store.clone(),
                 base_path.clone(),
                 self.dir_listing_enabled,
+                self.inline_optimization_enabled,
             )
             .await
             {

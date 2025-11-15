@@ -4257,6 +4257,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-core",
+ "lance-index",
  "lance-io",
  "lance-namespace",
  "log",

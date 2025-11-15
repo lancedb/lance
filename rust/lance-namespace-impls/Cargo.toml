@@ -37,6 +37,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
 lance = { workspace = true }
+lance-index = { workspace = true }
 lance-io = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }
@@ -65,6 +66,7 @@ tempfile.workspace = true
 wiremock.workspace = true
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
+rstest.workspace = true
 
 [lints]
 workspace = true
