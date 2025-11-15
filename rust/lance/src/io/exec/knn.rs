@@ -36,8 +36,8 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::ROW_ID;
-use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
     PARTITIONS_SEARCHED_METRIC,
@@ -61,8 +61,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
-    SelectionVectorToPrefilter,
+    FilteredRowAddrsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter,
+    PreFilterSource, SelectionVectorToPrefilter,
 };
 
 pub struct AnnPartitionMetrics {
@@ -289,7 +289,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]))
 });
 
@@ -749,7 +749,7 @@ impl ANNIvfSubIndexExec {
                     // just return the prefilter ids and don't bother searching any further
 
                     // This next if check should be true, because we wouldn't get max_results otherwise
-                    if let Some(iter_ids) = prefilter_mask.iter_ids() {
+                    if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
                         // We only run this on the first delta because the prefilter mask is shared
                         // by all deltas and we don't want to duplicate the rows.
                         if state
@@ -760,15 +760,15 @@ impl ANNIvfSubIndexExec {
                             let initial_ids = state.initial_ids.lock().unwrap();
                             let found_ids = HashSet::<_>::from_iter(initial_ids.iter().copied());
                             drop(initial_ids);
-                            let mask_ids = HashSet::from_iter(iter_ids.map(u64::from));
-                            let not_found_ids = mask_ids.difference(&found_ids);
-                            let not_found_ids =
-                                UInt64Array::from_iter_values(not_found_ids.copied());
+                            let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
+                            let not_found_addrs = mask_addrs.difference(&found_ids);
+                            let not_found_addrs =
+                                UInt64Array::from_iter_values(not_found_addrs.copied());
                             let not_found_distance =
-                                Float32Array::from_value(f32::INFINITY, not_found_ids.len());
+                                Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
                             let not_found_batch = RecordBatch::try_new(
                                 KNN_INDEX_SCHEMA.clone(),
-                                vec![Arc::new(not_found_distance), Arc::new(not_found_ids)],
+                                vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
                             )
                             .unwrap();
                             return futures::stream::once(async move { Ok(not_found_batch) })
@@ -1003,7 +1003,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let prefilter_loader = match &prefilter_source {
             PreFilterSource::FilteredRowIds(src_node) => {
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(Box::new(FilteredRowAddrsToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
             PreFilterSource::ScalarIndexQuery(src_node) => {
                 let stream = src_node.execute(partition, context)?;
@@ -1218,36 +1218,36 @@ impl ExecutionPlan for MultivectorScoringExec {
         let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
             stream.map(|batch| {
                 let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
 
-                // max-reduce for the same row id
+                // max-reduce for the same row addr
                 let min_sim = dists
                     .values()
                     .last()
                     .map(|dist| 1.0 - *dist)
                     .unwrap_or_default();
-                let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_sims = Vec::with_capacity(row_ids.len());
-                let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
+                let mut new_row_addrs = Vec::with_capacity(row_addrs.len());
+                let mut new_sims = Vec::with_capacity(row_addrs.len());
+                let mut visited_row_addrs = HashSet::with_capacity(row_addrs.len());
 
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
-                    // the results are sorted by distance, so we can skip if we have seen this row id before
-                    if visited_row_ids.contains(row_id) {
+                for (row_addr, dist) in row_addrs.values().iter().zip(dists.values().iter()) {
+                    // the results are sorted by distance, so we can skip if we have seen this row addr before
+                    if visited_row_addrs.contains(row_addr) {
                         continue;
                     }
-                    visited_row_ids.insert(row_id);
-                    new_row_ids.push(*row_id);
+                    visited_row_addrs.insert(row_addr);
+                    new_row_addrs.push(*row_addr);
                     // it's cosine distance, so we need to convert it to similarity
                     new_sims.push(1.0 - *dist);
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
+                let new_row_addrs = UInt64Array::from(new_row_addrs);
                 let new_dists = Float32Array::from(new_sims);
 
                 let batch = RecordBatch::try_new(
                     KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
+                    vec![Arc::new(new_dists), Arc::new(new_row_addrs)],
                 )?;
 
                 Ok::<_, DataFusionError>((min_sim, batch))
@@ -1262,10 +1262,10 @@ impl ExecutionPlan for MultivectorScoringExec {
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
             while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
 
-                let query_results = row_ids
+                let query_results = row_addrs
                     .values()
                     .iter()
                     .copied()
@@ -1339,6 +1339,7 @@ mod tests {
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::ROW_ADDR;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
@@ -1559,10 +1560,10 @@ mod tests {
                 .await?;
             let mut results = HashMap::new();
             for batch in batches {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
-                    results.insert(*row_id, *dist);
+                for (row_addr, dist) in row_addrs.values().iter().zip(dists.values().iter()) {
+                    results.insert(*row_addr, *dist);
                 }
             }
             Ok(results)
@@ -1739,7 +1740,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1776,7 +1777,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1813,7 +1814,7 @@ mod tests {
                 .scan_stats_callback(stats_holder.get_setter())
                 .project(&Vec::<String>::new())
                 .unwrap()
-                .with_row_id()
+                .with_row_address()
                 .try_into_batch()
                 .await
                 .unwrap();
@@ -1851,7 +1852,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1890,7 +1891,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1924,7 +1925,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();

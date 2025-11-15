@@ -188,6 +188,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = None,
@@ -220,6 +221,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
+        with_row_address : bool, optional
+            If set true, the returned batch will have an additional column named
+            `_rowaddr` that contains the row address of the batch.
         rank: int, optional (deprecated)
             If set, the rank (idx) of this process in distributed training / inference.
         world_size: int, optional (deprecated)
@@ -249,6 +253,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+        self.with_row_address = with_row_address
         self.batch_readahead = batch_readahead
         self._to_tensor_fn = to_tensor_fn
         self._hf_converter = None
@@ -343,6 +348,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     filter=self.filter,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
+                    with_row_address=self.with_row_address,
                     batch_readahead=self.batch_readahead,
                 )
 

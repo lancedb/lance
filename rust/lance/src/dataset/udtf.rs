@@ -325,7 +325,7 @@ pub mod tests {
             "#;
         let options = r#"
             {
-                "with_row_id": true
+                "with_row_addr": true
             }
             "#;
 
@@ -340,11 +340,11 @@ pub mod tests {
         let results = df.collect().await.unwrap();
         assert_eq!(results.len(), 1);
         let results = results.into_iter().next().unwrap();
-        assert_eq!(results.num_columns(), 4); // text, number, _score, _rowid
+        assert_eq!(results.num_columns(), 4); // text, number, _score, _rowaddr
         assert_eq!(results.num_rows(), 3);
-        let row_id_col = results.column_by_name("_rowid").unwrap();
-        let row_id_col = row_id_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-        row_id_col
+        let row_addr_col = results.column_by_name("_rowaddr").unwrap();
+        let row_addr_col = row_addr_col.as_any().downcast_ref::<UInt64Array>().unwrap();
+        row_addr_col
             .iter()
             .for_each(|v| assert!([1u64, 2u64, 4u64].contains(&v.unwrap())));
     }

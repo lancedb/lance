@@ -13,7 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
@@ -81,17 +81,17 @@ struct SQStorageChunk {
     // Helper fields, references to the batch
     // These fields share the `Arc` pointer to the columns in batch,
     // so it does not take more memory.
-    row_ids: UInt64Array,
+    row_addrs: UInt64Array,
     sq_codes: UInt8Array,
 }
 
 impl SQStorageChunk {
     // Create a new chunk from a RecordBatch.
     fn new(batch: RecordBatch) -> Result<Self> {
-        let row_ids = batch
-            .column_by_name(ROW_ID)
+        let row_addrs = batch
+            .column_by_name(ROW_ADDR)
             .ok_or(Error::Index {
-                message: "Row ID column not found in the batch".to_owned(),
+                message: "Row ADDR column not found in the batch".to_owned(),
                 location: location!(),
             })?
             .as_primitive::<UInt64Type>()
@@ -115,7 +115,7 @@ impl SQStorageChunk {
         Ok(Self {
             batch,
             dim,
-            row_ids,
+            row_addrs,
             sq_codes,
         })
     }
@@ -126,7 +126,7 @@ impl SQStorageChunk {
     }
 
     fn len(&self) -> usize {
-        self.row_ids.len()
+        self.row_addrs.len()
     }
 
     fn schema(&self) -> &SchemaRef {
@@ -135,7 +135,7 @@ impl SQStorageChunk {
 
     #[inline]
     fn row_id(&self, id: u32) -> u64 {
-        self.row_ids.value(id as usize)
+        self.row_addrs.value(id as usize)
     }
 
     /// Get a slice of SQ code for id
@@ -187,7 +187,7 @@ impl ScalarQuantizationStorage {
         offsets.push(0);
         for mut batch in batches.into_iter() {
             if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
+                batch = frag_reuse_index_ref.remap_row_addrs_record_batch(batch, 0)?
             }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
@@ -367,13 +367,13 @@ impl VectorStore for ScalarQuantizationStorage {
         self.distance_type
     }
 
-    fn row_id(&self, id: u32) -> u64 {
+    fn row_addr(&self, id: u32) -> u64 {
         let (offset, chunk) = self.chunk(id);
         chunk.row_id(id - offset)
     }
 
-    fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.chunks.iter().flat_map(|c| c.row_ids.values())
+    fn row_addrs(&self) -> impl Iterator<Item = &u64> {
+        self.chunks.iter().flat_map(|c| c.row_addrs.values())
     }
 
     /// Create a [DistCalculator] to compute the distance between the query.
@@ -500,6 +500,7 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ADDR;
     use lance_testing::datagen::generate_random_array;
     use rand::prelude::*;
 
@@ -514,7 +515,7 @@ mod tests {
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
             Field::new(
                 SQ_CODE_COLUMN,
                 DataType::FixedSizeList(
@@ -554,7 +555,7 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(vector_data, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(

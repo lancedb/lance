@@ -48,7 +48,7 @@ use lance_core::{
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result, ROW_ID,
+    Error, Result, ROW_ADDR,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
@@ -820,7 +820,7 @@ impl BTreeIndex {
             .await?;
         if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
             serialized_page =
-                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+                frag_reuse_index_ref.remap_row_addrs_record_batch(serialized_page, 1)?;
         }
         let result = self.sub_index.load_subindex(serialized_page).await?;
         Ok(result)
@@ -951,8 +951,8 @@ impl BTreeIndex {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
-        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let row_addr_field = schema.field(1).clone().with_name(ROW_ADDR);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_addr_field]));
         let new_schema_clone = new_schema.clone();
         let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
         let batches = reader_stream
@@ -1251,7 +1251,9 @@ impl ScalarIndex for BTreeIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1658,8 +1660,8 @@ async fn merge_pages(
     );
 
     let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
-    let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+    let row_addr_field = arrow_schema.field(1).clone().with_name(ROW_ADDR);
+    let stream_schema = Arc::new(Schema::new(vec![value_field, row_addr_field]));
 
     // Create execution plans for each stream
     let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -1901,7 +1903,7 @@ impl BTreeTrainingRequest {
         Self {
             parameters,
             // BTree indexes need data sorted by the value column
-            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         }
     }
 }
@@ -2067,7 +2069,7 @@ mod tests {
                 "value",
                 array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
             )
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
@@ -2141,7 +2143,7 @@ mod tests {
         // and use DF to sort the data like we would in a real dataset.
         let data = gen_batch()
             .col("value", array::cycle::<Float64Type>(values.clone()))
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -2183,7 +2185,7 @@ mod tests {
 
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -2236,7 +2238,7 @@ mod tests {
         let total_count = 2 * DEFAULT_BTREE_BATCH_SIZE;
         let full_data_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_count / 2), BatchCount::from(2));
         let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
             full_data_gen.schema(),
@@ -2258,7 +2260,7 @@ mod tests {
         let half_count = DEFAULT_BTREE_BATCH_SIZE;
         let fragment1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
         let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
             fragment1_gen.schema(),
@@ -2282,7 +2284,7 @@ mod tests {
         let row_ids_second_half: Vec<u64> = (start_val as u64..end_val as u64).collect();
         let fragment2_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_second_half))
-            .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
+            .col("_rowaddr", array::cycle::<UInt64Type>(row_ids_second_half))
             .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
         let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
             fragment2_gen.schema(),
@@ -2421,7 +2423,7 @@ mod tests {
         // Method 1: Build complete index directly
         let full_data_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_count / 3), BatchCount::from(3));
         let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
             full_data_gen.schema(),
@@ -2443,7 +2445,7 @@ mod tests {
         let fragment_size = DEFAULT_BTREE_BATCH_SIZE;
         let fragment1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
         let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
             fragment1_gen.schema(),
@@ -2467,7 +2469,7 @@ mod tests {
         let row_ids_fragment2: Vec<u64> = (start_val2 as u64..end_val2 as u64).collect();
         let fragment2_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_fragment2))
-            .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment2))
+            .col("_rowaddr", array::cycle::<UInt64Type>(row_ids_fragment2))
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
         let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
             fragment2_gen.schema(),
@@ -2491,7 +2493,7 @@ mod tests {
         let row_ids_fragment3: Vec<u64> = (start_val3 as u64..end_val3 as u64).collect();
         let fragment3_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_fragment3))
-            .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment3))
+            .col("_rowaddr", array::cycle::<UInt64Type>(row_ids_fragment3))
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
         let fragment3_data_source = Box::pin(RecordBatchStreamAdapter::new(
             fragment3_gen.schema(),

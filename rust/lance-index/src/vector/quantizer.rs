@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -246,28 +246,28 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
             .to_batches()?
             .map(|b| {
                 let mut indices = Vec::with_capacity(b.num_rows());
-                let mut new_row_ids = Vec::with_capacity(b.num_rows());
+                let mut new_row_addrs = Vec::with_capacity(b.num_rows());
 
                 let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
-                for (i, row_id) in row_ids.iter().enumerate() {
-                    match mapping.get(row_id) {
-                        Some(Some(new_id)) => {
+                for (i, row_addr) in row_ids.iter().enumerate() {
+                    match mapping.get(row_addr) {
+                        Some(Some(new_addr)) => {
                             indices.push(i as u32);
-                            new_row_ids.push(*new_id);
+                            new_row_addrs.push(*new_addr);
                         }
                         Some(None) => {}
                         None => {
                             indices.push(i as u32);
-                            new_row_ids.push(*row_id);
+                            new_row_addrs.push(*row_addr);
                         }
                     }
                 }
 
                 let indices = UInt32Array::from(indices);
-                let new_row_ids = UInt64Array::from(new_row_ids);
+                let new_row_addrs = UInt64Array::from(new_row_addrs);
                 let b = b
                     .take(&indices)?
-                    .replace_column_by_name(ROW_ID, Arc::new(new_row_ids))?;
+                    .replace_column_by_name(ROW_ADDR, Arc::new(new_row_addrs))?;
                 Ok(b)
             })
             .collect::<Result<Vec<_>>>()?;
