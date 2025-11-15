@@ -351,6 +351,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Overwrite {
                 ref fragments,
                 ref schema,
+                ref initial_bases,
                 ..
             } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
@@ -361,7 +362,26 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .getattr("Overwrite")
                     .expect("Failed to get Overwrite class");
 
-                cls.call1((schema_py, fragments_py))
+                // Convert initial_bases to Python if present.
+                let initial_bases_py = if let Some(bases) = initial_bases {
+                    use crate::dataset::DatasetBasePath;
+                    // Convert each Rust BasePath to a Python DatasetBasePath object
+                    let bases_py: Vec<DatasetBasePath> = bases
+                        .iter()
+                        .map(|bp| DatasetBasePath::from(bp.clone()))
+                        .collect();
+                    Some(pyo3::types::PyList::new(py, bases_py)?)
+                } else {
+                    None
+                };
+
+                // Call Python Overwrite constructor with or without initial_bases
+                // to maintain backward compatibility with existing code
+                if let Some(bases_list) = initial_bases_py {
+                    cls.call1((schema_py, fragments_py, bases_list))
+                } else {
+                    cls.call1((schema_py, fragments_py))
+                }
             }
             Operation::Update {
                 removed_fragment_ids,

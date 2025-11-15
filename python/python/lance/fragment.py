@@ -41,6 +41,7 @@ from .udf import BatchUDF, normalize_transform
 if TYPE_CHECKING:
     from .dataset import (
         ColumnOrdering,
+        DatasetBasePath,
         LanceDataset,
         LanceScanner,
         ReaderLike,
@@ -866,6 +867,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -885,6 +887,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -904,6 +907,7 @@ def write_fragments(
     storage_options: Optional[Dict[str, str]] = None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List["DatasetBasePath"]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -966,9 +970,19 @@ def write_fragments(
         2. Base path URI (e.g., "s3://bucket1/data")
 
         **CREATE mode**: References must match bases in `initial_bases`
-        (from dataset creation)
         **APPEND/OVERWRITE modes**: References must match bases in the
         existing manifest
+    initial_bases : list of DatasetBasePath, optional
+        Base paths to register when creating a new dataset (CREATE mode only).
+
+        This allows `target_bases` references to be resolved during fragment
+        writing. Example:
+
+        >>> from lance import DatasetBasePath
+        >>> initial_bases = [DatasetBasePath(path="s3://bucket1/data", name="base1")]
+
+        **Only valid in CREATE mode**. Will raise an error if used with
+        APPEND/OVERWRITE modes.
 
     Returns
     -------
@@ -1019,6 +1033,7 @@ def write_fragments(
         storage_options=storage_options,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
+        initial_bases=initial_bases,
     )
 
 

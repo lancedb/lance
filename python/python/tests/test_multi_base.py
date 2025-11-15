@@ -1096,10 +1096,12 @@ class TestWriteFragmentsWithTargetBases:
     def test_write_fragments_overwrite_mode_with_target_bases(self):
         """Test write_fragments in OVERWRITE mode with target_bases."""
         # Create initial dataset
-        initial_data = pd.DataFrame({
-            "id": range(30),
-            "value": [f"initial_{i}" for i in range(30)],
-        })
+        initial_data = pd.DataFrame(
+            {
+                "id": range(30),
+                "value": [f"initial_{i}" for i in range(30)],
+            }
+        )
 
         dataset = lance.write_dataset(
             initial_data,
@@ -1116,10 +1118,12 @@ class TestWriteFragmentsWithTargetBases:
         assert len(dataset.to_table()) == 30
 
         # Use write_fragments with mode="overwrite" to replace all data
-        overwrite_data = pd.DataFrame({
-            "id": range(100, 120),
-            "value": [f"overwrite_{i}" for i in range(100, 120)],
-        })
+        overwrite_data = pd.DataFrame(
+            {
+                "id": range(100, 120),
+                "value": [f"overwrite_{i}" for i in range(100, 120)],
+            }
+        )
 
         fragments = write_fragments(
             pa.Table.from_pandas(overwrite_data),
@@ -1133,8 +1137,7 @@ class TestWriteFragmentsWithTargetBases:
 
         # Commit with Overwrite operation
         operation = lance.LanceOperation.Overwrite(
-            pa.Table.from_pandas(overwrite_data).schema,
-            fragments
+            pa.Table.from_pandas(overwrite_data).schema, fragments
         )
         dataset = lance.LanceDataset.commit(
             dataset.uri, operation, read_version=dataset.version
@@ -1151,3 +1154,60 @@ class TestWriteFragmentsWithTargetBases:
         base2_path = Path(self.base2_uri)
         data_files = list(base2_path.glob("**/*.lance"))
         assert len(data_files) > 0, "Expected data files in base2"
+
+    def test_write_fragments_create_mode_with_initial_bases(self):
+        """Test write_fragments in CREATE mode with initial_bases."""
+        # Create a new dataset URI (doesn't exist yet)
+        dataset_uri = Path(self.test_dir) / "new_dataset_with_commit"
+
+        # Create base paths
+        base1_path = Path(self.test_dir) / "base1_new"
+        base2_path = Path(self.test_dir) / "base2_new"
+        base1_path.mkdir(parents=True, exist_ok=True)
+        base2_path.mkdir(parents=True, exist_ok=True)
+
+        # Define initial bases to register using DatasetBasePath objects
+        initial_bases = [
+            lance.DatasetBasePath(path=str(base1_path), name="base1"),
+            lance.DatasetBasePath(path=str(base2_path), name="base2"),
+        ]
+
+        # Write fragments in CREATE mode with both initial_bases and target_bases
+        # Use return_transaction=True so that the Rust code properly assigns
+        # IDs to initial_bases
+        data = pa.table({"id": range(20), "value": [f"val_{i}" for i in range(20)]})
+        transaction = write_fragments(
+            data,
+            str(dataset_uri),
+            mode="create",
+            target_bases=["base1"],
+            initial_bases=initial_bases,
+            return_transaction=True,
+        )
+
+        # Commit the transaction (initial_bases with proper IDs are already in
+        # the transaction)
+        dataset = lance.LanceDataset.commit(str(dataset_uri), transaction)
+
+        # Verify dataset was created
+        assert dataset.count_rows() == 20
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 20
+        assert set(result["id"]) == set(range(20))
+
+        # Verify base paths are registered
+        base_paths = dataset._ds.base_paths()
+        assert len(base_paths) == 2  # 2 bases (base1, base2)
+        # Check that our named bases are registered
+        base_names = [bp.name for bp in base_paths.values() if bp.name is not None]
+        assert "base1" in base_names
+        assert "base2" in base_names
+
+        # Verify data files are in base1 (not in dataset root)
+        data_files_base1 = list(base1_path.glob("**/*.lance"))
+        assert len(data_files_base1) > 0, "Expected data files in base1"
+
+        # Dataset root should not have data files (only manifest)
+        dataset_root = Path(dataset_uri)
+        data_files_root = list(dataset_root.glob("*.lance"))
+        assert len(data_files_root) == 0, "Should not have data files in root"
