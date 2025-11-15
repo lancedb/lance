@@ -584,7 +584,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_branch(
         self,
         branch: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
@@ -612,28 +612,6 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
-        ds._storage_options = self._storage_options
-        ds._default_scan_options = self._default_scan_options
-        ds._read_params = self._read_params
-        return ds
-
-    def checkout_branch(self, branch: str) -> "LanceDataset":
-        """Check out the latest version of a branch.
-
-        Parameters
-        ----------
-        branch: str
-            The branch name to checkout.
-
-        Returns
-        -------
-        LanceDataset
-            A dataset instance at the latest version of the branch.
-        """
-        inner = self._ds.checkout_branch(branch)
-        ds = LanceDataset.__new__(LanceDataset)
-        ds._ds = inner
-        ds._uri = inner.uri
         ds._storage_options = self._storage_options
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
@@ -2120,7 +2098,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version: int | str | Tuple[str, int]) -> "LanceDataset":
+    def checkout_version(
+        self, version: int | str | Tuple[Optional[str], [int]]
+    ) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -2131,8 +2111,8 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         version: int | str | Tuple[str, int],
-            The version to check out. A version number on main (`int`), a tag
-            (`str`) or a tuple of ('branch_name', 'version_number') can be provided.
+            The version to check out. A version number on the current branch (`int`),
+            a tag (`str`) or a tuple of ('branch_name', 'version_number').
 
         Returns
         -------
@@ -3327,8 +3307,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def shallow_clone(
         self,
-        target_path: Union[str, Path],
-        version: Union[int, str, Tuple[int, str]],
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> "LanceDataset":
@@ -3342,10 +3322,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         target_path : str or Path
             The URI or filesystem path to clone the dataset into.
-        version : int, str or Tuple[int, str]
-            The source version to clone. An integer specifies a version number in main;
-            a string specifies a tag name; a Tuple[int, str] specifies a version number
-            in a specified branch.
+        reference : int, str or Tuple[int, str]
+            The source reference to clone. An integer specifies a version number in
+            the current branch; a string specifies a tag name; a Tuple[int, str]
+            specifies a version number in a specified branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -3363,7 +3343,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, version, storage_options)
+        self._ds.shallow_clone(target_uri, reference, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
@@ -3653,6 +3633,7 @@ class Transaction:
 
 
 class Tag(TypedDict):
+    branch: Optional[str]
     version: int
     manifest_size: int
 
@@ -4938,7 +4919,11 @@ class Tags:
         """
         return self._ds.tags_ordered(order)
 
-    def create(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def create(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Create a tag for a given dataset version.
 
@@ -4947,12 +4932,12 @@ class Tags:
         tag: str,
             The name of the tag to create. This name must be unique among all tag
             names for the dataset.
-        version: int,
-            The dataset version to tag.
-        branch: Optional[str],
-            The specified branch to create the tag, None if the specified branch is main
+        reference : int, str or Tuple[int, str]
+            The source reference to tag. An integer specifies a version number in
+            the current branch; a string specifies a tag name; a Tuple[int, str]
+            specifies a version number in a specified branch.
         """
-        self._ds.create_tag(tag, version, branch)
+        self._ds.create_tag(tag, reference)
 
     def delete(self, tag: str) -> None:
         """
@@ -4966,7 +4951,11 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
-    def update(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def update(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Update tag to a new version.
 
@@ -4979,7 +4968,7 @@ class Tags:
         branch: Optional[str],
             The specified branch to create the tag, None if the specified branch is main
         """
-        self._ds.update_tag(tag, version, branch)
+        self._ds.update_tag(tag, reference)
 
 
 class Branches:

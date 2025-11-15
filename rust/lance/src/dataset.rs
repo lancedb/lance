@@ -439,8 +439,8 @@ impl Dataset {
 
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        match ref_ {
+        let reference: refs::Ref = version.into();
+        match reference {
             refs::Ref::Version(branch, version_number) => {
                 self.checkout_by_ref(version_number, branch).await
             }
@@ -1954,8 +1954,7 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_ = version.into();
-        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
+        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -1966,7 +1965,9 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params.unwrap_or_default())
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -4731,7 +4732,7 @@ mod tests {
         let bad_tag_creation = dataset.tags().create("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
-            "Version not found error: version Main::3 does not exist"
+            "Version not found error: version main:3 does not exist"
         );
 
         let bad_tag_deletion = dataset.tags().delete("tag1").await;
@@ -4818,7 +4819,7 @@ mod tests {
         let another_bad_tag_update = dataset.tags().update("tag1", 3).await;
         assert_eq!(
             another_bad_tag_update.err().unwrap().to_string(),
-            "Version not found error: version 3 does not exist"
+            "Version not found error: version main:3 does not exist"
         );
 
         dataset.tags().update("tag1", 2).await.unwrap();
@@ -9299,11 +9300,7 @@ mod tests {
         // create branch3 based on that tag, write data batch 4
         branch2_dataset
             .tags()
-            .create_on_branch(
-                "tag1",
-                branch2_dataset.version().version,
-                Some("dev/branch2"),
-            )
+            .create("tag1", ("dev/branch2", branch2_dataset.version().version))
             .await
             .unwrap();
 

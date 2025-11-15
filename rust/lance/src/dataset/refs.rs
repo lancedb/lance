@@ -34,32 +34,32 @@ pub enum Ref {
 }
 
 impl From<u64> for Ref {
-    fn from(ref_: u64) -> Self {
-        Version(None, Some(ref_))
+    fn from(reference: u64) -> Self {
+        Version(None, Some(reference))
     }
 }
 
 impl From<&str> for Ref {
-    fn from(ref_: &str) -> Self {
-        Tag(ref_.to_string())
+    fn from(reference: &str) -> Self {
+        Tag(reference.to_string())
     }
 }
 
 impl From<(&str, u64)> for Ref {
-    fn from(_ref: (&str, u64)) -> Self {
-        Version(Some(_ref.0.to_string()), Some(_ref.1))
+    fn from(reference: (&str, u64)) -> Self {
+        Version(Some(reference.0.to_string()), Some(reference.1))
     }
 }
 
 impl From<(Option<String>, Option<u64>)> for Ref {
-    fn from(_ref: (Option<String>, Option<u64>)) -> Self {
-        Version(_ref.0, _ref.1)
+    fn from(reference: (Option<String>, Option<u64>)) -> Self {
+        Version(reference.0, reference.1)
     }
 }
 
 impl From<(&str, Option<u64>)> for Ref {
-    fn from(_ref: (&str, Option<u64>)) -> Self {
-        Version(Some(_ref.0.to_string()), _ref.1)
+    fn from(reference: (&str, Option<u64>)) -> Self {
+        Version(Some(reference.0.to_string()), reference.1)
     }
 }
 
@@ -204,24 +204,12 @@ impl Tags<'_> {
         }
 
         let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
         Ok(tag_contents)
     }
 
-    pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
-        self.create_on_branch(tag, version, None).await
-    }
-
-    pub async fn create_on_branch(
-        &self,
-        tag: &str,
-        version_number: u64,
-        branch: Option<&str>,
-    ) -> Result<()> {
+    pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
-
         let root_location = self.refs.root()?;
-        let branch = branch.map(String::from);
         let tag_file = tag_path(&root_location.path, tag);
 
         if self.object_store().exists(&tag_file).await? {
@@ -229,39 +217,7 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-
-        let branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
-            )
-            .await?;
-
-        if !self.object_store().exists(&manifest_file.path).await? {
-            return Err(Error::VersionNotFound {
-                message: format!(
-                    "version {}::{} does not exist",
-                    branch.unwrap_or("Main".to_string()),
-                    version_number
-                ),
-            });
-        }
-
-        let manifest_size = if let Some(size) = manifest_file.size {
-            size as usize
-        } else {
-            self.object_store().size(&manifest_file.path).await? as usize
-        };
-
-        let tag_contents = TagContents {
-            branch,
-            version: version_number,
-            manifest_size,
-        };
+        let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
         self.object_store()
             .put(
@@ -287,43 +243,57 @@ impl Tags<'_> {
         self.object_store().delete(&tag_file).await
     }
 
-    pub async fn update(&self, tag: &str, version: u64) -> Result<()> {
-        self.update_on_branch(tag, version, None).await
-    }
-
-    /// Update a tag to a branch::version
-    pub async fn update_on_branch(
-        &self,
-        tag: &str,
-        version_number: u64,
-        branch: Option<&str>,
-    ) -> Result<()> {
+    pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
 
-        let branch = branch.map(String::from);
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
+        let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
-        let target_branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &target_branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
             )
-            .await?;
+            .await
+            .map(|_| ())
+    }
+
+    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
+        let reference = reference.into();
+        let (branch, version_number) = match reference {
+            Version(branch, version_number) => (branch, version_number),
+            Tag(tag_name) => {
+                let tag_content = self.get(tag_name.as_str()).await?;
+                (tag_content.branch, Some(tag_content.version))
+            }
+        };
+
+        let branch_location = self.refs.base_location.find_branch(branch.clone())?;
+        let manifest_file = if let Some(version_number) = version_number {
+            self.refs
+                .commit_handler
+                .resolve_version_location(
+                    &branch_location.path,
+                    version_number,
+                    &self.refs.object_store.inner,
+                )
+                .await?
+        } else {
+            self.refs
+                .commit_handler
+                .resolve_latest_location(&branch_location.path, &self.refs.object_store)
+                .await?
+        };
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("version {} does not exist", version_number),
+                message: format!("version {} does not exist", Version(branch, version_number)),
             });
         }
 
@@ -335,17 +305,10 @@ impl Tags<'_> {
 
         let tag_contents = TagContents {
             branch,
-            version: version_number,
+            version: manifest_file.version,
             manifest_size,
         };
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        Ok(tag_contents)
     }
 }
 
@@ -936,7 +899,6 @@ mod tests {
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
     #[case("a/b", &["a/b/c", "a/b/d"], None)]
-    #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
     #[case("single", &["other"], Some("single"))]
     #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
