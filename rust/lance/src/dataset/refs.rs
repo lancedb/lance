@@ -11,6 +11,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::dataset::branch_lineage::{collect_lineage_from, BranchLineage};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version};
 use crate::{Error, Result};
@@ -209,7 +210,8 @@ impl Tags<'_> {
     }
 
     pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
-        self.create_on_branch(tag, version, None).await
+        self.create_on_branch(tag, version, self.refs.base_location.branch.as_deref())
+            .await
     }
 
     pub async fn create_on_branch(
@@ -443,8 +445,24 @@ impl Branches<'_> {
             });
         };
 
+        let parent_branch_contents = if let Some(ref parent_branch) = source_branch {
+            let parent_file = branch_contents_path(&root_location.path, parent_branch);
+            if self.object_store().exists(&parent_file).await? {
+                Some(Box::new(
+                    BranchContents::from_path(&parent_file, self.object_store()).await?,
+                ))
+            } else {
+                return Err(Error::RefNotFound {
+                    message: format!("Parent branch {} does not exist", branch_name),
+                });
+            }
+        } else {
+            None
+        };
+
         let branch_contents = BranchContents {
             parent_branch: source_branch,
+            parent_lineage: parent_branch_contents,
             parent_version: version_number,
             create_at: chrono::Utc::now().timestamp() as u64,
             manifest_size: if let Some(size) = manifest_file.size {
@@ -536,35 +554,102 @@ impl Branches<'_> {
         remaining_branches: &[&str],
         base_location: &BranchLocation,
     ) -> Result<Option<Path>> {
-        let mut longest_used_length = 0;
-        for &candidate in remaining_branches {
-            let common_len = branch
-                .chars()
-                .zip(candidate.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            if common_len > longest_used_length {
-                longest_used_length = common_len;
+        let deleted_branch = BranchRelativePath::new(branch);
+        let mut related_branches = Vec::new();
+        let mut relative_dir = branch.to_string();
+        for branch in remaining_branches {
+            let branch = BranchRelativePath::new(branch);
+            if branch.is_parent(&deleted_branch) || branch.is_child(&deleted_branch) {
+                related_branches.push(branch);
+            } else if let Some(common_prefix) = deleted_branch.find_common_prefix(&branch) {
+                related_branches.push(common_prefix);
             }
         }
-        // Means this branch path is used as a prefix of other branches
-        if longest_used_length == branch.len() {
-            return Ok(None);
+
+        related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
+        if let Some(branch) = related_branches.first() {
+            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
+                // There are children of the deleted branch, we can't delete any directory for now
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
+                return Ok(None);
+            } else {
+                // We pick the longest common directory between the deleted branch and the remaining branches
+                // Then delete the first child of this common directory
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
+                relative_dir = format!(
+                    "{}/{}",
+                    branch.segments.join("/"),
+                    deleted_branch.segments[branch.segments.len()]
+                );
+            }
+        } else if !deleted_branch.segments.is_empty() {
+            // There are no common directories between the deleted branch and the remaining branches
+            // We need to delete the entire directory
+            // Example: deleted_branch = "a/b/c", remaining_branches = [], we need to delete "a"
+            relative_dir = deleted_branch.segments[0].to_string();
         }
 
-        let mut used_relative_path = &branch[..longest_used_length];
-        if let Some(last_slash_index) = used_relative_path.rfind('/') {
-            used_relative_path = &used_relative_path[..last_slash_index];
+        let absolute_dir = base_location.find_branch(Some(relative_dir))?;
+        Ok(Some(absolute_dir.path))
+    }
+
+    pub async fn collect_lineage(&self) -> Result<BranchLineage> {
+        let all_branches = self.list().await?;
+        collect_lineage_from(&all_branches)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct BranchRelativePath<'a> {
+    segments: Vec<&'a str>,
+}
+
+impl<'a> BranchRelativePath<'a> {
+    fn new(branch_name: &'a str) -> Self {
+        let segments = branch_name.split('/').collect_vec();
+        Self { segments }
+    }
+
+    fn find_common_prefix(&self, other: &Self) -> Option<Self> {
+        let mut common_segments = Vec::new();
+        for (i, segment) in self.segments.iter().enumerate() {
+            if i >= other.segments.len() || other.segments[i] != *segment {
+                break;
+            }
+            common_segments.push(*segment);
         }
-        let unused_dir = &branch[used_relative_path.len()..].trim_start_matches('/');
-        if let Some(sub_dir) = unused_dir.split('/').next() {
-            let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
-            // Use base_location to generate the cleanup path
-            let absolute_dir = base_location.find_branch(Some(relative_dir))?;
-            Ok(Some(absolute_dir.path))
+        if !common_segments.is_empty() {
+            Some(BranchRelativePath {
+                segments: common_segments,
+            })
         } else {
-            Ok(None)
+            None
+        }
+    }
+
+    fn is_parent(&self, other: &Self) -> bool {
+        if other.segments.len() <= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in self.segments.iter().enumerate() {
+                if other.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    fn is_child(&self, other: &Self) -> bool {
+        if other.segments.len() >= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in other.segments.iter().enumerate() {
+                if self.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
         }
     }
 }
@@ -581,6 +666,8 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
+    #[serde(default)]
+    pub parent_lineage: Option<Box<BranchContents>>,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
@@ -601,6 +688,21 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
+}
+
+pub fn standardize_branch(branch: Option<&str>) -> Option<String> {
+    match branch {
+        None => None,
+        Some("main") => None,
+        Some(name) => Some(name.to_string()),
+    }
+}
+
+pub fn normalize_branch(branch: Option<&str>) -> String {
+    match branch {
+        None => "main".to_string(),
+        Some(name) => name.to_string(),
+    }
 }
 
 async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
@@ -670,7 +772,10 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
             return Err(Error::InvalidRef {
-                message: format!("Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.", segment),
+                message: format!(
+                    "Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.",
+                    segment
+                ),
             });
         }
     }
@@ -888,6 +993,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
+            parent_lineage: None,
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -930,21 +1036,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("a/b/c", &["a/b/d", "a/e"], Some("a/b/c"))]
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
-    #[case("a/b", &["a/b/c", "a/b/d"], None)]
+    #[case("a/b", &["a/b/c", "b/c/d"], None)]
     #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
-    #[case("single", &["other"], Some("single"))]
-    #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
-    #[case("feature/user-auth", &["feature/user-signup"], Some("feature/user-auth"))]
-    #[case("release/2024.01", &["release/2024.02"], Some("release/2024.01"))]
-    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
-    #[case("feature", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
     #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1")
+    )]
+    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],

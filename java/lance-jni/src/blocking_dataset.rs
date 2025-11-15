@@ -199,7 +199,7 @@ impl BlockingDataset {
     }
 
     pub fn list_branches(&self) -> Result<HashMap<String, lance::dataset::refs::BranchContents>> {
-        let branches = RT.block_on(self.inner.list_branches())?;
+        let branches = RT.block_on(self.inner.branches().list())?;
         Ok(branches)
     }
 
@@ -218,7 +218,7 @@ impl BlockingDataset {
     }
 
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        RT.block_on(self.inner.delete_branch(branch))?;
+        RT.block_on(self.inner.branches().delete(branch, true))?;
         Ok(())
     }
 
@@ -2371,11 +2371,18 @@ fn inner_cleanup_with_policy<'local>(
         })?
         .unwrap_or(true);
 
+    let clean_referenced_branches = env
+        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
     let policy = CleanupPolicy {
         before_timestamp,
         before_version,
         delete_unverified,
         error_if_tagged_old_versions,
+        clean_referenced_branches,
     };
 
     let stats = {

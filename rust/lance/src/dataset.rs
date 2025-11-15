@@ -57,6 +57,7 @@ use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
+mod branch_lineage;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -9201,7 +9202,7 @@ mod tests {
     // 5. Delete branches
     // 6. Delete zombie branches
     #[tokio::test]
-    async fn test_branch() {
+    async fn test_branches() {
         let tempdir = TempDir::default();
         let test_uri = tempdir.path_str();
         let data_storage_version = LanceFileVersion::Stable;

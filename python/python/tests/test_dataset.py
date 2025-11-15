@@ -4795,15 +4795,6 @@ def test_branches(tmp_path: Path):
     assert b1_meta["manifest_size"] > 0
     assert "create_at" in b1_meta
 
-    try:
-        ds_main.branches.delete("branch1")
-    except OSError as e:
-        if "Not found" not in str(e):
-            raise
-    branches_after = ds_main.branches.list()
-    assert "branch1" not in branches_after
-    assert "branch2" in branches_after
-
     branch2 = ds_main.checkout_branch("branch2")
     assert branch2.version == 3
     assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
@@ -4813,3 +4804,12 @@ def test_branches(tmp_path: Path):
     branch2.checkout_latest()
     assert branch2.version == 3
     assert branch2.to_table().combine_chunks() == expected_branch2.combine_chunks()
+
+    try:
+        ds_main.branches.delete("branch1")
+    except OSError as e:
+        if "Not found" not in str(e):
+            raise
+    branches_after = ds_main.branches.list()
+    assert "branch1" not in branches_after
+    assert "branch2" in branches_after
