@@ -136,20 +136,15 @@ impl<'a> CleanupTask<'a> {
         // or clean around the manifest
         let tags = self.dataset.tags().list().await?;
         let current_branch = &self.dataset.manifest.branch;
+
+        // Only retain tags on the current branch.
+        // Tags on other branches would take effect in retain_branch_lineage_files
         let tagged_versions: HashSet<u64> = tags
             .values()
             .filter(|tag| match (tag.branch.as_ref(), current_branch.as_ref()) {
-                (Some(branch_of_tag), Some(current_branch)) => {
-                    branch_of_tag == current_branch
-                        || referenced_branches
-                            .iter()
-                            .any(|(branch, _)| branch == branch_of_tag)
-                }
-                (Some(branch_of_tag), None) => referenced_branches
-                    .iter()
-                    .any(|(branch, _)| branch == branch_of_tag),
-                (None, Some(_)) => false,
+                (Some(branch_of_tag), Some(current_branch)) => branch_of_tag == current_branch,
                 (None, None) => true,
+                _ => false,
             })
             .map(|tag_content| tag_content.version)
             .collect();
@@ -561,7 +556,7 @@ impl<'a> CleanupTask<'a> {
                 .checkout_version((Some(branch_name), None))
                 .await?;
             if let Some(stats) =
-                auto_cleanup_hook(&branch_dataset, branch_dataset.manifest.as_ref(), false).await?
+                cleanup_cascade_branch(&branch_dataset, branch_dataset.manifest.as_ref()).await?
             {
                 final_stats.bytes_removed += stats.bytes_removed;
                 final_stats.old_versions += stats.old_versions;
@@ -801,8 +796,36 @@ pub async fn cleanup_old_versions(
 pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
-    by_commit: bool,
 ) -> Result<Option<RemovalStats>> {
+    let policy = build_cleanup_policy(dataset, manifest).await?;
+    if let Some(policy) = policy {
+        Ok(Some(dataset.cleanup_with_policy(policy).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// This is trigger when a parent branch is cleaning and `clean_referenced_branches` is set as true
+/// For cascade branches, some cleanup parameters need be overridden.
+pub async fn cleanup_cascade_branch(
+    dataset: &Dataset,
+    manifest: &Manifest,
+) -> Result<Option<RemovalStats>> {
+    let policy = build_cleanup_policy(dataset, manifest).await?;
+    if let Some(mut policy) = policy {
+        policy.clean_referenced_branches = false;
+        policy.error_if_tagged_old_versions = false;
+        policy.delete_unverified = false;
+        Ok(Some(dataset.cleanup_with_policy(policy).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn build_cleanup_policy(
+    dataset: &Dataset,
+    manifest: &Manifest,
+) -> Result<Option<CleanupPolicy>> {
     if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
         let interval: u64 = match interval.parse() {
             Ok(i) => i,
@@ -823,14 +846,6 @@ pub async fn auto_cleanup_hook(
         return Ok(None);
     }
 
-    let mut policy = build_cleanup_policy(dataset, manifest).await?;
-    if !by_commit && policy.clean_referenced_branches {
-        policy.clean_referenced_branches = false;
-    }
-    Ok(Some(dataset.cleanup_with_policy(policy).await?))
-}
-
-pub async fn build_cleanup_policy(dataset: &Dataset, manifest: &Manifest) -> Result<CleanupPolicy> {
     let mut builder = CleanupPolicyBuilder::default();
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
@@ -877,7 +892,7 @@ pub async fn build_cleanup_policy(dataset: &Dataset, manifest: &Manifest) -> Res
         builder = builder.clean_referenced_branches(clean_referenced);
     }
 
-    Ok(builder.build())
+    Ok(Some(builder.build()))
 }
 
 fn tagged_old_versions_cleanup_error(
@@ -2271,6 +2286,7 @@ mod lineage_tests {
 
         async fn run_cleanup(&mut self) -> Result<RemovalStats> {
             let policy = CleanupPolicyBuilder::default()
+                .error_if_tagged_old_versions(false)
                 .retain_n_versions(&self.dataset, 1)
                 .await?
                 .build();
@@ -2279,6 +2295,7 @@ mod lineage_tests {
 
         async fn run_cleanup_with_referenced_branches(&mut self) -> Result<RemovalStats> {
             let policy = CleanupPolicyBuilder::default()
+                .error_if_tagged_old_versions(false)
                 .clean_referenced_branches(true)
                 .retain_n_versions(&self.dataset, 1)
                 .await?
@@ -2922,6 +2939,140 @@ mod lineage_tests {
         assert_eq!(setup.main.num_index_files, 8);
 
         setup.enable_auto_cleanup().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        // All cleaned up
+        assert_eq!(setup.main.num_manifest_files, 1);
+        assert_eq!(setup.main.num_data_files, 1);
+        assert_eq!(setup.main.num_tx_files, 1);
+        assert_eq!(setup.main.num_delete_files, 0);
+        assert_eq!(setup.main.num_index_files, 4);
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+    }
+
+    #[tokio::test]
+    async fn auto_clean_referenced_branches_with_tags() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup
+            .branch3
+            .dataset
+            .tags()
+            .create("branch3-tag", setup.branch3.dataset.version().version)
+            .await
+            .unwrap();
+        setup
+            .main
+            .dataset
+            .tags()
+            .create("main-tag", setup.main.dataset.version().version)
+            .await
+            .unwrap();
+
+        setup.branch2.compact().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+        setup.branch4.compact().await.unwrap();
+        setup
+            .main
+            .dataset
+            .branches()
+            .delete("branch1", true)
+            .await
+            .unwrap();
+
+        setup.main.compact().await.unwrap();
+        setup.enable_auto_cleanup().await.unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        // Two tags hold two manifest references
+        // Main tag holds 1 tx file, 3 data files, 2 deletion files and 4 index files
+        assert_eq!(setup.main.num_manifest_files, 3);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 2);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+        // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
+        assert_eq!(setup.branch2.num_manifest_files, 2);
+        assert_eq!(setup.branch2.num_data_files, 2);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 1);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        // Branch3 tag holds 1 tx file, 1 data files, 1 deletion files and 4 index files
+        assert_eq!(setup.branch3.num_manifest_files, 2);
+        assert_eq!(setup.branch3.num_data_files, 2);
+        assert_eq!(setup.branch3.num_tx_files, 2);
+        assert_eq!(setup.branch3.num_delete_files, 1);
+        assert_eq!(setup.branch3.num_index_files, 8);
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+
+        setup
+            .branch3
+            .dataset
+            .tags()
+            .delete("branch3-tag")
+            .await
+            .unwrap();
+        setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        // 1 manifest file referenced by branch3-tag is cleaned
+        assert_eq!(setup.main.num_manifest_files, 2);
+        assert_eq!(setup.main.num_data_files, 4);
+        assert_eq!(setup.main.num_tx_files, 2);
+        assert_eq!(setup.main.num_delete_files, 2);
+        assert_eq!(setup.main.num_index_files, 8);
+        assert_eq!(setup.branch2.num_manifest_files, 1);
+        assert_eq!(setup.branch2.num_data_files, 1);
+        assert_eq!(setup.branch2.num_tx_files, 1);
+        assert_eq!(setup.branch2.num_delete_files, 0);
+        assert_eq!(setup.branch2.num_index_files, 4);
+        assert_eq!(setup.branch3.num_manifest_files, 1);
+        assert_eq!(setup.branch3.num_data_files, 1);
+        assert_eq!(setup.branch3.num_tx_files, 1);
+        assert_eq!(setup.branch3.num_delete_files, 0);
+        assert_eq!(setup.branch3.num_index_files, 4);
+        assert_eq!(setup.branch4.num_manifest_files, 1);
+        assert_eq!(setup.branch4.num_data_files, 1);
+        assert_eq!(setup.branch4.num_tx_files, 1);
+        assert_eq!(setup.branch4.num_delete_files, 0);
+        assert_eq!(setup.branch4.num_index_files, 4);
+
+        setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
             .main
             .run_cleanup_with_referenced_branches()

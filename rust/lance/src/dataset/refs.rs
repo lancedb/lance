@@ -210,7 +210,8 @@ impl Tags<'_> {
     }
 
     pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
-        self.create_on_branch(tag, version, None).await
+        self.create_on_branch(tag, version, self.refs.base_location.branch.as_deref())
+            .await
     }
 
     pub async fn create_on_branch(
