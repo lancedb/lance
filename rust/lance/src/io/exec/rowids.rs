@@ -10,7 +10,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
@@ -30,7 +30,7 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
+use super::utils::{InstrumentedRecordBatchStreamAdapter, MetricsMode};
 
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
@@ -186,18 +186,21 @@ impl AddRowAddrExec {
 
         let input_stream = self.input.execute(partition, context)?;
 
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let rowid_pos = self.rowid_pos;
         let rowaddr_pos = self.rowaddr_pos;
         let output_schema = self.output_schema.clone();
         let stream = input_stream.then(move |batch| {
             let output_schema = output_schema.clone();
             let index_prereq = index_prereq.clone();
+            let baseline_metrics = baseline_metrics.clone();
             async move {
                 let batch = batch?;
                 index_prereq.wait_ready().await?;
                 let row_id_index = index_prereq.get_ready();
                 let index_ref = row_id_index.as_deref();
 
+                let _timer = baseline_metrics.elapsed_compute().timer();
                 let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
@@ -215,6 +218,7 @@ impl AddRowAddrExec {
             stream.boxed(),
             partition,
             &self.metrics,
+            MetricsMode::SkipElapsedCompute,
         );
         Ok(Box::pin(stream))
     }

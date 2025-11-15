@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, MetricsMode};
 use crate::{
     dataset::rowids::load_row_id_sequences,
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
@@ -17,7 +17,7 @@ use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
-        metrics::{ExecutionPlanMetricsSet, MetricsSet},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
@@ -219,6 +219,7 @@ impl ExecutionPlan for ScalarIndexExec {
             stream,
             partition,
             &self.metrics,
+            MetricsMode::MeasureElapsedCompute,
         )))
     }
 
@@ -351,6 +352,7 @@ impl MapIndexExec {
         column_name: String,
         index_name: String,
         metrics: Arc<IndexMetrics>,
+        baseline_metrics: BaselineMetrics,
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
@@ -371,14 +373,19 @@ impl MapIndexExec {
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
             let metrics = metrics.clone();
-            Self::map_batch(
-                column_name,
-                index_name,
-                dataset,
-                deletion_mask,
-                res,
-                metrics,
-            )
+            let baseline_metrics = baseline_metrics.clone();
+            async move {
+                let _timer = baseline_metrics.elapsed_compute().timer();
+                Self::map_batch(
+                    column_name,
+                    index_name,
+                    dataset,
+                    deletion_mask,
+                    res,
+                    metrics,
+                )
+                .await
+            }
         }))
     }
 }
@@ -425,12 +432,14 @@ impl ExecutionPlan for MapIndexExec {
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let index_vals = self.input.execute(partition, context)?;
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream_fut = Self::do_execute(
             index_vals,
             self.dataset.clone(),
             self.column_name.clone(),
             self.index_name.clone(),
             metrics,
+            baseline_metrics,
         );
         let stream = futures::stream::iter(vec![stream_fut])
             .then(|stream_fut| stream_fut)
@@ -441,6 +450,7 @@ impl ExecutionPlan for MapIndexExec {
             stream,
             partition,
             &self.metrics,
+            MetricsMode::SkipElapsedCompute,
         )))
     }
 
@@ -750,6 +760,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             stream.map_err(|err| err.into()),
             partition,
             &self.metrics,
+            MetricsMode::MeasureElapsedCompute,
         )))
     }
 

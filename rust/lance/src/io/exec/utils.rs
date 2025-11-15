@@ -244,6 +244,24 @@ impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
     }
 }
 
+/// Controls which metrics are collected by InstrumentedRecordBatchStreamAdapter.
+///
+/// The key difference is whether `elapsed_compute` timing is measured. When parent nodes
+/// use this adapter, they should skip elapsed_compute timing to avoid double-counting
+/// CPU time that is already measured by their child nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsMode {
+    /// Record `elapsed_compute` baseline metric.
+    MeasureElapsedCompute,
+
+    /// Skip `elapsed_compute` baseline metric.
+    ///
+    /// Use this for **parent nodes** (nodes with children) to avoid double-counting.
+    /// The cumulative_cpu calculation already sums child times, so measuring poll_next()
+    /// time here would count the child's work twice.
+    SkipElapsedCompute,
+}
+
 #[pin_project]
 pub struct InstrumentedRecordBatchStreamAdapter<S> {
     schema: SchemaRef,
@@ -252,6 +270,7 @@ pub struct InstrumentedRecordBatchStreamAdapter<S> {
     stream: S,
     baseline_metrics: BaselineMetrics,
     batch_count: Count,
+    mode: MetricsMode,
 }
 
 impl<S> InstrumentedRecordBatchStreamAdapter<S> {
@@ -260,6 +279,7 @@ impl<S> InstrumentedRecordBatchStreamAdapter<S> {
         stream: S,
         partition: usize,
         metrics: &ExecutionPlanMetricsSet,
+        mode: MetricsMode,
     ) -> Self {
         let batch_count = Count::new();
         MetricBuilder::new(metrics)
@@ -273,6 +293,7 @@ impl<S> InstrumentedRecordBatchStreamAdapter<S> {
             stream,
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             batch_count,
+            mode,
         }
     }
 }
@@ -288,9 +309,17 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.as_mut().project();
-        let timer = this.baseline_metrics.elapsed_compute().timer();
-        let poll = this.stream.poll_next(cx);
-        timer.done();
+
+        let poll = match *this.mode {
+            MetricsMode::MeasureElapsedCompute => {
+                let timer = this.baseline_metrics.elapsed_compute().timer();
+                let poll = this.stream.poll_next(cx);
+                timer.done();
+                poll
+            }
+            MetricsMode::SkipElapsedCompute => this.stream.poll_next(cx),
+        };
+
         if let Poll::Ready(Some(Ok(_))) = &poll {
             this.batch_count.add(1);
         }
@@ -450,7 +479,70 @@ mod tests {
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{array, BatchCount, RowCount};
 
-    use super::ReplayExec;
+    use super::{InstrumentedRecordBatchStreamAdapter, MetricsMode, ReplayExec};
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+
+    async fn run_instrumented_stream(mode: MetricsMode) -> MetricsSet {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let stream = futures::stream::iter(vec![Ok(batch)]);
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let instrumented_stream =
+            InstrumentedRecordBatchStreamAdapter::new(schema, stream.boxed(), 0, &metrics, mode);
+
+        let results: Vec<_> = instrumented_stream.try_collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        metrics.clone_inner()
+    }
+
+    #[tokio::test]
+    async fn test_metrics_mode_measure_elapsed_compute() {
+        let metrics_set = run_instrumented_stream(MetricsMode::MeasureElapsedCompute).await;
+        let elapsed_compute = metrics_set.elapsed_compute().unwrap_or(0);
+        assert!(
+            elapsed_compute > 0,
+            "MeasureElapsedCompute should record elapsed_compute timing."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_mode_skip_elapsed_compute() {
+        let metrics_set = run_instrumented_stream(MetricsMode::SkipElapsedCompute).await;
+        let elapsed_compute = metrics_set.elapsed_compute().unwrap_or(0);
+        assert!(
+            // Check for < 10ns. The underlying Time { nanos: 0 } is correct, but the
+            // convenience helper elapsed_compute() returns 1 instead of 0.
+            elapsed_compute < 2,
+            "SkipElapsedCompute should not record meaningful elapsed_compute timing. Got: {}ns",
+            elapsed_compute,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_metrics_recorded_in_both_modes() {
+        for mode in [
+            MetricsMode::MeasureElapsedCompute,
+            MetricsMode::SkipElapsedCompute,
+        ] {
+            let metrics_set = run_instrumented_stream(mode).await;
+            let output_rows = metrics_set.output_rows().unwrap_or(0);
+
+            assert_eq!(
+                output_rows, 3,
+                "output_rows should be recorded in {:?} mode",
+                mode
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_replay() {

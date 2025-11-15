@@ -61,8 +61,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
-    SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, MetricsMode,
+    PreFilterSource, SelectionVectorToPrefilter,
 };
 
 pub struct AnnPartitionMetrics {
@@ -221,6 +221,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
@@ -229,7 +230,9 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             .map(move |batch| {
                 let key = key.clone();
                 let column = column.clone();
+                let baseline_metrics = baseline_metrics.clone();
                 async move {
+                    let _timer = baseline_metrics.elapsed_compute().timer();
                     compute_distance(key, dt, &column, batch?)
                         .await
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
@@ -242,6 +245,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             stream.boxed(),
             partition,
             &self.metrics,
+            MetricsMode::SkipElapsedCompute,
         )) as SendableRecordBatchStream)
     }
 
