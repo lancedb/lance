@@ -733,23 +733,28 @@ impl DatasetIndexExt for Dataset {
             let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
             let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
             let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-            let plugin = index_details_wrapper.get_plugin()?;
 
-            if index_type.is_none() {
-                index_type = Some(plugin.index_type().to_string());
-            }
+            if let Ok(plugin) = index_details_wrapper.get_plugin() {
+                if index_type.is_none() {
+                    index_type = Some(plugin.index_type().to_string());
+                }
 
-            if let Some(stats) = plugin
-                .load_statistics(index_store.clone(), index_details.as_ref())
-                .await?
-            {
-                indices_stats.push(stats);
-                continue;
+                if let Some(stats) = plugin
+                    .load_statistics(index_store.clone(), index_details.as_ref())
+                    .await?
+                {
+                    indices_stats.push(stats);
+                    continue;
+                }
             }
 
             let index = self
                 .open_generic_index(&field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
                 .await?;
+
+            if index_type.is_none() {
+                index_type = Some(index.index_type().to_string());
+            }
 
             indices_stats.push(index.statistics()?);
         }
