@@ -715,55 +715,51 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .optimize_options
             .as_ref()
             .and_then(|opt| opt.num_indices_to_merge);
-        let (assign_batches, merge_indices, replaced_partition) = match Self::should_split(
-            ivf,
-            reader.as_ref(),
-            &self.existing_indices,
-            num_indices_to_merge,
-        )? {
-            Some(partition) => {
-                // Perform split and record the fact for downstream build/merge
-                log::info!(
-                    "split partition {}, will merge all {} delta indices",
-                    partition,
-                    self.existing_indices.len()
-                );
-                let split_results = self.split_partition(partition, ivf).await?;
-                let Some(ivf) = self.ivf.as_mut() else {
-                    return Err(Error::invalid_input(
-                        "IVF not set before building partitions",
-                        location!(),
-                    ));
-                };
-                ivf.centroids = Some(split_results.new_centroids);
-                (
-                    split_results.assign_batches,
-                    Arc::new(self.existing_indices.clone()),
-                    Some(partition),
-                )
-            }
-            None => {
-                let is_retrain = self
-                    .optimize_options
-                    .as_ref()
-                    .map(|opt| opt.retrain)
-                    .unwrap_or(false);
-                let num_to_merge = match is_retrain {
-                    true => self.existing_indices.len(), // retrain, merge all indices
-                    false => num_indices_to_merge.unwrap_or(0),
-                };
+        let (assign_batches, merge_indices, replaced_partition) =
+            match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
+                Some(partition) if num_indices_to_merge.is_none() => {
+                    // Perform split and record the fact for downstream build/merge
+                    log::info!(
+                        "split partition {}, will merge all {} delta indices",
+                        partition,
+                        self.existing_indices.len()
+                    );
+                    let split_results = self.split_partition(partition, ivf).await?;
+                    let Some(ivf) = self.ivf.as_mut() else {
+                        return Err(Error::invalid_input(
+                            "IVF not set before building partitions",
+                            location!(),
+                        ));
+                    };
+                    ivf.centroids = Some(split_results.new_centroids);
+                    (
+                        split_results.assign_batches,
+                        Arc::new(self.existing_indices.clone()),
+                        Some(partition),
+                    )
+                }
+                _ => {
+                    let is_retrain = self
+                        .optimize_options
+                        .as_ref()
+                        .map(|opt| opt.retrain)
+                        .unwrap_or(false);
+                    let num_to_merge = match is_retrain {
+                        true => self.existing_indices.len(), // retrain, merge all indices
+                        false => num_indices_to_merge.unwrap_or(0),
+                    };
 
-                let indices_to_merge = self.existing_indices
-                    [self.existing_indices.len().saturating_sub(num_to_merge)..]
-                    .to_vec();
+                    let indices_to_merge = self.existing_indices
+                        [self.existing_indices.len().saturating_sub(num_to_merge)..]
+                        .to_vec();
 
-                (
-                    vec![None; ivf.num_partitions()],
-                    Arc::new(indices_to_merge),
-                    None,
-                )
-            }
-        };
+                    (
+                        vec![None; ivf.num_partitions()],
+                        Arc::new(indices_to_merge),
+                        None,
+                    )
+                }
+            };
         self.merged_num = merge_indices.len();
         log::info!(
             "merge {}/{} delta indices",
@@ -1167,12 +1163,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         reader: &dyn ShuffleReader,
         existing_indices: &[Arc<dyn VectorIndex>],
-        num_indices_to_merge: Option<usize>,
     ) -> Result<Option<usize>> {
-        if num_indices_to_merge.is_some() {
-            return Ok(None);
-        }
-
         let index_type = IndexType::try_from(
             index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
         )?;
