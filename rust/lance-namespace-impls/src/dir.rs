@@ -2639,4 +2639,115 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Path traversal is not allowed"));
     }
+
+    #[tokio::test]
+    async fn test_namespace_write() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance_namespace::LanceNamespace;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        let namespace = Arc::new(namespace) as Arc<dyn LanceNamespace>;
+
+        // Use child namespace instead of root
+        let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+
+        // Test 1: CREATE mode
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader1,
+            namespace.clone(),
+            table_id.clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(dataset.version().version, 1);
+
+        // Test 2: APPEND mode
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let params_append = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let reader2 = RecordBatchIterator::new(vec![data2].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader2,
+            namespace.clone(),
+            table_id.clone(),
+            Some(params_append),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+        assert_eq!(dataset.version().version, 2);
+
+        // Test 3: OVERWRITE mode
+        let data3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(Int32Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+
+        let params_overwrite = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+
+        let reader3 = RecordBatchIterator::new(vec![data3].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write_into_namespace(
+            reader3,
+            namespace.clone(),
+            table_id.clone(),
+            Some(params_overwrite),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(dataset.version().version, 3);
+
+        // Verify old data was replaced
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let a_col = result
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_col.values(), &[100, 200]);
+    }
 }

@@ -111,23 +111,8 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
-
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
-
-    let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
-        location: location!(),
-    })?;
-
-    // Datafusion currently has bugs with spilling on string columns
-    // See https://github.com/apache/datafusion/issues/10073
-    //
-    // One we upgrade we can remove this
-    let use_spilling = !matches!(
-        column_field.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8
-    );
 
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
@@ -152,7 +137,7 @@ pub(crate) async fn scan_training_data(
 
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions {
-            use_spilling,
+            use_spilling: true,
             ..Default::default()
         })
         .await?;

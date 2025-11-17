@@ -33,8 +33,8 @@ If you're working on a performance related feature, benchmarks can be run via:
 cargo bench
 ```
 
-If you want detailed logging and full backtraces, set the following environment variables. 
-More details can be found [here](../../guide/performance.md#logging).
+If you want detailed logging and full backtraces, set the following environment variables.
+More details can be found [here](../docs/src/guide/performance.md#logging).
 
 ```bash
 LANCE_LOG=info RUST_BACKTRACE=FULL <cargo-commands>

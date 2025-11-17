@@ -1390,9 +1390,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.10.1"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
+checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "bytes-utils"
@@ -3325,7 +3325,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4470,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4517,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4548,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4614,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4682,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "approx",
  "arrow",
@@ -4755,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4836,7 +4836,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4927,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "clap",
  "lance-core",
@@ -6914,9 +6914,9 @@ dependencies = [
 
 [[package]]
 name = "rangemap"
-version = "1.6.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93e7e49bb0bf967717f7bd674458b3d6b0c5f48ec7e3038166026a69fc22223"
+checksum = "acbbbbea733ec66275512d0b9694f34102e7d5406fdbe2ad8d21b28dce92887c"
 
 [[package]]
 name = "rawpointer"
