@@ -78,4 +78,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Documentation
 
-For more information about Lance and its namespace system, see the [Lance Namespace documentation](https://lancedb.github.io/lance/format/namespace).
+For more information about Lance and its namespace system, see the [Lance Namespace documentation](https://lance.org/format/namespace).

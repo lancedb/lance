@@ -129,6 +129,6 @@ def _coerce_reader(
         raise TypeError(
             f"Unknown data type {type(data_obj)}. "
             "Please check "
-            "https://lancedb.github.io/lance/guide/read_and_write/ "
+            "https://lance.org/guide/read_and_write/ "
             "to see supported types."
         )
