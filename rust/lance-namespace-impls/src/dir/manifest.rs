@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::WriteParams;
+use lance::dataset::{builder::DatasetBuilder, WriteParams};
 use lance::session::Session;
 use lance::{dataset::scanner::Scanner, Dataset};
 use lance_core::{box_error, Error, Result};
@@ -21,7 +21,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::traits::DatasetIndexExt;
 use lance_index::IndexType;
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeregisterTableRequest,
@@ -256,7 +256,7 @@ impl ManifestNamespace {
         inline_optimization_enabled: bool,
     ) -> Result<Self> {
         let manifest_dataset =
-            Self::create_or_get_manifest(&root, object_store.clone(), session.clone()).await?;
+            Self::create_or_get_manifest(&root, &storage_options, session.clone()).await?;
 
         Ok(Self {
             root,
@@ -932,11 +932,21 @@ impl ManifestNamespace {
     /// Create or get the manifest dataset
     async fn create_or_get_manifest(
         root: &str,
-        _object_store: Arc<ObjectStore>,
-        _session: Option<Arc<Session>>,
+        storage_options: &Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
-        let dataset_result = Dataset::open(&manifest_path).await;
+        let mut builder = DatasetBuilder::from_uri(&manifest_path);
+
+        if let Some(sess) = session.clone() {
+            builder = builder.with_session(sess);
+        }
+
+        if let Some(opts) = storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+
+        let dataset_result = builder.load().await;
 
         if let Ok(dataset) = dataset_result {
             Ok(DatasetConsistencyWrapper::new(dataset))
@@ -945,7 +955,16 @@ impl ManifestNamespace {
             let schema = Self::manifest_schema();
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
-            let write_params = WriteParams::default();
+
+            let write_params = WriteParams {
+                session,
+                store_params: storage_options.as_ref().map(|opts| ObjectStoreParams {
+                    storage_options: Some(opts.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
             let dataset = Dataset::write(Box::new(reader), &manifest_path, Some(write_params))
                 .await
                 .map_err(|e| Error::IO {

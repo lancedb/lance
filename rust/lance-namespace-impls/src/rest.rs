@@ -294,6 +294,7 @@ fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct RestNamespace {
     delimiter: String,
     reqwest_config: Configuration,

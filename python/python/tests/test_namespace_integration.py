@@ -19,7 +19,13 @@ from typing import Dict
 import lance
 import pyarrow as pa
 import pytest
-from lance_namespace import DescribeTableResponse, LanceNamespace
+from lance_namespace import (
+    CreateEmptyTableRequest,
+    CreateEmptyTableResponse,
+    DescribeTableRequest,
+    DescribeTableResponse,
+    LanceNamespace,
+)
 
 # These are all keys that are accepted by storage_options
 CONFIG = {
@@ -68,15 +74,8 @@ def delete_bucket(s3, bucket_name):
         pass
 
 
-class MockLanceNamespace(LanceNamespace):
-    """
-    Mock namespace implementation that tracks credential refresh calls.
-
-    Similar to the Rust MockStorageOptionsProvider, this implementation:
-    - Returns incrementing credentials on each describe_table call
-    - Tracks the number of times describe_table has been called
-    - Returns credentials with short expiration times for testing refresh
-    """
+class TrackingNamespace(LanceNamespace):
+    """Mock namespace that wraps DirectoryNamespace and tracks API calls."""
 
     def __init__(
         self,
@@ -84,247 +83,532 @@ class MockLanceNamespace(LanceNamespace):
         storage_options: Dict[str, str],
         credential_expires_in_seconds: int = 60,
     ):
-        """
-        Initialize the mock namespace.
+        from lance.namespace import DirectoryNamespace
 
-        Parameters
-        ----------
-        bucket_name : str
-            The S3 bucket name where tables are stored
-        storage_options : Dict[str, str]
-            Base storage options (aws_endpoint, aws_region, etc.)
-        credential_expires_in_seconds : int
-            How long credentials should be valid (for testing refresh)
-        """
         self.bucket_name = bucket_name
         self.base_storage_options = storage_options
         self.credential_expires_in_seconds = credential_expires_in_seconds
-        self.call_count = 0
+        self.describe_call_count = 0
+        self.create_call_count = 0
         self.lock = Lock()
-        self.tables: Dict[str, str] = {}  # table_id -> location mapping
 
-    def register_table(self, table_id: list, location: str):
-        """Register a table in the mock namespace."""
-        table_key = "/".join(table_id)
-        self.tables[table_key] = location
+        # Create underlying DirectoryNamespace with storage options
+        dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
 
-    def get_call_count(self) -> int:
-        """Get the number of times describe_table has been called."""
+        if bucket_name.startswith("/") or bucket_name.startswith("file://"):
+            dir_props["root"] = f"{bucket_name}/namespace_root"
+        else:
+            dir_props["root"] = f"s3://{bucket_name}/namespace_root"
+
+        self.inner = DirectoryNamespace(**dir_props)
+
+    def get_describe_call_count(self) -> int:
         with self.lock:
-            return self.call_count
+            return self.describe_call_count
+
+    def get_create_call_count(self) -> int:
+        with self.lock:
+            return self.create_call_count
 
     def namespace_id(self) -> str:
-        """Return a unique identifier for this namespace instance."""
-        return "MockLanceNamespace { }"
+        return f"TrackingNamespace {{ inner: {self.inner.namespace_id()} }}"
 
-    def describe_table(self, request) -> DescribeTableResponse:
-        """
-        Describe a table and return storage options with incrementing credentials.
+    def _modify_storage_options(
+        self, storage_options: Dict[str, str], count: int
+    ) -> Dict[str, str]:
+        """Add incrementing credentials with expiration timestamp."""
+        modified = copy.deepcopy(storage_options) if storage_options else {}
 
-        This simulates a namespace server that returns temporary AWS credentials
-        that expire after a short time. Each call increments the credential counter.
-
-        Parameters
-        ----------
-        request : DescribeTableRequest
-            The describe table request.
-
-        Returns
-        -------
-        DescribeTableResponse
-            Response with location and storage_options
-        """
-        table_id = request.id
-
-        with self.lock:
-            self.call_count += 1
-            count = self.call_count
-
-        table_key = "/".join(table_id)
-        if table_key not in self.tables:
-            raise ValueError(f"Table not found: {table_key}")
-
-        location = self.tables[table_key]
-
-        # Create storage options with incrementing credentials
-        storage_options = copy.deepcopy(self.base_storage_options)
-
-        # Add incrementing credentials (similar to Rust MockStorageOptionsProvider)
-        storage_options["aws_access_key_id"] = f"AKID_{count}"
-        storage_options["aws_secret_access_key"] = f"SECRET_{count}"
-        storage_options["aws_session_token"] = f"TOKEN_{count}"
-
-        # Add expiration timestamp (current time + expires_in_seconds)
+        modified["aws_access_key_id"] = f"AKID_{count}"
+        modified["aws_secret_access_key"] = f"SECRET_{count}"
+        modified["aws_session_token"] = f"TOKEN_{count}"
         expires_at_millis = int(
             (time.time() + self.credential_expires_in_seconds) * 1000
         )
-        storage_options["expires_at_millis"] = str(expires_at_millis)
+        modified["expires_at_millis"] = str(expires_at_millis)
 
-        return DescribeTableResponse(
-            location=location,
-            storage_options=storage_options,
+        return modified
+
+    def create_empty_table(
+        self, request: CreateEmptyTableRequest
+    ) -> CreateEmptyTableResponse:
+        with self.lock:
+            self.create_call_count += 1
+            count = self.create_call_count
+
+        response = self.inner.create_empty_table(request)
+        response.storage_options = self._modify_storage_options(
+            response.storage_options, count
         )
+
+        return response
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        with self.lock:
+            self.describe_call_count += 1
+            count = self.describe_call_count
+
+        response = self.inner.describe_table(request)
+        response.storage_options = self._modify_storage_options(
+            response.storage_options, count
+        )
+
+        return response
 
 
 @pytest.mark.integration
 def test_namespace_open_dataset(s3_bucket: str):
-    """
-    Test opening a dataset through a namespace with credential tracking.
-
-    This test verifies that:
-    1. We can create a dataset and register it with a namespace
-    2. We can open the dataset through the namespace
-    3. The namespace's describe_table method is called to fetch credentials
-    """
+    """Test creating and opening datasets through namespace with credential tracking."""
     storage_options = copy.deepcopy(CONFIG)
 
-    # Create a test dataset directly on S3
-    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
-    table_name = uuid.uuid4().hex
-    table_uri = f"s3://{s3_bucket}/{table_name}.lance"
-
-    # Write dataset directly to S3
-    ds = lance.write_dataset(table1, table_uri, storage_options=storage_options)
-    assert len(ds.versions()) == 1
-    assert ds.count_rows() == 2
-
-    # Create mock namespace and register the table
-    namespace = MockLanceNamespace(
+    namespace = TrackingNamespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
-        credential_expires_in_seconds=60,
+        credential_expires_in_seconds=3600,
     )
-    namespace.register_table([table_name], table_uri)
 
-    # Open dataset through namespace (ignoring storage options from namespace)
-    # This should call describe_table once
-    assert namespace.get_call_count() == 0
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert len(ds.versions()) == 1
+    assert ds.count_rows() == 2
+    assert namespace.get_create_call_count() == 1
 
     ds_from_namespace = lance.dataset(
         namespace=namespace,
-        table_id=[table_name],
+        table_id=table_id,
+        storage_options=storage_options,
         ignore_namespace_table_storage_options=True,
     )
 
-    # Verify describe_table was called once during open
-    assert namespace.get_call_count() == 1
-
-    # Verify we can read the data
+    assert namespace.get_describe_call_count() == 1
     assert ds_from_namespace.count_rows() == 2
     result = ds_from_namespace.to_table()
     assert result == table1
+
+    # Test credential caching
+    call_count_before_reads = namespace.get_describe_call_count()
+    for _ in range(3):
+        assert ds_from_namespace.count_rows() == 2
+    assert namespace.get_describe_call_count() == call_count_before_reads
 
 
 @pytest.mark.integration
 def test_namespace_with_refresh(s3_bucket: str):
+    """Test credential refresh when credentials expire."""
     storage_options = copy.deepcopy(CONFIG)
 
-    # Create a test dataset
-    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
-    table_name = uuid.uuid4().hex
-    table_uri = f"s3://{s3_bucket}/{table_name}.lance"
-
-    ds = lance.write_dataset(table1, table_uri, storage_options=storage_options)
-    assert ds.count_rows() == 2
-
-    # Create mock namespace with very short expiration (2 seconds)
-    # to simulate credentials that need frequent refresh
-    namespace = MockLanceNamespace(
+    namespace = TrackingNamespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
-        credential_expires_in_seconds=2,  # Short expiration for testing
+        credential_expires_in_seconds=3,
     )
-    namespace.register_table([table_name], table_uri)
 
-    assert namespace.get_call_count() == 0
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
 
-    # Open dataset with short refresh offset
-    # Storage options from namespace are used by default
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 2
+    assert namespace.get_create_call_count() == 1
+
     ds_from_namespace = lance.dataset(
         namespace=namespace,
-        table_id=[table_name],
+        table_id=table_id,
         s3_credentials_refresh_offset_seconds=1,
     )
 
-    initial_call_count = namespace.get_call_count()
+    initial_call_count = namespace.get_describe_call_count()
     assert initial_call_count == 1
-
-    # Verify we can read the data
     assert ds_from_namespace.count_rows() == 2
     result = ds_from_namespace.to_table()
     assert result == table1
 
-    # Record call count after initial reads
-    call_count_after_initial_reads = namespace.get_call_count()
+    call_count_after_initial_reads = namespace.get_describe_call_count()
 
-    # Wait for credentials to expire
-    time.sleep(3)
+    time.sleep(5)
 
-    # Perform another read operation after expiration
-    # This should trigger a credential refresh since credentials have expired
     assert ds_from_namespace.count_rows() == 2
     result2 = ds_from_namespace.to_table()
     assert result2 == table1
 
-    final_call_count = namespace.get_call_count()
+    final_call_count = namespace.get_describe_call_count()
     assert final_call_count == call_count_after_initial_reads + 1
 
 
 @pytest.mark.integration
 def test_namespace_append_through_namespace(s3_bucket: str):
-    """
-    Test appending to a dataset opened through a namespace.
-
-    This verifies that write operations work correctly with namespace-managed
-    credentials.
-    """
+    """Test appending to dataset through namespace."""
     storage_options = copy.deepcopy(CONFIG)
 
-    # Create initial dataset
-    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
-    table_name = uuid.uuid4().hex
-    table_uri = f"s3://{s3_bucket}/{table_name}.lance"
-
-    ds = lance.write_dataset(table1, table_uri, storage_options=storage_options)
-    assert ds.count_rows() == 1
-    assert len(ds.versions()) == 1
-
-    # Create namespace and open dataset through it
-    namespace = MockLanceNamespace(
+    namespace = TrackingNamespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
-        credential_expires_in_seconds=60,
-    )
-    namespace.register_table([table_name], table_uri)
-
-    # Open through namespace
-    ds_from_namespace = lance.dataset(
-        namespace=namespace,
-        table_id=[table_name],
-        ignore_namespace_table_storage_options=True,
+        credential_expires_in_seconds=3600,
     )
 
-    assert ds_from_namespace.count_rows() == 1
-    initial_call_count = namespace.get_call_count()
-    assert initial_call_count == 1
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
 
-    # Append more data using the URI directly (not through namespace)
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 1
+    assert len(ds.versions()) == 1
+    assert namespace.get_create_call_count() == 1
+    initial_describe_count = namespace.get_describe_call_count()
+
     table2 = pa.Table.from_pylist([{"a": 10, "b": 20}])
     ds = lance.write_dataset(
-        table2, table_uri, mode="append", storage_options=storage_options
+        table2, namespace=namespace, table_id=table_id, mode="append"
     )
     assert ds.count_rows() == 2
     assert len(ds.versions()) == 2
+    assert namespace.get_create_call_count() == 1
+    assert namespace.get_describe_call_count() == initial_describe_count + 1
 
-    # Re-open through namespace to see updated data
     ds_from_namespace = lance.dataset(
         namespace=namespace,
-        table_id=[table_name],
+        table_id=table_id,
+        storage_options=storage_options,
         ignore_namespace_table_storage_options=True,
     )
 
     assert ds_from_namespace.count_rows() == 2
     assert len(ds_from_namespace.versions()) == 2
+    assert namespace.get_describe_call_count() == initial_describe_count + 2
 
-    # Describe_table should have been called again
-    assert namespace.get_call_count() == initial_call_count + 1
+
+@pytest.mark.integration
+def test_namespace_write_create_mode(s3_bucket: str):
+    """Test writing dataset through namespace in CREATE mode."""
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1,
+        namespace=namespace,
+        table_id=["test_ns", table_name],
+        mode="create",
+    )
+
+    assert namespace.get_create_call_count() == 1
+    assert ds.count_rows() == 2
+    assert len(ds.versions()) == 1
+    result = ds.to_table()
+    assert result == table1
+
+
+@pytest.mark.integration
+def test_namespace_write_append_mode(s3_bucket: str):
+    """Test writing dataset through namespace in APPEND mode."""
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 1
+    assert namespace.get_create_call_count() == 1
+    assert namespace.get_describe_call_count() == 0
+
+    table2 = pa.Table.from_pylist([{"a": 10, "b": 20}])
+
+    ds = lance.write_dataset(
+        table2,
+        namespace=namespace,
+        table_id=table_id,
+        mode="append",
+    )
+
+    assert namespace.get_create_call_count() == 1
+    describe_count_after_append = namespace.get_describe_call_count()
+    assert describe_count_after_append == 1
+    assert ds.count_rows() == 2
+    assert len(ds.versions()) == 2
+
+    call_count_before_reads = namespace.get_describe_call_count()
+    for _ in range(3):
+        assert ds.count_rows() == 2
+    assert namespace.get_describe_call_count() == call_count_before_reads
+
+
+@pytest.mark.integration
+def test_namespace_write_overwrite_mode(s3_bucket: str):
+    """Test writing dataset through namespace in OVERWRITE mode."""
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 1
+    assert namespace.get_create_call_count() == 1
+    assert namespace.get_describe_call_count() == 0
+
+    table2 = pa.Table.from_pylist([{"a": 10, "b": 20}, {"a": 100, "b": 200}])
+
+    ds = lance.write_dataset(
+        table2,
+        namespace=namespace,
+        table_id=table_id,
+        mode="overwrite",
+    )
+
+    assert namespace.get_create_call_count() == 1
+    describe_count_after_overwrite = namespace.get_describe_call_count()
+    assert describe_count_after_overwrite == 1
+    assert ds.count_rows() == 2
+    assert len(ds.versions()) == 2
+    result = ds.to_table()
+    assert result == table2
+
+    call_count_before_reads = namespace.get_describe_call_count()
+    for _ in range(3):
+        assert ds.count_rows() == 2
+    assert namespace.get_describe_call_count() == call_count_before_reads
+
+
+@pytest.mark.integration
+def test_namespace_distributed_write(s3_bucket: str):
+    """Test distributed write pattern through namespace."""
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+    )
+
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    from lance_namespace import CreateEmptyTableRequest
+
+    request = CreateEmptyTableRequest(id=table_id, location=None, properties=None)
+    response = namespace.create_empty_table(request)
+
+    assert namespace.get_create_call_count() == 1
+    assert namespace.get_describe_call_count() == 0
+
+    table_uri = response.location
+    assert table_uri is not None
+
+    from lance.namespace import LanceNamespaceStorageOptionsProvider
+
+    namespace_storage_options = response.storage_options
+    assert namespace_storage_options is not None
+
+    storage_options_provider = LanceNamespaceStorageOptionsProvider(
+        namespace=namespace, table_id=table_id
+    )
+
+    merged_options = dict(storage_options)
+    merged_options.update(namespace_storage_options)
+
+    from lance.fragment import write_fragments
+
+    fragment1_data = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 3, "b": 4}])
+    fragment1 = write_fragments(
+        fragment1_data,
+        table_uri,
+        storage_options=merged_options,
+        storage_options_provider=storage_options_provider,
+    )
+
+    fragment2_data = pa.Table.from_pylist([{"a": 10, "b": 20}, {"a": 30, "b": 40}])
+    fragment2 = write_fragments(
+        fragment2_data,
+        table_uri,
+        storage_options=merged_options,
+        storage_options_provider=storage_options_provider,
+    )
+
+    fragment3_data = pa.Table.from_pylist([{"a": 100, "b": 200}])
+    fragment3 = write_fragments(
+        fragment3_data,
+        table_uri,
+        storage_options=merged_options,
+        storage_options_provider=storage_options_provider,
+    )
+
+    all_fragments = fragment1 + fragment2 + fragment3
+
+    operation = lance.LanceOperation.Overwrite(fragment1_data.schema, all_fragments)
+
+    ds = lance.LanceDataset.commit(
+        table_uri,
+        operation,
+        storage_options=merged_options,
+        storage_options_provider=storage_options_provider,
+    )
+
+    assert ds.count_rows() == 5
+    assert len(ds.versions()) == 1
+
+    result = ds.to_table().sort_by("a")
+    expected = pa.Table.from_pylist(
+        [
+            {"a": 1, "b": 2},
+            {"a": 3, "b": 4},
+            {"a": 10, "b": 20},
+            {"a": 30, "b": 40},
+            {"a": 100, "b": 200},
+        ]
+    )
+    assert result == expected
+
+    ds_from_namespace = lance.dataset(
+        namespace=namespace,
+        table_id=table_id,
+    )
+    assert ds_from_namespace.count_rows() == 5
+
+
+@pytest.mark.integration
+def test_file_writer_with_storage_options_provider(s3_bucket: str):
+    """Test LanceFileWriter with storage_options_provider and credential refresh."""
+    from lance import LanceNamespaceStorageOptionsProvider
+    from lance.file import LanceFileReader, LanceFileWriter
+
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    assert namespace.get_create_call_count() == 0
+    assert namespace.get_describe_call_count() == 0
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 2
+    assert namespace.get_create_call_count() == 1
+
+    describe_response = namespace.describe_table(
+        DescribeTableRequest(id=table_id, version=None)
+    )
+    namespace_storage_options = describe_response.storage_options
+
+    provider = LanceNamespaceStorageOptionsProvider(
+        namespace=namespace, table_id=table_id
+    )
+
+    initial_describe_count = namespace.get_describe_call_count()
+
+    file_uri = f"s3://{s3_bucket}/{table_name}_file_test.lance"
+    schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
+
+    writer = LanceFileWriter(
+        file_uri,
+        schema=schema,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+    )
+
+    batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
+    writer.write_batch(batch)
+
+    batch2 = pa.RecordBatch.from_pydict(
+        {"x": [7, 8, 9], "y": [10, 11, 12]}, schema=schema
+    )
+    writer.write_batch(batch2)
+    writer.close()
+
+    describe_count_after_write = namespace.get_describe_call_count()
+    assert describe_count_after_write == initial_describe_count
+
+    reader = LanceFileReader(file_uri, storage_options=namespace_storage_options)
+    result = reader.read_all(batch_size=1024)
+    result_table = result.to_table()
+    assert result_table.num_rows == 6
+    assert result_table.schema == schema
+
+    expected_table = pa.table(
+        {"x": [1, 2, 3, 7, 8, 9], "y": [4, 5, 6, 10, 11, 12]}, schema=schema
+    )
+    assert result_table == expected_table
+
+    time.sleep(5)
+
+    file_uri2 = f"s3://{s3_bucket}/{table_name}_file_test2.lance"
+    writer2 = LanceFileWriter(
+        file_uri2,
+        schema=schema,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+    )
+
+    batch3 = pa.RecordBatch.from_pydict(
+        {"x": [100, 200], "y": [300, 400]}, schema=schema
+    )
+    writer2.write_batch(batch3)
+    writer2.close()
+
+    final_describe_count = namespace.get_describe_call_count()
+    assert final_describe_count == describe_count_after_write + 1
+
+    reader2 = LanceFileReader(file_uri2, storage_options=namespace_storage_options)
+    result2 = reader2.read_all(batch_size=1024)
+    result_table2 = result2.to_table()
+    assert result_table2.num_rows == 2
+    expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
+    assert result_table2 == expected_table2

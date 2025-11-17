@@ -299,6 +299,7 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider=None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,
@@ -325,6 +326,10 @@ class LanceFileWriter:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        storage_options_provider : optional, StorageOptionsProvider
+            A storage options provider that can fetch and refresh storage options
+            dynamically. This is useful for credentials that expire and need to be
+            refreshed automatically.
         max_page_bytes : optional, int
             The maximum size of a page in bytes, if a single array would create a
             page larger than this then it will be split into multiple pages. The
@@ -341,6 +346,7 @@ class LanceFileWriter:
                 data_cache_bytes=data_cache_bytes,
                 version=version,
                 storage_options=storage_options,
+                storage_options_provider=storage_options_provider,
                 max_page_bytes=max_page_bytes,
                 **kwargs,
             )

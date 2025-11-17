@@ -38,7 +38,7 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
 
 ## Example Notebooks
 
-Example notebooks are under `examples`. 
+Example notebooks are under `examples`.
 These are standalone notebooks you should be able to download and run.
 
 ## Benchmarks
@@ -50,5 +50,5 @@ These live under `benchmarks`.
 
 ## Code of Conduct
 
-We follow the Code of Conduct of [Python Foundation](https://www.python.org/psf/conduct/) and 
-[Rust Foundation](https://www.rust-lang.org/policies/code-of-conduct). 
+We follow the Code of Conduct of [Python Foundation](https://www.python.org/psf/conduct/) and
+[Rust Foundation](https://www.rust-lang.org/policies/code-of-conduct).
