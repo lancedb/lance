@@ -25,9 +25,7 @@ use arrow_array::{
     types::{ArrowDictionaryKeyType, UInt16Type, UInt32Type, UInt64Type, UInt8Type},
     Array, ArrayRef, OffsetSizeTrait, UInt64Array,
 };
-use arrow_buffer::{
-    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
-};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
@@ -228,12 +226,11 @@ impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
     }
 }
 
-impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
+impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
-
-        let offsets: ScalarBuffer<T> = block.offsets.clone().borrow_to_typed_slice();
+        let offsets = block.offsets.borrow_to_typed_view::<T>();
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];

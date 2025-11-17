@@ -283,7 +283,27 @@ impl PartialEq for ObjectStoreParams {
     }
 }
 
-fn uri_to_url(uri: &str) -> Result<Url> {
+/// Convert a URI string or local path to a URL
+///
+/// This function handles both proper URIs (with schemes like `file://`, `s3://`, etc.)
+/// and plain local filesystem paths. On Windows, it correctly handles drive letters
+/// that might be parsed as URL schemes.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_io::object_store::uri_to_url;
+/// // URIs are preserved
+/// let url = uri_to_url("s3://bucket/path").unwrap();
+/// assert_eq!(url.scheme(), "s3");
+///
+/// // Local paths are converted to file:// URIs
+/// # #[cfg(unix)]
+/// let url = uri_to_url("/tmp/data").unwrap();
+/// # #[cfg(unix)]
+/// assert_eq!(url.scheme(), "file");
+/// ```
+pub fn uri_to_url(uri: &str) -> Result<Url> {
     match Url::parse(uri) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme

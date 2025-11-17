@@ -10,8 +10,8 @@ import pyarrow.parquet as pq
 # specifically for random access scans
 
 tab = pq.read_table("~/lineitemsf1.snappy.parquet")
-dsv1 = lance.write_dataset(tab, "/tmp/lineitem.lancev1", use_legacy_format=True)
-dsv2 = lance.write_dataset(tab, "/tmp/lineitem.lancev2", use_legacy_format=False)
+dsv1 = lance.write_dataset(tab, "/tmp/lineitem.lancev1", data_storage_version="2.0")
+dsv2 = lance.write_dataset(tab, "/tmp/lineitem.lancev2", data_storage_version="2.1")
 
 dsv1 = lance.dataset("/tmp/lineitem.lancev1")
 dsv2 = lance.dataset("/tmp/lineitem.lancev2")

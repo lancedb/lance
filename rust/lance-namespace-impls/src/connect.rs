@@ -169,7 +169,8 @@ mod tests {
             .unwrap();
 
         // Verify we can use the namespace
-        let request = ListTablesRequest::new();
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
     }
@@ -188,7 +189,8 @@ mod tests {
             .unwrap();
 
         // Verify we can use the namespace
-        let request = ListTablesRequest::new();
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
     }
@@ -206,7 +208,8 @@ mod tests {
             .unwrap();
 
         // Verify we can use the namespace
-        let request = ListTablesRequest::new();
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec![]);
         let response = namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
     }

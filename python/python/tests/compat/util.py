@@ -1,23 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# Utilities shared by datagen.py and test_compat.py
+# Utilities shared by datagen.py
 #
 # Everything here must be runnable by older versions of Lance.
 
-from pathlib import Path
 
 import pyarrow as pa
-
-
-def get_path(name: str):
-    dataset_dir = (
-        Path(__file__).parent.parent.parent.parent.parent
-        / "test_data"
-        / "forward_compat"
-        / name
-    )
-    return dataset_dir
 
 
 def build_basic_types():

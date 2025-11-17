@@ -13,14 +13,14 @@ theme:
   favicon: logo/logo.png
   palette:
     - scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -67,13 +67,12 @@ plugins:
       proto_dir: ../protos
 
 extra:
+  generator: false
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/lancedb/lance
     - icon: fontawesome/brands/discord
       link: https://discord.gg/zMM32dvNtd
-    - icon: fontawesome/brands/twitter
-      link: https://twitter.com/lancedb
 
 copyright: © 2025 Lance Format. All rights reserved.
 

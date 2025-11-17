@@ -155,5 +155,9 @@ harness = false
 name = "take"
 harness = false
 
+[[bench]]
+name = "random_access"
+harness = false
+
 [lints]
 workspace = true
