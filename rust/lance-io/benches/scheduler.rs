@@ -94,8 +94,11 @@ fn bench_full_read(c: &mut Criterion) {
                     }
                     std::env::set_var("IO_THREADS", io_parallelism.to_string());
                     runtime.block_on(async {
-                        let scheduler =
-                            ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+                        let scheduler = ScanScheduler::try_new(
+                            obj_store,
+                            SchedulerConfig::default_for_testing(),
+                        )
+                        .unwrap();
                         let file_scheduler = scheduler
                             .open_file(&tmp_file, &CachedFileSize::unknown())
                             .await
@@ -185,10 +188,11 @@ fn bench_random_read(c: &mut Criterion) {
                         }
                         std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
                         runtime.block_on(async {
-                            let scheduler = ScanScheduler::new(
+                            let scheduler = ScanScheduler::try_new(
                                 obj_store,
                                 SchedulerConfig::default_for_testing(),
-                            );
+                            )
+                            .unwrap();
                             let file_scheduler = scheduler
                                 .open_file(&tmp_file, &CachedFileSize::unknown())
                                 .await

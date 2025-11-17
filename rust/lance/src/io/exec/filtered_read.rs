@@ -412,7 +412,7 @@ impl FilteredReadStream {
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+        let scan_scheduler = ScanScheduler::try_new(obj_store, scheduler_config)?;
 
         let (scoped_fragments, scan_planned_with_limit_pushed_down) = Self::plan_scan(
             dataset.as_ref(),

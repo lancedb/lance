@@ -1355,6 +1355,7 @@ impl BatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1691,6 +1692,7 @@ impl StructuralBatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);

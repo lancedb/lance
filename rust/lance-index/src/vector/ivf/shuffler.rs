@@ -507,7 +507,7 @@ impl IvfShuffler {
                 total_batches.push(reader.num_batches());
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-                let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
+                let scheduler = ScanScheduler::try_new(object_store.into(), scheduler_config)?;
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
@@ -531,10 +531,10 @@ impl IvfShuffler {
     async fn count_partition_size(&self, inputs: &[ShuffleInput]) -> Result<Vec<u64>> {
         let object_store = ObjectStore::local();
         let mut partition_sizes = vec![0; self.num_partitions as usize];
-        let scheduler = ScanScheduler::new(
+        let scheduler = ScanScheduler::try_new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
-        );
+        )?;
 
         for &ShuffleInput {
             file_idx,
@@ -642,7 +642,7 @@ impl IvfShuffler {
                     .boxed()
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-                let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
+                let scheduler = ScanScheduler::try_new(Arc::new(object_store), scheduler_config)?;
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
@@ -819,7 +819,7 @@ impl IvfShuffler {
             let object_store = Arc::new(ObjectStore::local());
             let path = basedir.child(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-            let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
+            let scan_scheduler = ScanScheduler::try_new(object_store, scheduler_config)?;
             let file_scheduler = scan_scheduler
                 .open_file(&path, &CachedFileSize::unknown())
                 .await?;

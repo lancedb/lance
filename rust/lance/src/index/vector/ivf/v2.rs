@@ -143,7 +143,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
     ) -> Result<Self> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler = ScanScheduler::try_new(object_store, scheduler_config)?;
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
@@ -2303,7 +2303,7 @@ mod tests {
         obj_store.copy(&store_path, &copied_path).await?;
         obj_store.delete(&store_path).await?;
         let scheduler =
-            ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
+            ScanScheduler::try_new(obj_store.clone(), SchedulerConfig::default_for_testing())?;
         let reader = FileReader::try_open(
             scheduler
                 .open_file(&copied_path, &CachedFileSize::unknown())
@@ -2365,7 +2365,8 @@ mod tests {
 
         let obj_store = Arc::new(ObjectStore::local());
         let scheduler =
-            ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
+            ScanScheduler::try_new(obj_store.clone(), SchedulerConfig::default_for_testing())
+                .unwrap();
 
         async fn get_pq_metadata(
             dataset: &Dataset,
