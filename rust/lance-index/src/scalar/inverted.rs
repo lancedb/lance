@@ -35,6 +35,7 @@ use crate::{
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
         CreatedIndex, ScalarIndex,
     },
+    IndexType,
 };
 
 use super::IndexStore;
@@ -131,6 +132,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     fn provides_exact_answer(&self) -> bool {
         false
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Inverted
     }
 
     fn version(&self) -> u32 {

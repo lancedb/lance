@@ -740,6 +740,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         true
     }
 
+    fn index_type(&self) -> IndexType {
+        IndexType::Scalar
+    }
+
     fn attach_registry(&self, registry: Arc<ScalarIndexPluginRegistry>) {
         let mut reg_ref = self.registry.lock().unwrap();
         *reg_ref = Some(registry);

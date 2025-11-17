@@ -1941,6 +1941,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         true
     }
 
+    fn index_type(&self) -> IndexType {
+        IndexType::BTree
+    }
+
     fn version(&self) -> u32 {
         BTREE_INDEX_VERSION
     }

@@ -382,6 +382,10 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         true
     }
 
+    fn index_type(&self) -> IndexType {
+        IndexType::LabelList
+    }
+
     fn version(&self) -> u32 {
         LABEL_LIST_INDEX_VERSION
     }

@@ -1235,6 +1235,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         false
     }
 
+    fn index_type(&self) -> IndexType {
+        IndexType::BloomFilter
+    }
+
     fn version(&self) -> u32 {
         BLOOMFILTER_INDEX_VERSION
     }
@@ -1258,6 +1262,14 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 }
 

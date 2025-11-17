@@ -969,6 +969,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         false
     }
 
+    fn index_type(&self) -> IndexType {
+        IndexType::ZoneMap
+    }
+
     fn version(&self) -> u32 {
         ZONEMAP_INDEX_VERSION
     }

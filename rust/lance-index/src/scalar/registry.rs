@@ -19,6 +19,7 @@ use crate::{
         label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
         CreatedIndex, IndexStore, ScalarIndex,
     },
+    IndexType,
 };
 
 pub const VALUE_COLUMN_NAME: &str = "value";
@@ -126,6 +127,9 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
+    /// Returns the index type for this plugin
+    fn index_type(&self) -> IndexType;
+
     /// The version of the index plugin
     ///
     /// We assume that indexes are not forwards compatible.  If an index was written with a
@@ -152,6 +156,15 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Optional hook allowing a plugin to provide statistics without loading the index.
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
 
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<ScalarIndexPluginRegistry>) {}

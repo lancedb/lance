@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::utils::address::RowAddress;
@@ -726,25 +726,35 @@ impl DatasetIndexExt for Dataset {
         let field_id = metadatas[0].fields[0];
         let field_path = self.schema().field_path(field_id)?;
 
-        // Open all delta indices
-        let indices = stream::iter(metadatas.iter())
-            .then(|m| {
-                let field_path = field_path.clone();
-                async move {
-                    self.open_generic_index(&field_path, &m.uuid.to_string(), &NoOpMetricsCollector)
-                        .await
-                }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
+        let mut indices_stats = Vec::with_capacity(metadatas.len());
+        let mut index_type: Option<String> = None;
 
-        // Stastistics for each delta index.
-        let indices_stats = indices
-            .iter()
-            .map(|idx| idx.statistics())
-            .collect::<Result<Vec<_>>>()?;
+        for meta in metadatas.iter() {
+            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
+            let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
+            let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+            let plugin = index_details_wrapper.get_plugin()?;
 
-        let index_type = indices[0].index_type().to_string();
+            if index_type.is_none() {
+                index_type = Some(plugin.index_type().to_string());
+            }
+
+            if let Some(stats) = plugin
+                .load_statistics(index_store.clone(), index_details.as_ref())
+                .await?
+            {
+                indices_stats.push(stats);
+                continue;
+            }
+
+            let index = self
+                .open_generic_index(&field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
+                .await?;
+
+            indices_stats.push(index.statistics()?);
+        }
+
+        let index_type = index_type.unwrap_or_else(|| "Unknown".to_string());
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
 
@@ -1604,24 +1614,21 @@ fn is_vector_field(data_type: DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::{ReadParams, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow_array::Int32Array;
-    use lance_io::utils::tracking_store::IOTracker;
-    use lance_io::{assert_io_eq, assert_io_lt};
-
-    use super::*;
-
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{Field, Schema};
+    use futures::stream::TryStreamExt;
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
@@ -1631,6 +1638,8 @@ mod tests {
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
     use lance_io::object_store::ObjectStoreParams;
+    use lance_io::utils::tracking_store::IOTracker;
+    use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
