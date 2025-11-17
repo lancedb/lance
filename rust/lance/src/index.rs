@@ -448,7 +448,7 @@ impl IndexDescriptionImpl {
 
             for fragment in dataset.get_fragments() {
                 if fragment_bitmap.contains(fragment.id() as u32) {
-                    rows_indexed += fragment.fast_physical_rows()? as u64;
+                    rows_indexed += fragment.fast_logical_rows()? as u64;
                 }
             }
         }
@@ -491,7 +491,9 @@ impl IndexDescription for IndexDescriptionImpl {
 
     fn details(&self) -> Result<String> {
         let plugin = self.details.get_plugin()?;
-        plugin.details_as_json(&self.details.0)
+        plugin
+            .details_as_json(&self.details.0)
+            .map(|v| v.to_string())
     }
 }
 

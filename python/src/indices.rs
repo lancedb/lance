@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
+
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
@@ -27,6 +29,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
+use crate::utils::PyJson;
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -468,28 +471,41 @@ pub fn load_shuffled_vectors(
 #[pyclass(name = "IndexSegmentDescription", module = "lance.indices", get_all)]
 #[derive(Clone)]
 pub struct PyIndexSegmentDescription {
+    /// The UUID of the index segment
     pub uuid: String,
-    pub dataset_version: u64,
-    pub fragment_ids: Vec<u32>,
+    /// The dataset version at which the index segment was last updated
+    pub dataset_version_at_last_update: u64,
+    /// The fragment ids that are covered by the index segment
+    pub fragment_ids: HashSet<u32>,
+    /// The version of the index
     pub index_version: i32,
+    /// The timestamp when the index segment was created
     pub created_at: Option<DateTime<Utc>>,
 }
 
 impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexSegmentDescription(uuid={}, dataset_version={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version, self.fragment_ids, self.index_version, self.created_at)
+        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at)
     }
 }
 
 #[pyclass(name = "IndexDescription", module = "lance.indices", get_all)]
 pub struct PyIndexDescription {
+    /// The name of the index
     pub name: String,
+    /// The full type URL of the index
     pub type_url: String,
+    /// The short type of the index (may not be unique)
     pub index_type: String,
+    /// The ids of the fields that the index is built on
     pub fields: Vec<u32>,
+    /// The names of the fields that the index is built on
     pub field_names: Vec<String>,
+    /// The number of rows indexed by the index
     pub num_rows_indexed: u64,
-    pub details: String,
+    /// The details of the index
+    pub details: PyJson,
+    /// The segments of the index
     pub segments: Vec<PyIndexSegmentDescription>,
 }
 
@@ -514,11 +530,11 @@ impl PyIndexDescription {
                 let fragment_ids = segment
                     .fragment_bitmap
                     .as_ref()
-                    .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+                    .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
                     .unwrap_or_default();
                 PyIndexSegmentDescription {
                     uuid: segment.uuid.to_string(),
-                    dataset_version: segment.dataset_version,
+                    dataset_version_at_last_update: segment.dataset_version,
                     fragment_ids,
                     index_version: segment.index_version,
                     created_at: segment.created_at,
@@ -526,9 +542,7 @@ impl PyIndexDescription {
             })
             .collect();
 
-        let details = index
-            .details()
-            .unwrap_or_else(|_| "<unknown-index-details>".to_string());
+        let details = index.details().unwrap_or_else(|_| "{}".to_string());
 
         Self {
             name: index.name().to_string(),
@@ -538,7 +552,7 @@ impl PyIndexDescription {
             segments,
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
-            details,
+            details: PyJson(details),
         }
     }
 }

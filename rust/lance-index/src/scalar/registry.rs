@@ -164,8 +164,8 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// These details will be user-visible and should be considered part of the public
     /// API.  As a result, efforts should be made to ensure the information is backwards
     /// compatible and avoid breaking changes.
-    fn details_as_json(&self, _details: &prost_types::Any) -> Result<String> {
+    fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
         // Return an empty JSON object as the default implementation
-        Ok("{}".to_string())
+        Ok(serde_json::json!({}))
     }
 }

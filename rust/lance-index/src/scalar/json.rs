@@ -835,7 +835,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }
 
-    fn details_as_json(&self, details: &prost_types::Any) -> Result<String> {
+    fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let registry = self.registry().unwrap();
         let json_details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
@@ -844,8 +844,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(serde_json::json!({
             "path": json_details.path,
             "target_details": target_details_json,
-        })
-        .to_string())
+        }))
     }
 }
 

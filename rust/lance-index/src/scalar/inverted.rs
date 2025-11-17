@@ -201,9 +201,9 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         )
     }
 
-    fn details_as_json(&self, details: &prost_types::Any) -> Result<String> {
+    fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
-        Ok(serde_json::to_string(&index_params)?)
+        Ok(serde_json::json!(&index_params))
     }
 }

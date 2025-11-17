@@ -4036,15 +4036,14 @@ def test_describe_indices(tmp_path):
     assert indices[0].field_names == ["text"]
     assert len(indices[0].segments) == 1
     assert indices[0].segments[0].uuid is not None
-    assert indices[0].segments[0].fragment_ids == [0]
-    assert indices[0].segments[0].dataset_version == 1
+    assert indices[0].segments[0].fragment_ids == {0}
+    assert indices[0].segments[0].dataset_version_at_last_update == 1
     assert indices[0].segments[0].index_version == 1
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
 
     details = indices[0].details
     assert details is not None and len(details) > 0
-    details = json.loads(details)
     assert details["lance_tokenizer"] is None
     assert details["base_tokenizer"] == "simple"
     assert details["language"] == "English"
@@ -4104,7 +4103,7 @@ def test_describe_indices(tmp_path):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":"{}"}',
+        '{"path":"x","target_details":{}}',
         "{}",
         "{}",
     ]
@@ -4117,9 +4116,14 @@ def test_describe_indices(tmp_path):
         assert indices[i].fields == [i + 2]
         assert indices[i].field_names == [data.column_names[i + 2]]
         assert len(indices[i].segments) == 1
-        assert indices[i].segments[0].fragment_ids == [0]
-        assert indices[i].segments[0].dataset_version == i + 2
+        assert indices[i].segments[0].fragment_ids == {0}
+        assert indices[i].segments[0].dataset_version_at_last_update == i + 2
         assert indices[i].segments[0].index_version == 0
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
-        assert indices[i].details == details[i]
+        assert indices[i].details == json.loads(details[i])
+
+    ds.delete("id < 50")
+    indices = ds.describe_indices()
+    for index in indices:
+        assert index.num_rows_indexed == 50

@@ -53,8 +53,8 @@ def transform_vectors(
 
 class IndexSegmentDescription:
     uuid: str
-    dataset_version: int
-    fragment_ids: list[int]
+    dataset_version_at_last_update: int
+    fragment_ids: set[int]
     index_version: int
     created_at: Optional[datetime]
 
@@ -68,6 +68,6 @@ class IndexDescription:
     fields: list[int]
     field_names: list[str]
     segments: list[IndexSegmentDescription]
-    details: str
+    details: dict
 
     def __repr__(self) -> str: ...
