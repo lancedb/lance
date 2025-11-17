@@ -1402,7 +1402,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     assert info.fields == [0]
     assert info.field_names == ["vector"]
     assert len(info.segments) == 1
-    assert info.segments[0].fragment_ids == [0]
+    assert info.segments[0].fragment_ids == {0}
     assert info.segments[0].dataset_version_at_last_update == 1
     assert info.segments[0].index_version == 1
     assert info.segments[0].created_at is not None
