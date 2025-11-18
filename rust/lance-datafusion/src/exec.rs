@@ -289,6 +289,7 @@ pub struct LanceExecutionOptions {
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
     pub execution_stats_callback: Option<ExecutionStatsCallback>,
+    pub skip_logging: bool,
 }
 
 impl std::fmt::Debug for LanceExecutionOptions {
@@ -298,6 +299,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
             .field("mem_pool_size", &self.mem_pool_size)
             .field("batch_size", &self.batch_size)
             .field("target_partition", &self.target_partition)
+            .field("skip_logging", &self.skip_logging)
             .field(
                 "execution_stats_callback",
                 &self.execution_stats_callback.is_some(),
@@ -508,10 +510,12 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    debug!(
-        "Executing plan:\n{}",
-        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
-    );
+    if !options.skip_logging {
+        debug!(
+            "Executing plan:\n{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        );
+    }
 
     let session_ctx = get_session_context(&options);
 
@@ -522,7 +526,9 @@ pub fn execute_plan(
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        report_plan_summary_metrics(plan.as_ref(), &options);
+        if !options.skip_logging {
+            report_plan_summary_metrics(plan.as_ref(), &options);
+        }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
