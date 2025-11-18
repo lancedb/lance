@@ -1226,16 +1226,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
     }
 
-    #[doc(hidden)]
-    pub async fn split_partition_for_bench(
-        &self,
-        part_idx: usize,
-        ivf: &IvfModel,
-    ) -> Result<usize> {
-        let result = self.split_partition(part_idx, ivf).await?;
-        Ok(result.assign_batches.len())
-    }
-
     async fn split_partition_impl<T: ArrowPrimitiveType>(
         &self,
         part_idx: usize,
