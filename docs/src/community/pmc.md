@@ -42,7 +42,7 @@ In addition to the [activities of maintainers](./maintainers.md#activities), PMC
 | Calvin Qi       | calvinqi        | Harvey.ai    |                                                                                                               |
 | Prashanth Rao   | prrao87         | LanceDB      |                                                                                                               |
 | Ethan Rosenthal | EthanRosenthal  | RunwayML     |                                                                                                               |                                                 |
-| Tim Saucer      | timsaucer       | ReRun.io     | Apache DataFusion PMC Member                                                                                  |
+| Tim Saucer      | timsaucer       | Rerun.io     | Apache DataFusion PMC Member                                                                                  |
 | Chang She       | changhiskhan    | LanceDB      | Pandas Co-Author                                                                                              |
 | Jasmine Wang    | onigiriisabunny | LanceDB      | Alluxio PMC Community Manager                                                                                 |
 | Lei Xu          | eddyxu          | LanceDB      | Apache Hadoop PMC Member                                                                                      |
