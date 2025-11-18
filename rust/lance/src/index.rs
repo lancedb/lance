@@ -1632,13 +1632,16 @@ mod tests {
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+    use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
+    use lance_index::scalar::{
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+    };
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -1707,6 +1710,92 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
+        const NUM_ROWS: usize = 500_000;
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Int32,
+            false,
+        )]));
+        let values: Vec<i32> = (0..NUM_ROWS as i32).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let io_tracker = Arc::new(IOTracker::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            ..WriteParams::default()
+        };
+
+        Dataset::write(reader, &test_dir, Some(write_params))
+            .await
+            .unwrap();
+
+        let read_params = ReadParams {
+            store_options: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            ..ReadParams::default()
+        };
+
+        let mut dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_read_params(read_params)
+            .load()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["status"],
+                IndexType::Bitmap,
+                Some("status_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index_meta = indices
+            .iter()
+            .find(|idx| idx.name == "status_idx")
+            .expect("status_idx should exist");
+        let lookup_path = dataset
+            .indice_files_dir(index_meta)
+            .unwrap()
+            .child(index_meta.uuid.to_string())
+            .child(BITMAP_LOOKUP_NAME);
+        let meta = dataset.object_store.inner.head(&lookup_path).await.unwrap();
+        assert!(
+            meta.size >= 1_000_000,
+            "bitmap index should be large enough to fail without metadata path, size={} bytes",
+            meta.size
+        );
+
+        io_tracker.incremental_stats();
+
+        dataset.index_statistics("status_idx").await.unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        assert!(
+            stats.read_bytes < 1024,
+            "index_statistics should only read metadata, read {} bytes",
+            stats.read_bytes
+        );
+        assert_eq!(
+            stats.write_bytes, 0,
+            "index_statistics should not perform writes"
+        );
     }
 
     fn sample_vector_field() -> Field {

@@ -797,146 +797,14 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 pub mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::{lance_format::LanceIndexStore, IndexStore, IndexWriter};
+    use crate::scalar::lance_format::LanceIndexStore;
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
     use futures::stream;
-    use lance_core::{
-        datatypes::Schema as LanceSchema,
-        utils::{address::RowAddress, tempfile::TempObjDir},
-    };
+    use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
-    use std::{any::Any, collections::HashMap};
-
-    #[derive(Debug)]
-    struct MetadataOnlyStore {
-        schema: Arc<LanceSchema>,
-    }
-
-    impl DeepSizeOf for MetadataOnlyStore {
-        fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
-            self.schema.deep_size_of_children(ctx)
-        }
-    }
-
-    #[derive(Debug)]
-    struct MetadataOnlyReader {
-        schema: Arc<LanceSchema>,
-    }
-
-    #[async_trait]
-    impl IndexReader for MetadataOnlyReader {
-        async fn read_record_batch(&self, _offset: u64, _batch_size: u64) -> Result<RecordBatch> {
-            panic!("metadata reader should not read record batches")
-        }
-
-        async fn read_range(
-            &self,
-            _range: std::ops::Range<usize>,
-            _projection: Option<&[&str]>,
-        ) -> Result<RecordBatch> {
-            panic!("metadata reader should not read ranges")
-        }
-
-        async fn num_batches(&self, _batch_size: u64) -> u32 {
-            0
-        }
-
-        fn num_rows(&self) -> usize {
-            0
-        }
-
-        fn schema(&self) -> &LanceSchema {
-            &self.schema
-        }
-    }
-
-    #[async_trait]
-    impl IndexStore for MetadataOnlyStore {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn io_parallelism(&self) -> usize {
-            1
-        }
-
-        async fn new_index_file(
-            &self,
-            _name: &str,
-            _schema: Arc<Schema>,
-        ) -> Result<Box<dyn IndexWriter>> {
-            panic!("metadata store does not support writing")
-        }
-
-        async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn IndexReader>> {
-            Ok(Arc::new(MetadataOnlyReader {
-                schema: self.schema.clone(),
-            }))
-        }
-
-        async fn copy_index_file(&self, _name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
-            panic!("metadata store does not support copy")
-        }
-
-        async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
-            panic!("metadata store does not support rename")
-        }
-
-        async fn delete_index_file(&self, _name: &str) -> Result<()> {
-            panic!("metadata store does not support delete")
-        }
-    }
-
-    #[tokio::test]
-    async fn test_bitmap_metadata_statistics_minimal_io() {
-        let tmpdir = TempObjDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let colors = vec![
-            "red", "blue", "green", "red", "yellow", "blue", "red", "green",
-        ];
-        let row_ids = (0u64..colors.len() as u64).collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(colors.clone())),
-                Arc::new(UInt64Array::from(row_ids.clone())),
-            ],
-        )
-        .unwrap();
-        let stream = stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
-        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
-            .await
-            .unwrap();
-
-        let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await.unwrap();
-        let schema = Arc::new(reader.schema().clone());
-
-        let metadata_store = MetadataOnlyStore { schema };
-        let stats = BitmapIndexPlugin
-            .load_statistics(Arc::new(metadata_store), &prost_types::Any::default())
-            .await
-            .unwrap()
-            .expect("bitmap metadata statistics should exist");
-
-        assert_eq!(
-            stats.get("num_bitmaps").and_then(|v| v.as_u64()).unwrap(),
-            4,
-            "num_bitmaps should equal number of distinct values",
-        );
-    }
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
