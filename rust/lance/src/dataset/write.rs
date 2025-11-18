@@ -42,7 +42,7 @@ use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
 
-fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
+pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
     if storage_version >= LanceFileVersion::V2_2 {
         BlobVersion::V2
     } else {
@@ -591,7 +591,7 @@ pub async fn write_fragments_internal(
 
     let allow_blob_version_change =
         dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
-    let (mut schema, storage_version) = if let Some(dataset) = dataset {
+    let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
@@ -639,7 +639,19 @@ pub async fn write_fragments_internal(
     };
 
     let target_blob_version = blob_version_for(storage_version);
-    schema.apply_blob_version(target_blob_version, allow_blob_version_change)?;
+    if let Some(dataset) = dataset {
+        let existing_version = dataset.blob_version();
+        if !allow_blob_version_change && existing_version != target_blob_version {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Blob column version mismatch. Dataset uses {:?} but write requires {:?}",
+                    existing_version, target_blob_version
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+    }
 
     let fragments = do_write_fragments(
         object_store,

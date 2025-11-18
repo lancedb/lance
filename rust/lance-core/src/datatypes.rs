@@ -62,10 +62,6 @@ pub static BLOB_V2_DESC_TYPE: LazyLock<DataType> =
 pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
     ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), true).with_metadata(HashMap::from([
         (lance_arrow::BLOB_META_KEY.to_string(), "true".to_string()),
-        (
-            lance_arrow::BLOB_VERSION_META_KEY.to_string(),
-            "2".to_string(),
-        ),
     ]))
 });
 

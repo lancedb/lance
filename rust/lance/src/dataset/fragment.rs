@@ -1131,7 +1131,7 @@ impl FileFragment {
         // incorrect `physical_row` values. So if we don't have a writer version,
         // we should not used the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
-        // See: https://github.com/lancedb/lance/issues/1531
+        // See: https://github.com/lance-format/lance/issues/1531
         if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
             return Ok(self.metadata.physical_rows.unwrap());
         }

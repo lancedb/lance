@@ -507,7 +507,7 @@ impl ObjectStoreParams {
 /// Currently this is AWS-specific. Needs investigation of how GCP and Azure credential
 /// refresh mechanisms work and whether they can be unified with AWS's approach.
 ///
-/// See: <https://github.com/lancedb/lance/pull/4905#discussion_r2474605265>
+/// See: <https://github.com/lance-format/lance/pull/4905#discussion_r2474605265>
 pub struct DynamicStorageOptionsCredentialProvider {
     provider: Arc<dyn StorageOptionsProvider>,
     cache: Arc<RwLock<Option<CachedCredential>>>,

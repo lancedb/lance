@@ -2457,7 +2457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_ivf_pq_up_to_date() {
-        // https://github.com/lancedb/lance/issues/4016
+        // https://github.com/lance-format/lance/issues/4016
         let nrows = 256;
         let dimensions = 16;
         let column_name = "vector";

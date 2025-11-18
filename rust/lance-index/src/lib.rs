@@ -4,7 +4,7 @@
 //! Lance secondary index library
 //!
 //! <section class="warning">
-//! This is internal crate used by <a href="https://github.com/lancedb/lance">the lance project</a>.
+//! This is internal crate used by <a href="https://github.com/lance-format/lance">the lance project</a>.
 //! <br/>
 //! API stability is not guaranteed.
 //! </section>

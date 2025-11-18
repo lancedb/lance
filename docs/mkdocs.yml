@@ -3,8 +3,8 @@ site_description: Open Lakehouse Format for Multimodal AI
 site_url: https://lance.org/
 docs_dir: src
 
-repo_name: lancedb/lance
-repo_url: https://github.com/lancedb/lance
+repo_name: lance-format/lance
+repo_url: https://github.com/lance-format/lance
 
 theme:
   name: material
@@ -70,9 +70,9 @@ extra:
   generator: false
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/lancedb/lance
+      link: https://github.com/lance-format/lance
     - icon: fontawesome/brands/discord
-      link: https://discord.gg/zMM32dvNtd
+      link: https://discord.gg/lance
 
 copyright: © 2025 Lance Format. All rights reserved.
 

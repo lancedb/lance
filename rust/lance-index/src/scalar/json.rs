@@ -302,7 +302,7 @@ impl ScalarQueryParser for JsonQueryParser {
             .map(|target_expr| self.wrap_search(target_expr))
     }
 
-    // TODO: maybe we should address it by https://github.com/lancedb/lance/issues/4624
+    // TODO: maybe we should address it by https://github.com/lance-format/lance/issues/4624
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {

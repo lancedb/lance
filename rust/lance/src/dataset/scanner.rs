@@ -292,9 +292,10 @@ impl LanceFilter {
                 })
             }
             #[cfg(not(feature = "substrait"))]
-            Self::Substrait(_) => {
-                panic!("Substrait filter is not supported in this build");
-            }
+            Self::Substrait(_) => Err(Error::NotSupported {
+                source: "Substrait filter is not supported in this build".into(),
+                location: location!(),
+            }),
             Self::Datafusion(expr) => Ok(expr.clone()),
         }
     }

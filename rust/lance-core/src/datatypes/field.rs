@@ -86,17 +86,20 @@ pub enum BlobVersion {
 }
 
 impl BlobVersion {
-    pub fn from_metadata_value(value: Option<&str>) -> Self {
+    /// Convert a persisted string value (e.g. table config) into a blob version
+    pub fn from_config_value(value: &str) -> Option<Self> {
         match value {
-            Some("2") => Self::V2,
-            _ => Self::V1,
+            "1" => Some(Self::V1),
+            "2" => Some(Self::V2),
+            _ => None,
         }
     }
 
-    pub fn metadata_value(self) -> Option<&'static str> {
+    /// Persistable string representation for table config.
+    pub fn config_value(self) -> &'static str {
         match self {
-            Self::V1 => None,
-            Self::V2 => Some("2"),
+            Self::V1 => "1",
+            Self::V2 => "2",
         }
     }
 }
@@ -261,7 +264,11 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(projection.blob_handling.unload_if_needed(new_field))
+            Some(
+                projection
+                    .blob_handling
+                    .unload_if_needed(new_field, projection.blob_version),
+            )
         }
     }
 
@@ -488,36 +495,13 @@ impl Field {
         self.metadata.contains_key(BLOB_META_KEY)
     }
 
-    pub fn blob_version(&self) -> BlobVersion {
-        if !self.is_blob() {
-            return BlobVersion::V1;
-        }
-        let value = self.metadata.get(BLOB_VERSION_META_KEY).map(|s| s.as_str());
-        BlobVersion::from_metadata_value(value)
-    }
-
-    pub fn set_blob_version(&mut self, version: BlobVersion) {
-        if !self.is_blob() {
-            return;
-        }
-        match version.metadata_value() {
-            Some(value) => {
-                self.metadata
-                    .insert(BLOB_VERSION_META_KEY.to_string(), value.to_string());
-            }
-            None => {
-                self.metadata.remove(BLOB_VERSION_META_KEY);
-            }
-        }
-    }
-
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded(mut self) -> Self {
+    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
         if self.data_type().is_binary_like() && self.is_blob() {
-            match self.blob_version() {
+            match version {
                 BlobVersion::V2 => {
                     self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
                     self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
@@ -1530,37 +1514,13 @@ mod tests {
     }
 
     #[test]
-    fn blob_version_detection_and_setting() {
-        let mut metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
-        let field_v1: Field = ArrowField::new("blob", DataType::LargeBinary, true)
-            .with_metadata(metadata.clone())
-            .try_into()
-            .unwrap();
-        assert_eq!(field_v1.blob_version(), BlobVersion::V1);
-
-        metadata.insert(BLOB_VERSION_META_KEY.to_string(), "2".to_string());
-        let mut field_v2: Field = ArrowField::new("blob", DataType::LargeBinary, true)
-            .with_metadata(metadata)
-            .try_into()
-            .unwrap();
-        assert_eq!(field_v2.blob_version(), BlobVersion::V2);
-
-        field_v2.set_blob_version(BlobVersion::V1);
-        assert_eq!(field_v2.blob_version(), BlobVersion::V1);
-        assert!(!field_v2.metadata.contains_key(BLOB_VERSION_META_KEY));
-    }
-
-    #[test]
     fn blob_into_unloaded_selects_v2_layout() {
-        let metadata = HashMap::from([
-            (BLOB_META_KEY.to_string(), "true".to_string()),
-            (BLOB_VERSION_META_KEY.to_string(), "2".to_string()),
-        ]);
+        let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
         let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
             .unwrap();
-        let unloaded = field.into_unloaded();
+        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }

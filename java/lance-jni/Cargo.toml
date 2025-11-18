@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/lancedb/lance"
+repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
 description = "JNI bindings for Lance Columnar format"
 
