@@ -19,7 +19,7 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use serde::Serialize;
 use snafu::location;
@@ -684,24 +684,24 @@ impl AnyQuery for TokenQuery {
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
-    Exact(RowIdTreeMap),
+    Exact(RowAddrTreeMap),
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
-    AtMost(RowIdTreeMap),
+    AtMost(RowAddrTreeMap),
     /// All of the given row ids satisfy the query but there may be more
     ///
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
-    AtLeast(RowIdTreeMap),
+    AtLeast(RowAddrTreeMap),
 }
 
 impl SearchResult {
-    pub fn row_ids(&self) -> &RowIdTreeMap {
+    pub fn row_addrs(&self) -> &RowAddrTreeMap {
         match self {
-            Self::Exact(row_ids) => row_ids,
-            Self::AtMost(row_ids) => row_ids,
-            Self::AtLeast(row_ids) => row_ids,
+            Self::Exact(row_addrs) => row_addrs,
+            Self::AtMost(row_addrs) => row_addrs,
+            Self::AtLeast(row_addrs) => row_addrs,
         }
     }
 

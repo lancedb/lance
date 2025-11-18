@@ -48,7 +48,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -2154,7 +2154,7 @@ impl Scanner {
     }
 
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids = RowIdTreeMap::from_iter(u64s);
+        let row_ids = RowAddrTreeMap::from_iter(u64s);
         let row_id_mask = RowIdMask::from_allowed(row_ids);
         let index_result = IndexExprResult::Exact(row_id_mask);
         let fragments_covered =
