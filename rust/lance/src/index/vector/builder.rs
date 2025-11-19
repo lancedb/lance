@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::future;
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
@@ -1316,53 +1317,54 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .collect::<Vec<_>>();
         if !reassign_targets.is_empty() {
             let builder = self;
-            let parallelism = get_num_compute_intensive_cpus();
             let distance_type = self.distance_type;
             let reassign_part_ids_clone = reassign_part_ids.clone();
             let reassign_part_centroids_clone = reassign_part_centroids.clone();
-            let parallel_ops = stream::iter(reassign_targets.into_iter().map(
-                move |(candidate_idx, part_id)| {
-                    let builder = builder;
-                    let reassign_part_ids = reassign_part_ids_clone.clone();
-                    let reassign_part_centroids = reassign_part_centroids_clone.clone();
-                    let centroid1 = c1.clone();
-                    let centroid2 = c2.clone();
-                    async move {
-                        let part_idx = part_id as usize;
-                        let Some((row_ids, vectors)) =
-                            builder.load_partition_raw_vectors(part_idx).await?
-                        else {
-                            // all vectors in this partition have been deleted
-                            return Ok::<Vec<(usize, AssignOp)>, Error>(Vec::new());
-                        };
-                        let ops = spawn_cpu(move || {
-                            Self::compute_reassign_assign_ops::<T>(
-                                distance_type,
-                                part_idx,
-                                candidate_idx,
-                                centroid1_part_idx,
-                                centroid2_part_idx,
-                                &row_ids,
-                                &vectors,
-                                centroid1,
-                                centroid2,
-                                &reassign_part_ids,
-                                &reassign_part_centroids,
-                            )
-                        })
-                        .await?;
-                        Ok(ops)
-                    }
-                },
-            ))
-            .buffered(parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
-            parallel_ops.into_iter().for_each(|ops| {
+            stream::iter(
+                reassign_targets
+                    .into_iter()
+                    .map(move |(candidate_idx, part_id)| {
+                        let builder = builder;
+                        let reassign_part_ids = reassign_part_ids_clone.clone();
+                        let reassign_part_centroids = reassign_part_centroids_clone.clone();
+                        let centroid1 = c1.clone();
+                        let centroid2 = c2.clone();
+                        async move {
+                            let part_idx = part_id as usize;
+                            let Some((row_ids, vectors)) =
+                                builder.load_partition_raw_vectors(part_idx).await?
+                            else {
+                                // all vectors in this partition have been deleted
+                                return Ok::<Vec<(usize, AssignOp)>, Error>(Vec::new());
+                            };
+                            let ops = spawn_cpu(move || {
+                                Self::compute_reassign_assign_ops::<T>(
+                                    distance_type,
+                                    part_idx,
+                                    candidate_idx,
+                                    centroid1_part_idx,
+                                    centroid2_part_idx,
+                                    &row_ids,
+                                    &vectors,
+                                    centroid1,
+                                    centroid2,
+                                    &reassign_part_ids,
+                                    &reassign_part_centroids,
+                                )
+                            })
+                            .await?;
+                            Ok(ops)
+                        }
+                    }),
+            )
+            .buffered(get_num_compute_intensive_cpus())
+            .try_for_each(|ops| {
                 for (target_idx, op) in ops {
                     assign_ops[target_idx].push(op);
                 }
-            });
+                future::ready(Ok(()))
+            })
+            .await?;
         }
 
         let new_centroids =
