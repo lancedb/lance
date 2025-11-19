@@ -150,7 +150,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: macos-14-large
+    runs-on: macos-14-xlarge
     timeout-minutes: 45
     strategy:
       matrix:

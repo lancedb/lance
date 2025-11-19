@@ -100,7 +100,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-13-large
           - target: aarch64-apple-darwin
-            runner: macos-14-large
+            runner: macos-14-xlarge
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
