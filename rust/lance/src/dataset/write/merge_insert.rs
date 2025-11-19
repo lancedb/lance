@@ -696,10 +696,10 @@ impl MergeInsertJob {
                 .unwrap()
                 .create_plan()
                 .await?;
-            let unioned = UnionExec::new(vec![target, unindexed_data]);
+            let unioned = UnionExec::try_new(vec![target, unindexed_data])?;
             // Enforce only 1 partition.
             target = Arc::new(RepartitionExec::try_new(
-                Arc::new(unioned),
+                unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?);
         }

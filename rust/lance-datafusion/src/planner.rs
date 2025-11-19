@@ -31,11 +31,7 @@ use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
     ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
 };
-use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
-    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
-};
+use datafusion::sql::sqlparser::ast::{AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan};
 use datafusion::{
     common::Column,
     logical_expr::{Between, BinaryExpr, Like, Operator},
@@ -679,7 +675,7 @@ impl Planner {
                 Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
             // For example, DATE '2020-01-01'
-            SQLExpr::TypedString { data_type, value } => {
+            SQLExpr::TypedString(TypedString { data_type, value, .. }) => {
                 let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
                     expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),

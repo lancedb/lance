@@ -64,7 +64,7 @@ pub struct PyIvfModel {
 #[pymethods]
 impl PyIvfModel {
     #[getter]
-    fn centroids(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         if let Some(centroids) = &self.inner.centroids {
             let data = centroids.clone().into_data();
             Ok(Some(data.to_pyarrow(py)?))
@@ -150,8 +150,8 @@ async fn do_train_ivf_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn train_ivf_model(
-    py: Python<'_>,
+fn train_ivf_model<'py>(
+    py: Python<'py>,
     dataset: &Dataset,
     column: &str,
     dimension: usize,
@@ -159,7 +159,7 @@ fn train_ivf_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let centroids = rt().block_on(
         Some(py),
         do_train_ivf_model(
@@ -210,8 +210,8 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn train_pq_model(
-    py: Python<'_>,
+fn train_pq_model<'py>(
+    py: Python<'py>,
     dataset: &Dataset,
     column: &str,
     dimension: usize,
@@ -220,7 +220,7 @@ fn train_pq_model(
     sample_rate: u32,
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
     let ivf_model = IvfModel {

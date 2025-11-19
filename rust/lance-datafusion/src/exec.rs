@@ -34,6 +34,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -545,7 +546,8 @@ pub async fn analyze_plan(
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
     let schema = plan.schema();
-    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+    // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
+    let analyze = Arc::new(AnalyzeExec::new(true, true, vec![MetricType::SUMMARY], plan, schema));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);

@@ -599,7 +599,7 @@ impl Dataset {
     }
 
     #[getter(schema)]
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let logical_schema = logical_schema_from_lance(self_.ds.schema());
         logical_schema.to_pyarrow(self_.py())
     }
@@ -1155,12 +1155,12 @@ impl Dataset {
     }
 
     #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
-    fn take(
-        self_: PyRef<'_, Self>,
+    fn take<'py>(
+        self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
@@ -1182,12 +1182,12 @@ impl Dataset {
     }
 
     #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
-    fn take_rows(
-        self_: PyRef<'_, Self>,
+    fn take_rows<'py>(
+        self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
@@ -2719,7 +2719,7 @@ impl SqlQuery {
     ///
     /// This is an eager operation that will load all results into memory.
     /// This corresponds to `into_batch_records` in Rust.
-    fn to_batch_records(&self) -> PyResult<Vec<PyObject>> {
+    fn to_batch_records<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         use arrow::pyarrow::ToPyArrow;
 
         let builder = self.builder.clone();
@@ -2731,18 +2731,16 @@ impl SqlQuery {
             .map_err(|e| PyValueError::new_err(e.to_string()))? // Handles tokio::JoinError
             .map_err(|e| PyValueError::new_err(e.to_string()))?; // Handles lance::Error
 
-        Python::with_gil(|py| {
-            batches
-                .iter()
-                .map(|rb| rb.to_pyarrow(py))
-                .collect::<PyResult<Vec<PyObject>>>()
-        })
+        batches
+            .iter()
+            .map(|rb| rb.to_pyarrow(py))
+            .collect::<PyResult<Vec<_>>>()
     }
 
     /// Execute the query and return a RecordBatchReader.
     ///
     /// This is a lazy operation that will stream results.
-    fn to_stream_reader(&self) -> PyResult<PyObject> {
+    fn to_stream_reader<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         use crate::reader::LanceReader;
         use arrow::pyarrow::IntoPyArrow;
         use arrow_array::RecordBatchReader;
@@ -2765,7 +2763,7 @@ impl SqlQuery {
         let dataset_stream = DatasetRecordBatchStream::new(stream);
         let reader: Box<dyn RecordBatchReader + Send> =
             Box::new(LanceReader::from_stream(dataset_stream));
-        Python::with_gil(|py| reader.into_pyarrow(py))
+        reader.into_pyarrow(py)
     }
 }
 

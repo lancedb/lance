@@ -171,11 +171,11 @@ impl FileFragment {
     }
 
     #[pyo3(signature=(row_indices, columns=None))]
-    fn take(
-        self_: PyRef<'_, Self>,
+    fn take<'py>(
+        self_: PyRef<'py, Self>,
         row_indices: Vec<usize>,
         columns: Option<Vec<String>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
@@ -351,7 +351,7 @@ impl FileFragment {
         }
     }
 
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
         logical_schema.to_pyarrow(self_.py())
@@ -712,7 +712,7 @@ pub struct FragmentSession {
 #[pymethods]
 impl FragmentSession {
     #[pyo3(signature=(indices))]
-    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
+    pub fn take<'py>(self_: PyRef<'py, Self>, indices: Vec<u32>) -> PyResult<Bound<'py, PyAny>> {
         let session = self_.session.clone();
         let batch = rt()
             .spawn(

@@ -72,7 +72,7 @@ const EXPORT_METADATA: [(&str, &str); 2] = [
 ];
 
 #[pyfunction]
-pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyObject> {
+pub fn bfloat16_array<'py>(values: Vec<Option<f32>>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let array = BFloat16Array::from_iter(values.into_iter().map(|v| v.map(bf16::from_f32)));
 
     // Create a record batch with a single column and an annotated schema
@@ -87,5 +87,5 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
         .map_err(|err| PyValueError::new_err(format!("Failed to build array: {}", err)))?;
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
-    pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))
+    pyarrow_batch.call_method1("__getitem__", ("bfloat16",))
 }

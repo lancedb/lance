@@ -39,7 +39,7 @@ use pyo3::{
     types::PyIterator,
     IntoPyObjectExt,
 };
-
+use pyo3::types::PyNone;
 use crate::file::object_store_from_uri_or_path;
 use crate::rt;
 
@@ -131,7 +131,7 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
+    fn predict<'py>(&self, py: Python<'py>, array: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
@@ -164,7 +164,7 @@ impl KMeans {
         cluster_ids.into_data().to_pyarrow(py)
     }
 
-    fn centroids(&self, py: Python) -> PyResult<PyObject> {
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         if let Some(kmeans) = self.trained_kmeans.as_ref() {
             let centroids: Float32Array = kmeans.centroids.as_primitive().clone();
             let fixed_size_arr =
@@ -177,7 +177,7 @@ impl KMeans {
                     })?;
             fixed_size_arr.into_data().to_pyarrow(py)
         } else {
-            Ok(py.None())
+            Ok(PyNone::get(py).to_owned().into_any())
         }
     }
 }
@@ -259,7 +259,7 @@ impl Hnsw {
         Ok(())
     }
 
-    fn vectors(&self, py: Python) -> PyResult<PyObject> {
+    fn vectors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.vectors.to_data().to_pyarrow(py)
     }
 }
