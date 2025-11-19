@@ -246,9 +246,9 @@ impl PyCompactionTask {
     /// Execute the compaction task and return the :py:class:`RewriteResult`.
     ///
     /// The rewrite result should be passed onto :py:meth:`lance.optimize.Compaction.commit`.
-    pub fn execute(&self, dataset: PyObject) -> PyResult<PyRewriteResult> {
+    pub fn execute(&self, py: Python<'_>, dataset: PyObject) -> PyResult<PyRewriteResult> {
         let dataset = unwrap_dataset(dataset)?;
-        let dataset = Python::with_gil(|py| dataset.borrow(py).clone());
+        let dataset = dataset.borrow(py).clone();
         let result = rt()
             .block_on(
                 None,
@@ -464,23 +464,19 @@ impl PyCompaction {
     /// CompactionMetrics
     ///     The metrics from the compaction operation.
     #[staticmethod]
-    pub fn execute(dataset: PyObject, options: PyObject) -> PyResult<PyCompactionMetrics> {
+    pub fn execute(py: Python<'_>, dataset: PyObject, options: PyObject) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
-        let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
+        let dataset = dataset_ref.borrow(py).clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let opts = Python::with_gil(|py| {
-            let options = options.downcast_bound::<PyDict>(py)?;
-            parse_compaction_options(options)
-        })?;
+        let options = options.downcast_bound::<PyDict>(py)?;
+        let opts = parse_compaction_options(options)?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
         let metrics = rt().block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
-        Python::with_gil(|py| {
-            dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);
-        });
+        dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);
         Ok(metrics.into())
     }
 
@@ -501,15 +497,13 @@ impl PyCompaction {
     /// -------
     /// CompactionPlan
     #[staticmethod]
-    pub fn plan(dataset: PyObject, options: PyObject) -> PyResult<PyCompactionPlan> {
+    pub fn plan(py: Python<'_>, dataset: PyObject, options: PyObject) -> PyResult<PyCompactionPlan> {
         let dataset = unwrap_dataset(dataset)?;
-        let dataset = Python::with_gil(|py| dataset.borrow(py).clone());
+        let dataset = dataset.borrow(py).clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let opts = Python::with_gil(|py| {
-            let options = options.downcast_bound::<PyDict>(py)?;
-            parse_compaction_options(options)
-        })?;
+        let options = options.downcast_bound::<PyDict>(py)?;
+        let opts = parse_compaction_options(options)?;
         let plan = rt()
             .block_on(None, async move {
                 plan_compaction(dataset.ds.as_ref(), &opts).await
@@ -538,11 +532,12 @@ impl PyCompaction {
     /// CompactionMetrics
     #[staticmethod]
     pub fn commit(
+        py: Python<'_>,
         dataset: PyObject,
         rewrites: Vec<PyRewriteResult>,
     ) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
-        let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
+        let dataset = dataset_ref.borrow(py).clone();
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
         // TODO: pass compaction option from plan and execute time
@@ -556,9 +551,7 @@ impl PyCompaction {
         let metrics = rt()
             .block_on(None, fut)?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Python::with_gil(|py| {
-            dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);
-        });
+        dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);
         Ok(metrics.into())
     }
 }

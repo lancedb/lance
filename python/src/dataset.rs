@@ -1256,6 +1256,7 @@ impl Dataset {
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
     fn take_scan(
         &self,
+        py: Python<'_>,
         row_slices: PyObject,
         columns: Option<Vec<String>>,
         batch_readahead: usize,
@@ -1272,7 +1273,7 @@ impl Dataset {
         };
 
         // Call into the Python iterable, only holding the GIL as necessary.
-        let py_iter = Python::with_gil(|py| row_slices.call_method0(py, "__iter__"))?;
+        let py_iter = row_slices.call_method0(py, "__iter__")?;
         let slice_iter = std::iter::from_fn(move || {
             Python::with_gil(|py| {
                 match py_iter
@@ -1469,25 +1470,24 @@ impl Dataset {
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let py = self_.py();
         let versions = self_.list_versions()?;
-        Python::with_gil(|py| {
-            let pyvers: Vec<PyObject> = versions
-                .iter()
-                .map(|v| {
-                    let dict = PyDict::new(py);
-                    dict.set_item("version", v.version).unwrap();
-                    dict.set_item(
-                        "timestamp",
-                        v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
-                    )
-                    .unwrap();
-                    let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                    dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
-                    dict.into_py_any(py)
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            Ok(pyvers)
-        })
+        let pyvers: Vec<PyObject> = versions
+            .iter()
+            .map(|v| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", v.version).unwrap();
+                dict.set_item(
+                    "timestamp",
+                    v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+                )
+                .unwrap();
+                let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
+                dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
+                dict.into_py_any(py)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(pyvers)
     }
 
     /// Fetches the currently checked out version of the dataset.
@@ -1584,37 +1584,35 @@ impl Dataset {
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
+        let py = self_.py();
         let tags = self_.list_tags_ordered(order.as_deref())?;
 
-        Python::with_gil(|py| {
-            let pylist = PyList::empty(py);
+        let pylist = PyList::empty(py);
 
-            for (tag_name, tag_content) in tags {
-                let dict = PyDict::new(py);
-                dict.set_item("version", tag_content.version)?;
-                dict.set_item("manifest_size", tag_content.manifest_size)?;
+        for (tag_name, tag_content) in tags {
+            let dict = PyDict::new(py);
+            dict.set_item("version", tag_content.version)?;
+            dict.set_item("manifest_size", tag_content.manifest_size)?;
 
-                pylist.append((tag_name.as_str(), dict))?;
-            }
+            pylist.append((tag_name.as_str(), dict))?;
+        }
 
-            Ok(PyObject::from(pylist))
-        })
+        Ok(PyObject::from(pylist))
     }
 
-    fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn tags(self_: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = self_.py();
         let tags = self_.list_tags()?;
 
-        Python::with_gil(|py| {
-            let pytags = PyDict::new(py);
-            for (k, v) in tags.iter() {
-                let dict = PyDict::new(py);
-                dict.set_item("branch", v.branch.clone())?;
-                dict.set_item("version", v.version)?;
-                dict.set_item("manifest_size", v.manifest_size)?;
-                pytags.set_item(k, dict.into_py_any(py)?)?;
-            }
-            pytags.into_py_any(py)
-        })
+        let pytags = PyDict::new(py);
+        for (k, v) in tags.iter() {
+            let dict = PyDict::new(py);
+            dict.set_item("branch", v.branch.clone())?;
+            dict.set_item("version", v.version)?;
+            dict.set_item("manifest_size", v.manifest_size)?;
+            pytags.set_item(k, dict.into_py_any(py)?)?;
+        }
+        pytags.into_py_any(py)
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
@@ -1722,25 +1720,28 @@ impl Dataset {
 
     /// List branches as a Python dictionary mapping name -> metadata
     fn branches(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let py = self_.py();
         let branches = rt()
             .block_on(None, self_.ds.branches().list())?
             .infer_error()?;
-        Python::with_gil(|py| {
-            let pybranches = PyDict::new(py);
-            for (name, meta) in branches.iter() {
-                let dict = PyDict::new(py);
-                dict.set_item("parent_branch", meta.parent_branch.clone())?;
-                dict.set_item("parent_version", meta.parent_version)?;
-                dict.set_item("create_at", meta.create_at)?;
-                dict.set_item("manifest_size", meta.manifest_size)?;
-                pybranches.set_item(name, dict.into_py_any(py)?)?;
-            }
-            Ok(pybranches.into())
-        })
+        let pybranches = PyDict::new(py);
+        for (name, meta) in branches.iter() {
+            let dict = PyDict::new(py);
+            dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("parent_version", meta.parent_version)?;
+            dict.set_item("create_at", meta.create_at)?;
+            dict.set_item("manifest_size", meta.manifest_size)?;
+            pybranches.set_item(name, dict.into_py_any(py)?)?;
+        }
+        Ok(pybranches.into())
     }
 
     /// List branches ordered by parent_version
-    fn branches_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, PyObject)>> {
+    fn branches_ordered(
+        &self,
+        py: Python<'_>,
+        order: Option<&str>,
+    ) -> PyResult<Vec<(String, PyObject)>> {
         let ordering = match order {
             Some("asc") => Some(std::cmp::Ordering::Less),
             Some("desc") => Some(std::cmp::Ordering::Greater),
@@ -1757,18 +1758,16 @@ impl Dataset {
                 self.ds.branches().list_ordered(ordering).await
             })?
             .infer_error()?;
-        Python::with_gil(|py| {
-            let mut out: Vec<(String, PyObject)> = Vec::new();
-            for (name, meta) in ordered.into_iter() {
-                let dict = PyDict::new(py);
-                dict.set_item("parent_branch", meta.parent_branch.clone())?;
-                dict.set_item("parent_version", meta.parent_version)?;
-                dict.set_item("create_at", meta.create_at)?;
-                dict.set_item("manifest_size", meta.manifest_size)?;
-                out.push((name, dict.into_py_any(py)?));
-            }
-            Ok(out)
-        })
+        let mut out: Vec<(String, PyObject)> = Vec::new();
+        for (name, meta) in ordered.into_iter() {
+            let dict = PyDict::new(py);
+            dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("parent_version", meta.parent_version)?;
+            dict.set_item("create_at", meta.create_at)?;
+            dict.set_item("manifest_size", meta.manifest_size)?;
+            out.push((name, dict.into_py_any(py)?));
+        }
+        Ok(out)
     }
 
     #[pyo3(signature = (**kwargs))]
@@ -2090,13 +2089,11 @@ impl Dataset {
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
         let core_fragments = self_.ds.get_fragments();
 
-        Python::with_gil(|_| {
-            let fragments: Vec<FileFragment> = core_fragments
-                .iter()
-                .map(|f| FileFragment::new(f.clone()))
-                .collect::<Vec<_>>();
-            Ok(fragments)
-        })
+        let fragments: Vec<FileFragment> = core_fragments
+            .iter()
+            .map(|f| FileFragment::new(f.clone()))
+            .collect::<Vec<_>>();
+        Ok(fragments)
     }
 
     fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {
@@ -2467,20 +2464,18 @@ impl Dataset {
     // Unified metadata APIs
 
     #[pyo3(signature = ())]
-    fn get_table_metadata(&mut self) -> PyResult<PyObject> {
+    fn get_table_metadata(&mut self, py: Python<'_>) -> PyResult<PyObject> {
         let new_self = self.ds.as_ref().clone();
 
         let table_metadata = new_self.metadata().clone();
 
         self.ds = Arc::new(new_self);
 
-        Python::with_gil(|py| {
-            let dict = PyDict::new(py);
-            for (k, v) in table_metadata {
-                dict.set_item(k, v)?;
-            }
-            Ok(dict.into())
-        })
+        let dict = PyDict::new(py);
+        for (k, v) in table_metadata {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
     }
 
     #[pyo3(signature = ())]
