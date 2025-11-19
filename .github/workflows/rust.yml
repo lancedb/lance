@@ -104,7 +104,7 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
-    runs-on: ubuntu-24.04-arm-4x
+    runs-on: ubuntu-24.04-arm64-4x
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4

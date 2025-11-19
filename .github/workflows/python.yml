@@ -155,7 +155,7 @@ jobs:
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: ubuntu-24.04-arm-4x
+    runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
