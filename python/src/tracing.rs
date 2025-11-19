@@ -18,7 +18,7 @@
 use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
-use pyo3::pyclass;
+use pyo3::{pyclass, Py, PyAny};
 use pyo3::pyfunction;
 use pyo3::pymethods;
 use pyo3::types::PyDict;
@@ -27,7 +27,6 @@ use pyo3::types::PyTuple;
 use pyo3::Bound;
 use pyo3::IntoPyObject;
 use pyo3::PyErr;
-use pyo3::PyObject;
 use pyo3::PyResult;
 use pyo3::Python;
 use std::sync::atomic::AtomicBool;
@@ -121,7 +120,7 @@ impl LoggingPassthroughState {
         self.inner = Some(inner);
     }
 
-    fn set_callback(&mut self, callback: PyObject) {
+    fn set_callback(&mut self, callback: Py<PyAny>) {
         if self.callback_sender.is_some() {
             panic!("Callback already set");
         }
@@ -364,7 +363,7 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
+pub fn capture_trace_events(callback: Py<PyAny>, py: Python<'_>) {
     SUBSCRIBER
         .write()
         .unwrap()

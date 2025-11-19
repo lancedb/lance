@@ -690,7 +690,7 @@ fn extract_update_map(ob: &Bound<'_, PyAny>) -> PyResult<Option<UpdateMap>> {
     }))
 }
 
-fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<PyObject> {
+fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<Py<PyAny>> {
     match update_map {
         None => Ok(py.None()),
         Some(map) => {

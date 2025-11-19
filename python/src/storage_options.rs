@@ -17,7 +17,7 @@ use crate::rt;
 /// to dataset functions, and we wrap them internally with this struct.
 pub struct PyStorageOptionsProvider {
     /// The Python object implementing get_storage_options()
-    inner: PyObject,
+    inner: Py<PyAny>,
 }
 
 impl std::fmt::Debug for PyStorageOptionsProvider {

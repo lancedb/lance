@@ -279,7 +279,7 @@ where
 }
 
 /// Export a Vec of Lance types to a Python object.
-pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<PyObject>>
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<Py<PyAny>>>
 where
     PyLance<&'a T>: IntoPyObject<'a>,
 {

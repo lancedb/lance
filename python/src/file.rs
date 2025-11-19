@@ -35,11 +35,7 @@ use lance_io::{
     ReadBatchParams,
 };
 use object_store::path::Path;
-use pyo3::{
-    exceptions::{PyIOError, PyRuntimeError},
-    pyclass, pyfunction, pymethods, types::PyAny, Bound, IntoPyObjectExt, PyErr, PyObject,
-    PyResult, Python,
-};
+use pyo3::{exceptions::{PyIOError, PyRuntimeError}, pyclass, pyfunction, pymethods, types::PyAny, Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
@@ -172,7 +168,7 @@ impl LanceFileStatistics {
 pub struct LanceFileMetadata {
     /// The schema of the file
     #[serde(skip)]
-    pub schema: Option<PyObject>,
+    pub schema: Option<Py<PyAny>>,
     /// The major version of the file
     pub major_version: u16,
     /// The minor version of the file
@@ -301,7 +297,6 @@ impl LanceFileWriter {
     #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, keep_original_array=None, max_page_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        py: Python<'_>,
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
@@ -446,7 +441,6 @@ impl LanceFileSession {
     #[new]
     #[pyo3(signature=(uri_or_path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
     pub fn new(
-        py: Python<'_>,
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
@@ -752,7 +746,6 @@ impl LanceFileReader {
     #[new]
     #[pyo3(signature=(path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, columns=None))]
     pub fn new(
-        py: Python<'_>,
         path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,

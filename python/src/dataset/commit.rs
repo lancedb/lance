@@ -22,7 +22,7 @@ use lance_core::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-static PY_CONFLICT_ERROR: LazyLock<PyResult<PyObject>> = LazyLock::new(|| {
+static PY_CONFLICT_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
     Python::attach(|py| {
         py.import("lance")
             .and_then(|lance| lance.getattr("commit"))
@@ -53,11 +53,11 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
 }
 
 pub struct PyCommitLock {
-    inner: PyObject,
+    inner: Py<PyAny>,
 }
 
 impl PyCommitLock {
-    pub fn new(inner: PyObject) -> Self {
+    pub fn new(inner: Py<PyAny>) -> Self {
         Self { inner }
     }
 }
@@ -96,7 +96,7 @@ impl CommitLock for PyCommitLock {
 }
 
 pub struct PyCommitLease {
-    inner: PyObject,
+    inner: Py<PyAny>,
 }
 
 #[async_trait::async_trait]

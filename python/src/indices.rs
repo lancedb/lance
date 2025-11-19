@@ -23,7 +23,7 @@ use pyo3::Bound;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
-    wrap_pyfunction, PyObject, PyResult, Python,
+    wrap_pyfunction, PyResult, Python,
 };
 
 use lance::index::DatasetIndexInternalExt;
@@ -363,7 +363,7 @@ pub fn shuffle_transformed_vectors(
     dir_path: &str,
     ivf_centroids: PyArrowType<ArrayData>,
     shuffle_output_root_filename: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
