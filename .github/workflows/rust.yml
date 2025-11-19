@@ -150,7 +150,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: "warp-macos-14-arm64-6x"
+    runs-on: warp-macos-14-arm64-6x
     timeout-minutes: 45
     strategy:
       matrix:
@@ -174,13 +174,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
+          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
       - name: Check benchmarks
         run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: warp-windows-latest-x64-4x
     defaults:

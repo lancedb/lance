@@ -24,10 +24,10 @@ use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
+use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
-    ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
-    VALUE_COLUMN_NAME,
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::{
@@ -35,7 +35,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams,
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
-use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
+use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use snafu::location;
@@ -217,8 +217,8 @@ pub(crate) async fn load_training_data(
 }
 
 // TODO: Allow users to register their own plugins
-static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<ScalarIndexPluginRegistry>> =
-    LazyLock::new(ScalarIndexPluginRegistry::with_default_plugins);
+static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
+    LazyLock::new(IndexPluginRegistry::with_default_plugins);
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
@@ -390,8 +390,8 @@ pub(crate) async fn infer_scalar_index_details(
 
 pub fn index_matches_criteria(
     index: &IndexMetadata,
-    criteria: &ScalarIndexCriteria,
-    field: &Field,
+    criteria: &IndexCriteria,
+    fields: &[&Field],
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
@@ -405,6 +405,12 @@ pub fn index_matches_criteria(
         if index.fields.len() != 1 {
             return Ok(false);
         }
+        if fields.len() != 1 {
+            // This should be unreachable since we just verified index.fields.len() == 1 but
+            // return false just in case
+            return Ok(false);
+        }
+        let field = fields[0];
         // Build the full field path for nested fields
         let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
             let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
@@ -576,7 +582,7 @@ mod tests {
     fn test_index_matches_criteria_vector_index() {
         let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
 
-        let criteria = ScalarIndexCriteria {
+        let criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
@@ -588,10 +594,10 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
-        let result = index_matches_criteria(&index1, &criteria, &field, true, &schema).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
 
-        let result = index_matches_criteria(&index1, &criteria, &field, false, &schema).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
     }
 
@@ -601,7 +607,7 @@ mod tests {
         let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
         let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
 
-        let criteria = ScalarIndexCriteria {
+        let criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
@@ -614,91 +620,91 @@ mod tests {
             metadata: Default::default(),
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         // test for_column
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: Some("mycol"),
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         // test has_name
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
             has_name: Some("btree_index"),
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         // test supports_exact_equality
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: true,
             for_column: None,
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
         let result =
-            index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&inverted_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
         let result =
-            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
 
         // test multiple indices
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
         let result =
-            index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&inverted_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
         let result =
-            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
     }
 

@@ -1115,6 +1115,43 @@ impl FileFragment {
         }
     }
 
+    /// Get the number of physical rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count in the metadata.  This method should
+    /// only be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_physical_rows(&self) -> Result<usize> {
+        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
+            Ok(self.metadata.physical_rows.unwrap())
+        } else {
+            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+        }
+    }
+
+    /// Get the number of deleted rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_num_deletions(&self) -> Result<usize> {
+        match &self.metadata().deletion_file {
+            Some(DeletionFile {
+                num_deleted_rows: Some(num_deleted),
+                ..
+            }) => Ok(*num_deleted),
+            None => Ok(0),
+            _ => Err(Error::Internal { message: format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()), location: location!() }),
+        }
+    }
+
+    /// Get the number of logical rows (physical rows - deleted rows) in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count or deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_logical_rows(&self) -> Result<usize> {
+        let num_physical_rows = self.fast_physical_rows()?;
+        let num_deleted_rows = self.fast_num_deletions()?;
+        Ok(num_physical_rows - num_deleted_rows)
+    }
+
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the

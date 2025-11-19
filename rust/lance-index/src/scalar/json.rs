@@ -35,12 +35,10 @@ use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID
 use crate::{
     frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
+    registry::IndexPluginRegistry,
     scalar::{
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
-        registry::{
-            ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingRequest,
-            VALUE_COLUMN_NAME,
-        },
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME},
         AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
     },
     Index, IndexType,
@@ -373,7 +371,7 @@ impl TrainingRequest for JsonTrainingRequest {
 /// Plugin implementation for a [`JsonIndex`]
 #[derive(Default)]
 pub struct JsonIndexPlugin {
-    registry: Mutex<Option<Arc<ScalarIndexPluginRegistry>>>,
+    registry: Mutex<Option<Arc<IndexPluginRegistry>>>,
 }
 
 impl std::fmt::Debug for JsonIndexPlugin {
@@ -383,7 +381,7 @@ impl std::fmt::Debug for JsonIndexPlugin {
 }
 
 impl JsonIndexPlugin {
-    fn registry(&self) -> Result<Arc<ScalarIndexPluginRegistry>> {
+    fn registry(&self) -> Result<Arc<IndexPluginRegistry>> {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
     }
 
@@ -709,6 +707,10 @@ impl JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn name(&self) -> &str {
+        "Json"
+    }
+
     fn new_training_request(
         &self,
         params: &str,
@@ -740,7 +742,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         true
     }
 
-    fn attach_registry(&self, registry: Arc<ScalarIndexPluginRegistry>) {
+    fn attach_registry(&self, registry: Arc<IndexPluginRegistry>) {
         let mut reg_ref = self.registry.lock().unwrap();
         *reg_ref = Some(registry);
     }
@@ -831,6 +833,18 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             .load_index(index_store, target_details, frag_reuse_index, cache)
             .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
+    }
+
+    fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
+        let registry = self.registry().unwrap();
+        let json_details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
+        let target_details = json_details.target_details.as_ref().expect_ok()?;
+        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        let target_details_json = target_plugin.details_as_json(target_details)?;
+        Ok(serde_json::json!({
+            "path": json_details.path,
+            "target_details": target_details_json,
+        }))
     }
 }
 

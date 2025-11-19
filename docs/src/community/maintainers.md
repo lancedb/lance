@@ -42,7 +42,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 
 | Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                 |
 |------------------------|----------------------|-------------------|---------------------|-------------------------------------------------|
-| Matt Basta             | mattbasta            | RunwayML          |                     |                                                 |
+| Matt Basta             | mattbasta            | Runway AI         |                     |                                                 |
 | Giuseppe Battista      | giusedroid           | AWS               |                     |                                                 |
 | Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                 |
 | Ayush Chaurasia        | AyushExel            | LanceDB           |                     |
