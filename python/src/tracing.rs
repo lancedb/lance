@@ -377,7 +377,7 @@ pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
 #[pyo3(signature=())]
 pub fn shutdown_tracing(py: Python<'_>) {
     // Release Python GIL to avoid deadlock between current thread with the receiver thread.
-    py.allow_threads(|| {
+    py.detach(|| {
         SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
     });
 }
