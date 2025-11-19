@@ -30,23 +30,21 @@ impl std::fmt::Debug for PyStorageOptionsProvider {
 
 impl Clone for PyStorageOptionsProvider {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
+        Python::attach(|py| Self {
             inner: self.inner.clone_ref(py),
         })
     }
 }
 
 impl PyStorageOptionsProvider {
-    pub fn new(obj: PyObject) -> PyResult<Self> {
-        Python::with_gil(|py| {
-            // Verify the object has a fetch_storage_options method
-            if !obj.bind(py).hasattr("fetch_storage_options")? {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "StorageOptionsProvider must implement fetch_storage_options() method",
-                ));
-            }
-            Ok(Self { inner: obj })
-        })
+    pub fn new(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Verify the object has a fetch_storage_options method
+        if !obj.hasattr("fetch_storage_options")? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "StorageOptionsProvider must implement fetch_storage_options() method",
+            ));
+        }
+        Ok(Self { inner: obj.clone().unbind() })
     }
 }
 
@@ -81,7 +79,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
 
         rt().runtime
             .spawn_blocking(move || {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     // Call the Python fetch_storage_options method
                     let result = py_provider
                         .inner
@@ -143,7 +141,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
     }
 
     fn provider_id(&self) -> String {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Call provider_id() method on the Python object
             // This should always succeed since StorageOptionsProvider.provider_id() has a default implementation
             let obj = self.py_provider.inner.bind(py);
@@ -162,7 +160,7 @@ impl StorageOptionsProvider for PyStorageOptionsProviderWrapper {
 /// Convert a Python object to an Arc<dyn StorageOptionsProvider>
 /// This is the main entry point for converting Python storage options providers to Rust
 pub fn py_object_to_storage_options_provider(
-    py_obj: PyObject,
+    py_obj: &Bound<'_, PyAny>,
 ) -> PyResult<Arc<dyn StorageOptionsProvider>> {
     let py_provider = PyStorageOptionsProvider::new(py_obj)?;
     Ok(Arc::new(PyStorageOptionsProviderWrapper::new(py_provider)))

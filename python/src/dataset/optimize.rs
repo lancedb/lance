@@ -64,7 +64,7 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
 }
 
 fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
-    Python::with_gil(|py| dataset.getattr(py, "_ds")?.extract::<Py<Dataset>>(py))
+    Python::attach(|py| dataset.getattr(py, "_ds")?.extract::<Py<Dataset>>(py))
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {

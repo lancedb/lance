@@ -318,7 +318,7 @@ impl MergeInsertBuilder {
     }
 }
 
-pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColumnTransform> {
+pub fn transforms_from_python(py: Python<'_>, transforms: &Bound<'_, PyAny>) -> PyResult<NewColumnTransform> {
     if let Ok(transforms) = transforms.downcast::<PyDict>() {
         let expressions = transforms
             .iter()
@@ -337,9 +337,9 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
         let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
         let result_checkpoint = result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
 
-        let udf_obj = transforms.into_py_any(transforms.py())?;
+        let udf_obj = transforms.into_py_any(py)?;
         let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
                 let result = udf_obj
                     .call_method1(py, "_call", (py_batch,))
@@ -478,7 +478,7 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         s3_credentials_refresh_offset_seconds: Option<u64>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
@@ -1275,7 +1275,7 @@ impl Dataset {
         // Call into the Python iterable, only holding the GIL as necessary.
         let py_iter = row_slices.call_method0(py, "__iter__")?;
         let slice_iter = std::iter::from_fn(move || {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 match py_iter
                     .call_method0(py, "__next__")
                     .and_then(|range| range.extract::<(u64, u64)>(py))
@@ -2163,12 +2163,13 @@ impl Dataset {
     #[staticmethod]
     #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
     fn commit(
+        py: Python<'_>,
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2184,6 +2185,7 @@ impl Dataset {
         }
 
         Self::commit_transaction(
+            py,
             dest,
             PyLance(transaction),
             commit_lock,
@@ -2199,24 +2201,19 @@ impl Dataset {
     #[staticmethod]
     #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_transaction(
+        py: Python<'_>,
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
-        let provider = storage_options_provider.and_then(|py_obj| {
-            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                .ok()
-                .map(|py_provider| {
-                    Arc::new(
-                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
-                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                })
-        });
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
 
         let object_store_params = if storage_options.is_some() || provider.is_some() {
             Some(ObjectStoreParams {
@@ -2272,20 +2269,14 @@ impl Dataset {
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<PyObject>,
+        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let provider = storage_options_provider.and_then(|py_obj| {
-            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                .ok()
-                .map(|py_provider| {
-                    Arc::new(
-                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
-                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                })
-        });
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
 
         let object_store_params = if storage_options.is_some() || provider.is_some() {
             Some(ObjectStoreParams {
@@ -2387,11 +2378,12 @@ impl Dataset {
     #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
     fn add_columns(
         &mut self,
+        py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
-        let transforms = transforms_from_python(transforms)?;
+        let transforms = transforms_from_python(py, transforms)?;
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
@@ -2971,7 +2963,7 @@ impl Dataset {
         let callback = callback.unbind();
 
         Ok(Arc::new(move |stats| {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let stats = ScanStatistics::from_lance(stats);
                 match callback.call1(py, (stats,)) {
                     Ok(_) => (),
@@ -3086,19 +3078,13 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
-        let storage_options_provider =
-            get_dict_opt::<PyObject>(options, "storage_options_provider")?.and_then(|py_obj| {
-                crate::storage_options::PyStorageOptionsProvider::new(py_obj)
-                    .ok()
-                    .map(|py_provider| {
-                        Arc::new(
-                            crate::storage_options::PyStorageOptionsProviderWrapper::new(
-                                py_provider,
-                            ),
-                        )
-                            as Arc<dyn lance_io::object_store::StorageOptionsProvider>
-                    })
-            });
+        let storage_options_provider = get_dict_opt::<PyObject>(options, "storage_options_provider")?
+            .map(|py_obj| {
+                crate::storage_options::py_object_to_storage_options_provider(
+                    &py_obj.bind(options.py())
+                )
+            })
+            .transpose()?;
 
         let s3_credentials_refresh_offset_seconds =
             get_dict_opt::<u64>(options, "s3_credentials_refresh_offset_seconds")?;
@@ -3406,7 +3392,7 @@ impl WriteFragmentProgress for PyWriteProgress {
     async fn begin(&self, fragment: &Fragment) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             self.py_obj
                 .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
@@ -3423,7 +3409,7 @@ impl WriteFragmentProgress for PyWriteProgress {
     async fn complete(&self, fragment: &Fragment) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             self.py_obj
                 .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
@@ -3466,7 +3452,7 @@ impl PyBatchUDFCheckpointWrapper {
 
 impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     fn get_batch(&self, info: &BatchInfo) -> lance::Result<Option<RecordBatch>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let info = self.batch_info_to_py(info, py)?;
             let batch = self.inner.call_method1(py, "get_batch", (info,))?;
             let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
@@ -3481,7 +3467,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     }
 
     fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
-        let fragment_data = Python::with_gil(|py| {
+        let fragment_data = Python::attach(|py| {
             let fragment = self
                 .inner
                 .call_method1(py, "get_fragment", (fragment_id,))?;
@@ -3507,7 +3493,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     }
 
     fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> lance::Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let info = self.batch_info_to_py(&info, py)?;
             let batch = PyArrowType(batch);
             self.inner.call_method1(py, "insert_batch", (info, batch))?;
@@ -3528,7 +3514,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
                 location!(),
             )
         })?;
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.inner
                 .call_method1(py, "insert_fragment", (fragment.id, data))?;
             Ok(())

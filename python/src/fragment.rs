@@ -286,11 +286,12 @@ impl FileFragment {
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
     fn add_columns(
         &mut self,
+        py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
-        let transforms = transforms_from_python(transforms)?;
+        let transforms = transforms_from_python(py, transforms)?;
 
         let fragment = self.fragment.clone();
         let (fragment, schema) = rt()

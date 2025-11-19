@@ -129,7 +129,7 @@ impl LoggingPassthroughState {
         self.callback_sender = Some(sender);
         self.callback_handle = Some(std::thread::spawn(move || {
             while let Ok(event) = receiver.recv() {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let call_python = |py: Python, event: TraceEvent| {
                         let py_event = PyTraceEvent::from(event);
                         let args = match PyTuple::new(py, [py_event]) {
