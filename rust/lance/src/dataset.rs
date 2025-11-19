@@ -5084,7 +5084,7 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         // This behavior will be re-introduced once we work on empty vector index handling.
-        // https://github.com/lancedb/lance/issues/4034
+        // https://github.com/lance-format/lance/issues/4034
         // let indices = dataset.load_indices().await.unwrap();
         // // With the new retention behavior, indices are kept even when all fragments are deleted
         // // This allows the index configuration to persist through data changes

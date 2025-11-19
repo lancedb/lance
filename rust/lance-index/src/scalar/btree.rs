@@ -1915,6 +1915,10 @@ pub struct BTreeIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn name(&self) -> &str {
+        "BTree"
+    }
+
     fn new_training_request(
         &self,
         params: &str,

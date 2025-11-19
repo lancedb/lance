@@ -652,10 +652,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .peekable(),
         );
 
-        let batch = transformed_stream.as_mut().peek().await;
+        let batch = transformed_stream.as_mut().peek_mut().await;
         let schema = match batch {
             Some(Ok(b)) => b.schema(),
-            Some(Err(e)) => panic!("do this better: error reading first batch: {:?}", e),
+            Some(Err(e)) => return Err(std::mem::replace(e, Error::Stop)),
             None => {
                 log::info!("no data to shuffle");
                 self.shuffle_reader = Some(Arc::new(IvfShufflerReader::new(

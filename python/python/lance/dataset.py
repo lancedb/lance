@@ -75,6 +75,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .io import StorageOptionsProvider
+    from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
 
@@ -645,7 +646,26 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.checkout_latest()
 
     def list_indices(self) -> List[Index]:
+        """
+        Returns index information for all indices in the dataset.
+
+        This method is deprecated as it requires loading the statistics for each index
+        which can be a very expensive operation.  Instead use describe_indices() to
+        list index information and index_statistics() to get the statistics for
+        individual indexes of interest.
+        """
+        # TODO: https://github.com/lancedb/lance/issues/5237 deprecate this method
+        # warnings.warn(
+        #     "The 'list_indices' method is deprecated.  It may be removed in a future"
+        #     "version.  Use describe_indices() instead.",
+        #     DeprecationWarning,
+        # )
+
         return self._ds.load_indices()
+
+    def describe_indices(self) -> List[IndexDescription]:
+        """Returns index information for all indices in the dataset."""
+        return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -702,7 +722,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -964,7 +984,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -3749,6 +3769,10 @@ class LanceOperation:
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
             The fragments that make up the new dataset.
+        initial_bases: list[DatasetBasePath], optional
+            Base paths to register when creating a new dataset (CREATE mode only).
+            **Only valid in CREATE mode**. Will raise an error if used with
+            OVERWRITE on existing dataset.
 
         Warning
         -------
@@ -3783,6 +3807,7 @@ class LanceOperation:
 
         new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
+        initial_bases: Optional[List[DatasetBasePath]] = None
 
         def __post_init__(self):
             if isinstance(self.new_schema, pa.Schema):
@@ -5108,6 +5133,7 @@ def write_dataset(
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
     ignore_namespace_table_storage_options: bool = False,
+    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5215,6 +5241,13 @@ def write_dataset(
         not be created, so credentials will not be automatically refreshed.
         This is useful when you want to use your own credentials instead of the
         namespace-provided credentials.
+    s3_credentials_refresh_offset_seconds : optional, int
+        The number of seconds before credential expiration to trigger a refresh.
+        Default is 60 seconds. Only applicable when using AWS S3 with temporary
+        credentials. For example, if set to 60, credentials will be refreshed
+        when they have less than 60 seconds remaining before expiration. This
+        should be set shorter than the credential lifetime to avoid using
+        expired credentials.
 
     Notes
     -----
@@ -5342,6 +5375,12 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
+
+    # Add s3_credentials_refresh_offset_seconds if specified
+    if s3_credentials_refresh_offset_seconds is not None:
+        params["s3_credentials_refresh_offset_seconds"] = (
+            s3_credentials_refresh_offset_seconds
+        )
 
     if commit_lock:
         if not callable(commit_lock):

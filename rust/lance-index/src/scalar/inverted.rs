@@ -105,6 +105,10 @@ impl TrainingRequest for InvertedIndexTrainingRequest {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn name(&self) -> &str {
+        "Inverted"
+    }
+
     fn new_training_request(
         &self,
         params: &str,
@@ -195,5 +199,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             InvertedIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
+        let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let index_params = InvertedIndexParams::try_from(&index_details)?;
+        Ok(serde_json::json!(&index_params))
     }
 }
