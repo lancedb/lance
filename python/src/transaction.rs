@@ -611,7 +611,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewriteGroup> {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
             .import(intern!(py, "lance"))
-            .and_then(|module| module.getattr(intern!(py, "LanceTransaction")))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .and_then(|cls| cls.getattr(intern!(py, "RewriteGroup")))
             .expect("Failed to get RewriteGroup class");
 
@@ -653,7 +653,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewrittenIndex> {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
             .import(intern!(py, "lance"))
-            .and_then(|module| module.getattr(intern!(py, "LanceTransaction")))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .and_then(|cls| cls.getattr(intern!(py, "RewrittenIndex")))
             .expect("Failed to get RewrittenIndex class");
 
