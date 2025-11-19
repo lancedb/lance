@@ -611,6 +611,11 @@ impl DynamicStorageOptionsCredentialProvider {
             }
         }
 
+        log::debug!(
+            "Refreshing S3 credentials from storage options provider: {}",
+            self.provider.provider_id()
+        );
+
         let storage_options_map = self
             .provider
             .fetch_storage_options()
@@ -642,6 +647,24 @@ impl DynamicStorageOptionsCredentialProvider {
                     store: "DynamicStorageOptionsCredentialProvider",
                     source: Box::new(e),
                 })?;
+
+        if let Some(expires_at) = expires_at_millis {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_millis() as u64;
+            let expires_in_secs = (expires_at.saturating_sub(now_ms)) / 1000;
+            log::debug!(
+                "Successfully refreshed S3 credentials from provider: {}, credentials expire in {} seconds",
+                self.provider.provider_id(),
+                expires_in_secs
+            );
+        } else {
+            log::debug!(
+                "Successfully refreshed S3 credentials from provider: {} (no expiration)",
+                self.provider.provider_id()
+            );
+        }
 
         *cache = Some(CachedCredential {
             credential: credential.clone(),

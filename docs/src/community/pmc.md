@@ -34,14 +34,14 @@ In addition to the [activities of maintainers](./maintainers.md#activities), PMC
 | Hao Ding        | Xuanwo          | LanceDB      | Apache OpenDAL PMC Chair, Apache Iceberg Committer, Apache Member and [more](https://xuanwo.io/about/)        |
 | Zhaowei Huang   | SaintBacchus    | Alibaba      | Apache Doris Committer                                                                                        |
 | Will Jones      | wjones127       | LanceDB      | Apache Arrow PMC Member, Apache DataFusion PMC Member, Delta Lake Maintainer                                  |
-| Matt Kafonek    | kafonek         | RunwayML     |                                                                                                               |
+| Matt Kafonek    | kafonek         | Runway AI    |                                                                                                               |
 | Denny Lee       | dennyglee       | Databricks   | Unity Catalog Maintainer, Delta Lake Maintainer, Apache Spark Contributor, MLflow Contributor                 |
 | Rob Meng        | chebbyChefNEQ   | Jump Trading |                                                                                                               |
 | Dao Mi          | dowjones226     | Netflix      |                                                                                                               |
 | Weston Pace     | westonpace      | LanceDB      | Apache Arrow PMC Member, Substrait SMC Member                                                                 |
 | Calvin Qi       | calvinqi        | Harvey.ai    |                                                                                                               |
 | Prashanth Rao   | prrao87         | LanceDB      |                                                                                                               |
-| Ethan Rosenthal | EthanRosenthal  | RunwayML     |                                                                                                               |                                                 |
+| Ethan Rosenthal | EthanRosenthal  | Runway AI    |                                                                                                               |                                                 |
 | Tim Saucer      | timsaucer       | ReRun.io     | Apache DataFusion PMC Member                                                                                  |
 | Chang She       | changhiskhan    | LanceDB      | Pandas Co-Author                                                                                              |
 | Jasmine Wang    | onigiriisabunny | LanceDB      | Alluxio PMC Community Manager                                                                                 |

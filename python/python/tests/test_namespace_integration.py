@@ -219,7 +219,11 @@ def test_namespace_with_refresh(s3_bucket: str):
     assert namespace.get_describe_call_count() == 0
 
     ds = lance.write_dataset(
-        table1, namespace=namespace, table_id=table_id, mode="create"
+        table1,
+        namespace=namespace,
+        table_id=table_id,
+        mode="create",
+        s3_credentials_refresh_offset_seconds=1,
     )
     assert ds.count_rows() == 2
     assert namespace.get_create_call_count() == 1
@@ -562,6 +566,7 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
         schema=schema,
         storage_options=namespace_storage_options,
         storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
     )
 
     batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
@@ -576,7 +581,12 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
     describe_count_after_write = namespace.get_describe_call_count()
     assert describe_count_after_write == initial_describe_count
 
-    reader = LanceFileReader(file_uri, storage_options=namespace_storage_options)
+    reader = LanceFileReader(
+        file_uri,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
+    )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
     assert result_table.num_rows == 6
@@ -595,6 +605,7 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
         schema=schema,
         storage_options=namespace_storage_options,
         storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
     )
 
     batch3 = pa.RecordBatch.from_pydict(
@@ -606,9 +617,223 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
     final_describe_count = namespace.get_describe_call_count()
     assert final_describe_count == describe_count_after_write + 1
 
-    reader2 = LanceFileReader(file_uri2, storage_options=namespace_storage_options)
+    reader2 = LanceFileReader(
+        file_uri2,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
+    )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
     assert result_table2.num_rows == 2
     expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
     assert result_table2 == expected_table2
+
+
+@pytest.mark.integration
+def test_file_reader_with_storage_options_provider(s3_bucket: str):
+    """Test LanceFileReader with storage_options_provider and credential refresh."""
+    from lance import LanceNamespaceStorageOptionsProvider
+    from lance.file import LanceFileReader, LanceFileWriter
+
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 2
+
+    describe_response = namespace.describe_table(
+        DescribeTableRequest(id=table_id, version=None)
+    )
+    namespace_storage_options = describe_response.storage_options
+
+    provider = LanceNamespaceStorageOptionsProvider(
+        namespace=namespace, table_id=table_id
+    )
+
+    file_uri = f"s3://{s3_bucket}/{table_name}_file_reader_test.lance"
+    schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
+
+    # Write a file first (without provider to keep it simple)
+    writer = LanceFileWriter(
+        file_uri,
+        schema=schema,
+        storage_options=namespace_storage_options,
+    )
+    batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
+    writer.write_batch(batch)
+    writer.close()
+
+    # Get fresh credentials for reading
+    describe_response = namespace.describe_table(
+        DescribeTableRequest(id=table_id, version=None)
+    )
+    namespace_storage_options = describe_response.storage_options
+
+    initial_describe_count = namespace.get_describe_call_count()
+
+    # First read should work without needing refresh
+    reader = LanceFileReader(
+        file_uri,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
+    )
+    result = reader.read_all(batch_size=1024)
+    result_table = result.to_table()
+    assert result_table.num_rows == 3
+    assert result_table.schema == schema
+
+    describe_count_after_first_read = namespace.get_describe_call_count()
+    assert describe_count_after_first_read == initial_describe_count
+
+    # Wait for credentials to expire
+    time.sleep(5)
+
+    # Write a second file
+    file_uri2 = f"s3://{s3_bucket}/{table_name}_file_reader_test2.lance"
+    writer2 = LanceFileWriter(
+        file_uri2,
+        schema=schema,
+        storage_options=namespace_storage_options,
+    )
+    batch2 = pa.RecordBatch.from_pydict(
+        {"x": [100, 200], "y": [300, 400]}, schema=schema
+    )
+    writer2.write_batch(batch2)
+    writer2.close()
+
+    # Second read should trigger credential refresh
+    reader2 = LanceFileReader(
+        file_uri2,
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
+    )
+    result2 = reader2.read_all(batch_size=1024)
+    result_table2 = result2.to_table()
+    assert result_table2.num_rows == 2
+    expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
+    assert result_table2 == expected_table2
+
+    final_describe_count = namespace.get_describe_call_count()
+    assert final_describe_count == describe_count_after_first_read + 1
+
+
+@pytest.mark.integration
+def test_file_session_with_storage_options_provider(s3_bucket: str):
+    """Test LanceFileSession with storage_options_provider and credential refresh."""
+    from lance import LanceNamespaceStorageOptionsProvider
+    from lance.file import LanceFileSession
+
+    storage_options = copy.deepcopy(CONFIG)
+
+    namespace = TrackingNamespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3,
+    )
+
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    ds = lance.write_dataset(
+        table1, namespace=namespace, table_id=table_id, mode="create"
+    )
+    assert ds.count_rows() == 2
+
+    describe_response = namespace.describe_table(
+        DescribeTableRequest(id=table_id, version=None)
+    )
+    namespace_storage_options = describe_response.storage_options
+
+    provider = LanceNamespaceStorageOptionsProvider(
+        namespace=namespace, table_id=table_id
+    )
+
+    initial_describe_count = namespace.get_describe_call_count()
+
+    # Create session with storage_options_provider
+    session = LanceFileSession(
+        f"s3://{s3_bucket}/{table_name}_session",
+        storage_options=namespace_storage_options,
+        storage_options_provider=provider,
+        s3_credentials_refresh_offset_seconds=1,
+    )
+
+    # Test contains method
+    assert not session.contains("session_test.lance")
+
+    # Test list method
+    files = session.list()
+    assert isinstance(files, list)
+
+    schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
+
+    # Write using session - should not trigger credential refresh
+    writer = session.open_writer(
+        "session_test.lance",
+        schema=schema,
+    )
+    batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
+    writer.write_batch(batch)
+    writer.close()
+
+    describe_count_after_first_write = namespace.get_describe_call_count()
+    assert describe_count_after_first_write == initial_describe_count
+
+    # Test contains method after write
+    assert session.contains("session_test.lance")
+
+    # Read using session - should not trigger credential refresh
+    reader = session.open_reader("session_test.lance")
+    result = reader.read_all(batch_size=1024)
+    result_table = result.to_table()
+    assert result_table.num_rows == 3
+    assert result_table.schema == schema
+
+    expected_table = pa.table({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
+    assert result_table == expected_table
+
+    describe_count_after_first_read = namespace.get_describe_call_count()
+    assert describe_count_after_first_read == describe_count_after_first_write
+
+    # Wait for credentials to expire
+    time.sleep(5)
+
+    # Write again, should trigger credential refresh
+    writer2 = session.open_writer(
+        "session_test2.lance",
+        schema=schema,
+    )
+    batch2 = pa.RecordBatch.from_pydict(
+        {"x": [100, 200], "y": [300, 400]}, schema=schema
+    )
+    writer2.write_batch(batch2)
+    writer2.close()
+
+    describe_count_after_second_write = namespace.get_describe_call_count()
+    assert describe_count_after_second_write == describe_count_after_first_read + 1
+
+    # Read the second file - should not trigger another refresh since we just refreshed
+    reader2 = session.open_reader("session_test2.lance")
+    result2 = reader2.read_all(batch_size=1024)
+    result_table2 = result2.to_table()
+    assert result_table2.num_rows == 2
+    expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
+    assert result_table2 == expected_table2
+
+    final_describe_count = namespace.get_describe_call_count()
+    assert final_describe_count == describe_count_after_second_write
