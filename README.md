@@ -9,10 +9,10 @@
 
 <a href="https://lance.org">Documentation</a> •
 <a href="https://lance.org/community">Community</a> •
-<a href="https://discord.gg/zMM32dvNtd">Discord</a>
+<a href="https://discord.gg/lance">Discord</a>
 
-[CI]: https://github.com/lancedb/lance/actions/workflows/rust.yml
-[CI Badge]: https://github.com/lancedb/lance/actions/workflows/rust.yml/badge.svg
+[CI]: https://github.com/lance-format/lance/actions/workflows/rust.yml
+[CI Badge]: https://github.com/lance-format/lance/actions/workflows/rust.yml/badge.svg
 [Docs]: https://lance.org
 [Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
 [crates.io]: https://crates.io/crates/lance

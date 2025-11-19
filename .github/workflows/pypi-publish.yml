@@ -42,11 +42,11 @@ jobs:
           - platform: aarch64
             manylinux: "2_17"
             extra_args: ""
-            runner: ubuntu-2404-4x-arm64
+            runner: warp-ubuntu-2404-arm64-4x
           - platform: aarch64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
-            runner: ubuntu-2404-4x-arm64
+            runner: warp-ubuntu-2404-arm64-4x
     runs-on: ${{ matrix.config.runner }}
     steps:
     - uses: actions/checkout@v4

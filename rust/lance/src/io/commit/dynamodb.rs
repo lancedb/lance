@@ -6,7 +6,7 @@
 // TODO: these tests are copied from super::external_manifest::test
 // since these tests applies to all external manifest stores,
 // we should move them to a common place
-// https://github.com/lancedb/lance/issues/1208
+// https://github.com/lance-format/lance/issues/1208
 // Windows FS can't handle concurrent copy
 #[cfg(all(test, not(target_os = "windows")))]
 mod test {
