@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     timeout-minutes: 45
-    runs-on: warp-ubuntu-latest-x64-8x
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

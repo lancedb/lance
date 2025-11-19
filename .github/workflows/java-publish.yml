@@ -180,7 +180,7 @@ jobs:
           if-no-files-found: error
   macos-arm64:
     name: Build on MacOS Arm64 and release
-    runs-on: warp-macos-14-arm64-6x
+    runs-on: macos-14
     timeout-minutes: 60
     needs:
       - linux-arm64
