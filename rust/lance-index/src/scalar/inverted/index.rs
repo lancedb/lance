@@ -35,11 +35,8 @@ use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::utils::{
-    mask::RowIdMask,
-    tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
-};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{
     container::list::ExpLinkedList,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -789,7 +786,7 @@ impl InvertedPartition {
         &self,
         params: &FtsSearchParams,
         operator: Operator,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate>> {

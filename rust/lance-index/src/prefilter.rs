@@ -4,15 +4,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::Result;
 
-/// A trait to be implemented by anything supplying a prefilter row id mask
+/// A trait to be implemented by anything supplying a prefilter row addr mask
 ///
 /// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<RowIdMask>;
+    async fn load(self: Box<Self>) -> Result<RowAddrMask>;
 }
 
 /// Filter out row ids that we know are not relevant to the query.
@@ -36,10 +36,10 @@ pub trait PreFilter: Send + Sync {
     /// If the filter is empty.
     fn is_empty(&self) -> bool;
 
-    /// Get the row id mask for this prefilter
+    /// Get the row addr mask for this prefilter
     ///
     /// This method must be called after `wait_for_ready`
-    fn mask(&self) -> Arc<RowIdMask>;
+    fn mask(&self) -> Arc<RowAddrMask>;
 
     /// Check whether a slice of row ids should be included in a query.
     ///
@@ -63,8 +63,8 @@ impl PreFilter for NoFilter {
         true
     }
 
-    fn mask(&self) -> Arc<RowIdMask> {
-        Arc::new(RowIdMask::all_rows())
+    fn mask(&self) -> Arc<RowAddrMask> {
+        Arc::new(RowAddrMask::all_rows())
     }
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {

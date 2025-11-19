@@ -12,7 +12,7 @@ use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use itertools::Itertools;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::Result;
 
 use crate::metrics::MetricsCollector;
@@ -341,7 +341,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate>> {
         let limit = params.limit.unwrap_or(usize::MAX);
@@ -349,7 +349,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        match (mask.max_len(), mask.iter_ids()) {
+        match (mask.max_len(), mask.iter_addrs()) {
             (Some(num_rows_matched), Some(row_ids))
                 if num_rows_matched * 100
                     <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
@@ -930,7 +930,7 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::default(),
-                Arc::new(RowIdMask::default()),
+                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();
@@ -972,7 +972,7 @@ mod tests {
 
         let result = wand.search(
             &FtsSearchParams::default(),
-            Arc::new(RowIdMask::default()),
+            Arc::new(RowAddrMask::default()),
             &NoOpMetricsCollector,
         );
 

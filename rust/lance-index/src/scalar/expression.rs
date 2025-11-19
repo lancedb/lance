@@ -23,7 +23,7 @@ use super::{
     SearchResult, TextQuery, TokenQuery,
 };
 use lance_core::{
-    utils::mask::{NullableRowIdMask, RowIdMask},
+    utils::mask::{NullableRowIdMask, RowAddrMask},
     Error, Result,
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
@@ -983,19 +983,19 @@ impl NullableIndexExprResult {
 #[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowIdMask),
+    Exact(RowAddrMask),
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowIdMask),
+    AtMost(RowAddrMask),
     // The answer is at least the rows in the allow list minus the rows in the block list
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
-    AtLeast(RowIdMask),
+    AtLeast(RowAddrMask),
 }
 
 impl IndexExprResult {
-    pub fn row_id_mask(&self) -> &RowIdMask {
+    pub fn row_addr_mask(&self) -> &RowAddrMask {
         match self {
             Self::Exact(mask) => mask,
             Self::AtMost(mask) => mask,
@@ -1011,7 +1011,7 @@ impl IndexExprResult {
         }
     }
 
-    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
         match discriminant {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
@@ -1028,8 +1028,8 @@ impl IndexExprResult {
         &self,
         fragments_covered_by_result: &RoaringBitmap,
     ) -> Result<RecordBatch> {
-        let row_id_mask = self.row_id_mask();
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let row_addr_mask = self.row_addr_mask();
+        let row_addr_mask_arr = row_addr_mask.into_arrow()?;
         let discriminant = self.discriminant();
         let discriminant_arr =
             Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
@@ -1043,7 +1043,7 @@ impl IndexExprResult {
         Ok(RecordBatch::try_new(
             INDEX_EXPR_RESULT_SCHEMA.clone(),
             vec![
-                Arc::new(row_id_mask_arr),
+                Arc::new(row_addr_mask_arr),
                 Arc::new(discriminant_arr),
                 Arc::new(fragments_covered_arr),
             ],

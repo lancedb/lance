@@ -32,7 +32,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
@@ -98,9 +98,9 @@ impl EvaluatedIndex {
                 location: location!(),
             });
         }
-        let row_id_mask = RowIdMask::from_arrow(batch.column(0).as_binary())?;
+        let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = IndexExprResult::from_parts(row_id_mask, match_type)?;
+        let index_result = IndexExprResult::from_parts(row_addr_mask, match_type)?;
 
         let applicable_fragments = batch.column(2).as_binary::<i32>();
         let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
@@ -663,22 +663,22 @@ impl FilteredReadStream {
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
                 match &evaluated_index.index_result {
-                    IndexExprResult::Exact(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                    IndexExprResult::Exact(row_addr_mask) => {
+                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
                         let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
                         scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
                     }
-                    IndexExprResult::AtMost(row_id_mask) => {
+                    IndexExprResult::AtMost(row_addr_mask) => {
                         // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
                         let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, matched_ranges);
                     }
-                    IndexExprResult::AtLeast(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                    IndexExprResult::AtLeast(row_addr_mask) => {
+                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
                         let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
