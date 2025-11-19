@@ -546,8 +546,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::pbold::NGramIndexDetails;
     use lance_index::IndexType;
+    use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -1186,6 +1186,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_zonemap_with_deletions() {
+        let deletion_predicates = [
+            "NOT value",            // every other row
+            "id > 8191 or id < 10", // Second zone of each fragment
+            "id < 9190 ",           // Most of first zone
+        ];
+        let query_predicates = ["value", "id <= 8191", "id >= 1"];
+
+        async fn filter_query(ds: &Dataset, query_pred: &str) -> arrow_array::RecordBatch {
+            ds.scan()
+                .filter(query_pred)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+        }
+
+        for del_pred in &deletion_predicates {
+            // We use 2 * 8192 so each fragment has two zones.
+            let mut ds = lance_datagen::gen_batch()
+                .col("id", array::step::<UInt64Type>())
+                .col("value", array::cycle_bool(vec![true, false]))
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2 * 8192))
+                .await
+                .unwrap();
+
+            // Create zonemap index on "value" column
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+            ds.create_index_builder(&["value"], IndexType::Scalar, &params)
+                .name("value_zone_map".into())
+                .await
+                .unwrap();
+            ds.create_index_builder(&["id"], IndexType::Scalar, &params)
+                .name("id_zone_map".into())
+                .await
+                .unwrap();
+
+            ds.delete(del_pred).await.unwrap();
+            let mut result_before = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                result_before.push(batch);
+            }
+            ds.drop_index("value_zone_map").await.unwrap();
+            ds.drop_index("id_zone_map").await.unwrap();
+
+            let mut expected = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                expected.push(batch);
+            }
+
+            for (before, expected) in result_before.iter().zip(expected.iter()) {
+                assert_eq!(before, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}'", del_pred);
+            }
+
+            // Now recreate the indexes for the next iteration
+            ds.create_index_builder(&["value"], IndexType::Scalar, &params)
+                .name("value_zone_map".into())
+                .await
+                .unwrap();
+            ds.create_index_builder(&["id"], IndexType::Scalar, &params)
+                .name("id_zone_map".into())
+                .await
+                .unwrap();
+            let mut result_after = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                result_after.push(batch);
+            }
+
+            for (after, expected) in result_after.iter().zip(expected.iter()) {
+                assert_eq!(after, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index", del_pred);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_zonemap_deletion_then_index() {
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
@@ -1239,14 +1317,11 @@ mod tests {
             .await
             .unwrap();
 
-        let after_ids: Vec<u64> = after_index["id"]
+        let after_ids = after_index["id"]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+            .values();
 
         // This assertion will FAIL if bug #4758 is present
         assert_eq!(
@@ -1258,7 +1333,7 @@ mod tests {
         );
         assert_eq!(
             after_ids,
-            vec![0, 2, 4, 6, 8],
+            &[0, 2, 4, 6, 8],
             "Zonemap index with deletions returns wrong results"
         );
     }
