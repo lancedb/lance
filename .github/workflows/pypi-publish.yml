@@ -98,9 +98,9 @@ jobs:
         python-minor-version: ["9"]
         config:
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-13-large
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-14-large
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
