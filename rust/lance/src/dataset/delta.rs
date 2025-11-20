@@ -293,24 +293,7 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use std::sync::Arc;
 
-    async fn create_test_dataset() -> Dataset {
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
-
-        let write_params = WriteParams {
-            ..Default::default()
-        };
-        Dataset::write(data, "memory://", Some(write_params.clone()))
-            .await
-            .unwrap()
-    }
-
-    // -----------------------
-    // Local helper functions
-    // -----------------------
-    async fn write_dataset_memory(
+    async fn create_test_dataset(
         rows: usize,
         batches: usize,
         value: &str,
@@ -399,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_no_transaction() {
-        let ds = create_test_dataset().await;
+        let ds = create_test_dataset(1_000, 10, "value", false).await;
         let delta = ds.delta().compared_against_version(1).build().unwrap();
         let result = delta.list_transactions().await;
         assert_eq!(result.unwrap().len(), 0);
@@ -407,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_single_transaction() {
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
         ds.delete("key = 5").await.unwrap();
 
         let delta_struct = ds
@@ -423,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_multiple_transactions() {
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
         ds.delete("key = 5").await.unwrap();
         ds.delete("key = 6").await.unwrap();
 
@@ -441,7 +424,7 @@ mod tests {
     async fn test_list_contains_deleted_transaction() {
         MockClock::set_system_time(std::time::Duration::from_secs(1));
 
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
 
         MockClock::set_system_time(std::time::Duration::from_secs(2));
 
@@ -481,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_created_at_version_basic() {
         // Create dataset with stable row IDs enabled
-        let ds = write_dataset_memory(100, 1, "value", true).await;
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
@@ -502,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_last_updated_at_version_basic() {
         // Create dataset with stable row IDs enabled
-        let ds = write_dataset_memory(100, 1, "value", true).await;
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
@@ -549,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_version_metadata_after_update() {
         // Create dataset with stable row IDs enabled
-        let ds = write_dataset_memory(100, 1, "value", true).await;
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
@@ -652,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_version_metadata_after_delete() {
         // Create dataset with stable row IDs enabled
-        let mut ds = write_dataset_memory(100, 1, "value", true).await;
+        let mut ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
@@ -1107,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter_version_columns_with_other_columns() {
         // Create dataset
-        let ds = write_dataset_memory(100, 1, "value", true).await;
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         // Update some rows (version 2)
         let ds = update_where(ds, "key >= 30 AND key < 60", "updated").await;
@@ -1219,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_updated_rows() {
         // Create initial dataset (version 1)
-        let ds = write_dataset_memory(100, 1, "value", true).await;
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
