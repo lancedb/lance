@@ -155,7 +155,7 @@ jobs:
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: warp-ubuntu-2404-arm64-4x
+    runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
@@ -187,7 +187,7 @@ jobs:
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
-    runs-on: "macos-14"
+    runs-on: "macos-14-xlarge"
     defaults:
       run:
         shell: bash

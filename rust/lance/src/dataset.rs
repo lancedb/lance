@@ -395,6 +395,7 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
+        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -407,7 +408,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref())
+                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -415,10 +416,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection)
+                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
         }
     }
 }

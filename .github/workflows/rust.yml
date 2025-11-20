@@ -104,7 +104,7 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
-    runs-on: warp-ubuntu-2404-arm64-4x
+    runs-on: ubuntu-24.04-arm64-4x
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -129,7 +129,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
   build-no-lock:
-    runs-on: warp-ubuntu-2404-x64-8x
+    runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
@@ -150,7 +150,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: warp-macos-14-arm64-6x
+    runs-on: macos-14-xlarge
     timeout-minutes: 45
     strategy:
       matrix:
@@ -182,7 +182,7 @@ jobs:
         run: |
           cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
   windows-build:
-    runs-on: warp-windows-latest-x64-4x
+    runs-on: windows-latest-4x
     defaults:
       run:
         working-directory: rust

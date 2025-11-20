@@ -1689,37 +1689,33 @@ def test_zonemap_zone_size(tmp_path: Path):
     assert small_bytes_read < large_bytes_read
 
 
-def test_bloomfilter_index(tmp_path: Path):
-    """Test create bloomfilter index"""
-    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
-    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
-    indices = dataset.list_indices()
-    assert len(indices) == 1
+def test_zonemap_deletion_handling(tmp_path: Path):
+    """Test zonemap deletion handling"""
+    data = pa.table(
+        {
+            "id": range(10),
+            "value": [True, False] * 5,
+        }
+    )
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.delete("NOT value")
+    assert ds.to_table(filter="value = True").num_rows == 5
+    assert ds.to_table(filter="value = False").num_rows == 0
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
-    # Get detailed index statistics
-    index_stats = dataset.stats.index_stats("values_idx")
-    assert index_stats["index_type"] == "BloomFilter"
-    assert "indices" in index_stats
-    assert len(index_stats["indices"]) == 1
+    ds.create_scalar_index("value", index_type="zonemap")
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
-    # Verify bloomfilter statistics
-    bloom_stats = index_stats["indices"][0]
-    assert "num_blocks" in bloom_stats
-    assert bloom_stats["num_blocks"] == 2
-    assert bloom_stats["number_of_items"] == 8192
-    assert "probability" in bloom_stats
-    assert bloom_stats["probability"] == 0.00057  # Default probability
-
-    # Test that the bloomfilter index is being used in the query plan
-    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
-    plan = scanner.explain_plan()
-    assert "ScalarIndexQuery" in plan
-
-    # Verify the query returns correct results
-    result = scanner.to_table()
-    assert result.num_rows == 1
-    assert result["values"][0].as_py() == 1234
+    # now create the index before deletion
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.create_scalar_index("value", index_type="zonemap")
+    ds.delete("NOT value")
+    assert ds.to_table(filter="value = True").num_rows == 5
+    assert ds.to_table(filter="value = False").num_rows == 0
+    ids = ds.to_table(filter="value = True")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
 
 def test_zonemap_index_remapping(tmp_path: Path):
@@ -1776,6 +1772,68 @@ def test_zonemap_index_remapping(tmp_path: Path):
 
     result = scanner.to_table()
     assert result.num_rows == 501  # 1000..1500 inclusive
+
+
+def test_bloomfilter_index(tmp_path: Path):
+    """Test create bloomfilter index"""
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+
+    # Get detailed index statistics
+    index_stats = dataset.stats.index_stats("values_idx")
+    assert index_stats["index_type"] == "BloomFilter"
+    assert "indices" in index_stats
+    assert len(index_stats["indices"]) == 1
+
+    # Verify bloomfilter statistics
+    bloom_stats = index_stats["indices"][0]
+    assert "num_blocks" in bloom_stats
+    assert bloom_stats["num_blocks"] == 2
+    assert bloom_stats["number_of_items"] == 8192
+    assert "probability" in bloom_stats
+    assert bloom_stats["probability"] == 0.00057  # Default probability
+
+    # Test that the bloomfilter index is being used in the query plan
+    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 1
+    assert result["values"][0].as_py() == 1234
+
+
+def test_bloomfilter_deletion_handling(tmp_path: Path):
+    """Test bloomfilter deletion handling"""
+    data = pa.table(
+        {
+            "id": range(10),
+            "value": [1, 0] * 5,
+        }
+    )
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
+
+    # now create the index before deletion
+    ds = lance.write_dataset(data, "memory://", max_rows_per_group=5)
+    ds.create_scalar_index("value", index_type="bloomfilter")
+    ds.delete("value = 0")
+    assert ds.to_table(filter="value = 1").num_rows == 5
+    assert ds.to_table(filter="value = 0").num_rows == 0
+    ids = ds.to_table(filter="value = 1")["id"].to_pylist()
+    assert ids == [0, 2, 4, 6, 8]
 
 
 def test_json_index():
