@@ -419,9 +419,7 @@ impl ProjectionRequest {
                     ProjectionPlan::from_schema(dataset, &projection, blob_version)
                 }
             }
-            Self::Sql(columns) => {
-                ProjectionPlan::from_expressions(dataset, &columns, blob_version)
-            }
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
         }
     }
 }
