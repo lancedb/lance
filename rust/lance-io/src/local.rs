@@ -89,7 +89,7 @@ pub struct LocalObjectReader {
     block_size: usize,
 
     /// IO tracker for monitoring read operations.
-    io_tracker: Option<Arc<IOTracker>>,
+    io_tracker: Arc<IOTracker>,
 }
 
 impl DeepSizeOf for LocalObjectReader {
@@ -119,7 +119,7 @@ impl LocalObjectReader {
         block_size: usize,
         known_size: Option<usize>,
     ) -> Result<Box<dyn Reader>> {
-        Self::open_with_tracker(path, block_size, known_size, None).await
+        Self::open_with_tracker(path, block_size, known_size, Default::default()).await
     }
 
     /// Open a local object reader with optional IO tracking.
@@ -128,7 +128,7 @@ impl LocalObjectReader {
         path: &Path,
         block_size: usize,
         known_size: Option<usize>,
-        io_tracker: Option<Arc<IOTracker>>,
+        io_tracker: Arc<IOTracker>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
@@ -212,9 +212,8 @@ impl Reader for LocalObjectReader {
             source: err.into(),
         });
 
-        // Record the read operation if tracking is enabled
-        if let (Ok(_), Some(tracker)) = (&result, io_tracker.as_ref()) {
-            tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+        if let Ok(_) = &result {
+            io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
         }
 
         result
@@ -238,9 +237,8 @@ impl Reader for LocalObjectReader {
             source: err.into(),
         });
 
-        // Record the read operation if tracking is enabled
-        if let (Ok(bytes), Some(tracker)) = (&result, io_tracker.as_ref()) {
-            tracker.record_read("get_all", path, bytes.len() as u64, None);
+        if let Ok(bytes) = &result {
+            io_tracker.record_read("get_all", path, bytes.len() as u64, None);
         }
 
         result
