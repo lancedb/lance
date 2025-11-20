@@ -59,3 +59,10 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
+    io_buffer_size: Optional[int]
+    """
+    The size of the IO buffer.  You may want to increase this if running
+    into deadlocks during compaction.
+
+    The default will use the same default from ``scanner``.
+    """

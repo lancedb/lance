@@ -152,6 +152,10 @@ pub struct CompactionOptions {
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
     pub batch_size: Option<usize>,
+    /// The size of the IO buffer.  If not
+    /// specified then the default (see
+    /// [`crate::dataset::Scanner::io_buffer_size`]) will be used.
+    pub io_buffer_size: Option<u64>,
     /// Whether to defer remapping indices during compaction. If true, indices will
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
@@ -169,6 +173,7 @@ impl Default for CompactionOptions {
             num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
+            io_buffer_size: None,
             defer_index_remap: false,
         }
     }
@@ -682,6 +687,9 @@ async fn rewrite_files(
     }
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
+    }
+    if let Some(io_buffer_size) = options.io_buffer_size {
+        scanner.io_buffer_size(io_buffer_size);
     }
     // Generate an ID for logging purposes
     let task_id = uuid::Uuid::new_v4();
