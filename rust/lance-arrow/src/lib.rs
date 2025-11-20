@@ -45,6 +45,8 @@ pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 /// Key used by lance to mark a field as a blob
 /// TODO: Use Arrow extension mechanism instead?
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+/// Arrow extension type name for Lance blob v2 columns
+pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 

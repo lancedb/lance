@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
     json::{is_arrow_json_field, is_json_field},
-    ARROW_EXT_NAME_KEY, *,
+    DataTypeExt, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
@@ -41,6 +41,15 @@ use crate::{
 /// (2) The field must be a leaf without child (i.e. it is a primitive data type).
 /// (3) The field must not be within a list type.
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
+
+fn has_blob_v2_extension(field: &ArrowField) -> bool {
+    field.data_type() == &DataType::LargeBinary
+        && field
+            .metadata()
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
+}
 
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
@@ -493,6 +502,11 @@ impl Field {
     /// Blob fields will load descriptions by default
     pub fn is_blob(&self) -> bool {
         self.metadata.contains_key(BLOB_META_KEY)
+            || self
+                .metadata
+                .get(ARROW_EXT_NAME_KEY)
+                .map(|name| name == BLOB_V2_EXT_NAME)
+                .unwrap_or(false)
     }
 
     /// If the field is a blob, return a new field with the same name and id
@@ -975,15 +989,24 @@ impl TryFrom<&ArrowField> for Field {
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
-        let metadata = field.metadata().clone();
+        let mut metadata = field.metadata().clone();
         let unenforced_primary_key = metadata
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
+        let is_blob_v2 = has_blob_v2_extension(field);
+
+        if is_blob_v2 {
+            metadata
+                .entry(BLOB_META_KEY.to_string())
+                .or_insert_with(|| "true".to_string());
+        }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
+        } else if is_blob_v2 {
+            LogicalType::from(super::BLOB_LOGICAL_TYPE)
         } else {
             LogicalType::try_from(field.data_type())?
         };
@@ -1023,6 +1046,17 @@ impl From<&Field> for ArrowField {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
 
+        if field.logical_type.is_blob() {
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+            );
+            metadata.entry(ARROW_EXT_META_KEY.to_string()).or_default();
+            metadata
+                .entry(BLOB_META_KEY.to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
             metadata.insert(
@@ -1041,6 +1075,8 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+    use std::collections::HashMap;
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
@@ -1523,5 +1559,32 @@ mod tests {
         let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn blob_extension_roundtrip() {
+        let metadata = HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+            (ARROW_EXT_META_KEY.to_string(), "".to_string()),
+        ]);
+        let arrow_field =
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert_eq!(
+            field.logical_type,
+            LogicalType::from(crate::datatypes::BLOB_LOGICAL_TYPE)
+        );
+        assert!(field.is_blob());
+        assert_eq!(field.data_type(), DataType::LargeBinary);
+
+        let roundtrip: ArrowField = ArrowField::from(&field);
+        assert_eq!(
+            roundtrip.metadata().get(ARROW_EXT_NAME_KEY),
+            Some(&BLOB_V2_EXT_NAME.to_string())
+        );
+        assert_eq!(
+            roundtrip.metadata().get(BLOB_META_KEY),
+            Some(&"true".to_string())
+        );
     }
 }

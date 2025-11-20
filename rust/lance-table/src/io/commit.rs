@@ -303,7 +303,7 @@ async fn current_manifest_path(
                 if next_version >= version {
                     warn!(
                         "List operation was expected to be lexically ordered, but was not. This \
-                         could mean a corrupt read. Please make a bug report on the lancedb/lance \
+                         could mean a corrupt read. Please make a bug report on the lance-format/lance \
                          GitHub repository."
                     );
                     break;

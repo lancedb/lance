@@ -140,7 +140,7 @@ impl<'a> InsertBuilder<'a> {
         data: Vec<RecordBatch>,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
-        // and write in parallel. https://github.com/lancedb/lance/issues/1980
+        // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
             return Err(Error::InvalidInput {
                 source: "No data to write".into(),

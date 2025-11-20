@@ -659,7 +659,7 @@ async fn rewrite_files(
     // The versions of Lance prior to when we started writing the writer version
     // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
     // make sure to recompute them.
-    // See: https://github.com/lancedb/lance/issues/1531
+    // See: https://github.com/lance-format/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
 
     // It's possible the fragments are old and don't have physical rows or

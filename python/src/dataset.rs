@@ -86,7 +86,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::PyIndexConfig;
+use crate::indices::{PyIndexConfig, PyIndexDescription};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -2599,6 +2599,18 @@ impl Dataset {
         let builder = self.ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=())]
+    fn describe_indices(&self, py: Python<'_>) -> PyResult<Vec<PyIndexDescription>> {
+        let new_self = self.ds.as_ref().clone();
+        let indices = rt()
+            .block_on(Some(py), new_self.describe_indices(None))?
+            .infer_error()?;
+        Ok(indices
+            .into_iter()
+            .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
+            .collect())
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2935,10 +2947,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                     })
             });
 
-        if storage_options.is_some() || storage_options_provider.is_some() {
+        let s3_credentials_refresh_offset_seconds =
+            get_dict_opt::<u64>(options, "s3_credentials_refresh_offset_seconds")?;
+
+        if storage_options.is_some()
+            || storage_options_provider.is_some()
+            || s3_credentials_refresh_offset_seconds.is_some()
+        {
+            let s3_credentials_refresh_offset = s3_credentials_refresh_offset_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(std::time::Duration::from_secs(60));
+
             p.store_params = Some(ObjectStoreParams {
                 storage_options,
                 storage_options_provider,
+                s3_credentials_refresh_offset,
                 ..Default::default()
             });
         }

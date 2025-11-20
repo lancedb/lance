@@ -909,7 +909,7 @@ async fn check_round_trip_encoding_inner(
         None
     } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
         // TODO(tsaucer) When arrow upgrades to 56, remove this if statement
-        // This is due to a check for concat_struct in arrow-rs. See https://github.com/lancedb/lance/pull/4598
+        // This is due to a check for concat_struct in arrow-rs. See https://github.com/lance-format/lance/pull/4598
         let capacities = Capacities::Array(num_rows as usize);
         let array_data: Vec<_> = data.iter().map(|a| a.to_data()).collect::<Vec<_>>();
         let array_data = array_data.iter().collect();

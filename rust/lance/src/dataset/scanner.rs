@@ -64,7 +64,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
-use lance_index::ScalarIndexCriteria;
+use lance_index::IndexCriteria;
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -2285,11 +2285,7 @@ impl Scanner {
     ) -> Result<bool> {
         let index = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
             .await?;
         match index {
             Some(index) => match &index.fragment_bitmap {
@@ -2441,7 +2437,7 @@ impl Scanner {
                     let has_fts_index = self
                         .dataset
                         .load_scalar_index(
-                            ScalarIndexCriteria::default()
+                            IndexCriteria::default()
                                 .for_column(&column_path)
                                 .supports_fts(),
                         )
@@ -2685,11 +2681,7 @@ impl Scanner {
 
         let index_meta = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?
             .ok_or(Error::invalid_input(
                 format!("No Inverted index found for column {}", column),
@@ -2735,11 +2727,7 @@ impl Scanner {
 
         let index = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?;
 
         let (match_plan, flat_match_plan) = match &index {
@@ -3046,7 +3034,7 @@ impl Scanner {
             ScalarIndexExpr::Query(search) => {
                 let idx = self
                     .dataset
-                    .load_scalar_index(ScalarIndexCriteria::default().with_name(&search.index_name))
+                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
                     .await?
                     .expect("Index not found even though it must have been found earlier");
                 Ok(idx
