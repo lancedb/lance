@@ -1489,9 +1489,22 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[test]
+    fn projection_from_schema_defaults_to_v1() {
+        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
+        let schema = Schema {
+            fields: vec![field],
+            metadata: HashMap::new(),
+        };
+
+        let projection = Projection::empty(Arc::new(schema));
+
+        assert_eq!(projection.blob_version, BlobVersion::V1);
+    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {
