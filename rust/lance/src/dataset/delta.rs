@@ -319,7 +319,10 @@ mod tests {
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8(value.to_string()))
-            .into_reader_rows(RowCount::from(rows), BatchCount::from(batches));
+            .into_reader_rows(
+                RowCount::from(rows as u64),
+                BatchCount::from(batches as u32),
+            );
 
         let write_params = WriteParams {
             enable_stable_row_ids: stable_row_ids,
@@ -342,23 +345,24 @@ mod tests {
         let data = lance_datagen::gen_batch()
             .col("key", array::step_custom::<Int32Type>(start_key, 1))
             .col("value", array::fill_utf8(value.to_string()))
-            .into_reader_rows(RowCount::from(rows), BatchCount::from(batches));
+            .into_reader_rows(
+                RowCount::from(rows as u64),
+                BatchCount::from(batches as u32),
+            );
 
         let write_params = WriteParams {
             enable_stable_row_ids: stable_row_ids,
-            mode: if append { crate::dataset::WriteMode::Append } else { crate::dataset::WriteMode::Create },
+            mode: if append {
+                crate::dataset::WriteMode::Append
+            } else {
+                crate::dataset::WriteMode::Create
+            },
             ..Default::default()
         };
-        Dataset::write(data, dir, Some(write_params))
-            .await
-            .unwrap()
+        Dataset::write(data, dir, Some(write_params)).await.unwrap()
     }
 
-    async fn update_where<T: Into<Arc<Dataset>>>(
-        ds: T,
-        predicate: &str,
-        value: &str,
-    ) -> Dataset {
+    async fn update_where<T: Into<Arc<Dataset>>>(ds: T, predicate: &str, value: &str) -> Dataset {
         let updated = crate::dataset::UpdateBuilder::new(ds.into())
             .update_where(predicate)
             .unwrap()
