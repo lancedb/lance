@@ -35,7 +35,7 @@ use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_index::{DatasetIndexExt, IndexCriteria};
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
@@ -222,11 +222,7 @@ impl ExecutionPlan for MatchQueryExec {
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",
@@ -439,11 +435,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
         let stream = stream::once(async move {
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?;
             let inverted_idx = match index_meta {
                 Some(index_meta) => {
@@ -645,11 +637,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 query.terms
             )))?;
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",

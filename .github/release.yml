@@ -7,6 +7,9 @@ changelog:
     - title: Breaking Changes 🛠
       labels:
         - breaking-change
+    - title: Critical Fixes ‼️
+      labels:
+        - critical-fix
     - title: New Features 🎉
       labels:
         - enhancement

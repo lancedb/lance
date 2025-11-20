@@ -140,7 +140,7 @@ impl<'a> InsertBuilder<'a> {
         data: Vec<RecordBatch>,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
-        // and write in parallel. https://github.com/lancedb/lance/issues/1980
+        // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
             return Err(Error::InvalidInput {
                 source: "No data to write".into(),
@@ -216,36 +216,28 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                // Fetch auto_cleanup params from context
-                let config_upsert_values = match context.params.auto_cleanup.as_ref() {
-                    Some(auto_cleanup_params) => {
+                let config_upsert_values =
+                    if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
                         let mut upsert_values = HashMap::new();
-
                         upsert_values.insert(
                             String::from("lance.auto_cleanup.interval"),
                             auto_cleanup_params.interval.to_string(),
                         );
 
-                        match auto_cleanup_params.older_than.to_std() {
-                            Ok(d) => {
-                                upsert_values.insert(
-                                    String::from("lance.auto_cleanup.older_than"),
-                                    format_duration(d).to_string(),
-                                );
+                        let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
+                            Error::InvalidInput {
+                                source: e.into(),
+                                location: location!(),
                             }
-                            Err(e) => {
-                                return Err(Error::InvalidInput {
-                                    source: e.into(),
-                                    location: location!(),
-                                })
-                            }
-                        };
-
+                        })?;
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.older_than"),
+                            format_duration(duration).to_string(),
+                        );
                         Some(upsert_values)
-                    }
-                    None => None,
-                };
-
+                    } else {
+                        None
+                    };
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
@@ -254,15 +246,12 @@ impl<'a> InsertBuilder<'a> {
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
-            WriteMode::Overwrite => {
-                Operation::Overwrite {
-                    // Use the full schema, not the written schema
-                    schema,
-                    fragments,
-                    config_upsert_values: None,
-                    initial_bases: context.params.initial_bases.clone(),
-                }
-            }
+            WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
+                config_upsert_values: None,
+                initial_bases: context.params.initial_bases.clone(),
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 

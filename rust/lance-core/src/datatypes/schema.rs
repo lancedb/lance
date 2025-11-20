@@ -146,13 +146,6 @@ impl Schema {
         }
     }
 
-    pub fn apply_blob_version(&mut self, version: BlobVersion, allow_change: bool) -> Result<()> {
-        for field in self.fields.iter_mut() {
-            apply_blob_version_to_field(field, version, allow_change)?;
-        }
-        Ok(())
-    }
-
     pub fn has_dictionary_types(&self) -> bool {
         self.fields.iter().any(|f| f.has_dictionary_types())
     }
@@ -893,31 +886,6 @@ fn explain_metadata_difference(
     }
 }
 
-fn apply_blob_version_to_field(
-    field: &mut Field,
-    version: BlobVersion,
-    allow_change: bool,
-) -> Result<()> {
-    if field.is_blob() {
-        let current = field.blob_version();
-        if current != version && !allow_change {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "Blob column '{}' uses version {:?}, expected {:?}",
-                    field.name, current, version
-                )
-                .into(),
-                location: location!(),
-            });
-        }
-        field.set_blob_version(version);
-    }
-    for child in field.children.iter_mut() {
-        apply_blob_version_to_field(child, version, allow_change)?;
-    }
-    Ok(())
-}
-
 /// What to do when a column is missing in the schema
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnMissing {
@@ -972,9 +940,9 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field) -> Field {
+    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded()
+            field.into_unloaded_with_version(version)
         } else {
             field
         }
@@ -994,6 +962,7 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
+    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -1011,6 +980,7 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
+            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -1026,6 +996,7 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
+            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1056,6 +1027,11 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
+        self
+    }
+
+    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
+        self.blob_version = blob_version;
         self
     }
 
@@ -1516,7 +1492,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::datatypes::BlobVersion;
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -2536,24 +2511,5 @@ mod tests {
                 .to_string()
                 .contains(error_message_contains[idx]));
         }
-    }
-
-    #[test]
-    fn apply_blob_version_requires_consistent_metadata() {
-        let arrow_field = ArrowField::new("blob", ArrowDataType::LargeBinary, true).with_metadata(
-            HashMap::from([
-                (BLOB_META_KEY.to_string(), "true".to_string()),
-                (BLOB_VERSION_META_KEY.to_string(), "2".to_string()),
-            ]),
-        );
-        let mut schema =
-            Schema::try_from(&ArrowSchema::new(vec![arrow_field])).expect("schema creation");
-
-        assert!(schema.apply_blob_version(BlobVersion::V1, false).is_err());
-
-        schema
-            .apply_blob_version(BlobVersion::V1, true)
-            .expect("allow metadata change when permitted");
-        assert_eq!(schema.fields[0].blob_version(), BlobVersion::V1);
     }
 }

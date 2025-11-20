@@ -33,7 +33,7 @@ pub(crate) mod index_extension;
 /// A session contains two different caches:
 ///  - The index cache is used to cache opened indices and will cache index data
 ///  - The metadata cache is used to cache a variety of dataset metadata (more
-///    details can be found in the [performance guide](https://lancedb.github.io/lance/guide/performance/)
+///    details can be found in the [performance guide](https://lance.org/guide/performance/)
 #[derive(Clone)]
 pub struct Session {
     /// Global cache for opened indices.

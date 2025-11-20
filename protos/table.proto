@@ -257,6 +257,15 @@ message IndexMetadata {
   //
   // Indices should avoid putting large amounts of information in this field, as it will
   // bloat the manifest.
+  //
+  // Indexes are plugins, and so the format of the details message is flexible and not fully
+  // defined by the table format.  However, there are some conventions that should be followed:
+  //
+  // - When Lance APIs refer to indexes they will use the type URL of the index details as the
+  //   identifier for the index type.  If a user provides a simple string identifier like
+  //   "btree" then it will be converted to "/lance.table.BTreeIndexDetails"
+  // - Type URLs comparisons are case-insensitive.  Thereform an index must have a unique type
+  //   URL ignoring case.
   google.protobuf.Any index_details = 6;
 
   // The minimum lance version that this index is compatible with.

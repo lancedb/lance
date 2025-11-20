@@ -1250,6 +1250,10 @@ impl NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
+    fn name(&self) -> &str {
+        "NGram"
+    }
+
     fn new_training_request(
         &self,
         _params: &str,

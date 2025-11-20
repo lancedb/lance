@@ -652,10 +652,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .peekable(),
         );
 
-        let batch = transformed_stream.as_mut().peek().await;
+        let batch = transformed_stream.as_mut().peek_mut().await;
         let schema = match batch {
             Some(Ok(b)) => b.schema(),
-            Some(Err(e)) => panic!("do this better: error reading first batch: {:?}", e),
+            Some(Err(e)) => return Err(std::mem::replace(e, Error::Stop)),
             None => {
                 log::info!("no data to shuffle");
                 self.shuffle_reader = Some(Arc::new(IvfShufflerReader::new(
@@ -711,9 +711,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // if no partitions to split, we just create a new delta index,
         // otherwise, we need to merge all existing indices and split large partitions.
         let reader = reader.clone();
+        let num_indices_to_merge = self
+            .optimize_options
+            .as_ref()
+            .and_then(|opt| opt.num_indices_to_merge);
         let (assign_batches, merge_indices, replaced_partition) =
             match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
-                Some(partition) => {
+                Some(partition) if num_indices_to_merge.is_none() => {
                     // Perform split and record the fact for downstream build/merge
                     log::info!(
                         "split partition {}, will merge all {} delta indices",
@@ -734,7 +738,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         Some(partition),
                     )
                 }
-                None => {
+                _ => {
                     let is_retrain = self
                         .optimize_options
                         .as_ref()
@@ -742,11 +746,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .unwrap_or(false);
                     let num_to_merge = match is_retrain {
                         true => self.existing_indices.len(), // retrain, merge all indices
-                        false => self
-                            .optimize_options
-                            .as_ref()
-                            .and_then(|opt| opt.num_indices_to_merge)
-                            .unwrap_or(0),
+                        false => num_indices_to_merge.unwrap_or(0),
                     };
 
                     let indices_to_merge = self.existing_indices

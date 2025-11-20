@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance import LanceFragment
+from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
@@ -1389,6 +1389,23 @@ def test_load_indices(dataset):
     )
     indices = dataset.list_indices()
     assert len(indices) == 1
+
+
+def test_describe_vector_index(indexed_dataset: LanceDataset):
+    info = indexed_dataset.describe_indices()[0]
+
+    assert info.name == "vector_idx"
+    assert info.type_url == "/lance.table.VectorIndexDetails"
+    # This is currently Unknown because vector indices are not yet handled by plugins
+    assert info.index_type == "Unknown"
+    assert info.num_rows_indexed == 1000
+    assert info.fields == [0]
+    assert info.field_names == ["vector"]
+    assert len(info.segments) == 1
+    assert info.segments[0].fragment_ids == {0}
+    assert info.segments[0].dataset_version_at_last_update == 1
+    assert info.segments[0].index_version == 1
+    assert info.segments[0].created_at is not None
 
 
 def test_optimize_indices(indexed_dataset):

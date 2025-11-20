@@ -9,7 +9,7 @@ test:
 .PHONY: test
 
 integtest:
-	pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py
+	pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py
 .PHONY: integtest
 
 doctest:
