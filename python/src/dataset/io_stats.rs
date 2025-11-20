@@ -29,8 +29,8 @@ pub struct IoStats {
 impl IoStats {
     fn __repr__(&self) -> String {
         format!(
-            "IOStats(read_iops={}, read_bytes={}, write_iops={}, write_bytes={}, num_hops={})",
-            self.read_iops, self.read_bytes, self.write_iops, self.written_bytes, self.num_hops
+            "IOStats(read_iops={}, read_bytes={}, write_iops={}, write_bytes={})",
+            self.read_iops, self.read_bytes, self.write_iops, self.written_bytes
         )
     }
 }
@@ -42,7 +42,7 @@ impl IoStats {
             read_iops: stats.read_iops,
             read_bytes: stats.read_bytes,
             write_iops: stats.write_iops,
-            written_bytes: stats.write_bytes,
+            written_bytes: stats.written_bytes,
         }
     }
 }
