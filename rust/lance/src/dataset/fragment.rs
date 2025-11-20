@@ -3894,7 +3894,7 @@ mod tests {
         {
             let stats = dataset.object_store().io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4300);
+            assert_io_lt!(stats, written_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.

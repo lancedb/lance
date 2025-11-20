@@ -496,7 +496,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     None,
-                    Some(Arc::new(self.io_tracker.clone())),
+                    Arc::new(self.io_tracker.clone()),
                 )
                 .await
             }
@@ -533,7 +533,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     Some(known_size),
-                    Some(Arc::new(self.io_tracker.clone())),
+                    Arc::new(self.io_tracker.clone()),
                 )
                 .await
             }

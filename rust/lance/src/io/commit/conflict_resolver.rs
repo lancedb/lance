@@ -1970,7 +1970,7 @@ mod tests {
                 );
                 assert!(dataset.object_store().exists(&new_path).await.unwrap());
 
-                assert_io_eq!(io_stats, num_hops, 1);
+                assert_io_eq!(io_stats, num_stages, 1);
             } else {
                 // No IO should have happened.
                 assert_io_eq!(io_stats, read_iops, 0);

@@ -212,7 +212,7 @@ impl Reader for LocalObjectReader {
             source: err.into(),
         });
 
-        if let Ok(_) = &result {
+        if result.is_ok() {
             io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
         }
 

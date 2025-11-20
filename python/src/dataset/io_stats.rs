@@ -22,12 +22,7 @@ pub struct IoStats {
     /// Number of write IO operations performed
     pub write_iops: u64,
     /// Total bytes written to storage
-    pub write_bytes: u64,
-    /// Number of disjoint periods where at least one IO is in-flight
-    ///
-    /// This metric helps understand IO parallelism. A lower number indicates
-    /// more parallel IO operations.
-    pub num_hops: u64,
+    pub written_bytes: u64,
 }
 
 #[pymethods]
@@ -35,7 +30,7 @@ impl IoStats {
     fn __repr__(&self) -> String {
         format!(
             "IOStats(read_iops={}, read_bytes={}, write_iops={}, write_bytes={}, num_hops={})",
-            self.read_iops, self.read_bytes, self.write_iops, self.write_bytes, self.num_hops
+            self.read_iops, self.read_bytes, self.write_iops, self.written_bytes, self.num_hops
         )
     }
 }
@@ -47,8 +42,7 @@ impl IoStats {
             read_iops: stats.read_iops,
             read_bytes: stats.read_bytes,
             write_iops: stats.write_iops,
-            write_bytes: stats.write_bytes,
-            num_hops: stats.num_hops,
+            written_bytes: stats.write_bytes,
         }
     }
 }

@@ -642,7 +642,7 @@ mod tests {
         assert_io_eq!(io_stats, write_iops, 2);
         // We can't write them in parallel. The transaction file must exist before
         // we can write the manifest.
-        assert_io_eq!(io_stats, num_hops, 3);
+        assert_io_eq!(io_stats, num_stages, 3);
     }
 
     #[tokio::test]
@@ -711,7 +711,7 @@ mod tests {
         // of those. We should be able to read in 5 hops.
         if use_cache {
             assert_io_eq!(io_stats, read_iops, 1); // Just list versions
-            assert_io_eq!(io_stats, num_hops, 3);
+            assert_io_eq!(io_stats, num_stages, 3);
         } else {
             // We need to read the other manifests and transactions.
 
@@ -720,7 +720,7 @@ mod tests {
             // It's possible to read the txns for some versions before we
             // finish reading later versions and so the entire "read versions
             // and txs" may appear as 1 hop instead of 2.
-            assert_io_lt!(io_stats, num_hops, 6);
+            assert_io_lt!(io_stats, num_stages, 6);
         }
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
     }
