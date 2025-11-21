@@ -258,7 +258,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "half",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "num",
 ]
 
@@ -2802,7 +2802,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3063,9 +3063,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -3473,12 +3473,12 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.12.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6717a8d2a5a929a1a2eb43a12812498ed141a0bcfb7e8f7844fbdbe4303bba9f"
+checksum = "0ad4bb2b565bca0645f4d68c5c9af97fba094e9791da685bf83cb5f3ce74acf2"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrayref",
  "paste",
@@ -3773,7 +3773,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3856,7 +3856,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3893,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3925,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4099,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4240,7 +4240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a599cb10a9cd92b1300debcef28da8f70b935ec937f44fcd1b70a7c986a11c5c"
 dependencies = [
  "core2",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "rle-decode-fast",
 ]
 
@@ -5047,7 +5047,7 @@ dependencies = [
  "flate2",
  "futures",
  "half",
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "lz4_flex",
  "num",
  "num-bigint",
@@ -5460,7 +5460,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5892,7 +5892,7 @@ version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2057b2325e68a893284d1538021ab90279adac1139957ca2a74426c6f118fb48"
 dependencies = [
- "hashbrown 0.16.0",
+ "hashbrown 0.16.1",
  "memchr",
 ]
 
@@ -8113,18 +8113,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.27"
+version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0894878a5fa3edfd6da3f88c4805f4c8558e2b996227a3d864f47fe11e38282c"
+checksum = "43fa6694ed34d6e57407afbccdeecfa268c470a7d2a5b0cf49ce9fcc345afb90"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.27"
+version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88d2b8d9c68ad2b9e4340d7832716a4d21a22a1154777ad56ea55c51a9cf3831"
+checksum = "c640b22cd9817fae95be82f0d2f90b11f7605f6c319d16705c459b27ac2cbc26"
 dependencies = [
  "proc-macro2",
  "quote",

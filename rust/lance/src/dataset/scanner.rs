@@ -3925,7 +3925,7 @@ mod test {
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_io::utils::tracking_store::IOTracker;
+
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use object_store::throttle::ThrottleConfig;
@@ -6475,15 +6475,10 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
 
-        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
@@ -6503,9 +6498,9 @@ mod test {
             .unwrap();
 
         // First run a full scan to get a baseline
-        let _ = io_tracker.incremental_stats(); // reset
+        let _ = dataset.object_store().io_stats_incremental(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -6517,7 +6512,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -6531,7 +6526,7 @@ mod test {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let io_stats = io_tracker.incremental_stats();
+            let io_stats = dataset.object_store().io_stats_incremental();
             assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
@@ -6545,7 +6540,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let index_scan_bytes = io_stats.read_bytes;
 
@@ -6558,7 +6553,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
@@ -7622,15 +7617,10 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(5));
 
-        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
@@ -7695,7 +7685,7 @@ mod test {
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
@@ -7708,7 +7698,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7720,7 +7710,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7733,7 +7723,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7746,7 +7736,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
     }
 
