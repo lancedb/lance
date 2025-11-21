@@ -1800,7 +1800,7 @@ mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::{ReadParams, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
@@ -1823,8 +1823,6 @@ mod tests {
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-    use lance_io::object_store::ObjectStoreParams;
-    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
@@ -1904,9 +1902,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let mut dataset = Dataset::write(reader, &test_dir, Some(write_params))
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
         let io_tracker = dataset.object_store().io_tracker().clone();
 
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
@@ -1938,6 +1934,7 @@ mod tests {
             meta.size
         );
 
+        // Reset stats collected during index creation
         io_tracker.incremental_stats();
 
         dataset.index_statistics("status_idx").await.unwrap();
