@@ -2641,11 +2641,7 @@ mod tests {
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
-    use lance_io::{
-        assert_io_eq, assert_io_lt,
-        object_store::{ObjectStore, ObjectStoreParams},
-        utils::tracking_store::IOTracker,
-    };
+    use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -3920,12 +3916,7 @@ mod tests {
         )
         .unwrap();
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(IOTracker::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -3938,9 +3929,9 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = io_stats.incremental_stats();
+            let stats = dataset.object_store().io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4300);
+            assert_io_lt!(stats, written_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
@@ -3963,7 +3954,7 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = io_stats.incremental_stats();
+        let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }

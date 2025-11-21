@@ -39,6 +39,7 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::CleanupStats;
+use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
@@ -253,6 +254,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;

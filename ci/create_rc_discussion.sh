@@ -61,7 +61,7 @@ DISCUSSION_BODY="${DISCUSSION_BODY}
 
 #### Python
 \`\`\`bash
-pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==${RC_VERSION}
+pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance==${RC_VERSION}
 \`\`\`
 
 #### Java (Maven)

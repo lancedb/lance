@@ -96,10 +96,12 @@ use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
+use self::io_stats::IoStats;
 
 pub mod blob;
 pub mod cleanup;
 pub mod commit;
+pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
@@ -2043,6 +2045,18 @@ impl Dataset {
 
     fn session(&self) -> Session {
         Session::new(self.ds.session())
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters
+    fn io_stats_snapshot(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_snapshot();
+        IoStats::from_lance(stats)
+    }
+
+    /// Get incremental IO statistics for this dataset
+    fn io_stats_incremental(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_incremental();
+        IoStats::from_lance(stats)
     }
 
     #[staticmethod]
