@@ -1904,32 +1904,10 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let io_tracker = Arc::new(IOTracker::default());
-        let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
-                ..Default::default()
-            }),
-            ..WriteParams::default()
-        };
-
-        Dataset::write(reader, &test_dir, Some(write_params))
+        let mut dataset = Dataset::write(reader, &test_dir, Some(write_params))
             .await
             .unwrap();
-
-        let read_params = ReadParams {
-            store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
-                ..Default::default()
-            }),
-            ..ReadParams::default()
-        };
-
-        let mut dataset = DatasetBuilder::from_uri(&test_dir)
-            .with_read_params(read_params)
-            .load()
-            .await
-            .unwrap();
+        let io_tracker = dataset.object_store().io_tracker().clone();
 
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
@@ -1965,13 +1943,17 @@ mod tests {
         dataset.index_statistics("status_idx").await.unwrap();
 
         let stats = io_tracker.incremental_stats();
-        assert!(
-            stats.read_bytes < 1024,
+        assert_io_lt!(
+            stats,
+            read_bytes,
+            1024,
             "index_statistics should only read metadata, read {} bytes",
             stats.read_bytes
         );
-        assert_eq!(
-            stats.written_bytes, 0,
+        assert_io_eq!(
+            stats,
+            written_bytes,
+            0,
             "index_statistics should not perform writes"
         );
     }
