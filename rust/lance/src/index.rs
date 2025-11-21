@@ -1800,7 +1800,7 @@ mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ReadParams, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
@@ -1971,7 +1971,7 @@ mod tests {
             stats.read_bytes
         );
         assert_eq!(
-            stats.write_bytes, 0,
+            stats.written_bytes, 0,
             "index_statistics should not perform writes"
         );
     }
