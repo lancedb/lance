@@ -53,7 +53,7 @@ The key features of Lance include:
 For more details, see the full [Lance format specification](https://lance.org/format).
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/docs/community/contributing) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/community/contributing/) for more information.
 
 ## Quick Start
 
