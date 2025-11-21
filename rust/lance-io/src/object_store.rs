@@ -38,6 +38,7 @@ pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
+use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
 
@@ -124,6 +125,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// IO tracker for monitoring read/write operations
+    io_tracker: IOTracker,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -370,8 +373,13 @@ impl ObjectStore {
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
+
+            // Always wrap with IO tracking
+            let io_tracker = IOTracker::default();
+            let tracked_store = io_tracker.wrap("", inner);
+
             let store = Self {
-                inner,
+                inner: tracked_store,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -379,6 +387,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                io_tracker,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -471,13 +480,46 @@ impl ObjectStore {
             .unwrap_or(self.io_parallelism)
     }
 
+    /// Get the IO tracker for this object store
+    ///
+    /// The IO tracker can be used to get statistics about read/write operations
+    /// performed on this object store.
+    pub fn io_tracker(&self) -> &IOTracker {
+        &self.io_tracker
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters
+    ///
+    /// Returns the current IO statistics without modifying the internal state.
+    /// Use this when you need to check stats without resetting them.
+    pub fn io_stats_snapshot(&self) -> IoStats {
+        self.io_tracker.stats()
+    }
+
+    /// Get incremental IO statistics since the last call to this method
+    ///
+    /// Returns the accumulated statistics since the last call and resets the
+    /// counters to zero. This is useful for tracking IO operations between
+    /// different stages of processing.
+    pub fn io_stats_incremental(&self) -> IoStats {
+        self.io_tracker.incremental_stats()
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, None).await,
+            "file" => {
+                LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    None,
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -506,7 +548,15 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
+            "file" => {
+                LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    Some(known_size),
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -777,8 +827,12 @@ impl ObjectStore {
             None => store,
         };
 
+        // Always wrap with IO tracking
+        let io_tracker = IOTracker::default();
+        let tracked_store = io_tracker.wrap("", store);
+
         Self {
-            inner: store,
+            inner: tracked_store,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -786,6 +840,7 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            io_tracker,
         }
     }
 }

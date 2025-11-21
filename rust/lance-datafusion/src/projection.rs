@@ -14,7 +14,7 @@ use std::{
 };
 
 use lance_core::{
-    datatypes::{OnMissing, Projectable, Projection, Schema},
+    datatypes::{BlobVersion, OnMissing, Projectable, Projection, Schema},
     Error, Result, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
     ROW_OFFSET, WILDCARD,
 };
@@ -37,11 +37,16 @@ struct ProjectionBuilder {
     needs_row_created_at: bool,
     must_add_row_offset: bool,
     has_wildcard: bool,
+    blob_version: BlobVersion,
 }
 
 impl ProjectionBuilder {
-    fn new(base: Arc<dyn Projectable>) -> Self {
-        let full_schema = Arc::new(Projection::full(base.clone()).to_arrow_schema());
+    fn new(base: Arc<dyn Projectable>, blob_version: BlobVersion) -> Self {
+        let full_schema = Arc::new(
+            Projection::full(base.clone())
+                .with_blob_version(blob_version)
+                .to_arrow_schema(),
+        );
         let full_schema = Arc::new(ProjectionPlan::add_system_columns(&full_schema));
         let planner = Planner::new(full_schema);
 
@@ -58,6 +63,7 @@ impl ProjectionBuilder {
             needs_row_last_updated_at: false,
             must_add_row_offset: false,
             has_wildcard: false,
+            blob_version,
         }
     }
 
@@ -146,6 +152,8 @@ impl ProjectionBuilder {
                 .union_columns(&self.physical_cols, OnMissing::Ignore)?
         };
 
+        physical_projection = physical_projection.with_blob_version(self.blob_version);
+
         physical_projection.with_row_id = self.needs_row_id;
         physical_projection.with_row_addr = self.needs_row_addr || self.must_add_row_offset;
         physical_projection.with_row_last_updated_at_version = self.needs_row_last_updated_at;
@@ -202,8 +210,9 @@ impl ProjectionPlan {
     pub fn from_expressions(
         base: Arc<dyn Projectable>,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
+        blob_version: BlobVersion,
     ) -> Result<Self> {
-        let mut builder = ProjectionBuilder::new(base);
+        let mut builder = ProjectionBuilder::new(base, blob_version);
         builder.add_columns(columns)?;
         builder.build()
     }
@@ -242,7 +251,11 @@ impl ProjectionPlan {
     /// ```
     ///
     /// This is something that cannot be done easily using expressions.
-    pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
+    pub fn from_schema(
+        base: Arc<dyn Projectable>,
+        projection: &Schema,
+        blob_version: BlobVersion,
+    ) -> Result<Self> {
         // Separate data columns from system columns
         // System columns (_rowid, _rowaddr, etc.) are handled via flags in Projection,
         // not as fields in the Schema
@@ -282,7 +295,9 @@ impl ProjectionPlan {
         };
 
         // Calculate the physical projection from data columns only
-        let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
+        let mut physical_projection = Projection::empty(base)
+            .union_schema(&data_schema)
+            .with_blob_version(blob_version);
         physical_projection.with_row_id = with_row_id;
         physical_projection.with_row_addr = with_row_addr;
 
@@ -303,7 +318,7 @@ impl ProjectionPlan {
         })
     }
 
-    pub fn full(base: Arc<dyn Projectable>) -> Result<Self> {
+    pub fn full(base: Arc<dyn Projectable>, blob_version: BlobVersion) -> Result<Self> {
         let physical_cols: Vec<&str> = base
             .schema()
             .fields
@@ -311,8 +326,9 @@ impl ProjectionPlan {
             .map(|f| f.name.as_ref())
             .collect::<Vec<_>>();
 
-        let physical_projection =
-            Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
+        let physical_projection = Projection::empty(base.clone())
+            .union_columns(&physical_cols, OnMissing::Ignore)?
+            .with_blob_version(blob_version);
 
         let requested_output_expr = physical_cols
             .into_iter()
