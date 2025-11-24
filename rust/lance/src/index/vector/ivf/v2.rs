@@ -614,7 +614,7 @@ mod tests {
     use std::collections::HashSet;
     use std::{ops::Range, sync::Arc};
 
-    use all_asserts::{assert_ge, assert_lt};
+    use all_asserts::{assert_ge, assert_le, assert_lt};
     use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
@@ -839,8 +839,7 @@ mod tests {
         let mut values = Vec::with_capacity(total_rows * vectors_per_row * DIM);
         let mut rng = StdRng::seed_from_u64(12345);
         let mut current_id = 0u64;
-        for (_cluster_idx, (&rows, &offset)) in cluster_sizes.iter().zip(offsets.iter()).enumerate()
-        {
+        for (&rows, &offset) in cluster_sizes.iter().zip(offsets.iter()) {
             for _ in 0..rows {
                 ids.push(current_id);
                 current_id += 1;
@@ -875,7 +874,7 @@ mod tests {
         ));
         let schema: Arc<_> = Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
-            Field::new("vector", DataType::List(vector_field.clone()), false),
+            Field::new("vector", DataType::List(vector_field), false),
         ])
         .into();
         let batch = RecordBatch::try_new(schema.clone(), vec![ids_array, list_array]).unwrap();
@@ -2958,8 +2957,9 @@ mod tests {
         // Verify partition count decreased after join
         let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
         let final_num_partitions = final_ctx.num_partitions();
-        assert!(
-            final_num_partitions <= initial_partitions - 1,
+        assert_le!(
+            final_num_partitions,
+            initial_partitions,
             "Partition count should drop after join, was {}, now {}",
             initial_partitions,
             final_num_partitions
