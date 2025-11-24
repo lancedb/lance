@@ -664,7 +664,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .optimize_options
             .as_ref()
             .and_then(|opt| opt.num_indices_to_merge);
-        let no_partition_maintain = || {
+        let no_partition_adjustment = || {
             let is_retrain = self
                 .optimize_options
                 .as_ref()
@@ -686,14 +686,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )
         };
 
-        let (assign_batches, merge_indices, partition_maintain) = if num_indices_to_merge.is_some()
+        let (assign_batches, merge_indices, partition_adjustment) = if num_indices_to_merge
+            .is_some()
             || self.optimize_options.is_none()
         {
-            no_partition_maintain()
+            no_partition_adjustment()
         } else {
-            match Self::check_partition_maintain(ivf, reader.as_ref(), &self.existing_indices)? {
-                Some(partition_maintain) => match partition_maintain {
-                    PartitionMaintain::Split(partition) => {
+            match Self::check_partition_adjustment(ivf, reader.as_ref(), &self.existing_indices)? {
+                Some(partition_adjustment) => match partition_adjustment {
+                    PartitionAdjustment::Split(partition) => {
                         // Perform split and record the fact for downstream build/merge
                         log::info!(
                             "split partition {}, will merge all {} delta indices",
@@ -711,10 +712,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         (
                             split_results.assign_batches,
                             Arc::new(self.existing_indices.clone()),
-                            Some(partition_maintain),
+                            Some(partition_adjustment),
                         )
                     }
-                    PartitionMaintain::Join(partition) => {
+                    PartitionAdjustment::Join(partition) => {
                         log::info!("join partition {}", partition);
                         let results = self.join_partition(partition, ivf).await?;
                         let Some(ivf) = self.ivf.as_mut() else {
@@ -727,11 +728,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         (
                             results.assign_batches,
                             Arc::new(self.existing_indices.clone()),
-                            Some(partition_maintain),
+                            Some(partition_adjustment),
                         )
                     }
                 },
-                None => no_partition_maintain(),
+                None => no_partition_adjustment(),
             }
         };
         self.merged_num = merge_indices.len();
@@ -757,9 +758,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
                     let skip_existing_batches =
-                        partition_maintain == Some(PartitionMaintain::Split(partition));
-                    let partition = match partition_maintain {
-                        Some(PartitionMaintain::Join(joined_partition))
+                        partition_adjustment == Some(PartitionAdjustment::Split(partition));
+                    let partition = match partition_adjustment {
+                        Some(PartitionAdjustment::Join(joined_partition))
                             if partition >= joined_partition =>
                         {
                             partition + 1
@@ -1151,11 +1152,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     // check whether need to split or join partition
-    fn check_partition_maintain(
+    fn check_partition_adjustment(
         ivf: &IvfModel,
         reader: &dyn ShuffleReader,
         existing_indices: &[Arc<dyn VectorIndex>],
-    ) -> Result<Option<PartitionMaintain>> {
+    ) -> Result<Option<PartitionAdjustment>> {
         let index_type = IndexType::try_from(
             index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
         )?;
@@ -1185,9 +1186,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         if let Some(partition) = split_partition {
-            Ok(Some(PartitionMaintain::Split(partition)))
+            Ok(Some(PartitionAdjustment::Split(partition)))
         } else if let Some(partition) = join_partition {
-            Ok(Some(PartitionMaintain::Join(partition)))
+            Ok(Some(PartitionAdjustment::Join(partition)))
         } else {
             Ok(None)
         }
@@ -1945,8 +1946,10 @@ enum ReassignPartition {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum PartitionMaintain {
+enum PartitionAdjustment {
+    /// Split partition at given id
     Split(usize),
+    /// Join partition at given id
     Join(usize),
 }
 
