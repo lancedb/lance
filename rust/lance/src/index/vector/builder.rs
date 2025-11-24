@@ -268,6 +268,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
+        log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].clone();
         let mapping = Arc::new(mapping.clone());
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
@@ -299,7 +300,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         self.merge_partitions(
             stream::iter(build_iter)
-                .buffer_unordered(get_num_compute_intensive_cpus())
+                .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
         )
         .await?;
