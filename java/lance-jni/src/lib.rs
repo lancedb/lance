@@ -39,6 +39,7 @@ macro_rules! ok_or_throw_with_return {
     };
 }
 
+mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
 pub mod error;
@@ -47,9 +48,11 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod merge_insert;
+mod namespace;
 mod optimize;
 mod schema;
 mod sql;
+mod storage_options;
 pub mod traits;
 mod transaction;
 pub mod utils;
@@ -57,6 +60,7 @@ pub mod utils;
 pub use error::Error;
 pub use error::Result;
 pub use ffi::JNIEnvExt;
+pub use storage_options::JavaStorageOptionsProvider;
 
 use env_logger::{Builder, Env};
 use std::env;

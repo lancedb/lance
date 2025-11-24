@@ -97,24 +97,16 @@ impl KeepFiniteVectors {
     }
 }
 
-// We compute L2 distance for f16 in f32 space, so f16 vectors will not overflow.
-const MAX_VIABLE_VALUE_F16: half::f16 = half::f16::MAX;
-// The maximum viable value we can compute f32 l2 distance with on vectors < 10_000 dimensions.
-// (f32::MAX / 40_000.0).sqrt() // Only date we can do this with a const fn.
-const MAX_VIABLE_VALUE_F32: f32 = 9.2e+16;
-// We cast final distance to f32, so f64 vectors have the same limit as f32.
-const MAX_VIABLE_VALUE_F64: f64 = MAX_VIABLE_VALUE_F32 as f64;
-
-fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array, max_value: T::Native) -> bool
+fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
 where
     T::Native: Float,
 {
     arr.null_count() == 0
-        && arr
+        && !arr
             .as_primitive::<T>()
             .values()
             .iter()
-            .all(|&v| v.abs() <= max_value)
+            .any(|&v| !v.is_finite())
 }
 
 impl Transformer for KeepFiniteVectors {
@@ -144,11 +136,11 @@ impl Transformer for KeepFiniteVectors {
             if let Some(data) = arr {
                 let is_valid = match data.data_type() {
                     // f16 vectors are computed in f32 space, so they will not overflow.
-                    DataType::Float16 => is_all_finite::<Float16Type>(&data, MAX_VIABLE_VALUE_F16),
+                    DataType::Float16 => is_all_finite::<Float16Type>(&data),
                     // f32 vectors must be bounded to avoid overflow in distance computation.
-                    DataType::Float32 => is_all_finite::<Float32Type>(&data, MAX_VIABLE_VALUE_F32),
+                    DataType::Float32 => is_all_finite::<Float32Type>(&data),
                     // f32 vectors are computed in f32 space, so they have the same limit as f64.
-                    DataType::Float64 => is_all_finite::<Float64Type>(&data, MAX_VIABLE_VALUE_F64),
+                    DataType::Float64 => is_all_finite::<Float64Type>(&data),
                     DataType::UInt8 => data.null_count() == 0,
                     DataType::Int8 => data.null_count() == 0,
                     _ => false,
@@ -366,19 +358,13 @@ mod tests {
     #[test]
     fn test_is_all_finite() {
         let array = Float32Array::from(vec![1.0, 2.0]);
-        assert!(is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32));
+        assert!(is_all_finite::<Float32Type>(&array));
 
-        let failure_values = [
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NAN,
-            MAX_VIABLE_VALUE_F32 * 2.0,
-            -MAX_VIABLE_VALUE_F32 * 2.0,
-        ];
+        let failure_values = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
         for &v in &failure_values {
             let array = Float32Array::from(vec![1.0, v]);
             assert!(
-                !is_all_finite::<Float32Type>(&array, MAX_VIABLE_VALUE_F32),
+                !is_all_finite::<Float32Type>(&array),
                 "value {} should fail is_all_finite",
                 v
             );
@@ -387,24 +373,24 @@ mod tests {
 
     #[test]
     fn test_finite_f16() {
-        let v1 = vec![MAX_VIABLE_VALUE_F16; 10_000];
-        let v2 = vec![-MAX_VIABLE_VALUE_F16; 10_000];
+        let v1 = vec![f16::MAX; 10_000];
+        let v2 = vec![f16::MAX - f16::from_f32_const(1.0); 10_000];
         let distance = f16::l2(&v1, &v2);
         assert!(distance.is_finite());
     }
 
     #[test]
     fn test_finite_f32() {
-        let v1 = vec![MAX_VIABLE_VALUE_F32; 10_000];
-        let v2 = vec![-MAX_VIABLE_VALUE_F32; 10_000];
+        let v1 = vec![f32::MAX; 10_000];
+        let v2 = vec![f32::MAX - 1.0; 10_000];
         let distance = f32::l2(&v1, &v2);
         assert!(distance.is_finite());
     }
 
     #[test]
     fn test_finite_f64() {
-        let v1 = vec![MAX_VIABLE_VALUE_F64; 10_000];
-        let v2 = vec![-MAX_VIABLE_VALUE_F64; 10_000];
+        let v1 = vec![f64::MAX; 10_000];
+        let v2 = vec![f64::MAX - 1.0; 10_000];
         let distance = f64::l2(&v1, &v2);
         assert!(distance.is_finite());
     }

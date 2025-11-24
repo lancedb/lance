@@ -43,7 +43,9 @@ use lance_core::{
 };
 use lance_file::{
     format::MAGIC,
-    writer::{FileWriter, FileWriterOptions},
+    previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    },
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -81,7 +83,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -379,20 +381,12 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = options.num_indices_to_merge;
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - num_indices_to_merge
-    };
-    let indices_to_merge = existing_indices[start_pos..].to_vec();
-    let merged_num = indices_to_merge.len();
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
-    match index_type {
+    let merged_num = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -404,14 +398,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                     dataset.clone(),
@@ -421,14 +416,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                     shuffler,
                     (),
                     frag_reuse_index,
+                    options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(indices_to_merge)
+                .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
                 .build()
-                .await?;
+                .await?
             }
         }
         // IVF_PQ
@@ -441,14 +437,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
@@ -460,14 +457,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
@@ -478,80 +476,75 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
                 shuffler,
-                None,
-                None,
-                // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
                 frag_reuse_index,
+                options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
+            .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
             .build()
-            .await?;
+            .await?
         }
         (sub_index_type, quantization_type) => {
             unimplemented!(
@@ -560,7 +553,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 quantization_type
             )
         }
-    }
+    };
 
     Ok((new_uuid, merged_num))
 }
@@ -609,7 +602,7 @@ async fn optimize_ivf_pq_indices(
 
     let start_pos = existing_indices
         .len()
-        .saturating_sub(options.num_indices_to_merge);
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
 
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
@@ -683,10 +676,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    let start_pos = if num_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_to_merge
     };
 
     let indices_to_merge = existing_indices[start_pos..]
@@ -701,7 +695,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the HNSW writer
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -725,8 +723,11 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1041,6 +1042,10 @@ impl VectorIndex for IVFIndex {
         unimplemented!("only for v2 IVFIndex")
     }
 
+    fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         unimplemented!("only for v2 IVFIndex")
@@ -1245,6 +1250,9 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
+        warn!("Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid", params.sample_rate);
+    }
 
     // If metric type is cosine, normalize the training data, and after this point,
     // treat the metric type as L2.
@@ -1471,10 +1479,82 @@ pub(crate) async fn remap_index_file_v3(
     mapping: &HashMap<u64, Option<u64>>,
     column: String,
 ) -> Result<()> {
+    let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().child(new_uuid);
-    index
-        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
-        .await
+    let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
+    match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "the field type {} is not supported for FLAT index",
+                    element_type
+                ),
+                location: location!(),
+            }),
+        },
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
+                .remap(mapping)
+                .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1659,7 +1739,11 @@ async fn write_ivf_hnsw_file(
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    let mut writer = PreviousFileWriter::with_object_writer(
+        writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1687,8 +1771,11 @@ async fn write_ivf_hnsw_file(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer =
-        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    let mut aux_writer = PreviousFileWriter::with_object_writer(
+        aux_writer,
+        schema,
+        &PreviousFileWriterOptions::default(),
+    )?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -2310,7 +2397,6 @@ mod tests {
                 removed_indices: vec![],
             },
             None,
-            None,
         );
 
         // Apply the transaction to register the index
@@ -2412,7 +2498,6 @@ mod tests {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
             },
-            None,
             None,
         );
 

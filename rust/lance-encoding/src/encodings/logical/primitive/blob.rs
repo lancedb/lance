@@ -194,7 +194,8 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
             None
         };
 
-        let repdef = RepDefUnraveler::new(rep, def, self.def_meaning.clone());
+        let repdef =
+            RepDefUnraveler::new(rep, def, self.def_meaning.clone(), positions.len() as u64);
 
         Ok(DecodedPage {
             data: decoded.data,
@@ -520,7 +521,7 @@ impl DecodePageTask for BlobDecodePageTask {
 
         Ok(DecodedPage {
             data: data_block,
-            repdef: RepDefUnraveler::new(rep, def, self.def_meaning),
+            repdef: RepDefUnraveler::new(rep, def, self.def_meaning, num_values),
         })
     }
 }

@@ -34,7 +34,6 @@ num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-roaring.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true

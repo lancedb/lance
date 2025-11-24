@@ -45,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -203,6 +204,21 @@ public class DatasetTest {
             assertEquals(3, dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
+
+            List<ManifestSummary> summaries =
+                versions.stream().map(Version::getManifestSummary).collect(Collectors.toList());
+            assertEquals(0, summaries.get(0).getTotalFragments());
+            assertEquals(0, summaries.get(0).getTotalDataFiles());
+            assertEquals(0, summaries.get(0).getTotalDataFileRows());
+            assertEquals(0, summaries.get(0).getTotalRows());
+            assertEquals(1, summaries.get(1).getTotalFragments());
+            assertEquals(1, summaries.get(1).getTotalDataFiles());
+            assertEquals(5, summaries.get(1).getTotalDataFileRows());
+            assertEquals(5, summaries.get(1).getTotalRows());
+            assertEquals(2, summaries.get(2).getTotalFragments());
+            assertEquals(2, summaries.get(2).getTotalDataFiles());
+            assertEquals(8, summaries.get(2).getTotalDataFileRows());
+            assertEquals(8, summaries.get(2).getTotalRows());
           }
         }
       }
@@ -356,7 +372,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException, URISyntaxException {
+  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException {
     Path datasetPath = tempDir.resolve("serialized_manifest");
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -365,24 +381,18 @@ public class DatasetTest {
       try (Dataset dataset1 = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset1.version());
         Path manifestPath = datasetPath.resolve("_versions");
-        Stream<Path> fileStream = Files.list(manifestPath);
-        assertEquals(1, fileStream.count());
-        Path filePath = manifestPath.resolve("1.manifest");
-        byte[] manifestBytes = Files.readAllBytes(filePath);
-        // Need to trim the magic number at end and message length at beginning
-        // https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96
-        byte[] trimmedManifest = Arrays.copyOfRange(manifestBytes, 4, manifestBytes.length - 16);
-        ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
-        manifestBuffer.put(trimmedManifest);
-        manifestBuffer.flip();
-        try (Dataset dataset2 = testDataset.write(1, 5)) {
-          assertEquals(2, dataset2.version());
-          assertEquals(2, dataset2.latestVersion());
-          // When reading from the serialized manifest, it shouldn't know about the second dataset
-          ReadOptions readOptions =
-              new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
-          Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
-          assertEquals(1, dataset1Manifest.version());
+        try (Stream<Path> fileStream = Files.list(manifestPath)) {
+          assertEquals(1, fileStream.count());
+          ByteBuffer manifestBuffer = readManifest(manifestPath.resolve("1.manifest"));
+          try (Dataset dataset2 = testDataset.write(1, 5)) {
+            assertEquals(2, dataset2.version());
+            assertEquals(2, dataset2.latestVersion());
+            // When reading from the serialized manifest, it shouldn't know about the second dataset
+            ReadOptions readOptions =
+                new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
+            Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
+            assertEquals(1, dataset1Manifest.version());
+          }
         }
       }
     }
@@ -1390,6 +1400,276 @@ public class DatasetTest {
         assertEquals(5, allOptions.getBatchSize().get().intValue());
         assertFalse(allOptions.getDeferIndexRemap().get());
       }
+    }
+  }
+
+  /**
+   * This method must be aligned with the implementation in <a
+   * href="https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96">...</a>
+   */
+  public ByteBuffer readManifest(Path filePath) throws IOException {
+    byte[] fileBytes = Files.readAllBytes(filePath);
+    int fileSize = fileBytes.length;
+
+    // Basic file size validation
+    if (fileSize < 16) {
+      throw new IllegalArgumentException("File too small");
+    }
+
+    // Read the last 16 bytes of the file to get metadata
+    // Structure: [manifest_pos (8 bytes)][magic (8 bytes)]
+    ByteBuffer tailBuffer = ByteBuffer.wrap(fileBytes, fileSize - 16, 16);
+    tailBuffer.order(ByteOrder.LITTLE_ENDIAN);
+    long manifestPos = tailBuffer.getLong(); // Read manifest start position
+    // Magic number bytes are read but not validated, we simply skip over them
+    tailBuffer.getLong(); // This reads and skips the 8-byte magic number
+
+    // Remove strict validation since file_size can be larger than manifest_size
+    // due to index and transaction metadata at the beginning of the file
+    // Only ensure manifestPos is not negative and doesn't cause overflow
+    if (manifestPos < 0 || manifestPos >= Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("Invalid manifest position: " + manifestPos);
+    }
+
+    int manifestStart = (int) manifestPos;
+
+    // Verify we have enough data for the length field
+    if (manifestStart + 4 > fileSize) {
+      throw new IllegalArgumentException("Manifest position beyond file bounds");
+    }
+
+    // Calculate the actual length of the protobuf data
+    // The structure is: [4-byte length][protobuf data][8-byte manifest_pos][8-byte magic]
+    byte[] trimmedManifest =
+        Arrays.copyOfRange(fileBytes, manifestStart + 4, fileBytes.length - 16);
+    ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
+    manifestBuffer.put(trimmedManifest);
+    manifestBuffer.flip();
+    return manifestBuffer;
+  }
+
+  @Test
+  void testShallowClone(@TempDir Path tempDir) {
+    String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
+    String dstPathByVersion = tempDir.resolve("shallow_clone_version_dst").toString();
+    String dstPathByTag = tempDir.resolve("shallow_clone_tag_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      // Prepare a simple source dataset with some rows
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      try (Dataset src = suite.write(1, 5)) { // write 5 rows -> version 2
+        assertEquals(2, src.version());
+        long srcRowCount = src.countRows();
+        Schema srcSchema = src.getSchema();
+
+        // shallow clone by version
+        try (Dataset clone = src.shallowClone(dstPathByVersion, Ref.ofMain(src.version()))) {
+          // Validate the version cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByVersion, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByVersion, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+
+        // shallow clone by tag
+        src.tags().create("tag", src.version());
+        try (Dataset clone = src.shallowClone(dstPathByTag, Ref.ofTag("tag"))) {
+          // Validate the tag cloned dataset
+          assertNotNull(clone);
+          assertEquals(dstPathByTag, clone.uri());
+          assertEquals(srcSchema.getFields(), clone.getSchema().getFields());
+          assertEquals(srcRowCount, clone.countRows());
+        }
+
+        // Ensure the dataset at targetPath can be opened successfully
+        try (Dataset opened =
+            Dataset.open(allocator, dstPathByTag, new ReadOptions.Builder().build())) {
+          assertNotNull(opened);
+          assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
+          assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testBranches(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testBranches").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      try (Dataset mainV1 = suite.createEmptyDataset()) {
+        assertEquals(1, mainV1.version());
+
+        // Step 1. write to main dataset, 5 rows -> main:2
+        try (Dataset mainV2 = suite.write(1, 5)) {
+          assertEquals(2, mainV2.version());
+          assertEquals(5, mainV2.countRows());
+
+          // Step2. create branch2 based on main:2
+          try (Dataset branch1V2 = mainV2.branches().create("branch1", 2)) {
+            assertEquals(2, branch1V2.version());
+
+            // Write batch B on branch1: 3 rows -> global@3
+            FragmentMetadata fragB = suite.createNewFragment(3);
+            Append appendB = Append.builder().fragments(Collections.singletonList(fragB)).build();
+            try (Dataset branch1V3 =
+                branch1V2.newTransactionBuilder().operation(appendB).build().commit()) {
+              assertEquals(3, branch1V3.version());
+              assertEquals(8, branch1V3.countRows()); // A(5) + B(3)
+
+              // Step 3. Create branch2 based on branch1's latest version (simulate tag 't1')
+              mainV1.tags().create("tag", 3, "branch1");
+
+              try (Dataset branch2V3 = branch1V2.branches().create("branch2", "tag")) {
+                assertEquals(3, branch2V3.version());
+                assertEquals(8, branch2V3.countRows()); // A(5) + B(3)
+
+                // Step 4. Write batch C on branch2: 2 rows -> branch2:4
+                FragmentMetadata fragC = suite.createNewFragment(2);
+                Append appendC = Append.builder().fragments(Arrays.asList(fragC)).build();
+                try (Dataset branch2V4 =
+                    branch2V3.newTransactionBuilder().operation(appendC).build().commit()) {
+                  assertEquals(4, branch2V4.version());
+                  assertEquals(10, branch2V4.countRows()); // A(5) + B(3) + C(2)
+
+                  // Step 5. Validate branch listing metadata;
+                  // delete branch1;
+                  // validate listing again
+                  List<Branch> branches = branch2V4.branches().list();
+                  Optional<Branch> b1 =
+                      branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  Optional<Branch> b2 =
+                      branches.stream().filter(b -> b.getName().equals("branch2")).findFirst();
+                  assertTrue(b1.isPresent(), "branch1 should be listed");
+                  assertTrue(b2.isPresent(), "branch2 should be listed");
+                  Branch branch1Meta = b1.get();
+                  Branch branch2Meta = b2.get();
+
+                  // Metadata fields and consistency checks
+                  assertEquals("branch1", branch1Meta.getName());
+                  assertEquals(2, branch1Meta.getParentVersion());
+                  assertFalse(branch1Meta.getParentBranch().isPresent());
+                  assertTrue(branch1Meta.getCreateAt() > 0);
+                  assertTrue(branch1Meta.getManifestSize() > 0);
+
+                  assertEquals("branch2", branch2Meta.getName());
+                  assertTrue(branch2Meta.getParentBranch().isPresent());
+                  assertEquals("branch1", branch2Meta.getParentBranch().get());
+                  assertEquals(3, branch2Meta.getParentVersion());
+                  assertTrue(branch2Meta.getCreateAt() > 0);
+                  assertTrue(branch2Meta.getManifestSize() > 0);
+
+                  // Delete branch1 and verify listing
+                  try {
+                    mainV2.branches().delete("branch1");
+                  } catch (Exception ignored) {
+                    // Some environments may report NotFound on cleanup; ignore and proceed
+                  }
+                  List<Branch> branchListAfterDelete = mainV2.branches().list();
+                  assertTrue(
+                      branchListAfterDelete.stream().noneMatch(b -> b.getName().equals("branch1")),
+                      "branch1 should be deleted");
+
+                  Optional<Branch> branch2AfterDelete =
+                      branchListAfterDelete.stream()
+                          .filter(b -> b.getName().equals("branch2"))
+                          .findFirst();
+                  assertTrue(branch2AfterDelete.isPresent(), "branch2 should remain");
+                  assertEquals(branch2Meta, branch2AfterDelete.get());
+
+                  // Step 6. use checkout_branch to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2"))) {
+                    assertEquals(4, branch2V4New.version());
+                    assertEquals(10, branch2V4New.countRows()); // A(5) + B(3) + C(2)
+                  }
+
+                  // Step 7. use checkout reference to checkout branch2
+                  try (Dataset branch2V4New = mainV2.checkout(Ref.ofBranch("branch2", 3))) {
+                    assertEquals(3, branch2V4New.version());
+                    assertEquals(8, branch2V4New.countRows()); // A(5) + B(3)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ===== Blob API tests =====
+  @Test
+  void testReadZeroLengthBlob(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadZeroLengthBlob").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(0L), "blobs");
+      assertEquals(1, blobs.size());
+      BlobFile blobFile = blobs.get(0);
+      assertEquals(0L, blobFile.size());
+      assertArrayEquals(new byte[0], blobFile.read());
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 1_000_000, "expected large blob size");
+      byte[] data1 = blobFile.readUpTo(256);
+      assertEquals(256, data1.length);
+      assertEquals(256L, blobFile.tell());
+      blobFile.seek(512);
+      byte[] range = blobFile.readUpTo(256);
+      assertEquals(256, range.length);
+      assertEquals(768L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertEquals(size, all.length);
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 256), data1);
+      assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadSmallBlobSequentialIntegrity(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadSmallBlobSequentialIntegrity").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs");
+      BlobFile blobFile = blobs.get(0);
+      long size = blobFile.size();
+      assertTrue(size >= 128, "expected small blob size");
+
+      blobFile.seek(0);
+      byte[] data1 = blobFile.readUpTo(64);
+      byte[] data2 = blobFile.readUpTo(64);
+      byte[] restData = blobFile.read();
+      byte[] combined = new byte[data1.length + data2.length + restData.length];
+      System.arraycopy(data1, 0, combined, 0, data1.length);
+      System.arraycopy(data2, 0, combined, data2.length, data2.length);
+      System.arraycopy(restData, 0, combined, data1.length + data2.length, restData.length);
+
+      blobFile.seek(0);
+      byte[] allData = blobFile.read();
+      assertArrayEquals(allData, combined);
+      blobFile.close();
     }
   }
 }

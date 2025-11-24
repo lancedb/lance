@@ -98,6 +98,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             crate::dataset::WhenMatched::DoNothing => "DoNothing",
             crate::dataset::WhenMatched::UpdateAll => "UpdateAll",
             crate::dataset::WhenMatched::UpdateIf(_) => "UpdateIf",
+            crate::dataset::WhenMatched::Fail => "Fail",
         };
         let when_not_matched = if self.params.insert_not_matched {
             "InsertAll"

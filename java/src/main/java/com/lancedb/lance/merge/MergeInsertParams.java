@@ -88,6 +88,19 @@ public class MergeInsertParams {
   }
 
   /**
+   * Specify that when a row in the source table matches a row in the target table, the entire merge
+   * operation will fail with an error.
+   *
+   * <p>This can be used to ensure that no existing rows are overwritten or modified after inserted.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedFail() {
+    this.whenMatched = WhenMatched.Fail;
+    return this;
+  }
+
+  /**
    * Specify what should happen when a source row has no match in the target.
    *
    * @param whenNotMatched The action to take when a source row has no match in the target.
@@ -284,6 +297,12 @@ public class MergeInsertParams {
      * true.
      */
     UpdateIf,
+
+    /**
+     * The operation will fail if a match is found between the source and target table. This can be
+     * used to ensure that no existing rows are overwritten or modified after inserted.
+     */
+    Fail,
   }
 
   public enum WhenNotMatched {

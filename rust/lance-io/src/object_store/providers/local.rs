@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
@@ -31,6 +31,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
@@ -47,6 +48,15 @@ impl ObjectStoreProvider for FileStoreProvider {
                 location!(),
             )
         })
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        scheme: &str,
+        _authority: &str,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok(scheme.to_string())
     }
 }
 
@@ -72,6 +82,28 @@ mod tests {
             let path = provider.extract_path(&url).unwrap();
             assert_eq!(path.as_ref(), expected_path, "uri: '{}'", uri);
         }
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file",
+            provider
+                .calculate_object_store_prefix("file", "etc", None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_for_file_object_store() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file-object-store",
+            provider
+                .calculate_object_store_prefix("file-object-store", "etc", None)
+                .unwrap()
+        );
     }
 
     #[test]

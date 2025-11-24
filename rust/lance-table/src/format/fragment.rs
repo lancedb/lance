@@ -14,6 +14,9 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::rowids::version::{
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+};
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -54,6 +57,7 @@ impl DataFile {
         file_major_version: u32,
         file_minor_version: u32,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -62,7 +66,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
-            base_id: None,
+            base_id,
         }
     }
 
@@ -83,7 +87,11 @@ impl DataFile {
         }
     }
 
-    pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
+    pub fn new_legacy_from_fields(
+        path: impl Into<String>,
+        fields: Vec<i32>,
+        base_id: Option<u32>,
+    ) -> Self {
         Self::new(
             path,
             fields,
@@ -91,6 +99,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             None,
+            base_id,
         )
     }
 
@@ -98,6 +107,7 @@ impl DataFile {
         path: impl Into<String>,
         schema: &Schema,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
@@ -108,6 +118,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             file_size_bytes,
+            base_id,
         )
     }
 
@@ -281,6 +292,14 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Last updated at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Created at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -291,6 +310,8 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -324,10 +345,12 @@ impl Fragment {
     ) -> Self {
         Self {
             id,
-            files: vec![DataFile::new_legacy(path, schema, None)],
+            files: vec![DataFile::new_legacy(path, schema, None, None)],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -347,6 +370,7 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         );
         self.files.push(data_file);
         self
@@ -373,12 +397,14 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         ));
     }
 
     /// Add a new [`DataFile`] to this fragment.
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
-        self.files.push(DataFile::new_legacy(path, schema, None));
+        self.files
+            .push(DataFile::new_legacy(path, schema, None, None));
     }
 
     // True if this fragment is made up of legacy v1 files, false otherwise
@@ -446,6 +472,14 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            last_updated_at_version_meta: p
+                .last_updated_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
+            created_at_version_meta: p
+                .created_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -476,13 +510,17 @@ impl From<&Fragment> for pb::DataFragment {
                 })
             }
         });
-
+        let last_updated_at_version_sequence =
+            last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
+        let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            last_updated_at_version_sequence,
+            created_at_version_sequence,
         }
     }
 }
@@ -519,6 +557,7 @@ mod tests {
             vec![DataFile::new_legacy_from_fields(
                 path.to_string(),
                 vec![0, 1, 2, 3],
+                None,
             )]
         )
     }

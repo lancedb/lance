@@ -203,19 +203,6 @@ impl UpdateBuilder {
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .any(|f| !f.is_default_storage())
-        {
-            return Err(Error::NotSupported {
-                source: "Updating datasets containing non-default storage columns".into(),
-                location: location!(),
-            });
-        }
-
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
@@ -322,23 +309,16 @@ impl UpdateJob {
             .manifest()
             .data_storage_format
             .lance_file_version()?;
-        let written = write_fragments_internal(
+        let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
             WriteParams::with_storage_version(version),
+            None, // TODO: support multiple bases for update
         )
         .await?;
-
-        if written.blob.is_some() {
-            return Err(Error::NotSupported {
-                source: "Updating blob columns".into(),
-                location: location!(),
-            });
-        }
-        let mut new_fragments = written.default.0;
 
         let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
             message: format!("Failed to receive row ids: {}", err),
@@ -413,12 +393,7 @@ impl UpdateJob {
             update_mode: Some(RewriteRows),
         };
 
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
@@ -453,7 +428,7 @@ impl UpdateJob {
 
         enum FragmentChange {
             Unchanged,
-            Modified(Fragment),
+            Modified(Box<Fragment>),
             Removed(u64),
         }
 
@@ -468,7 +443,7 @@ impl UpdateJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -483,7 +458,7 @@ impl UpdateJob {
         while let Some(res) = stream.next().await.transpose()? {
             match res {
                 FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
                 FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
             }
         }
@@ -716,7 +691,19 @@ mod tests {
         assert_eq!(fragments.len(), 3);
 
         // One fragment not touched (id = 0..10)
-        assert_eq!(fragments[0].metadata, original_fragments[0].metadata,);
+        assert_eq!(fragments[0].metadata.id, original_fragments[0].metadata.id);
+        assert_eq!(
+            fragments[0].metadata.files,
+            original_fragments[0].metadata.files
+        );
+        assert_eq!(
+            fragments[0].metadata.physical_rows,
+            original_fragments[0].metadata.physical_rows
+        );
+        assert_eq!(
+            fragments[0].metadata.row_id_meta,
+            original_fragments[0].metadata.row_id_meta
+        );
         // One fragment partially modified (id = 10..15)
         assert_eq!(
             fragments[1].metadata.files,

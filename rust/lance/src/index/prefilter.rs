@@ -32,9 +32,9 @@ use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
-use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
+use crate::Result;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 

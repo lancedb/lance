@@ -23,9 +23,6 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=line-tables-only"
   RUST_BACKTRACE: "1"
   CI: "true"
   # Color output for pytest is off by default.
@@ -60,8 +57,6 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Install linting tools
         run: |
           pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
@@ -79,14 +74,14 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
+          cargo clippy  --profile ci --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
           pip install maturin
-          maturin develop --locked --extras tests,ray
+          maturin develop --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate
@@ -115,9 +110,9 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
       - name: Upload wheels as artifacts
         if: ${{ matrix.python-minor-version == '13' }}
@@ -126,13 +121,11 @@ jobs:
           name: linux-wheels
           path: python/target/wheels/pylance-*.whl
 
-  forward-compat:
+  compat:
     needs: linux
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
-    name: Forward Compatibility Tests (${{ matrix.lance-version }})
-    strategy:
-      matrix:
-        lance-version: ["0.16.0", "0.30.0", "0.36.0"]
+    name: Compatibility Tests
     defaults:
       run:
         shell: bash
@@ -154,20 +147,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install $(ls wheels/pylance-*.whl)[tests,ray]
-      - name: Generate forward compatibility files
-        env:
-          PYTHONPATH: python/tests
-        run: python -m forward_compat.datagen
-      - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
+      - name: Run compatibility tests
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pytest pylance==${{ matrix.lance-version }}
-          pytest python/tests/forward_compat --run-forward
+          make compattest
+        env:
+          COMPAT_TEMP_VENV: 1
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: ubuntu-2404-4x-arm64
+    runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
@@ -186,12 +174,11 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
           manylinux: "2_28"
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
@@ -200,7 +187,7 @@ jobs:
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
-    runs-on: "macos-14"
+    runs-on: "macos-14-xlarge"
     defaults:
       run:
         shell: bash
@@ -218,9 +205,9 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_mac_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
         with:
           skip-torch: "true"
@@ -241,9 +228,9 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_windows_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
@@ -265,9 +252,9 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           pip install ray[data]

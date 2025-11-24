@@ -712,10 +712,15 @@ impl IndexedExpression {
     fn maybe_not(self) -> Option<Self> {
         match (self.scalar_query, self.refine_expr) {
             (Some(_), Some(_)) => None,
-            (Some(scalar_query), None) => Some(Self {
-                scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
-                refine_expr: None,
-            }),
+            (Some(scalar_query), None) => {
+                if scalar_query.needs_recheck() {
+                    return None;
+                }
+                Some(Self {
+                    scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
+                    refine_expr: None,
+                })
+            }
             (None, Some(refine_expr)) => Some(Self {
                 scalar_query: None,
                 refine_expr: Some(Expr::Not(Box::new(refine_expr))),
@@ -1670,6 +1675,7 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_schema::{Field, Schema};
+    use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
@@ -1734,7 +1740,7 @@ mod tests {
         let state = ctx.state();
         let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
         if optimize {
-            let props = ExecutionProps::default();
+            let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
             let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
             let simplifier =
                 datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);

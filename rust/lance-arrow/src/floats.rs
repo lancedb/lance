@@ -75,8 +75,10 @@ impl TryFrom<&Field> for FloatType {
     }
 }
 
-/// Trait for float types used in Arrow Array.
+/// Trait for float types used in Lance indexes
 ///
+/// This mimics the utilities provided by [`arrow_array::ArrowPrimitiveType`]
+/// but applies to all float types (including bfloat16)
 pub trait ArrowFloatType: Debug {
     type Native: FromPrimitive
         + FloatToArrayType<ArrowType = Self>
@@ -97,6 +99,11 @@ pub trait ArrowFloatType: Debug {
     }
 }
 
+/// Trait to be implemented by native types that have a corresponding [`ArrowFloatType`]
+/// implementation.
+///
+/// This helps define what operations are supported by native floats and also helps convert
+/// from a native type back to the corresponding Arrow float type.
 pub trait FloatToArrayType:
     Float
     + Bounded
@@ -109,6 +116,7 @@ pub trait FloatToArrayType:
     + Sync
     + Copy
 {
+    /// The corresponding [`ArrowFloatType`] implementation for this native type
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 
@@ -168,7 +176,10 @@ impl ArrowFloatType for Float64Type {
     type ArrayType = Float64Array;
 }
 
-/// [FloatArray] is a trait that is implemented by all float type arrays.
+/// [FloatArray] is a trait that is implemented by all float type arrays
+///
+/// This is similar to [`arrow_array::PrimitiveArray`] but applies to all float types (including bfloat16)
+/// and is implemented as a trait and not a struct
 pub trait FloatArray<T: ArrowFloatType + ?Sized>:
     Array + Clone + From<Vec<T::Native>> + 'static
 {
@@ -202,7 +213,10 @@ impl FloatArray<Float64Type> for Float64Array {
     }
 }
 
-/// Convert a float32 array to another float array.
+/// Convert a float32 array to another float array
+///
+/// This is used during queries as query vectors are always provided as float32 arrays
+/// and need to be converted to the appropriate float type for the index.
 pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Arc<dyn Array>> {
     match float_type {
         FloatType::BFloat16 => Ok(Arc::new(BFloat16Array::from_iter_values(

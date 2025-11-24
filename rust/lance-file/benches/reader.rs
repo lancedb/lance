@@ -9,12 +9,10 @@ use futures::{FutureExt, StreamExt};
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::{
-    v2::{
-        reader::{FileReader, FileReaderOptions},
-        testing::test_cache,
-        writer::{FileWriter, FileWriterOptions},
-    },
+    reader::{FileReader, FileReaderOptions},
+    testing::test_cache,
     version::LanceFileVersion,
+    writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::{
     object_store::ObjectStore,

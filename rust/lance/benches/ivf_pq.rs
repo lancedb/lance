@@ -10,11 +10,11 @@ use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use lance::{
-    arrow::*,
     dataset::{WriteMode, WriteParams},
     index::vector::VectorIndexParams,
     Dataset,
 };
+use lance_arrow::*;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;

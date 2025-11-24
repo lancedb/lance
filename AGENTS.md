@@ -125,3 +125,24 @@ Tests:
   /// # }
   /// ```
   ```
+
+## Review Guidelines
+
+Please consider the following when reviewing code contributions.
+
+### Rust API design
+* Design public APIs so they can be evolved easily in the future without breaking
+  changes. Often this means using builder patterns or options structs instead of
+  long argument lists.
+* For public APIs, prefer inputs that use `Into<T>` or `AsRef<T>` traits to allow
+  more flexible inputs. For example, use `name: Into<String>` instead of `name: String`,
+  so we don't have to write `func("my_string".to_string())`.
+
+### Testing
+* Ensure all new public APIs have documentation and examples.
+* Ensure that all bugfixes and features have corresponding tests. **We do not merge
+  code without tests.**
+
+### Documentation
+* New features must include updates to the rust documentation comments. Link to
+  relevant structs and methods to increase the value of documentation.

@@ -748,7 +748,7 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::info!(
+        log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
@@ -756,6 +756,10 @@ impl IvfSubIndex for HNSW {
             hnsw.inner.params.ef_construction,
             storage.distance_type(),
         );
+
+        if storage.is_empty() {
+            return Ok(hnsw);
+        }
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
@@ -770,8 +774,14 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
-    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        unimplemented!("HNSW remap is not supported yet");
+    fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>, // we don't need the mapping here because we rebuild the graph from remapped storage
+        store: &impl VectorStore,
+    ) -> Result<Self> {
+        // We can't simply remap the row ids in the graph because the vectors are changed,
+        // so the graph needs to be rebuilt.
+        Self::index_vectors(store, self.inner.params.clone())
     }
 
     /// Encode the sub index into a record batch
@@ -830,9 +840,11 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_file::{
-        reader::FileReader,
-        writer::{FileWriter, FileWriterOptions},
+    use lance_file::previous::{
+        reader::FileReader as PreviousFileReader,
+        writer::{
+            FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+        },
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
@@ -877,10 +889,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = FileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &FileWriterOptions::default(),
+            &PreviousFileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -888,7 +900,7 @@ mod tests {
         writer.write_record_batch(batch).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader

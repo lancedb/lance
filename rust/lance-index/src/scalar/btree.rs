@@ -982,12 +982,6 @@ impl BTreeIndex {
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
     ) -> Result<SendableRecordBatchStream> {
-        let data_type = new_data.schema().field(0).data_type().clone();
-        // Datafusion currently has bugs with spilling on string columns
-        // See https://github.com/apache/datafusion/issues/10073
-        //
-        // One we upgrade we can remove this
-        let use_spilling = !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
@@ -1012,7 +1006,7 @@ impl BTreeIndex {
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
-                use_spilling,
+                use_spilling: true,
                 ..Default::default()
             },
         )?;
@@ -1921,6 +1915,10 @@ pub struct BTreeIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn name(&self) -> &str {
+        "BTree"
+    }
+
     fn new_training_request(
         &self,
         params: &str,

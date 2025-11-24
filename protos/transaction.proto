@@ -68,6 +68,8 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
     // Key-value pairs to merge with existing config.
     map<string, string> config_upsert_values = 4;
+    // The base paths to be added for the initial dataset creation
+    repeated BasePath initial_bases = 5;
   }
 
   // Add or replace a new secondary index.
@@ -271,6 +273,12 @@ message Transaction {
     repeated MemWalIndexDetails.MemWal removed = 3;
   }
 
+  // An operation that updates base paths in the dataset.
+  message UpdateBases {
+    // The new base paths to add to the manifest.
+    repeated BasePath new_bases = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -287,11 +295,10 @@ message Transaction {
     DataReplacement data_replacement = 111;
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
+    UpdateBases update_bases = 114;
   }
 
-  // An operation to apply to the blob dataset
-  oneof blob_operation {
-    Append blob_append = 200;
-    Overwrite blob_overwrite = 202;
-  }  
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 200, 202;
+  reserved "blob_append", "blob_overwrite";
 }

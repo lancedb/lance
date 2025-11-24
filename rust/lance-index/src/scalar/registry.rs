@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_core::{cache::LanceCache, Error, Result};
-use snafu::location;
+use lance_core::{cache::LanceCache, Result};
 
-use crate::pb;
-use crate::pbold;
+use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
-    scalar::{
-        bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
-        CreatedIndex, IndexStore, ScalarIndex,
-    },
+    scalar::{expression::ScalarQueryParser, CreatedIndex, IndexStore, ScalarIndex},
 };
 
 pub const VALUE_COLUMN_NAME: &str = "value";
@@ -123,6 +116,16 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex>;
 
+    /// A short name for the index
+    ///
+    /// This is a friendly name for display purposes and also can be used as an alias for
+    /// the index type URL.  If multiple plugins have the same name, then the first one
+    /// found will be used.
+    ///
+    /// By convention this is MixedCase with no spaces.  When used as an alias, it will be
+    /// compared case-insensitively.
+    fn name(&self) -> &str;
+
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
@@ -154,82 +157,15 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Optional hook that plugins can use if they need to be aware of the registry
-    fn attach_registry(&self, _registry: Arc<ScalarIndexPluginRegistry>) {}
-}
+    fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
 
-/// A registry of scalar index plugins
-pub struct ScalarIndexPluginRegistry {
-    plugins: HashMap<String, Box<dyn ScalarIndexPlugin>>,
-}
-
-impl ScalarIndexPluginRegistry {
-    fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
-        let details_name = details_name.to_lowercase();
-        if details_name.ends_with("indexdetails") {
-            details_name.replace("indexdetails", "")
-        } else {
-            details_name
-        }
-    }
-
-    /// Adds a plugin to the registry, using the name of the details message to determine
-    /// the plugin name.
+    /// Returns a JSON string representation of the provided index details
     ///
-    /// The plugin name will be the lowercased name of the details message with any trailing
-    /// "indexdetails" removed.
-    ///
-    /// For example, if the details message is `BTreeIndexDetails`, the plugin name will be
-    /// `btree`.
-    pub fn add_plugin<
-        DetailsType: prost::Message + prost::Name,
-        PluginType: ScalarIndexPlugin + std::default::Default + 'static,
-    >(
-        &mut self,
-    ) {
-        let plugin_name = self.get_plugin_name_from_details_name(DetailsType::NAME);
-        self.plugins
-            .insert(plugin_name, Box::new(PluginType::default()));
-    }
-
-    /// Create a registry with the default plugins
-    pub fn with_default_plugins() -> Arc<Self> {
-        let mut registry = Self {
-            plugins: HashMap::new(),
-        };
-        registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
-        registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
-        registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
-        registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
-        registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
-        registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
-        registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
-        registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
-
-        let registry = Arc::new(registry);
-        for plugin in registry.plugins.values() {
-            plugin.attach_registry(registry.clone());
-        }
-
-        registry
-    }
-
-    /// Get an index plugin suitable for training an index with the given parameters
-    pub fn get_plugin_by_name(&self, name: &str) -> Result<&dyn ScalarIndexPlugin> {
-        self.plugins
-            .get(name)
-            .map(|plugin| plugin.as_ref())
-            .ok_or_else(|| Error::InvalidInput {
-                source: format!("No scalar index plugin found for name {}", name).into(),
-                location: location!(),
-            })
-    }
-
-    pub fn get_plugin_by_details(
-        &self,
-        details: &prost_types::Any,
-    ) -> Result<&dyn ScalarIndexPlugin> {
-        let details_name = details.type_url.split('.').next_back().unwrap();
-        let plugin_name = self.get_plugin_name_from_details_name(details_name);
-        self.get_plugin_by_name(&plugin_name)
+    /// These details will be user-visible and should be considered part of the public
+    /// API.  As a result, efforts should be made to ensure the information is backwards
+    /// compatible and avoid breaking changes.
+    fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
+        // Return an empty JSON object as the default implementation
+        Ok(serde_json::json!({}))
     }
 }

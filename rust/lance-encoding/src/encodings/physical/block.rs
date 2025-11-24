@@ -27,8 +27,12 @@ use snafu::location;
 
 use std::str::FromStr;
 
-use crate::format::pb21::{self, CompressiveEncoding};
-use crate::format::ProtobufUtils21;
+use crate::compression::{BlockCompressor, BlockDecompressor};
+use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
+use crate::format::{
+    pb21::{self, CompressiveEncoding},
+    ProtobufUtils21,
+};
 use crate::{
     buffer::LanceBuffer,
     compression::VariablePerValueDecompressor,
@@ -386,6 +390,33 @@ impl GeneralBufferCompressor {
     }
 }
 
+/// A block decompressor that first applies general-purpose compression (LZ4/Zstd)
+/// before delegating to an inner block decompressor.
+#[derive(Debug)]
+pub struct GeneralBlockDecompressor {
+    inner: Box<dyn BlockDecompressor>,
+    compressor: Box<dyn BufferCompressor>,
+}
+
+impl GeneralBlockDecompressor {
+    pub fn try_new(
+        inner: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+    ) -> Result<Self> {
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        Ok(Self { inner, compressor })
+    }
+}
+
+impl BlockDecompressor for GeneralBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+        self.inner
+            .decompress(LanceBuffer::from(decompressed), num_values)
+    }
+}
+
 // An encoder which uses generic compression, such as zstd/lz4 to encode buffers
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
@@ -544,6 +575,40 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
     }
 }
 
+impl BlockCompressor for CompressedBufferEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let encoded = match data {
+            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+            DataBlock::VariableWidth(variable_width) => {
+                // Wrap VariableEncoder to handle the encoding
+                let encoder = VariableEncoder::default();
+                BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Unsupported data block type".into(),
+                    location: location!(),
+                })
+            }
+        };
+
+        let mut compressed = Vec::new();
+        self.compressor.compress(&encoded, &mut compressed)?;
+        Ok(LanceBuffer::from(compressed))
+    }
+}
+
+impl BlockDecompressor for CompressedBufferEncoder {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+
+        // Delegate to BinaryBlockDecompressor which handles the inline metadata
+        let inner_decoder = BinaryBlockDecompressor::default();
+        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +731,7 @@ mod tests {
 
         use super::*;
 
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
         use crate::{
             constants::{
                 COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
@@ -706,6 +772,8 @@ mod tests {
                 // Some bad cardinality estimatation causes us to use dictionary encoding currently
                 // which causes the expected encoding check to fail.
                 field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+                // Also disable size-based dictionary encoding
                 field_meta.insert(
                     STRUCTURAL_ENCODING_META_KEY.to_string(),
                     STRUCTURAL_ENCODING_FULLZIP.to_string(),

@@ -30,7 +30,7 @@ pub struct InvertedIndexParams {
     /// lance tokenizer takes care of different data types, such as text, json, etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
-    /// - default: text
+    /// - none: auto type inference
     pub(crate) lance_tokenizer: Option<String>,
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
@@ -70,6 +70,11 @@ pub struct InvertedIndexParams {
     #[serde(default = "bool_true")]
     pub(crate) remove_stop_words: bool,
 
+    /// use customized stop words.
+    /// - `None`: use built-in stop words based on language
+    /// - `Some(words)`: use customized stop words
+    pub(crate) custom_stop_words: Option<Vec<String>>,
+
     /// ascii folding
     #[serde(default = "bool_true")]
     pub(crate) ascii_folding: bool,
@@ -103,6 +108,33 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
+        })
+    }
+}
+
+impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
+    type Error = Error;
+
+    fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            lance_tokenizer: defaults.lance_tokenizer,
+            base_tokenizer: details
+                .base_tokenizer
+                .as_ref()
+                .cloned()
+                .unwrap_or(defaults.base_tokenizer),
+            language: serde_json::from_str(details.language.as_str())?,
+            with_position: details.with_position,
+            max_token_length: details.max_token_length.map(|l| l as usize),
+            lower_case: details.lower_case,
+            stem: details.stem,
+            remove_stop_words: details.remove_stop_words,
+            custom_stop_words: defaults.custom_stop_words,
+            ascii_folding: details.ascii_folding,
+            min_ngram_length: details.min_ngram_length,
+            max_ngram_length: details.max_ngram_length,
+            prefix_only: details.prefix_only,
         })
     }
 }
@@ -141,7 +173,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
-            lance_tokenizer: Some("text".to_owned()),
+            lance_tokenizer: None,
             base_tokenizer,
             language,
             with_position: false,
@@ -149,6 +181,7 @@ impl InvertedIndexParams {
             lower_case: true,
             stem: true,
             remove_stop_words: true,
+            custom_stop_words: None,
             ascii_folding: true,
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
@@ -203,6 +236,11 @@ impl InvertedIndexParams {
         self
     }
 
+    pub fn custom_stop_words(mut self, custom_stop_words: Option<Vec<String>>) -> Self {
+        self.custom_stop_words = custom_stop_words;
+        self
+    }
+
     pub fn ascii_folding(mut self, ascii_folding: bool) -> Self {
         self.ascii_folding = ascii_folding;
         self
@@ -245,16 +283,20 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = tantivy::tokenizer::StopWordFilter::new(self.language)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "removing stop words for language {:?} is not supported yet",
-                            self.language
-                        ),
-                        location!(),
-                    )
-                })?;
+            let stop_word_filter = match &self.custom_stop_words {
+                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
+                None => {
+                    tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "removing stop words for language {:?} is not supported yet",
+                                self.language
+                            ),
+                            location!(),
+                        )
+                    })?
+                }
+            };
             builder = builder.filter_dynamic(stop_word_filter);
         }
         if self.ascii_folding {

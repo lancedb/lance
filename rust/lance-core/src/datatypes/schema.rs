@@ -15,8 +15,8 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -144,47 +144,6 @@ impl Schema {
         } else {
             Some(differences.join(", "))
         }
-    }
-
-    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
-        let fields = self
-            .fields
-            .iter()
-            .filter(|f| f.storage_class() == storage_class)
-            .cloned()
-            .collect();
-        Self {
-            fields,
-            metadata: self.metadata.clone(),
-        }
-    }
-
-    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
-    /// If there are no blob storage class fields, the second schema will be `None`.
-    /// The order of fields is preserved.
-    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
-        let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut sibling_fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields.iter() {
-            match field.storage_class() {
-                StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => sibling_fields.push(field.clone()),
-            }
-        }
-        (
-            Self {
-                fields: local_fields,
-                metadata: self.metadata.clone(),
-            },
-            if sibling_fields.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    fields: sibling_fields,
-                    metadata: self.metadata.clone(),
-                })
-            },
-        )
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -770,7 +729,7 @@ pub fn compare_fields(
     expected: &[Field],
     options: &SchemaCompareOptions,
 ) -> bool {
-    if options.allow_missing_if_nullable || options.ignore_field_order {
+    if options.allow_missing_if_nullable || options.ignore_field_order || options.allow_subschema {
         let expected_names = expected
             .iter()
             .map(|f| f.name.as_str())
@@ -797,6 +756,9 @@ pub fn compare_fields(
                     return false;
                 }
                 cumulative_position = *pos;
+            } else if options.allow_subschema {
+                // allow_subschema: allow missing any field
+                continue;
             } else if options.allow_missing_if_nullable && expected_field.nullable {
                 continue;
             } else {
@@ -844,7 +806,10 @@ pub fn explain_fields_difference(
         .map(prepend_path)
         .collect::<Vec<_>>();
     let missing_fields = expected_names.difference(&field_names);
-    let missing_fields = if options.allow_missing_if_nullable {
+    let missing_fields = if options.allow_subschema {
+        // allow_subschema: don't report any missing fields
+        Vec::new()
+    } else if options.allow_missing_if_nullable {
         missing_fields
             .filter(|f| {
                 let expected_field = expected.iter().find(|ef| ef.name == **f).unwrap();
@@ -975,9 +940,9 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field) -> Field {
+    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded()
+            field.into_unloaded_with_version(version)
         } else {
             field
         }
@@ -994,7 +959,10 @@ pub struct Projection {
     pub field_ids: HashSet<i32>,
     pub with_row_id: bool,
     pub with_row_addr: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
+    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -1003,7 +971,16 @@ impl Debug for Projection {
             .field("field_ids", &self.field_ids)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_addr", &self.with_row_addr)
+            .field(
+                "with_row_last_updated_at_version",
+                &self.with_row_last_updated_at_version,
+            )
+            .field(
+                "with_row_created_at_version",
+                &self.with_row_created_at_version,
+            )
             .field("blob_handling", &self.blob_handling)
+            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -1016,7 +993,10 @@ impl Projection {
             field_ids: HashSet::new(),
             with_row_id: false,
             with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
+            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1035,8 +1015,23 @@ impl Projection {
         self
     }
 
+    pub fn with_row_last_updated_at_version(mut self) -> Self {
+        self.with_row_last_updated_at_version = true;
+        self
+    }
+
+    pub fn with_row_created_at_version(mut self) -> Self {
+        self.with_row_created_at_version = true;
+        self
+    }
+
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
+        self
+    }
+
+    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
+        self.blob_version = blob_version;
         self
     }
 
@@ -1060,6 +1055,12 @@ impl Projection {
             return Ok(self);
         } else if column == ROW_ADDR {
             self.with_row_addr = true;
+            return Ok(self);
+        } else if column == crate::ROW_LAST_UPDATED_AT_VERSION {
+            self.with_row_last_updated_at_version = true;
+            return Ok(self);
+        } else if column == crate::ROW_CREATED_AT_VERSION {
+            self.with_row_created_at_version = true;
             return Ok(self);
         }
 
@@ -1124,6 +1125,10 @@ impl Projection {
         self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
         self.with_row_id = self.with_row_id && other.with_row_id;
         self.with_row_addr = self.with_row_addr && other.with_row_addr;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && other.with_row_created_at_version;
         self
     }
 
@@ -1141,6 +1146,10 @@ impl Projection {
                 self.with_row_id = true;
             } else if field.name == ROW_ADDR {
                 self.with_row_addr = true;
+            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+                self.with_row_last_updated_at_version = true;
+            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+                self.with_row_created_at_version = true;
             } else {
                 // If a field is not in our schema then it should probably have an id of -1.  If it isn't -1
                 // that probably implies some kind of weird schema mixing is going on and we should panic.
@@ -1155,6 +1164,10 @@ impl Projection {
         self.field_ids.extend(&other.field_ids);
         self.with_row_id = self.with_row_id || other.with_row_id;
         self.with_row_addr = self.with_row_addr || other.with_row_addr;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version || other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version || other.with_row_created_at_version;
         self
     }
 
@@ -1170,6 +1183,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id |= other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr |= other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        self.with_row_last_updated_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1189,6 +1210,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id &= !other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr &= !other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        self.with_row_last_updated_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1205,6 +1234,10 @@ impl Projection {
             .collect();
         self.with_row_addr = self.with_row_addr && !other.with_row_addr;
         self.with_row_id = self.with_row_id && !other.with_row_id;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && !other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && !other.with_row_created_at_version;
         self
     }
 
@@ -1222,6 +1255,10 @@ impl Projection {
                 self.with_row_id = false;
             } else if field.name == ROW_ADDR {
                 self.with_row_addr = false;
+            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+                self.with_row_last_updated_at_version = false;
+            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+                self.with_row_created_at_version = false;
             } else {
                 debug_assert_eq!(field.id, -1);
             }
@@ -1231,14 +1268,22 @@ impl Projection {
 
     /// True if the projection does not select any fields or take the row id / addr
     pub fn is_empty(&self) -> bool {
-        self.field_ids.is_empty() && !self.with_row_addr && !self.with_row_id
+        self.field_ids.is_empty()
+            && !self.with_row_addr
+            && !self.with_row_id
+            && !self.with_row_last_updated_at_version
+            && !self.with_row_created_at_version
     }
 
     /// True if the projection is only the row_id or row_addr columns
     ///
     /// Note: this will return false for a completely empty projection
     pub fn is_metadata_only(&self) -> bool {
-        self.field_ids.is_empty() && (self.with_row_addr || self.with_row_id)
+        self.field_ids.is_empty()
+            && (self.with_row_addr
+                || self.with_row_id
+                || self.with_row_last_updated_at_version
+                || self.with_row_created_at_version)
     }
 
     /// True if the projection has at least one non-metadata column
@@ -1262,6 +1307,12 @@ impl Projection {
         }
         if self.with_row_addr {
             extra_fields.push(ROW_ADDR_FIELD.clone());
+        }
+        if self.with_row_last_updated_at_version {
+            extra_fields.push(crate::ROW_LAST_UPDATED_AT_VERSION_FIELD.clone());
+        }
+        if self.with_row_created_at_version {
+            extra_fields.push(crate::ROW_CREATED_AT_VERSION_FIELD.clone());
         }
         schema.extend(&extra_fields).unwrap();
         schema
@@ -1421,6 +1472,9 @@ pub fn format_field_path(fields: &[&str]) -> String {
 /// - "parent.child" -> “`parent`.`child`”
 /// - "parent.`child.with.dot`" -> “`parent`.`child.with.dot`”
 pub fn escape_field_path_for_project(name: &str) -> String {
+    if name == WILDCARD {
+        return name.to_string();
+    }
     let segments = parse_field_path(name).unwrap_or_else(|_| vec![name.to_string()]);
     segments
         .iter()
@@ -1435,9 +1489,22 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[test]
+    fn projection_from_schema_defaults_to_v1() {
+        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
+        let schema = Schema {
+            fields: vec![field],
+            metadata: HashMap::new(),
+        };
+
+        let projection = Projection::empty(Arc::new(schema));
+
+        assert_eq!(projection.blob_version, BlobVersion::V1);
+    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {

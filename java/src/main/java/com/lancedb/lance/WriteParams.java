@@ -33,11 +33,32 @@ public class WriteParams {
     OVERWRITE
   }
 
+  public enum LanceFileVersion {
+    LEGACY("legacy"),
+    V0_1("0.1"),
+    V2_0("2.0"),
+    STABLE("stable"),
+    V2_1("2.1"),
+    NEXT("next"),
+    V2_2("2.2");
+
+    private final String versionString;
+
+    LanceFileVersion(String versionString) {
+      this.versionString = versionString;
+    }
+
+    public String getVersionString() {
+      return versionString;
+    }
+  }
+
   private final Optional<Integer> maxRowsPerFile;
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
+  private final Optional<LanceFileVersion> dataStorageVersion;
   private Map<String, String> storageOptions = new HashMap<>();
 
   private WriteParams(
@@ -46,12 +67,14 @@ public class WriteParams {
       Optional<Long> maxBytesPerFile,
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
+      Optional<LanceFileVersion> dataStorageVersion,
       Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
     this.enableStableRowIds = enableStableRowIds;
+    this.dataStorageVersion = dataStorageVersion;
     this.storageOptions = storageOptions;
   }
 
@@ -80,6 +103,10 @@ public class WriteParams {
     return enableStableRowIds;
   }
 
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(LanceFileVersion::getVersionString);
+  }
+
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
@@ -91,6 +118,7 @@ public class WriteParams {
         .add("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
         .add("maxBytesPerFile", maxBytesPerFile.orElse(null))
         .add("mode", mode.orElse(null))
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 
@@ -101,6 +129,7 @@ public class WriteParams {
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
+    private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
@@ -123,6 +152,11 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withDataStorageVersion(LanceFileVersion dataStorageVersion) {
+      this.dataStorageVersion = Optional.of(dataStorageVersion);
+      return this;
+    }
+
     public Builder withStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
       return this;
@@ -140,6 +174,7 @@ public class WriteParams {
           maxBytesPerFile,
           mode,
           enableStableRowIds,
+          dataStorageVersion,
           storageOptions);
     }
   }

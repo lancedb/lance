@@ -34,9 +34,11 @@ use url::Url;
 use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
+pub mod storage_options;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
+use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
 
@@ -61,6 +63,9 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use storage_options::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+};
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -120,6 +125,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// IO tracker for monitoring read/write operations
+    io_tracker: IOTracker,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -141,13 +148,9 @@ impl std::fmt::Display for ObjectStore {
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// Wrap an object store with additional functionality
     ///
-    /// The storage_options contain namespace information (e.g., azure_storage_account_name)
-    /// that wrappers may need for proper isolation
-    fn wrap(
-        &self,
-        original: Arc<dyn OSObjectStore>,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Arc<dyn OSObjectStore>;
+    /// The store_prefix is a string which uniquely identifies the object
+    /// store being wrapped.
+    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
 
 #[derive(Debug, Clone)]
@@ -166,14 +169,10 @@ impl ChainedWrappingObjectStore {
 }
 
 impl WrappingObjectStore for ChainedWrappingObjectStore {
-    fn wrap(
-        &self,
-        original: Arc<dyn OSObjectStore>,
-        storage_options: Option<&HashMap<String, String>>,
-    ) -> Arc<dyn OSObjectStore> {
+    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         self.wrappers
             .iter()
-            .fold(original, |acc, wrapper| wrapper.wrap(acc, storage_options))
+            .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
     }
 }
 
@@ -189,6 +188,8 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Dynamic storage options provider for automatic credential refresh
+    pub storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
     /// Use constant size upload parts for multipart uploads. Only necessary
     /// for Cloudflare R2, which doesn't support variable size parts. When this
     /// is false, max upload size is 2.5TB. When this is true, the max size is
@@ -208,6 +209,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            storage_options_provider: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
         }
@@ -218,7 +220,7 @@ impl Default for ObjectStoreParams {
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For hashing, we use pointer values for ObjectStore, S3 credentials, and wrapper
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper, and storage options provider
         self.block_size.hash(state);
         if let Some((store, url)) = &self.object_store {
             Arc::as_ptr(store).hash(state);
@@ -238,6 +240,9 @@ impl std::hash::Hash for ObjectStoreParams {
                 value.hash(state);
             }
         }
+        if let Some(provider) = &self.storage_options_provider {
+            provider.provider_id().hash(state);
+        }
         self.use_constant_size_upload_parts.hash(state);
         self.list_is_lexically_ordered.hash(state);
     }
@@ -253,7 +258,8 @@ impl PartialEq for ObjectStoreParams {
             return false;
         }
 
-        // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
+        // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
+        // For storage_options_provider, we use provider_id() for semantic equality
         self.block_size == other.block_size
             && self
                 .object_store
@@ -267,12 +273,40 @@ impl PartialEq for ObjectStoreParams {
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self.storage_options == other.storage_options
+            && self
+                .storage_options_provider
+                .as_ref()
+                .map(|p| p.provider_id())
+                == other
+                    .storage_options_provider
+                    .as_ref()
+                    .map(|p| p.provider_id())
             && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
             && self.list_is_lexically_ordered == other.list_is_lexically_ordered
     }
 }
 
-fn uri_to_url(uri: &str) -> Result<Url> {
+/// Convert a URI string or local path to a URL
+///
+/// This function handles both proper URIs (with schemes like `file://`, `s3://`, etc.)
+/// and plain local filesystem paths. On Windows, it correctly handles drive letters
+/// that might be parsed as URL schemes.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_io::object_store::uri_to_url;
+/// // URIs are preserved
+/// let url = uri_to_url("s3://bucket/path").unwrap();
+/// assert_eq!(url.scheme(), "s3");
+///
+/// // Local paths are converted to file:// URIs
+/// # #[cfg(unix)]
+/// let url = uri_to_url("/tmp/data").unwrap();
+/// # #[cfg(unix)]
+/// assert_eq!(url.scheme(), "file");
+/// ```
+pub fn uri_to_url(uri: &str) -> Result<Url> {
     match Url::parse(uri) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
@@ -334,11 +368,18 @@ impl ObjectStore {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
+            let store_prefix =
+                registry.calculate_object_store_prefix(uri, params.storage_options.as_ref())?;
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(inner, params.storage_options.as_ref());
+                inner = wrapper.wrap(&store_prefix, inner);
             }
+
+            // Always wrap with IO tracking
+            let io_tracker = IOTracker::default();
+            let tracked_store = io_tracker.wrap("", inner);
+
             let store = Self {
-                inner,
+                inner: tracked_store,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -346,6 +387,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                io_tracker,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -357,6 +399,27 @@ impl ObjectStore {
         let path = provider.extract_path(&url)?;
 
         Ok((store, path))
+    }
+
+    /// Extract the path component from a URI without initializing the object store.
+    ///
+    /// This is a synchronous operation that only parses the URI and extracts the path,
+    /// without creating or initializing any object store instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - The object store registry to get the provider
+    /// * `uri` - The URI to extract the path from
+    ///
+    /// # Returns
+    ///
+    /// The extracted path component
+    pub fn extract_path_from_uri(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Result<Path> {
+        let url = uri_to_url(uri)?;
+        let provider = registry.get_provider(url.scheme()).ok_or_else(|| {
+            Error::invalid_input(format!("Unknown scheme: {}", url.scheme()), location!())
+        })?;
+        provider.extract_path(&url)
     }
 
     #[deprecated(note = "Use `from_uri` instead")]
@@ -417,13 +480,46 @@ impl ObjectStore {
             .unwrap_or(self.io_parallelism)
     }
 
+    /// Get the IO tracker for this object store
+    ///
+    /// The IO tracker can be used to get statistics about read/write operations
+    /// performed on this object store.
+    pub fn io_tracker(&self) -> &IOTracker {
+        &self.io_tracker
+    }
+
+    /// Get a snapshot of current IO statistics without resetting counters
+    ///
+    /// Returns the current IO statistics without modifying the internal state.
+    /// Use this when you need to check stats without resetting them.
+    pub fn io_stats_snapshot(&self) -> IoStats {
+        self.io_tracker.stats()
+    }
+
+    /// Get incremental IO statistics since the last call to this method
+    ///
+    /// Returns the accumulated statistics since the last call and resets the
+    /// counters to zero. This is useful for tracking IO operations between
+    /// different stages of processing.
+    pub fn io_stats_incremental(&self) -> IoStats {
+        self.io_tracker.incremental_stats()
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, None).await,
+            "file" => {
+                LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    None,
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -452,7 +548,15 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
+            "file" => {
+                LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    Some(known_size),
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -679,6 +783,13 @@ impl StorageOptions {
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.get(key)
     }
+
+    /// Get the expiration time in milliseconds since epoch, if present
+    pub fn expires_at_millis(&self) -> Option<u64> {
+        self.0
+            .get(EXPIRES_AT_MILLIS_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+    }
 }
 
 impl From<HashMap<String, String>> for StorageOptions {
@@ -686,6 +797,9 @@ impl From<HashMap<String, String>> for StorageOptions {
         Self::new(value)
     }
 }
+
+static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
+    std::sync::LazyLock::new(ObjectStoreRegistry::default);
 
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
@@ -704,12 +818,21 @@ impl ObjectStore {
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
 
         let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(store, storage_options),
+            Some(wrapper) => {
+                let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
+                    .calculate_object_store_prefix(location.as_ref(), storage_options)
+                    .unwrap();
+                wrapper.wrap(&store_prefix, store)
+            }
             None => store,
         };
 
+        // Always wrap with IO tracking
+        let io_tracker = IOTracker::default();
+        let tracked_store = io_tracker.wrap("", store);
+
         Self {
-            inner: store,
+            inner: tracked_store,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -717,6 +840,7 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            io_tracker,
         }
     }
 }
@@ -937,8 +1061,8 @@ mod tests {
     impl WrappingObjectStore for TestWrapper {
         fn wrap(
             &self,
+            _store_prefix: &str,
             _original: Arc<dyn OSObjectStore>,
-            _storage_options: Option<&HashMap<String, String>>,
         ) -> Arc<dyn OSObjectStore> {
             self.called.store(true, Ordering::Relaxed);
 

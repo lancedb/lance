@@ -5,7 +5,7 @@
 
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
 
-use crate::BLOB_META_KEY;
+use crate::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
 
 pub enum Indentation {
     OneLine,
@@ -91,15 +91,22 @@ impl FieldExt for Field {
     // Check if field has metadata `packed` set to true, this check is case insensitive.
     fn is_packed_struct(&self) -> bool {
         let field_metadata = self.metadata();
-        field_metadata
-            .get("packed")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+        const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
+        PACKED_KEYS.iter().any(|key| {
+            field_metadata
+                .get(*key)
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
     }
 
     fn is_blob(&self) -> bool {
         let field_metadata = self.metadata();
         field_metadata.get(BLOB_META_KEY).is_some()
+            || field_metadata
+                .get(ARROW_EXT_NAME_KEY)
+                .map(|value| value == BLOB_V2_EXT_NAME)
+                .unwrap_or(false)
     }
 }
 

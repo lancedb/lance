@@ -59,27 +59,18 @@ jobs:
             - Namespace Spec: namespace
           EOF
           cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
-          cp lance-namespace/CONTRIBUTING.md docs/src/community/contributing/namespace.md
-          # Update contributing .pages to include namespace.md in navbar
-          echo "  - Namespace: namespace.md" >> docs/src/community/contributing/.pages
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
           cat >> docs/src/integrations/.pages << 'EOF'
             - Apache Spark: spark
           EOF
-          cp lance-spark/CONTRIBUTING.md docs/src/community/contributing/spark.md
-          # Update contributing .pages to include spark.md in navbar
-          echo "  - Apache Spark: spark.md" >> docs/src/community/contributing/.pages
       - name: Copy lance-ray docs
         run: |
           cp -r lance-ray/docs/src docs/src/integrations/ray
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
           EOF
-          cp lance-ray/CONTRIBUTING.md docs/src/community/contributing/ray.md
-          # Update contributing .pages to include ray.md in navbar
-          echo "  - Ray: ray.md" >> docs/src/community/contributing/.pages
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

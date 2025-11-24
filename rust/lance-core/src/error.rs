@@ -59,7 +59,7 @@ pub enum Error {
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention { message: String, location: Location },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
+    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"))]
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
@@ -109,6 +109,11 @@ pub enum Error {
         message: String,
         major_version: u16,
         minor_version: u16,
+        location: Location,
+    },
+    #[snafu(display("Namespace error: {source}, {location}"))]
+    Namespace {
+        source: BoxedError,
         location: Location,
     },
 }

@@ -13,7 +13,7 @@ use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
-use lance_core::{Error, Result};
+use lance_core::{assume_eq, Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
@@ -159,7 +159,10 @@ impl ProductQuantizer {
                             num_sub_vectors,
                             sub_idx,
                         );
-                        compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
+                        // SAFETY: The must be 2^NUM_BITS centroids, it's safe to unwrap_or(0),
+                        // this could happen if all distances are INFs in the case of vectors are large.
+                        assume_eq!(centroids.len(), 2_usize.pow(NUM_BITS) * sub_dim);
+                        compute_partition(centroids, sub_vector, distance_type).unwrap_or(0) as u8
                     })
                     .collect::<Vec<_>>();
                 if NUM_BITS == 4 {

@@ -6,8 +6,7 @@
 use std::{
     cmp::{max, Ordering},
     collections::{HashMap, VecDeque},
-    fmt::{self, Display},
-    str::FromStr,
+    fmt,
     sync::Arc,
 };
 
@@ -22,7 +21,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
     json::{is_arrow_json_field, is_json_field},
-    ARROW_EXT_NAME_KEY, *,
+    DataTypeExt, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
@@ -30,9 +29,10 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
-
-pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    Error, Result,
+};
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
 /// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
@@ -41,6 +41,15 @@ pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-clas
 /// (2) The field must be a leaf without child (i.e. it is a primitive data type).
 /// (3) The field must not be within a list type.
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
+
+fn has_blob_v2_extension(field: &ArrowField) -> bool {
+    field.data_type() == &DataType::LargeBinary
+        && field
+            .metadata()
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
+}
 
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
@@ -71,6 +80,37 @@ pub struct SchemaCompareOptions {
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
+    /// Allow the source schema to be a subset of the target schema (default false)
+    pub allow_subschema: bool,
+}
+
+/// Blob column format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobVersion {
+    /// Legacy blob format (position / size only).
+    #[default]
+    V1,
+    /// Blob v2 struct format.
+    V2,
+}
+
+impl BlobVersion {
+    /// Convert a persisted string value (e.g. table config) into a blob version
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value {
+            "1" => Some(Self::V1),
+            "2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Persistable string representation for table config.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }
+    }
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -83,40 +123,6 @@ pub enum Encoding {
     Dictionary,
     /// RLE encoding.
     RLE,
-}
-
-/// Describes the rate at which a column should be compacted
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
-pub enum StorageClass {
-    /// Default storage class (stored in primary dataset)
-    #[default]
-    Default,
-    /// Blob storage class (stored in blob dataset)
-    Blob,
-}
-
-impl Display for StorageClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => write!(f, "default"),
-            Self::Blob => write!(f, "blob"),
-        }
-    }
-}
-
-impl FromStr for StorageClass {
-    type Err = Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "default" | "" => Ok(Self::Default),
-            "blob" => Ok(Self::Blob),
-            _ => Err(Error::Schema {
-                message: format!("Unknown storage class: {}", s),
-                location: location!(),
-            }),
-        }
-    }
 }
 
 /// What to do on a merge operation if the types of the fields don't match
@@ -143,7 +149,6 @@ pub struct Field {
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
-    pub storage_class: StorageClass,
     pub unenforced_primary_key: bool,
 }
 
@@ -171,14 +176,6 @@ impl Field {
     pub fn has_dictionary_types(&self) -> bool {
         matches!(self.data_type(), DataType::Dictionary(_, _))
             || self.children.iter().any(Self::has_dictionary_types)
-    }
-
-    pub fn is_default_storage(&self) -> bool {
-        self.storage_class == StorageClass::Default
-    }
-
-    pub fn storage_class(&self) -> StorageClass {
-        self.storage_class
     }
 
     /// Merge a field with another field using a reference field to ensure
@@ -276,7 +273,11 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(projection.blob_handling.unload_if_needed(new_field))
+            Some(
+                projection
+                    .blob_handling
+                    .unload_if_needed(new_field, projection.blob_version),
+            )
         }
     }
 
@@ -501,16 +502,29 @@ impl Field {
     /// Blob fields will load descriptions by default
     pub fn is_blob(&self) -> bool {
         self.metadata.contains_key(BLOB_META_KEY)
+            || self
+                .metadata
+                .get(ARROW_EXT_NAME_KEY)
+                .map(|name| name == BLOB_V2_EXT_NAME)
+                .unwrap_or(false)
     }
 
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded(mut self) -> Self {
+    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
         if self.data_type().is_binary_like() && self.is_blob() {
-            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            match version {
+                BlobVersion::V2 => {
+                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+                }
+                BlobVersion::V1 => {
+                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+                }
+            }
         }
         self
     }
@@ -526,7 +540,6 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
-            storage_class: self.storage_class,
             unenforced_primary_key: self.unenforced_primary_key,
         };
         if path_components.is_empty() {
@@ -744,7 +757,6 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
                 unenforced_primary_key: self.unenforced_primary_key,
             };
             return Ok(f);
@@ -808,7 +820,6 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class,
                 unenforced_primary_key: self.unenforced_primary_key,
             })
         }
@@ -924,11 +935,13 @@ impl Field {
 
     // Check if field has metadata `packed` set to true, this check is case insensitive.
     pub fn is_packed_struct(&self) -> bool {
-        let field_metadata = &self.metadata;
-        field_metadata
-            .get("packed")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+        const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
+        PACKED_KEYS.iter().any(|key| {
+            self.metadata
+                .get(*key)
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
     }
 
     /// Return true if the field is a leaf field.
@@ -976,21 +989,24 @@ impl TryFrom<&ArrowField> for Field {
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
-        let storage_class = field
-            .metadata()
-            .get(LANCE_STORAGE_CLASS_SCHEMA_META_KEY)
-            .map(|s| StorageClass::from_str(s))
-            .unwrap_or(Ok(StorageClass::Default))?;
-
-        let unenforced_primary_key = field
-            .metadata()
+        let mut metadata = field.metadata().clone();
+        let unenforced_primary_key = metadata
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
+        let is_blob_v2 = has_blob_v2_extension(field);
+
+        if is_blob_v2 {
+            metadata
+                .entry(BLOB_META_KEY.to_string())
+                .or_insert_with(|| "true".to_string());
+        }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
+        } else if is_blob_v2 {
+            LogicalType::from(super::BLOB_LOGICAL_TYPE)
         } else {
             LogicalType::try_from(field.data_type())?
         };
@@ -1008,11 +1024,10 @@ impl TryFrom<&ArrowField> for Field {
                 DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
-            metadata: field.metadata().clone(),
+            metadata,
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            storage_class,
             unenforced_primary_key,
         })
     }
@@ -1031,6 +1046,17 @@ impl From<&Field> for ArrowField {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
 
+        if field.logical_type.is_blob() {
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+            );
+            metadata.entry(ARROW_EXT_META_KEY.to_string()).or_default();
+            metadata
+                .entry(BLOB_META_KEY.to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
             metadata.insert(
@@ -1039,15 +1065,6 @@ impl From<&Field> for ArrowField {
             );
         }
 
-        match field.storage_class {
-            StorageClass::Default => {}
-            StorageClass::Blob => {
-                metadata.insert(
-                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
-                    "blob".to_string(),
-                );
-            }
-        }
         out.with_metadata(metadata)
     }
 }
@@ -1058,7 +1075,8 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
-
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+    use std::collections::HashMap;
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
@@ -1529,5 +1547,44 @@ mod tests {
         // Finally, ignore will ignore
         assert!(f1.compare_with_options(&f2, &ignore_nullability));
         assert!(f2.compare_with_options(&f1, &ignore_nullability));
+    }
+
+    #[test]
+    fn blob_into_unloaded_selects_v2_layout() {
+        let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
+        assert_eq!(unloaded.children.len(), 5);
+        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn blob_extension_roundtrip() {
+        let metadata = HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+            (ARROW_EXT_META_KEY.to_string(), "".to_string()),
+        ]);
+        let arrow_field =
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert_eq!(
+            field.logical_type,
+            LogicalType::from(crate::datatypes::BLOB_LOGICAL_TYPE)
+        );
+        assert!(field.is_blob());
+        assert_eq!(field.data_type(), DataType::LargeBinary);
+
+        let roundtrip: ArrowField = ArrowField::from(&field);
+        assert_eq!(
+            roundtrip.metadata().get(ARROW_EXT_NAME_KEY),
+            Some(&BLOB_V2_EXT_NAME.to_string())
+        );
+        assert_eq!(
+            roundtrip.metadata().get(BLOB_META_KEY),
+            Some(&"true".to_string())
+        );
     }
 }

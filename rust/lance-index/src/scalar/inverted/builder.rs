@@ -7,6 +7,7 @@ use super::{
     InvertedIndexParams,
 };
 use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
@@ -144,6 +145,15 @@ impl InvertedIndexBuilder {
     ) -> Result<()> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
+
+        // infer lance_tokenizer based on document type
+        if self.params.lance_tokenizer.is_none() {
+            let schema = new_data.schema();
+            let field = schema.column_with_name(doc_col).expect_ok()?.1;
+            let doc_type = DocType::try_from(field)?;
+            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        }
+
         let new_data = document_input(new_data, doc_col)?;
 
         self.update_index(new_data).await?;

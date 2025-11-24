@@ -12,6 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import datetime
+from typing import Optional
+
 import pyarrow as pa
 
 class IndexConfig:
@@ -47,3 +50,24 @@ def transform_vectors(
     pq_codebook: pa.Array,
     dst_uri: str,
 ): ...
+
+class IndexSegmentDescription:
+    uuid: str
+    dataset_version_at_last_update: int
+    fragment_ids: set[int]
+    index_version: int
+    created_at: Optional[datetime]
+
+    def __repr__(self) -> str: ...
+
+class IndexDescription:
+    name: str
+    type_url: str
+    index_type: str
+    num_rows_indexed: int
+    fields: list[int]
+    field_names: list[str]
+    segments: list[IndexSegmentDescription]
+    details: dict
+
+    def __repr__(self) -> str: ...

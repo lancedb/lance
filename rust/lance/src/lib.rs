@@ -71,7 +71,7 @@
 
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
-pub use lance_core::{datatypes, error};
+pub use lance_core::datatypes;
 pub use lance_core::{Error, Result};
 use std::sync::LazyLock;
 
@@ -97,3 +97,14 @@ pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
 
 pub static DIST_FIELD: LazyLock<arrow_schema::Field> =
     LazyLock::new(|| arrow_schema::Field::new(DIST_COL, DataType::Float32, true));
+
+/// Re-exports of 3rd party dependencies used in lance public APIs
+///
+/// Users that only use these dependencies for the sake of communicating with
+/// Lance APIs can use these re-exports to ensure they are always pinned to the
+/// same version that lance is using.
+pub mod deps {
+    pub use arrow_array;
+    pub use arrow_schema;
+    pub use datafusion;
+}

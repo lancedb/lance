@@ -16,7 +16,8 @@ use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
+use lance_index::scalar::inverted::lance_tokenizer::DocType;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
@@ -99,7 +100,10 @@ fn bench_inverted(c: &mut Criterion) {
             black_box(
                 invert_index
                     .bm25_search(
-                        vec![sample_words[word_idx].clone()].into(),
+                        Arc::new(Tokens::new(
+                            vec![sample_words[word_idx].clone()],
+                            DocType::Text,
+                        )),
                         params.clone().into(),
                         Operator::Or,
                         no_filter.clone(),

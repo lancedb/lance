@@ -8,9 +8,9 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
@@ -138,7 +138,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::v2::writer::FileWriter::try_new(
+        let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
             schema,
             FileWriterOptions {
@@ -197,6 +197,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
+        let version = params.data_storage_version.unwrap_or_default();
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -209,7 +210,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             &schema,
             stream,
             params.into_owned(),
-            LanceFileVersion::Stable,
+            version,
+            None, // Fragment creation doesn't use target_bases
         )
         .await
     }
@@ -242,7 +244,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema,
@@ -532,7 +534,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_write_fragments_with_format_version(
+    async fn test_write_with_format_version(
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
@@ -555,6 +557,37 @@ mod tests {
 
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
+            let (major_version, minor_version) = file_version.to_numbers();
+            assert_eq!(f.file_major_version, major_version);
+            assert_eq!(f.file_minor_version, minor_version);
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_fragments_with_format_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable
+        )]
+        file_version: LanceFileVersion,
+    ) {
+        let data = test_data();
+        let tmp_dir = TempStrDir::default();
+        let writer_params = WriteParams {
+            data_storage_version: Some(file_version),
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write_params(&writer_params)
+            .write_fragments(data)
+            .await
+            .unwrap();
+
+        assert!(!fragment.is_empty());
+        fragment[0].files.iter().for_each(|f| {
             let (major_version, minor_version) = file_version.to_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);

@@ -14,14 +14,7 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
-  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
-  # CI builds are faster with incremental disabled.
-  CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_JOBS: "1"
 
 jobs:
   rust-clippy-fmt:
@@ -56,6 +49,21 @@ jobs:
       matrix:
         java-version: [8, 11, 17]
     name: Build and Test with Java ${{ matrix.java-version }}
+    services:
+      localstack:
+        image: localstack/localstack:4.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,dynamodb,kms
+          AWS_ACCESS_KEY_ID: ACCESS_KEY
+          AWS_SECRET_ACCESS_KEY: SECRET_KEY
+        options: >-
+          --health-cmd "curl -s http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 3
+          --health-start-period 10s
     steps:
       - name: Install dependencies
         run: |
@@ -73,8 +81,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni
-          cache-targets: false
-          cache-workspace-crates: true
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:
@@ -87,5 +93,7 @@ jobs:
           mvn spotless:check
       - name: Running tests with Java ${{ matrix.java-version }}
         working-directory: java
+        env:
+          LANCE_INTEGRATION_TEST: "1"
         run: |
           mvn install

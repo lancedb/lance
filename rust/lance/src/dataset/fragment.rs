@@ -21,18 +21,23 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::v2::LanceEncodingsIo;
+use lance_file::previous::reader::{
+    read_batch as previous_read_batch, FileReader as PreviousFileReader,
+};
+use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::version::LanceFileVersion;
-use lance_file::{determine_file_version, v2};
+use lance_file::{determine_file_version, LanceEncodingsIo};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
@@ -53,7 +58,6 @@ use super::scanner::Scanner;
 use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
-use crate::arrow::*;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -122,20 +126,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn is_legacy(&self) -> bool;
     // Return a reference to the legacy reader, panics if called on a v2
     // file.
-    fn as_legacy(&self) -> &FileReader {
+    fn as_legacy(&self) -> &PreviousFileReader {
         self.as_legacy_opt()
             .expect("legacy function called on v2 file")
     }
     // Return a reference to the legacy reader if this is a v1 reader and
     // return None otherwise
-    fn as_legacy_opt(&self) -> Option<&FileReader>;
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader>;
     // Return a mutable reference to the legacy reader if this is a v1 reader
     // and return None otherwise
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader>;
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader>;
 }
 
 fn ranges_to_tasks(
-    reader: &FileReader,
+    reader: &PreviousFileReader,
     ranges: Vec<(i32, Range<usize>)>,
     projection: Arc<Schema>,
 ) -> ReadBatchTaskStream {
@@ -146,7 +150,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                read_batch(
+                previous_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
@@ -166,12 +170,12 @@ fn ranges_to_tasks(
 
 #[derive(Clone, Debug)]
 struct V1Reader {
-    reader: FileReader,
+    reader: PreviousFileReader,
     projection: Arc<Schema>,
 }
 
 impl V1Reader {
-    fn new(reader: FileReader, projection: Arc<Schema>) -> Self {
+    fn new(reader: PreviousFileReader, projection: Arc<Schema>) -> Self {
         Self { reader, projection }
     }
 }
@@ -279,11 +283,11 @@ impl GenericFileReader for V1Reader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&FileReader> {
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
         Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
         Some(&mut self.reader)
     }
 }
@@ -295,7 +299,7 @@ mod v2_adapter {
 
     #[derive(Debug, Clone)]
     pub struct Reader {
-        reader: Arc<v2::reader::FileReader>,
+        reader: Arc<lance_file::reader::FileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
@@ -304,7 +308,7 @@ mod v2_adapter {
 
     impl Reader {
         pub fn new(
-            reader: Arc<v2::reader::FileReader>,
+            reader: Arc<lance_file::reader::FileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
@@ -478,11 +482,11 @@ mod v2_adapter {
             false
         }
 
-        fn as_legacy_opt(&self) -> Option<&FileReader> {
+        fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
             None
         }
 
-        fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
             None
         }
     }
@@ -587,11 +591,11 @@ impl GenericFileReader for NullReader {
         false
     }
 
-    fn as_legacy_opt(&self) -> Option<&FileReader> {
+    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
         None
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
         None
     }
 }
@@ -602,6 +606,10 @@ pub struct FragReadConfig {
     pub with_row_id: bool,
     // Add the row address column
     pub with_row_address: bool,
+    // Add the last updated at version column
+    pub with_row_last_updated_at_version: bool,
+    // Add the created at version column
+    pub with_row_created_at_version: bool,
     /// The scan scheduler to use for reading data files.
     ///
     /// This should be specified if multiple readers are being used in
@@ -628,6 +636,23 @@ impl FragReadConfig {
     pub fn with_row_address(mut self, value: bool) -> Self {
         self.with_row_address = value;
         self
+    }
+
+    pub fn with_row_last_updated_at_version(mut self, value: bool) -> Self {
+        self.with_row_last_updated_at_version = value;
+        self
+    }
+
+    pub fn with_row_created_at_version(mut self, value: bool) -> Self {
+        self.with_row_created_at_version = value;
+        self
+    }
+
+    pub fn has_system_cols(&self) -> bool {
+        self.with_row_id
+            || self.with_row_address
+            || self.with_row_last_updated_at_version
+            || self.with_row_created_at_version
     }
 
     pub fn with_scan_scheduler(mut self, value: Arc<ScanScheduler>) -> Self {
@@ -728,7 +753,7 @@ impl FileFragment {
             let file_scheduler = scheduler
                 .open_file(&filepath, &CachedFileSize::unknown())
                 .await?;
-            let reader = v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
@@ -740,7 +765,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::ReaderProjection::from_whole_schema(
+            let projection = lance_file::reader::ReaderProjection::from_whole_schema(
                 dataset.schema(),
                 reader.metadata().version(),
             );
@@ -850,7 +875,7 @@ impl FileFragment {
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
 
-        if opened_files.is_empty() && !read_config.with_row_id && !read_config.with_row_address {
+        if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::io(
                 format!(
                     "Did not find any data files for schema: {}\nfragment_id={}",
@@ -871,6 +896,7 @@ impl FileFragment {
             ArrowSchema::from(projection),
             self.count_rows(None).await?,
             num_physical_rows,
+            Arc::new(self.metadata.clone()),
         )?;
 
         if read_config.with_row_id {
@@ -878,6 +904,12 @@ impl FileFragment {
         }
         if read_config.with_row_address {
             reader.with_row_address();
+        }
+        if read_config.with_row_last_updated_at_version {
+            reader.with_row_last_updated_at_version();
+        }
+        if read_config.with_row_created_at_version {
+            reader.with_row_created_at_version();
         }
 
         Ok(reader)
@@ -908,7 +940,7 @@ impl FileFragment {
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                let reader = FileReader::try_new_with_fragment_id(
+                let reader = PreviousFileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
                     &path,
                     self.schema().clone(),
@@ -935,21 +967,29 @@ impl FileFragment {
                 .dataset
                 .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
-            let (store_scheduler, reader_priority) =
-                if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
-                } else {
-                    (
-                        ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                        ),
-                        0,
-                    )
-                };
+            let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
+                // TODO: make object stores for non-default bases reuse the same scan scheduler
+                //  currently we always create a new one
+                let object_store = self.dataset.object_store_for_base(base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&object_store);
+                (
+                    ScanScheduler::new(object_store, config),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+                (
+                    scan_scheduler.clone(),
+                    read_config.reader_priority.unwrap_or(0),
+                )
+            } else {
+                (
+                    ScanScheduler::new(
+                        self.dataset.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    ),
+                    0,
+                )
+            };
             let file_scheduler = store_scheduler
                 .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
                 .await?;
@@ -957,7 +997,7 @@ impl FileFragment {
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
-                v2::reader::FileReader::try_open_with_file_metadata(
+                lance_file::reader::FileReader::try_open_with_file_metadata(
                     Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
@@ -1075,6 +1115,43 @@ impl FileFragment {
         }
     }
 
+    /// Get the number of physical rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count in the metadata.  This method should
+    /// only be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_physical_rows(&self) -> Result<usize> {
+        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
+            Ok(self.metadata.physical_rows.unwrap())
+        } else {
+            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+        }
+    }
+
+    /// Get the number of deleted rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_num_deletions(&self) -> Result<usize> {
+        match &self.metadata().deletion_file {
+            Some(DeletionFile {
+                num_deleted_rows: Some(num_deleted),
+                ..
+            }) => Ok(*num_deleted),
+            None => Ok(0),
+            _ => Err(Error::Internal { message: format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()), location: location!() }),
+        }
+    }
+
+    /// Get the number of logical rows (physical rows - deleted rows) in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count or deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_logical_rows(&self) -> Result<usize> {
+        let num_physical_rows = self.fast_physical_rows()?;
+        let num_deleted_rows = self.fast_num_deletions()?;
+        Ok(num_physical_rows - num_deleted_rows)
+    }
+
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
@@ -1091,7 +1168,7 @@ impl FileFragment {
         // incorrect `physical_row` values. So if we don't have a writer version,
         // we should not used the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
-        // See: https://github.com/lancedb/lance/issues/1531
+        // See: https://github.com/lance-format/lance/issues/1531
         if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
             return Ok(self.metadata.physical_rows.unwrap());
         }
@@ -1304,11 +1381,11 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false).await
+        self.take_rows(&row_ids, projection, false, false).await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
-    pub(crate) async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
+    pub async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
         let Some(deletion_file) = self.metadata.deletion_file.as_ref() else {
             return Ok(None);
         };
@@ -1330,7 +1407,7 @@ impl FileFragment {
         let file_metadata = cache
             .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
-                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                    lance_file::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
             })
             .await?;
@@ -1350,12 +1427,15 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
+        with_row_id: bool,
         with_row_address: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
-                FragReadConfig::default().with_row_address(with_row_address),
+                FragReadConfig::default()
+                    .with_row_id(with_row_id)
+                    .with_row_address(with_row_address),
             )
             .await?;
 
@@ -1432,13 +1512,6 @@ impl FileFragment {
                 }
             }
             schema = schema.project(&projection)?;
-        }
-
-        if schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "adding columns whose value depends on scanning non-default storage".into(),
-                location: location!(),
-            });
         }
 
         // If there is no projection, we at least need to read the row addresses
@@ -1584,7 +1657,10 @@ impl FileFragment {
             OnMissing::Error,
             OnTypeMismatch::Error,
         )?;
-        let read_columns = right_schema.field_names();
+        // Prepare the read projection: align with the write_schema's columns and append the left_on column.
+        let mut read_columns: Vec<String> =
+            write_schema.fields.iter().map(|f| f.name.clone()).collect();
+        read_columns.push(left_on.to_string());
         let mut updater = self
             .updater(
                 Some(&read_columns),
@@ -1858,9 +1934,24 @@ pub struct FragmentReader {
     /// True if we should generate a row address column in output
     with_row_addr: bool,
 
+    /// True if we should generate a last updated at version column in output
+    with_row_last_updated_at_version: bool,
+
+    /// True if we should generate a created at version column in output
+    with_row_created_at_version: bool,
+
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
+
+    /// The fragment metadata (needed for version columns)
+    fragment: Arc<Fragment>,
+
+    /// The last_updated_at version sequence (loaded from fragment metadata)
+    last_updated_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+
+    /// The created_at version sequence (loaded from fragment metadata)
+    created_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
 
     // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,
@@ -1887,7 +1978,12 @@ impl Clone for FragmentReader {
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
             make_deletions_null: self.make_deletions_null,
+            fragment: self.fragment.clone(),
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
         }
@@ -1916,6 +2012,7 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
@@ -1924,6 +2021,7 @@ impl FragmentReader {
         output_schema: ArrowSchema,
         num_rows: usize,
         num_physical_rows: usize,
+        fragment: Arc<Fragment>,
     ) -> Result<Self> {
         if let Some(legacy_reader) = readers.first().and_then(|reader| reader.as_legacy_opt()) {
             let num_batches = legacy_reader.num_batches();
@@ -1952,7 +2050,12 @@ impl FragmentReader {
             fragment_id,
             with_row_id: false,
             with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             make_deletions_null: false,
+            fragment,
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
             num_rows,
             num_physical_rows,
         })
@@ -1978,6 +2081,50 @@ impl FragmentReader {
 
     pub(crate) fn with_make_deletions_null(&mut self) -> &mut Self {
         self.make_deletions_null = true;
+        self
+    }
+
+    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+        self.with_row_last_updated_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.last_updated_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.last_updated_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.last_updated_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_last_updated_at_version");
+
+        self
+    }
+
+    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+        self.with_row_created_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.created_at_sequence.is_none() {
+            if let Some(meta) = &self.fragment.created_at_version_meta {
+                if let Ok(sequence) = meta.load_sequence() {
+                    self.created_at_sequence = Some(Arc::new(sequence));
+                }
+            }
+            // If no metadata or load fails, sequence remains None (will default to version 1)
+        }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_created_at_version");
+
         self
     }
 
@@ -2148,6 +2295,10 @@ impl FragmentReader {
                 row_id_sequence: self.row_id_sequence.clone(),
                 with_row_id: self.with_row_id,
                 with_row_addr: self.with_row_addr,
+                with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+                with_row_created_at_version: self.with_row_created_at_version,
+                last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+                created_at_sequence: self.created_at_sequence.clone(),
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
@@ -2196,9 +2347,7 @@ impl FragmentReader {
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
-        let merged = if self.with_row_addr as usize + self.with_row_id as usize
-            == self.output_schema.fields.len()
-        {
+        let merged = if self.num_system_cols() == self.output_schema.fields.len() {
             let selected_rows = params.to_offsets_total(total_num_rows).len();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
@@ -2242,6 +2391,10 @@ impl FragmentReader {
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params,
             total_num_rows,
         };
@@ -2303,6 +2456,13 @@ impl FragmentReader {
         )
     }
 
+    fn num_system_cols(&self) -> usize {
+        self.with_row_id as usize
+            + self.with_row_addr as usize
+            + self.with_row_created_at_version as usize
+            + self.with_row_last_updated_at_version as usize
+    }
+
     /// Reads a range of rows from the fragment
     ///
     /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
@@ -2349,9 +2509,7 @@ impl FragmentReader {
             num_requested_rows += range.end - range.start;
         }
 
-        let merged_stream = if self.with_row_addr as usize + self.with_row_id as usize
-            == self.output_schema.fields.len()
-        {
+        let merged_stream = if self.num_system_cols() == self.output_schema.fields.len() {
             let tasks = (0..num_requested_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
@@ -2391,6 +2549,10 @@ impl FragmentReader {
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
+            with_row_last_updated_at_version: self.with_row_last_updated_at_version,
+            with_row_created_at_version: self.with_row_created_at_version,
+            last_updated_at_sequence: self.last_updated_at_sequence.clone(),
+            created_at_sequence: self.created_at_sequence.clone(),
             params: ReadBatchParams::Ranges(ranges),
             total_num_rows,
         };
@@ -2470,16 +2632,18 @@ impl FragmentReader {
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+    use lance_file::writer::FileWriterOptions;
+    use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use v2::writer::FileWriterOptions;
 
     use super::*;
     use crate::{
@@ -2488,7 +2652,7 @@ mod tests {
             InsertBuilder,
         },
         session::Session,
-        utils::test::{StatsHolder, TestDatasetGenerator},
+        utils::test::TestDatasetGenerator,
     };
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
@@ -2652,63 +2816,125 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_update() {
-        let test_dir1 = TempStrDir::default();
-        let test_uri1 = &test_dir1;
-        let mut dataset1 = create_dataset_v2(test_uri1).await;
-        let _ = dataset1
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset_v2(test_uri).await;
+
+        // Test update with _rowid
+        let _ = dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
                 None,
                 None,
             )
             .await;
-        let mut fragment1 = dataset1.get_fragment(0).unwrap();
-        let test_dir2 = TempStrDir::default();
-        let test_uri2 = &test_dir2;
-        let mut dataset2 = create_dataset_v2(test_uri2).await;
-        let _ = dataset2
-            .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("col1".into(), "2".into())]),
-                None,
-                None,
-            )
-            .await;
-        let fragment2 = dataset2.get_fragment(0).unwrap();
-        let fragment2 = fragment2
-            .delete("_rowid=0 OR _rowid=3")
+        let mut fragment1 = dataset.get_fragment(0).unwrap();
+
+        let schema1 = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch1 = RecordBatch::try_new(
+            schema1.clone(),
+            vec![
+                Arc::new(UInt64Array::from(
+                    (0..40).filter(|&v| v != 0 && v != 3).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vec![2; 38])),
+            ],
+        )
+        .unwrap();
+        let right_stream1: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch1)].into_iter(),
+            schema1,
+        ));
+        let (updated_fragment1, fields_modified1) = fragment1
+            .update_columns(right_stream1, ROW_ID, ROW_ID)
             .await
-            .unwrap()
             .unwrap();
-        let batches = fragment2
-            .scan()
-            .with_row_id()
-            .batch_size(10)
+        let op1 = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated_fragment1],
+            new_fragments: vec![],
+            fields_modified: fields_modified1,
+            mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+        };
+        let mut dataset1 = Dataset::commit(
+            test_uri,
+            op1,
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset1.get_fragments().len(), 5);
+        let scanner1 = dataset1.get_fragment(0).unwrap().scan();
+        let batches1 = scanner1
             .try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let schema = batches[0].schema_ref().clone();
-        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema,
+        assert_eq!(batches1.len(), 1);
+        let mut expected_col1 = vec![2; 40];
+        expected_col1[0] = -1;
+        expected_col1[3] = -1;
+        assert_eq!(
+            batches1[0].column_by_name("col1").unwrap().as_ref(),
+            &Int64Array::from(expected_col1)
+        );
+
+        // Test update with user specified keys
+        let _ = dataset1
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col2".into(), "false".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment2 = dataset1.get_fragment(0).unwrap();
+
+        let schema2 = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i1", DataType::Int32, true),
+            ArrowField::new("col2", DataType::Boolean, true),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch2 = RecordBatch::try_new(
+            schema2.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    (0..40).filter(|&v| v != 0 && v != 3).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(vec![true; 38])),
+                Arc::new(Int64Array::from(vec![3; 38])),
+            ],
+        )
+        .unwrap();
+        let right_stream2: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch2)].into_iter(),
+            schema2,
         ));
-        let (updated_fragment, fields_modified) = fragment1
-            .update_columns(right_stream, ROW_ID, ROW_ID)
+        let (updated_fragment2, fields_modified2) = fragment2
+            .update_columns(right_stream2, "i", "i1")
             .await
             .unwrap();
         let op = Operation::Update {
             removed_fragment_ids: vec![],
-            updated_fragments: vec![updated_fragment],
+            updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
-            fields_modified,
+            fields_modified: fields_modified2,
             mem_wal_to_merge: None,
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
         };
-        let new_dataset = Dataset::commit(
-            test_uri1,
+        let dataset2 = Dataset::commit(
+            test_uri,
             op,
             Some(dataset1.version().version),
             None,
@@ -2718,27 +2944,30 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(new_dataset.get_fragments().len(), 5);
-        let mut scanner = new_dataset.get_fragment(0).unwrap().scan();
-        let batches = scanner
-            .batch_size(10)
+        assert_eq!(dataset2.get_fragments().len(), 5);
+        let scanner2 = dataset2.get_fragment(0).unwrap().scan();
+        let batches2 = scanner2
             .try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.len(), 4);
-        let binding = batches[0].column_by_name("col1").unwrap().clone();
-        let _vector = binding.as_any().downcast_ref::<Int64Array>().unwrap();
-        let actual_values = _vector.values();
-        let mut expected_values = vec![2; actual_values.len()];
-        expected_values[0] = -1;
-        expected_values[3] = -1;
+        assert_eq!(batches2.len(), 1);
+
+        expected_col1 = vec![3; 40];
+        expected_col1[0] = -1;
+        expected_col1[3] = -1;
         assert_eq!(
-            actual_values,
-            &expected_values[..],
-            "The vector content did not match the expected values."
+            batches2[0].column_by_name("col1").unwrap().as_ref(),
+            &Int64Array::from(expected_col1)
+        );
+        let mut expected_col2 = vec![true; 40];
+        expected_col2[0] = false;
+        expected_col2[3] = false;
+        assert_eq!(
+            batches2[0].column_by_name("col2").unwrap().as_ref(),
+            &BooleanArray::from(expected_col2)
         );
     }
 
@@ -3088,7 +3317,7 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3107,7 +3336,7 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3117,7 +3346,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false)
+            .take_rows(&[], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3127,7 +3356,7 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), true)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
             .await
             .unwrap();
         assert_eq!(
@@ -3168,6 +3397,7 @@ mod tests {
             schema: schema.clone(),
             fragments,
             config_upsert_values: None,
+            initial_bases: None,
         };
 
         let new_dataset =
@@ -3277,6 +3507,7 @@ mod tests {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
                 config_upsert_values: None,
+                initial_bases: None,
             };
 
             let dataset =
@@ -3438,7 +3669,7 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = FileReader::try_new_with_fragment_id(
+        let file_reader = PreviousFileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .child("data")
@@ -3628,7 +3859,7 @@ mod tests {
         let file_path = dataset.data_dir().child("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer =
-            v2::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -3685,12 +3916,7 @@ mod tests {
         )
         .unwrap();
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(StatsHolder::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -3701,17 +3927,17 @@ mod tests {
             .unwrap();
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        // Assert file is small (< 4kb)
+        // Assert file is small (< 4300 bytes)
         {
-            let stats = io_stats.incremental_stats();
-            assert_eq!(stats.write_iops, 3);
-            assert!(stats.write_bytes < 4096);
+            let stats = dataset.object_store().io_stats_incremental();
+            assert_io_eq!(stats, write_iops, 3);
+            assert_io_lt!(stats, written_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
         let projection = Schema::try_from(schema.as_ref())
             .unwrap()
-            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7], true);
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
         let reader = fragment
             .open(&projection, Default::default())
             .await
@@ -3728,8 +3954,8 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = io_stats.incremental_stats();
-        assert_eq!(stats.read_iops, 1);
-        assert!(stats.read_bytes < 4096);
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 1);
+        assert_io_lt!(stats, read_bytes, 4096);
     }
 }

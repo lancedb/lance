@@ -14,12 +14,7 @@ use lance_core::datatypes::Schema;
 /// Execute a metadata update operation on a dataset.
 /// This is moved from Dataset::update_op to keep metadata logic in this module.
 pub async fn execute_metadata_update(dataset: &mut Dataset, operation: Operation) -> Result<()> {
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        operation,
-        /*blobs_op=*/ None,
-        None,
-    );
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;

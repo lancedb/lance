@@ -18,10 +18,8 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::{
-    reader::{FileReader, FileReaderOptions},
-    writer::FileWriter,
-};
+use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::writer::FileWriter;
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -29,8 +27,6 @@ use lance_io::{
     utils::CachedFileSize,
 };
 use object_store::path::Path;
-use snafu::location;
-use tokio::sync::Mutex;
 
 use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
 
@@ -108,10 +104,6 @@ impl Shuffler for IvfShuffler {
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>> {
-        if self.num_partitions == 1 {
-            return Ok(Box::new(SinglePartitionReader::new(data)));
-        }
-
         let num_partitions = self.num_partitions;
         let mut partition_sizes = vec![0; num_partitions];
         let schema = data.schema().without_column(PART_ID_COLUMN);
@@ -190,7 +182,6 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
-                log::info!("shuffle {} batches, flushing", counter);
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -282,51 +273,11 @@ impl ShuffleReader for IvfShufflerReader {
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
-        Ok(self.partition_sizes[partition_id])
+        Ok(self.partition_sizes.get(partition_id).copied().unwrap_or(0))
     }
 
     fn total_loss(&self) -> Option<f64> {
         Some(self.loss)
-    }
-}
-
-pub struct SinglePartitionReader {
-    data: Mutex<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>,
-}
-
-impl SinglePartitionReader {
-    pub fn new(data: Box<dyn RecordBatchStream + Unpin + 'static>) -> Self {
-        Self {
-            data: Mutex::new(Some(data)),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ShuffleReader for SinglePartitionReader {
-    async fn read_partition(
-        &self,
-        _partition_id: usize,
-    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let mut data = self.data.lock().await;
-        match data.as_mut() {
-            Some(_) => Ok(data.take()),
-            None => Err(Error::Internal {
-                message: "the partition has been read and consumed".to_string(),
-                location: location!(),
-            }),
-        }
-    }
-
-    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
-        // we don't really care about the partition size
-        // it's used for determining the order of building the index and skipping empty partitions
-        // so we just return 1 here
-        Ok(1)
-    }
-
-    fn total_loss(&self) -> Option<f64> {
-        None
     }
 }
 

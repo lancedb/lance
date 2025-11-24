@@ -33,6 +33,7 @@ from .._arrow.bf16 import BFloat16Array
 from ..commit import CommitLock
 from ..dataset import (
     AlterColumn,
+    Branch,
     ExecuteResult,
     Index,
     LanceOperation,
@@ -45,6 +46,7 @@ from ..fragment import (
     DataFile,
     FragmentMetadata,
 )
+from ..io import StorageOptionsProvider
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
@@ -58,6 +60,7 @@ from .fragment import (
 from .fragment import (
     RowIdMeta as RowIdMeta,
 )
+from .indices import IndexDescription as IndexDescription
 from .optimize import (
     Compaction as Compaction,
 )
@@ -79,13 +82,6 @@ from .trace import capture_trace_events as capture_trace_events
 from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
-def infer_tfrecord_schema(
-    uri: str,
-    tensor_features: Optional[List[str]] = None,
-    string_features: Optional[List[str]] = None,
-) -> pa.Schema: ...
-def read_tfrecord(uri: str, schema: pa.Schema) -> pa.RecordBatchReader: ...
-
 class CleanupStats:
     bytes_removed: int
     old_versions: int
@@ -98,6 +94,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int],
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
+        storage_options_provider: Optional[StorageOptionsProvider],
+        s3_credentials_refresh_offset_seconds: Optional[int],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -108,7 +106,11 @@ class LanceFileWriter:
 
 class LanceFileSession:
     def __init__(
-        self, base_path: str, storage_options: Optional[Dict[str, str]] = None
+        self,
+        base_path: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -122,12 +124,16 @@ class LanceFileSession:
         keep_original_array: Optional[bool] = None,
         max_page_bytes: Optional[int] = None,
     ) -> LanceFileWriter: ...
+    def contains(self, path: str) -> bool: ...
+    def list(self, path: Optional[str] = None) -> List[str]: ...
 
 class LanceFileReader:
     def __init__(
         self,
         path: str,
         storage_options: Optional[Dict[str, str]],
+        storage_options_provider: Optional[StorageOptionsProvider],
+        s3_credentials_refresh_offset_seconds: Optional[int],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -212,6 +218,7 @@ class _Dataset:
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
     def load_indices(self) -> List[Index]: ...
+    def describe_indices(self) -> List[IndexDescription]: ...
     def scanner(
         self,
         columns: Optional[List[str]] = None,
@@ -273,7 +280,15 @@ class _Dataset:
     def versions(self) -> List[Version]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
-    def checkout_version(self, version: int | str) -> _Dataset: ...
+    def checkout_version(self, version: int | str | Tuple[str, int]) -> _Dataset: ...
+    def checkout_branch(self, branch: str) -> _Dataset: ...
+    def checkout_latest(self) -> _Dataset: ...
+    def shallow_clone(
+        self,
+        target_path: str,
+        reference: Optional[int | str | Tuple[str, int]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> _Dataset: ...
     def restore(self): ...
     def cleanup_old_versions(
         self,
@@ -282,11 +297,25 @@ class _Dataset:
         error_if_tagged_old_versions: Optional[bool] = None,
     ) -> CleanupStats: ...
     def get_version(self, tag: str) -> int: ...
+    # Tag operations
     def tags(self) -> Dict[str, Tag]: ...
     def tags_ordered(self, order: Optional[str]) -> List[Tuple[str, Tag]]: ...
-    def create_tag(self, tag: str, version: int): ...
+    def create_tag(
+        self, tag: str, version: int, branch: Optional[str] = None
+    ) -> Tag: ...
     def delete_tag(self, tag: str): ...
-    def update_tag(self, tag: str, version: int): ...
+    def update_tag(self, tag: str, version: int, branch: Optional[str] = None): ...
+    # Branch operations
+    def branches(self) -> Dict[str, Branch]: ...
+    def branches_ordered(self, order: Optional[str]) -> List[Tuple[str, Branch]]: ...
+    def create_branch(
+        self,
+        branch: str,
+        reference: Optional[int | str | Tuple[str, int]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> _Dataset: ...
+    def delete_branch(self, branch: str) -> None: ...
     def optimize_indices(self, **kwargs): ...
     def create_index(
         self,
@@ -319,10 +348,10 @@ class _Dataset:
     def commit(
         dest: str | _Dataset,
         operation: LanceOperation.BaseOperation,
-        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
@@ -334,6 +363,7 @@ class _Dataset:
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
@@ -354,11 +384,12 @@ class _Dataset:
     def read_transaction(self, version: int) -> Optional[Transaction]: ...
     def get_transactions(
         self, recent_transactions=10
-    ) -> Optional[List[Transaction]]: ...
+    ) -> List[Optional[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
     def when_matched_update_all(self, condition: Optional[str] = None) -> Self: ...
+    def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -527,10 +558,17 @@ class PyFullTextQuery:
     ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
+    """Statistics about a scan operation."""
+
     iops: int
+    requests: int
     bytes_read: int
     indices_loaded: int
     parts_loaded: int
+    index_comparisons: int
+    all_counts: Dict[
+        str, int
+    ]  # Additional metrics for debugging purposes. Subject to change.
 
 __version__: str
 language_model_home: Callable[[], str]

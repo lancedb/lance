@@ -5,7 +5,7 @@ use std::str::Utf8Error;
 
 use arrow_schema::ArrowError;
 use jni::{errors::Error as JniError, JNIEnv};
-use lance::error::Error as LanceError;
+use lance::Error as LanceError;
 use serde_json::Error as JsonError;
 
 #[derive(Debug, PartialEq, Eq)]

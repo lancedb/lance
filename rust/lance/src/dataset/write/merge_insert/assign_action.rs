@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{MergeInsertParams, WhenNotMatchedBySource};
-use crate::{dataset::WhenMatched, error::Result};
+use crate::{dataset::WhenMatched, Result};
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{col, Case, Expr};
 use snafu::location;
@@ -23,6 +23,8 @@ pub enum Action {
     UpdateAll = 1,
     Insert = 2,
     Delete = 3,
+    /// Fail the operation if a match is found
+    Fail = 4,
 }
 
 impl TryFrom<u8> for Action {
@@ -34,6 +36,7 @@ impl TryFrom<u8> for Action {
             1 => Ok(Self::UpdateAll),
             2 => Ok(Self::Insert),
             3 => Ok(Self::Delete),
+            4 => Ok(Self::Fail),
             _ => Err(crate::Error::InvalidInput {
                 source: format!("Invalid action code: {}", value).into(),
                 location: location!(),
@@ -117,6 +120,9 @@ pub fn merge_insert_action(
             }
         }
         WhenMatched::DoNothing => {}
+        WhenMatched::Fail => {
+            cases.push((matched, Action::Fail.as_literal_expr()));
+        }
     }
 
     match &params.delete_not_matched_by_source {

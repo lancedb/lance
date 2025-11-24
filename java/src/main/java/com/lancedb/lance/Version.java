@@ -43,6 +43,10 @@ public class Version {
     return id;
   }
 
+  public ManifestSummary getManifestSummary() {
+    return ManifestSummary.fromMetadata(metadata);
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)

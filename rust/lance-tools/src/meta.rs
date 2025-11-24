@@ -3,7 +3,7 @@
 
 use crate::cli::LanceFileMetaArgs;
 use lance_core::Result;
-use lance_file::v2::reader::{CachedFileMetadata, FileReader};
+use lance_file::reader::{CachedFileMetadata, FileReader};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use std::fmt;

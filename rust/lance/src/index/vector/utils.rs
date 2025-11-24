@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, FixedSizeListArray};
+use arrow_array::{cast::AsArray, ArrayRef, FixedSizeListArray, RecordBatch};
 use futures::StreamExt;
 use lance_arrow::{interleave_batches, DataTypeExt};
 use lance_core::datatypes::Schema;
@@ -16,6 +16,72 @@ use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
+
+/// Helper function to extract a column from a RecordBatch, supporting nested field paths.
+///
+/// This function handles:
+/// - Simple column names: "column"
+/// - Nested paths: "parent.child" or "parent.child.grandchild"
+/// - Backtick-escaped field names: "parent.`field.with.dots`"
+fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+    // Try to get the column directly first (fast path for simple columns)
+    if let Some(col) = batch.column_by_name(column) {
+        return Ok(col.clone());
+    }
+
+    // Parse the field path using Lance's field path parsing logic
+    // This properly handles backtick-escaped field names
+    let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| Error::Index {
+        message: format!("Failed to parse field path '{}': {}", column, e),
+        location: location!(),
+    })?;
+
+    if parts.is_empty() {
+        return Err(Error::Index {
+            message: format!("Invalid empty field path: {}", column),
+            location: location!(),
+        });
+    }
+
+    // Get the root column
+    let mut current_array: ArrayRef = batch
+        .column_by_name(&parts[0])
+        .ok_or_else(|| Error::Index {
+            message: format!(
+                "Column '{}' does not exist in batch (looking for root field '{}')",
+                column, parts[0]
+            ),
+            location: location!(),
+        })?
+        .clone();
+
+    // Navigate through nested struct fields
+    for part in &parts[1..] {
+        let struct_array = current_array
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .ok_or_else(|| Error::Index {
+                message: format!(
+                    "Cannot access nested field '{}' in column '{}': parent is not a struct",
+                    part, column
+                ),
+                location: location!(),
+            })?;
+
+        current_array = struct_array
+            .column_by_name(part)
+            .ok_or_else(|| Error::Index {
+                message: format!(
+                    "Nested field '{}' does not exist in column '{}'",
+                    part, column
+                ),
+                location: location!(),
+            })?
+            .clone();
+    }
+
+    Ok(current_array)
+}
 
 /// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
@@ -35,10 +101,7 @@ fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) 
     match (data_type,in_list) {
         (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
         (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
-        _ => Err(Error::Index {
-            message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input(format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type), location!()))
     }
 }
 
@@ -93,13 +156,13 @@ fn infer_vector_element_type_impl(
         (arrow::datatypes::DataType::List(inner), false) => {
             infer_vector_element_type_impl(inner.data_type(), true)
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
-                data_type
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::invalid_input(
+            format!(
+            "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+            data_type
+        ),
+            location!(),
+        )),
     }
 }
 
@@ -171,13 +234,7 @@ pub async fn maybe_sample_training_data(
         while let Some(batch) = scan.next().await {
             let batch = batch?;
 
-            let array = batch.column_by_name(column).ok_or(Error::Index {
-                message: format!(
-                    "Sample training data: column {} does not exist in return",
-                    column
-                ),
-                location: location!(),
-            })?;
+            let array = get_column_from_batch(&batch, column)?;
             let null_count = array.logical_null_count();
             if null_count < array.len() {
                 num_non_null += array.len() - null_count;
@@ -218,7 +275,8 @@ pub async fn maybe_sample_training_data(
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
         if is_nullable {
-            scanner.filter_expr(datafusion_expr::col(column).is_not_null());
+            let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+            scanner.filter_expr(column_expr.is_not_null());
         }
         let batch = scanner.try_into_batch().await?;
         info!(
@@ -228,13 +286,7 @@ pub async fn maybe_sample_training_data(
         batch
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
+    let array = get_column_from_batch(&batch, column)?;
 
     match array.data_type() {
         arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),

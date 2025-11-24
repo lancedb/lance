@@ -1,0 +1,72 @@
+[package]
+name = "lance-namespace-impls"
+description = "Lance Namespace Implementations"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+rest = ["dep:reqwest"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
+# Cloud storage features for directory implementation - align with lance-io
+dir-gcp = ["lance-io/gcp"]
+dir-aws = ["lance-io/aws"]
+dir-azure = ["lance-io/azure"]
+dir-oss = ["lance-io/oss"]
+
+[dependencies]
+lance-namespace.workspace = true
+lance-core.workspace = true
+
+# REST implementation dependencies (optional, enabled by "rest" feature)
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "charset",
+    "gzip",
+    "http2",
+    "stream",
+    "rustls-tls-native-roots"
+] }
+# Directory implementation dependencies (always enabled)
+url = { workspace = true }
+lance = { workspace = true }
+lance-index = { workspace = true }
+lance-io = { workspace = true }
+object_store = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+
+# REST adapter implementation dependencies (optional, enabled by "rest-adapter" feature)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true, features = ["trace", "cors"] }
+serde = { workspace = true, optional = true }
+
+# Common dependencies
+async-trait.workspace = true
+bytes.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["sync", "full"] }
+serde_json = { workspace = true }
+futures.workspace = true
+log.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+wiremock.workspace = true
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+rstest.workspace = true
+
+[lints]
+workspace = true

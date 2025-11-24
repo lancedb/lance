@@ -97,6 +97,7 @@ use crate::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::Error;
@@ -471,14 +472,12 @@ pub async fn plan_compaction(
 ) -> Result<CompactionPlan> {
     // get_fragments should be returning fragments in sorted order (by id)
     // and fragment ids should be unique
+    let fragments = dataset.get_fragments();
     debug_assert!(
-        dataset
-            .get_fragments()
-            .windows(2)
-            .all(|w| w[0].id() < w[1].id()),
+        fragments.windows(2).all(|w| w[0].id() < w[1].id()),
         "fragments in manifest are not sorted"
     );
-    let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
+    let mut fragment_metrics = futures::stream::iter(fragments)
         .map(|fragment| async move {
             match collect_metrics(&fragment).await {
                 Ok(metrics) => Ok((fragment.metadata, metrics)),
@@ -609,7 +608,6 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
-        /*blob_op=*/ None,
         None,
     );
 
@@ -661,7 +659,7 @@ async fn rewrite_files(
     // The versions of Lance prior to when we started writing the writer version
     // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
     // make sure to recompute them.
-    // See: https://github.com/lancedb/lance/issues/1531
+    // See: https://github.com/lance-format/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
 
     // It's possible the fragments are old and don't have physical rows or
@@ -675,6 +673,13 @@ async fn rewrite_files(
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut scanner = dataset.scan();
+    let has_blob_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob());
+    if has_blob_columns {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
     }
@@ -727,19 +732,16 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    let new_fragments = write_fragments_internal(
+    let (mut new_fragments, _) = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema().clone(),
         reader,
         params,
+        None, // Compaction doesn't use target_bases
     )
     .await?;
-
-    // We should not be rewriting any blob data
-    assert!(new_fragments.blob.is_none());
-    let mut new_fragments = new_fragments.default.0;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -768,6 +770,14 @@ async fn rewrite_files(
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+        if dataset.manifest.uses_stable_row_ids() {
+            recalc_versions_for_rewritten_fragments(
+                dataset.as_ref(),
+                &mut new_fragments,
+                &fragments,
+            )
+            .await?;
+        }
 
         if options.defer_index_remap {
             let no_addrs = RoaringTreemap::new();
@@ -860,6 +870,104 @@ async fn rechunk_stable_row_ids(
         // TODO: if large enough, serialize to separate file
         let serialized = lance_table::rowids::write_row_ids(&sequence);
         fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+    }
+
+    Ok(())
+}
+
+/// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
+async fn recalc_versions_for_rewritten_fragments(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    old_fragments: &[Fragment],
+) -> Result<()> {
+    // Load old per-row last_updated_at version sequences
+    let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+    // Load old per-row created_at version sequences
+    let mut old_created_at_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
+        Vec::with_capacity(old_fragments.len());
+
+    for frag in old_fragments.iter() {
+        let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
+            match row_id_meta {
+                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
+                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+            }
+        } else {
+            frag.physical_rows.unwrap_or(0) as u64
+        };
+
+        // Load created_at sequence (default to version 1 if missing)
+        let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load created_at version sequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            // Default: treat all rows as created at version 1
+            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
+        };
+
+        // Load last_updated_at sequence (default to same as created_at sequence)
+        let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
+            version_meta.load_sequence().map_err(|e| Error::Internal {
+                message: format!("Failed to load last_updated_at version sequence: {}", e),
+                location: location!(),
+            })?
+        } else {
+            created_at_seq.clone()
+        };
+
+        // Apply deletion mask if present (positions are local offsets)
+        if let Some(deletion_file) = &frag.deletion_file {
+            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+            last_updated_seq.mask(deletions.to_sorted_iter())?;
+            created_at_seq.mask(deletions.to_sorted_iter())?;
+        }
+
+        old_last_updated_sequences.push(last_updated_seq);
+        old_created_at_sequences.push(created_at_seq);
+    }
+
+    // Ensure row counts match new fragments total
+    let old_total: u64 = old_last_updated_sequences.iter().map(|s| s.len()).sum();
+    let new_total: u64 = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .sum();
+    debug_assert_eq!(old_total, new_total);
+
+    // Rechunk version runs aligned to new fragment sizes
+    let chunk_sizes: Vec<u64> = new_fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .collect();
+
+    let new_last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_last_updated_sequences,
+        chunk_sizes.clone(),
+        false,
+    )?;
+
+    let new_created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
+        old_created_at_sequences,
+        chunk_sizes,
+        false,
+    )?;
+
+    // Set both version metadata on new fragments
+    for ((fragment, last_updated_seq), created_at_seq) in new_fragments
+        .iter_mut()
+        .zip(new_last_updated_sequences.into_iter())
+        .zip(new_created_at_sequences.into_iter())
+    {
+        fragment.last_updated_at_version_meta = Some(
+            lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
+        );
+        fragment.created_at_version_meta = Some(
+            lance_table::format::RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
+        );
     }
 
     Ok(())
@@ -958,8 +1066,6 @@ pub async fn commit_compaction(
             rewritten_indices,
             frag_reuse_index,
         },
-        // TODO: Add a blob compaction pass
-        /*blob_op= */ None,
         None,
     );
 
@@ -983,12 +1089,13 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type, Int64Type};
     use arrow_array::{
-        Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
-        RecordBatchIterator,
+        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
+    use lance_arrow::BLOB_META_KEY;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::Error;
@@ -1005,6 +1112,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -1024,6 +1132,8 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
@@ -1230,6 +1340,57 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_columns() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, false)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let expected_payload: Vec<Vec<u8>> =
+            vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9, 10], vec![11]];
+        let id_column: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            0..expected_payload.len() as i32,
+        ));
+        let blob_array: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+            expected_payload.iter().map(|value| Some(value.as_slice())),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_column, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+        assert!(dataset.get_fragments().len() > 1);
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let dataset = Arc::new(dataset);
+        let row_indices: Vec<u64> = (0..expected_payload.len() as u64).collect();
+        let blobs = dataset
+            .take_blobs_by_indices(&row_indices, "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected_payload.len());
+        for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
+            let bytes = blob.read().await.unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
     }
 
     fn row_addrs(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {

@@ -35,11 +35,32 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v4
+      - name: Check if stable release
+        id: check_version
+        run: |
+          # Get the tag from the event
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "Checking tag: $TAG"
+
+          # Skip if tag contains -beta or -rc (not a stable release)
+          if [[ "$TAG" == *-beta.* ]] || [[ "$TAG" == *-rc.* ]]; then
+            echo "Skipping cargo publish for non-stable version: $TAG"
+            echo "Only stable versions (without -beta or -rc) are published to crates.io"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Stable version detected: $TAG"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
       - uses: Swatinem/rust-cache@v2
+        if: steps.check_version.outputs.skip != 'true'
         with:
           workspaces: rust
       - name: Verify and checkout specified tag
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.check_version.outputs.skip != 'true'
         run: |
           git fetch --all --tags
           if git rev-parse ${{ github.event.inputs.tag }} >/dev/null 2>&1; then
@@ -52,6 +73,7 @@ jobs:
             exit 1
           fi
       - name: Install dependencies
+        if: steps.check_version.outputs.skip != 'true'
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
@@ -59,6 +81,7 @@ jobs:
       # - uses: rust-lang/crates-io-auth-action@v1
       #   id: auth
       - uses: albertlockett/publish-crates@v2.2
+        if: steps.check_version.outputs.skip != 'true'
         with:
           # registry-token: ${{ steps.auth.outputs.token }}
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -108,6 +108,16 @@ def test_sql_predicates(dataset):
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
 
 
+def test_sql_current_date(tmp_path: Path):
+    table = pa.table(
+        {"date": pa.array([date(2020, 1, 1), date(2020, 1, 2)], type=pa.date32())}
+    )
+    dataset = lance.write_dataset(table, tmp_path / "current_date")
+
+    filtered = dataset.to_table(filter="date <= current_date()")
+    assert filtered.equals(dataset.to_table())
+
+
 def test_illegal_predicates(dataset):
     bad_parse = [
         "str BETWEEN 10 AND 20",
@@ -314,7 +324,7 @@ def test_struct_field_order(tmp_path):
 
 
 @pytest.mark.skip(
-    reason="enable this in recurring test https://github.com/lancedb/lance/pull/4190"
+    reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
     " as it requires release mode"
 )
 def test_filter_depth_limit():
