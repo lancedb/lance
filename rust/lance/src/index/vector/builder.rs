@@ -687,6 +687,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let (assign_batches, merge_indices, partition_maintain) = if num_indices_to_merge.is_some()
+            || self.optimize_options.is_none()
         {
             no_partition_maintain()
         } else {
