@@ -1561,7 +1561,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 centroids.clone(),
                 self.distance_type,
-                &self.column,
+                vector_field.name().as_str(),
                 quantizer.into(),
                 None,
             )?,
