@@ -171,13 +171,16 @@ impl Transformer for ResidualTransform {
             ),
             location: location!(),
         })?;
-        let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
-            message: format!(
-                "Compute residual vector: original vector column not found: {}",
-                self.vec_col
-            ),
-            location: location!(),
-        })?;
+        let original = batch
+            .column_by_qualified_name(&self.vec_col)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Compute residual vector: original vector column {} not found in batch {}",
+                    self.vec_col,
+                    batch.schema(),
+                ),
+                location: location!(),
+            })?;
         let original_vectors = original.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: original vector column {} is not fixed size list: {}",

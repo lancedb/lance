@@ -39,7 +39,7 @@ pub mod r#struct;
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 
-/// Arrow extension metadata key for extension metadata  
+/// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Key used by lance to mark a field as a blob
@@ -744,6 +744,10 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
+        if let Some(column) = self.column_by_name(name) {
+            return Some(column);
+        }
+
         let split = name.split('.').collect::<Vec<_>>();
         if split.is_empty() {
             return None;

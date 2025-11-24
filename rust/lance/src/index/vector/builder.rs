@@ -1135,7 +1135,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let batch = Flatten::new(&self.column).transform(&batch)?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let vectors = batch[&self.column].as_fixed_size_list().clone();
+        let vectors = batch
+            .column_by_qualified_name(&self.column)
+            .ok_or(Error::invalid_input(
+                format!(
+                    "vector column {} not found in batch {}",
+                    self.column,
+                    batch.schema()
+                ),
+                location!(),
+            ))?
+            .as_fixed_size_list()
+            .clone();
         Ok(Some((row_ids, vectors)))
     }
 
