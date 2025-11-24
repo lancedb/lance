@@ -1940,12 +1940,19 @@ mod tests {
         dataset.index_statistics("status_idx").await.unwrap();
 
         let stats = io_tracker.incremental_stats();
-        assert_io_lt!(
+        assert_io_eq!(
             stats,
             read_bytes,
-            1024,
-            "index_statistics should only read metadata, read {} bytes",
+            4096,
+            "index_statistics should only read the index footer; got {} bytes",
             stats.read_bytes
+        );
+        assert_io_lt!(
+            stats,
+            read_iops,
+            3,
+            "index_statistics should only require a head plus one range read; got {} ops",
+            stats.read_iops
         );
         assert_io_eq!(
             stats,
