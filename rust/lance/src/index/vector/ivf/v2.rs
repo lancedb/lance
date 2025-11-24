@@ -1002,6 +1002,7 @@ mod tests {
         expected_after_join: usize,
     ) -> (usize, usize, usize) {
         const ROWS_TO_APPEND_FOR_JOIN: usize = 32;
+        let row_count_before = dataset.count_all_rows().await.unwrap();
         let index_ctx = load_vector_index_context(dataset, "vector", index_name).await;
         let partitions = index_ctx.stats()["indices"][0]["partitions"]
             .as_array()
@@ -1044,14 +1045,22 @@ mod tests {
 
         let post_ctx = load_vector_index_context(dataset, "vector", index_name).await;
         let post_partitions = post_ctx.num_partitions();
-        assert!(
-            post_partitions <= expected_after_join,
+        assert_eq!(
+            post_partitions,
+            expected_after_join,
             "Expected partitions to be at most {} after join, got stats: {}",
             expected_after_join,
             post_ctx.stats_json()
         );
 
-        (row_ids.len() - 1, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
+        let row_count_after = dataset.count_all_rows().await.unwrap();
+        debug_assert!(
+            row_count_before + ROWS_TO_APPEND_FOR_JOIN >= row_count_after,
+            "row count should not increase after delete + append"
+        );
+        let deleted_rows = row_count_before + ROWS_TO_APPEND_FOR_JOIN - row_count_after;
+
+        (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
     async fn append_constant_vector(dataset: &mut Dataset, rows: usize, template: &[f32]) {
