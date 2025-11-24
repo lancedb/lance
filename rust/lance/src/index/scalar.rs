@@ -24,10 +24,10 @@ use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
+use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
-    ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
-    VALUE_COLUMN_NAME,
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::{
@@ -35,7 +35,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams,
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
-use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
+use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use snafu::location;
@@ -111,23 +111,8 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
-
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
-
-    let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
-        location: location!(),
-    })?;
-
-    // Datafusion currently has bugs with spilling on string columns
-    // See https://github.com/apache/datafusion/issues/10073
-    //
-    // One we upgrade we can remove this
-    let use_spilling = !matches!(
-        column_field.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8
-    );
 
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
@@ -152,7 +137,7 @@ pub(crate) async fn scan_training_data(
 
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions {
-            use_spilling,
+            use_spilling: true,
             ..Default::default()
         })
         .await?;
@@ -232,8 +217,8 @@ pub(crate) async fn load_training_data(
 }
 
 // TODO: Allow users to register their own plugins
-static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<ScalarIndexPluginRegistry>> =
-    LazyLock::new(ScalarIndexPluginRegistry::with_default_plugins);
+static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
+    LazyLock::new(IndexPluginRegistry::with_default_plugins);
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
@@ -405,8 +390,8 @@ pub(crate) async fn infer_scalar_index_details(
 
 pub fn index_matches_criteria(
     index: &IndexMetadata,
-    criteria: &ScalarIndexCriteria,
-    field: &Field,
+    criteria: &IndexCriteria,
+    fields: &[&Field],
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
@@ -420,6 +405,12 @@ pub fn index_matches_criteria(
         if index.fields.len() != 1 {
             return Ok(false);
         }
+        if fields.len() != 1 {
+            // This should be unreachable since we just verified index.fields.len() == 1 but
+            // return false just in case
+            return Ok(false);
+        }
+        let field = fields[0];
         // Build the full field path for nested fields
         let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
             let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
@@ -546,8 +537,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::pbold::NGramIndexDetails;
     use lance_index::IndexType;
+    use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -591,7 +582,7 @@ mod tests {
     fn test_index_matches_criteria_vector_index() {
         let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
 
-        let criteria = ScalarIndexCriteria {
+        let criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
@@ -603,10 +594,10 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
-        let result = index_matches_criteria(&index1, &criteria, &field, true, &schema).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
 
-        let result = index_matches_criteria(&index1, &criteria, &field, false, &schema).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
     }
 
@@ -616,7 +607,7 @@ mod tests {
         let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
         let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
 
-        let criteria = ScalarIndexCriteria {
+        let criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
@@ -629,91 +620,91 @@ mod tests {
             metadata: Default::default(),
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         // test for_column
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: Some("mycol"),
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         // test has_name
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
             has_name: Some("btree_index"),
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         // test supports_exact_equality
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: true,
             for_column: None,
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
         let result =
-            index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
+            index_matches_criteria(&inverted_index, &criteria, &[&field], false, &schema).unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
         let result =
-            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(!result);
 
         // test multiple indices
-        let mut criteria = ScalarIndexCriteria {
+        let mut criteria = IndexCriteria {
             must_support_fts: false,
             must_support_exact_equality: false,
             for_column: None,
             has_name: None,
         };
         let result =
-            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
         let result =
-            index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&inverted_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
         let result =
-            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
     }
 
@@ -1183,5 +1174,511 @@ mod tests {
         let stats = target_scalar_index.statistics().unwrap();
         let rows_per_zone = stats["rows_per_zone"].as_u64().unwrap();
         assert_eq!(rows_per_zone, 200, "ZoneMap rows_per_zone should be 200");
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_with_deletions() {
+        let deletion_predicates = [
+            "NOT value",            // every other row
+            "id > 8191 or id < 10", // Second zone of each fragment
+            "id < 9190 ",           // Most of first zone
+        ];
+        let query_predicates = ["value", "id <= 8191", "id >= 1"];
+
+        async fn filter_query(ds: &Dataset, query_pred: &str) -> arrow_array::RecordBatch {
+            ds.scan()
+                .filter(query_pred)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+        }
+
+        for del_pred in &deletion_predicates {
+            // We use 2 * 8192 so each fragment has two zones.
+            let mut ds = lance_datagen::gen_batch()
+                .col("id", array::step::<UInt64Type>())
+                .col("value", array::cycle_bool(vec![true, false]))
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2 * 8192))
+                .await
+                .unwrap();
+
+            // Create zonemap index on "value" column
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+            ds.create_index_builder(&["value"], IndexType::Scalar, &params)
+                .name("value_zone_map".into())
+                .await
+                .unwrap();
+            ds.create_index_builder(&["id"], IndexType::Scalar, &params)
+                .name("id_zone_map".into())
+                .await
+                .unwrap();
+
+            ds.delete(del_pred).await.unwrap();
+            let mut result_before = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                result_before.push(batch);
+            }
+            ds.drop_index("value_zone_map").await.unwrap();
+            ds.drop_index("id_zone_map").await.unwrap();
+
+            let mut expected = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                expected.push(batch);
+            }
+
+            for (before, expected) in result_before.iter().zip(expected.iter()) {
+                assert_eq!(before, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}'", del_pred);
+            }
+
+            // Now recreate the indexes for the next iteration
+            ds.create_index_builder(&["value"], IndexType::Scalar, &params)
+                .name("value_zone_map".into())
+                .await
+                .unwrap();
+            ds.create_index_builder(&["id"], IndexType::Scalar, &params)
+                .name("id_zone_map".into())
+                .await
+                .unwrap();
+            let mut result_after = Vec::new();
+            for query_pred in &query_predicates {
+                let batch = filter_query(&ds, query_pred).await;
+                result_after.push(batch);
+            }
+
+            for (after, expected) in result_after.iter().zip(expected.iter()) {
+                assert_eq!(after, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index", del_pred);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_deletion_then_index() {
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows in two fragments: alternating boolean values
+        // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_bool(vec![true, false]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Delete rows where value=false (rows 1, 3, 5, 7, 9)
+        ds.delete("NOT value").await.unwrap();
+
+        // Verify data before index creation: should have 5 rows with value=true
+        let before_index = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_ids = before_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_ids,
+            &[0, 2, 4, 6, 8],
+            "Before index: should have 5 rows"
+        );
+
+        // Create zonemap index on "value" column
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let after_index = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_ids = after_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // This assertion will FAIL if bug #4758 is present
+        assert_eq!(
+            after_ids.len(),
+            5,
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            after_ids.len(),
+            after_ids
+        );
+        assert_eq!(
+            after_ids,
+            &[0, 2, 4, 6, 8],
+            "Zonemap index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_index_then_deletion() {
+        // Tests the opposite scenario: create index FIRST, then perform deletions
+        // Verifies that zonemap index properly handles deletions that occur after index creation
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating boolean values
+        // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_bool(vec![true, false]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Verify initial data: should have 10 rows
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
+
+        let initial_count: usize = initial_data["id"].len();
+        assert_eq!(initial_count, 10, "Should start with 10 rows");
+
+        // CREATE INDEX FIRST (before deletion)
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Query with index before deletion - should return all 5 rows with value=true
+        let before_deletion = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_deletion_ids = before_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "Before deletion: should return 5 rows with value=true"
+        );
+
+        // NOW DELETE rows where value=false (rows 1, 3, 5, 7, 9)
+        ds.delete("NOT value").await.unwrap();
+
+        // Query after deletion - should still return 5 rows with value=true
+        let after_deletion = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_deletion_ids = after_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // Verify we get the correct data after deletion
+        assert_eq!(
+            after_deletion_ids.len(),
+            5,
+            "After deletion: Expected 5 rows, got {}",
+            after_deletion_ids.len()
+        );
+        assert_eq!(
+            after_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "After deletion: Should return rows [0, 2, 4, 6, 8] with value=true"
+        );
+
+        // Verify the actual values are correct
+        let after_deletion_values: Vec<bool> = after_deletion["value"]
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            after_deletion_values,
+            vec![true, true, true, true, true],
+            "All returned rows should have value=true"
+        );
+
+        // Count rows matching "value = true"
+        let count_true = ds
+            .scan()
+            .filter("value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_true_rows: usize = count_true.num_rows();
+
+        // Count rows matching "value = false" (should be 0 after deletion)
+        let count_false = ds
+            .scan()
+            .filter("NOT value")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_false_rows: usize = count_false.num_rows();
+
+        // The key assertions: filtered queries should return correct data
+        assert_eq!(
+            count_true_rows, 5,
+            "Should have exactly 5 rows with value=true"
+        );
+        assert_eq!(
+            count_false_rows, 0,
+            "Should have 0 rows with value=false after deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_deletion_then_index() {
+        // Reproduces the same bug as #4758 but for bloom filter indexes
+        // After deleting rows and creating a bloom filter index, queries return fewer results than expected
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Delete rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Verify data before index creation: should have 5 rows with value="apple"
+        let before_index = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_ids = before_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_ids,
+            &[0, 2, 4, 6, 8],
+            "Before index: should have 5 rows"
+        );
+
+        // Create bloom filter index on "value" column with small zone size to ensure the bug is triggered
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let after_index = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_ids = after_index["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // This assertion verifies the fix works
+        assert_eq!(
+            after_ids.len(),
+            5,
+            "Expected 5 rows after index creation, got {}. Only {:?} returned instead of [0, 2, 4, 6, 8]",
+            after_ids.len(),
+            after_ids
+        );
+        assert_eq!(
+            after_ids,
+            &[0, 2, 4, 6, 8],
+            "Bloom filter index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_index_then_deletion() {
+        // Tests the opposite scenario: create bloom filter index FIRST, then perform deletions
+        // Verifies that bloom filter index properly handles deletions that occur after index creation
+        use arrow::datatypes::UInt64Type;
+        use lance_datagen::array;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_index::IndexType;
+
+        // Create dataset with 10 rows: alternating string values "apple" and "banana"
+        // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("value", array::cycle_utf8_literals(&["apple", "banana"]))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        // Verify initial data: should have 10 rows
+        let initial_data = ds.scan().try_into_batch().await.unwrap();
+
+        let initial_count: usize = initial_data.num_rows();
+        assert_eq!(initial_count, 10, "Should start with 10 rows");
+
+        // CREATE INDEX FIRST (before deletion)
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+            &BloomParams {
+                number_of_items: 5, // Small zone size to ensure multiple zones
+                probability: 0.01,
+            },
+        );
+        ds.create_index(&["value"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Query with index before deletion - should return all 5 rows with value="apple"
+        let before_deletion = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let before_deletion_ids = before_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        assert_eq!(
+            before_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "Before deletion: should return 5 rows with value='apple'"
+        );
+
+        // NOW DELETE rows where value="banana" (rows 1, 3, 5, 7, 9)
+        ds.delete("value = 'banana'").await.unwrap();
+
+        // Query after deletion - should still return 5 rows with value="apple"
+        let after_deletion = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_deletion_ids = after_deletion["id"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap()
+            .values();
+
+        // Verify we get the correct data after deletion
+        assert_eq!(
+            after_deletion_ids.len(),
+            5,
+            "After deletion: Expected 5 rows, got {}",
+            after_deletion_ids.len()
+        );
+        assert_eq!(
+            after_deletion_ids,
+            &[0, 2, 4, 6, 8],
+            "After deletion: Should return rows [0, 2, 4, 6, 8] with value='apple'"
+        );
+
+        // Verify the actual values are correct
+        let after_deletion_values: Vec<&str> = after_deletion["value"]
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            after_deletion_values,
+            vec!["apple", "apple", "apple", "apple", "apple"],
+            "All returned rows should have value='apple'"
+        );
+
+        // Count rows matching "value = 'apple'"
+        let count_apple = ds
+            .scan()
+            .filter("value = 'apple'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_apple_rows: usize = count_apple.num_rows();
+
+        // Count rows matching "value = 'banana'" (should be 0 after deletion)
+        let count_banana = ds
+            .scan()
+            .filter("value = 'banana'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let count_banana_rows: usize = count_banana.num_rows();
+
+        // The key assertions: filtered queries should return correct data
+        assert_eq!(
+            count_apple_rows, 5,
+            "Should have exactly 5 rows with value='apple'"
+        );
+        assert_eq!(
+            count_banana_rows, 0,
+            "Should have 0 rows with value='banana' after deletion"
+        );
     }
 }

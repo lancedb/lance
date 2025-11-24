@@ -23,7 +23,7 @@ use arrow_schema::DataType;
 use lance::datatypes::Schema;
 use lance::Result;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::kmeans::{
@@ -42,6 +42,22 @@ use pyo3::{
 
 use crate::file::object_store_from_uri_or_path;
 use crate::rt;
+
+/// A wrapper around a JSON string that converts to a Python object
+/// using json.loads when marshalling to Python.
+#[derive(Debug, Clone)]
+pub struct PyJson(pub String);
+
+impl<'py> IntoPyObject<'py> for PyJson {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        let json_module = py.import("json")?;
+        json_module.call_method1("loads", (self.0,))
+    }
+}
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -223,7 +239,7 @@ impl Hnsw {
         let mut writer = rt()
             .block_on(
                 Some(py),
-                FileWriter::<ManifestDescribing>::try_new(
+                PreviousFileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())

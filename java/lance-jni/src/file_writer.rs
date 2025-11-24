@@ -22,8 +22,8 @@ use jni::{
 };
 use lance::io::ObjectStore;
 use lance_file::{
-    v2::writer::{FileWriter, FileWriterOptions},
     version::LanceFileVersion,
+    writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 

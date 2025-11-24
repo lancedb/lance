@@ -48,6 +48,7 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod merge_insert;
+mod namespace;
 mod optimize;
 mod schema;
 mod sql;

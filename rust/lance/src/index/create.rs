@@ -37,7 +37,7 @@ pub struct CreateIndexBuilder<'a> {
     replace: bool,
     train: bool,
     fragments: Option<Vec<u32>>,
-    fragment_uuid: Option<String>,
+    index_uuid: Option<String>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -56,7 +56,7 @@ impl<'a> CreateIndexBuilder<'a> {
             replace: false,
             train: true,
             fragments: None,
-            fragment_uuid: None,
+            index_uuid: None,
         }
     }
 
@@ -80,8 +80,8 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    pub fn fragment_uuid(mut self, uuid: String) -> Self {
-        self.fragment_uuid = Some(uuid);
+    pub fn index_uuid(mut self, uuid: String) -> Self {
+        self.index_uuid = Some(uuid);
         self
     }
 
@@ -136,7 +136,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         }
 
-        let index_id = match &self.fragment_uuid {
+        let index_id = match &self.index_uuid {
             Some(uuid_str) => Uuid::parse_str(uuid_str).map_err(|e| Error::Index {
                 message: format!("Invalid UUID string provided: {}", e),
                 location: location!(),
@@ -355,7 +355,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
-            /*blobs_op= */ None,
             None,
         );
 
@@ -535,7 +534,7 @@ mod tests {
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .fragment_uuid(shared_uuid.clone());
+                    .index_uuid(shared_uuid.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
 

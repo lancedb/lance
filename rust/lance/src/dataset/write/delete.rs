@@ -234,12 +234,7 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids: data.deleted_fragment_ids,
             predicate: self.predicate.clone(),
         };
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let mut builder = CommitBuilder::new(dataset);
 

@@ -308,13 +308,7 @@ pub(super) async fn add_columns(
     .await?;
 
     let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        operation,
-        // TODO: Make it possible to add new blob columns
-        /*blob_op= */ None,
-        None,
-    );
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
@@ -478,17 +472,6 @@ pub(super) async fn alter_columns(
             )
         })?;
 
-        if !field_src.is_default_storage() {
-            return Err(Error::NotSupported {
-                source: format!(
-                    "Column \"{}\" is not a default storage column and cannot yet be altered",
-                    alteration.path
-                )
-                .into(),
-                location: location!(),
-            });
-        }
-
         if let Some(nullable) = alteration.nullable {
             // TODO: in the future, we could check the values of the column to see if
             //       they are all non-null and thus the column could be made non-nullable.
@@ -547,7 +530,6 @@ pub(super) async fn alter_columns(
             Operation::Project { schema: new_schema },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
-            None,
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
@@ -621,7 +603,6 @@ pub(super) async fn alter_columns(
                 fragments,
             },
             /*blob_op= */ None,
-            None,
         )
     };
 
@@ -643,18 +624,7 @@ pub(super) async fn alter_columns(
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
-        if let Some(field) = dataset.schema().field(col) {
-            if !field.is_default_storage() {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Column \"{}\" is not a default storage column and cannot yet be dropped",
-                        col
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-        } else {
+        if dataset.schema().field(col).is_none() {
             return Err(Error::invalid_input(
                 format!("Column {} does not exist in the dataset", col),
                 location!(),
@@ -676,7 +646,6 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         dataset.manifest.version,
         Operation::Project { schema: new_schema },
         /*blob_op= */ None,
-        None,
     );
 
     dataset

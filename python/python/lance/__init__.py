@@ -6,7 +6,9 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
+from lance_namespace import DescribeTableRequest, LanceNamespace
 
 from . import io, log
 from .blob import BlobColumn, BlobFile
@@ -89,8 +91,8 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
-    namespace: Optional[any] = None,
-    table_id: Optional[list] = None,
+    namespace: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
     ignore_namespace_table_storage_options: bool = False,
     s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
@@ -151,15 +153,13 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
-    namespace : optional
+    namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
-        This can be any object with a describe_table(table_id, version) method
-        that returns a dict with 'location' and 'storage_options' keys.
-        For example, use lance_namespace.connect() from the lance_namespace package.
+        Use lance_namespace.connect() from the lance_namespace package.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table().
-    table_id : optional, list of str
+    table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
     ignore_namespace_table_storage_options : bool, default False
@@ -207,15 +207,17 @@ def dataset(
                 "Both 'namespace' and 'table_id' must be provided together."
             )
 
-        table_info = namespace.describe_table(table_id=table_id, version=version)
-        uri = table_info.get("location")
+        request = DescribeTableRequest(id=table_id, version=version)
+        response = namespace.describe_table(request)
+
+        uri = response.location
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
 
         if ignore_namespace_table_storage_options:
             namespace_storage_options = None
         else:
-            namespace_storage_options = table_info.get("storage_options")
+            namespace_storage_options = response.storage_options
 
         if namespace_storage_options:
             storage_options_provider = LanceNamespaceStorageOptionsProvider(

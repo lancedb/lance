@@ -424,11 +424,6 @@ pub fn write_fragments(
 ) -> PyResult<Vec<PyObject>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
-    assert!(
-        written.blobs_op.is_none(),
-        "Blob writing is not yet supported by the python _write_fragments API"
-    );
-
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
         Operation::Append { fragments, .. } => Ok(fragments),

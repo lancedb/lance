@@ -107,7 +107,7 @@ public class Query {
     private String column;
     private float[] key;
     private int k = 10;
-    private int minimumNprobes = 20;
+    private int minimumNprobes = 1;
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();

@@ -628,11 +628,8 @@ public class TestUtils {
     /**
      * Build the Arrow schema with a filter column and a blob column marked as blob storage.
      *
-     * <p>Columns: - filterer: Int64 (not nullable) - blobs: Binary (nullable) with metadata
-     * {"lance-schema:storage-class":"blob"}
-     *
-     * <p>Note: ArrowType.LargeBinary may not be available in our Arrow Java version; Binary is
-     * sufficient for tests and aligns with Lance blob storage when annotated via metadata.
+     * <p>Columns: - filterer: Int64 (not nullable) - blobs: LargeBinary (nullable) annotated with
+     * metadata {"lance-encoding:blob":"true"}
      */
     public Schema getSchema() {
       Map<String, String> blobMeta = Maps.newHashMap();

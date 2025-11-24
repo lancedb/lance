@@ -219,14 +219,18 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testWriteWithStorage(@TempDir Path tempDir) {
+  void testWriteWithStorage(@TempDir Path tempDir) throws IOException {
     String filePath = "az://fail_bucket" + tempDir.resolve("test_write_with_storage");
     BufferAllocator allocator = new RootAllocator();
     Map<String, String> storageOptions = new HashMap<>();
     try {
       LanceFileWriter.open(filePath, allocator, null, storageOptions);
-    } catch (IOException e) {
-      assertTrue(e.getMessage().contains("Account must be specified"));
+    } catch (IllegalArgumentException e) {
+      assertTrue(
+          e.getMessage()
+              .contains(
+                  "Unable to find object store prefix: no Azure account "
+                      + "name in URI, and no storage account configured."));
     }
 
     storageOptions.put("account_name", "some_account");

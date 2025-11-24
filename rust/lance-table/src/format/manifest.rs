@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
@@ -19,7 +19,7 @@ use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::{Schema, StorageClass};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
@@ -35,9 +35,6 @@ use snafu::location;
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
-
-    /// Local schema, only containing fields with the default storage class (not blobs)
-    pub local_schema: Schema,
 
     /// Dataset version
     pub version: u64,
@@ -79,6 +76,9 @@ pub struct Manifest {
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
+    /// The file position of the inline transaction content inside the manifest
+    pub transaction_section: Option<usize>,
+
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
     fragment_offsets: Vec<usize>,
@@ -98,9 +98,6 @@ pub struct Manifest {
     /// associated with the table. This is different than configuration, which
     /// is used to tell libraries how to read, write, or manage the table.
     pub table_metadata: HashMap<String, String>,
-
-    /// Blob dataset version
-    pub blob_dataset_version: Option<u64>,
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
@@ -174,15 +171,12 @@ impl Manifest {
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
-        blob_dataset_version: Option<u64>,
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Self {
             schema,
-            local_schema,
             version: 1,
             branch: None,
             writer_version: Some(WriterVersion::default()),
@@ -195,12 +189,12 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: None,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
             config: HashMap::new(),
             table_metadata: HashMap::new(),
-            blob_dataset_version,
             base_paths,
         }
     }
@@ -209,16 +203,11 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
-        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
-
-        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
 
         Self {
             schema,
-            local_schema,
             version: previous.version + 1,
             branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
@@ -231,12 +220,12 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
-            blob_dataset_version,
             base_paths: previous.base_paths.clone(),
         }
     }
@@ -276,7 +265,6 @@ impl Manifest {
 
         Self {
             schema: self.schema.clone(),
-            local_schema: self.local_schema.clone(),
             version: self.version,
             branch: branch_name,
             writer_version: self.writer_version.clone(),
@@ -289,11 +277,11 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
+            transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
-            blob_dataset_version: self.blob_dataset_version,
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
                 let base_path = BasePath::new(ref_base_id, ref_path, ref_name, true);
@@ -921,11 +909,9 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
-        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Ok(Self {
             schema,
-            local_schema,
             version: p.version,
             branch: p.branch,
             writer_version,
@@ -942,16 +928,12 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
+            transaction_section: p.transaction_section.map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
-            blob_dataset_version: if p.blob_dataset_version == 0 {
-                None
-            } else {
-                Some(p.blob_dataset_version)
-            },
             base_paths: p
                 .base_paths
                 .iter()
@@ -1009,7 +991,6 @@ impl From<&Manifest> for pb::Manifest {
                 version: m.data_storage_format.version.clone(),
             }),
             config: m.config.clone(),
-            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
             base_paths: m
                 .base_paths
                 .values()
@@ -1020,6 +1001,7 @@ impl From<&Manifest> for pb::Manifest {
                     path: base_path.path.clone(),
                 })
                 .collect(),
+            transaction_section: m.transaction_section.map(|i| i as u64),
         }
     }
 }
@@ -1054,7 +1036,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for FileReader {
+impl SelfDescribingFileReader for PreviousFileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,
@@ -1294,7 +1276,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1370,7 +1351,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1394,7 +1374,6 @@ mod tests {
             schema,
             Arc::new(fragments),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
             HashMap::new(),
         );
 
@@ -1423,7 +1402,6 @@ mod tests {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1446,7 +1424,6 @@ mod tests {
             schema.clone(),
             Arc::new(empty_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1470,7 +1447,6 @@ mod tests {
             schema.clone(),
             Arc::new(real_fragments),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 
@@ -1506,7 +1482,6 @@ mod tests {
             schema,
             Arc::new(vec![fragment_with_deletion]),
             DataStorageFormat::default(),
-            None,
             HashMap::new(),
         );
 

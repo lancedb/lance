@@ -550,7 +550,7 @@ pub mod tests {
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        // TODO (https://github.com/lancedb/lance/issues/4783)
+        // TODO (https://github.com/lance-format/lance/issues/4783)
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
         check_specific_random(field, test_cases).await;
     }

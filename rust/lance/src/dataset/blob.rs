@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{future::Future, ops::DerefMut, sync::Arc};
+use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow::datatypes::UInt64Type;
+use arrow::datatypes::{UInt64Type, UInt8Type};
 use arrow_schema::DataType;
-use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
 use super::Dataset;
-use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
-use lance_core::{
-    datatypes::{Schema, StorageClass},
-    error::CloneableResult,
-    utils::{
-        address::RowAddress,
-        futures::{Capacity, SharedStreamExt},
-    },
-    Error, Result,
-};
+use arrow_array::{Array, StructArray};
+use lance_core::datatypes::BlobVersion;
+use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
+
+pub const BLOB_VERSION_CONFIG_KEY: &str = "lance.blob.version";
+
+pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion {
+    config
+        .get(BLOB_VERSION_CONFIG_KEY)
+        .and_then(|value| BlobVersion::from_config_value(value))
+        .unwrap_or(BlobVersion::V1)
+}
 
 /// Current state of the reader.  Held in a mutex for easy sharing
 ///
@@ -201,9 +201,25 @@ pub(super) async fn take_blobs(
         .execute()
         .await?;
     let descriptions = description_and_addr.column(0).as_struct();
+    let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
+    let blob_field_id = blob_field_id as u32;
+
+    match dataset.blob_version() {
+        BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V2 => collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs),
+    }
+}
+
+const INLINE_BLOB_KIND: u8 = 0;
+
+fn collect_blob_files_v1(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    descriptions: &StructArray,
+    row_addrs: &arrow::array::PrimitiveArray<UInt64Type>,
+) -> Result<Vec<BlobFile>> {
     let positions = descriptions.column(0).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(1).as_primitive::<UInt64Type>();
-    let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     Ok(row_addrs
         .values()
@@ -216,71 +232,49 @@ pub(super) async fn take_blobs(
             Some((*row_addr, position, size))
         })
         .map(|(row_addr, position, size)| {
-            BlobFile::new(
-                dataset.clone(),
-                blob_field_id as u32,
-                row_addr,
-                position,
-                size,
-            )
+            BlobFile::new(dataset.clone(), blob_field_id, row_addr, position, size)
         })
         .collect())
 }
 
-pub trait BlobStreamExt: Sized {
-    /// Splits a stream into a regular portion (the first stream)
-    /// and a blob portion (the second stream)
-    ///
-    /// The first stream contains all fields with the default storage class and
-    /// may be identical to self.
-    ///
-    /// The second stream may be None (if there are no fields with the blob storage class)
-    /// or it contains all fields with the blob storage class.
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>);
-}
+fn collect_blob_files_v2(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    descriptions: &StructArray,
+    row_addrs: &arrow::array::PrimitiveArray<UInt64Type>,
+) -> Result<Vec<BlobFile>> {
+    let kinds = descriptions.column(0).as_primitive::<UInt8Type>();
+    let positions = descriptions.column(1).as_primitive::<UInt64Type>();
+    let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
 
-impl BlobStreamExt for SendableRecordBatchStream {
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>) {
-        let mut indices_with_blob = Vec::with_capacity(schema.fields.len());
-        let mut indices_without_blob = Vec::with_capacity(schema.fields.len());
-        for (idx, field) in schema.fields.iter().enumerate() {
-            if field.storage_class() == StorageClass::Blob {
-                indices_with_blob.push(idx);
-            } else {
-                indices_without_blob.push(idx);
+    let mut files = Vec::with_capacity(row_addrs.len());
+    for (idx, row_addr) in row_addrs.values().iter().enumerate() {
+        if positions.is_null(idx) || sizes.is_null(idx) {
+            continue;
+        }
+
+        if !kinds.is_null(idx) {
+            let kind = kinds.value(idx);
+            if kind != INLINE_BLOB_KIND {
+                return Err(Error::NotSupported {
+                    source: format!("Blob kind {} is not supported", kind).into(),
+                    location: location!(),
+                });
             }
         }
-        if indices_with_blob.is_empty() {
-            (self, None)
-        } else {
-            let left_schema = Arc::new(self.schema().project(&indices_without_blob).unwrap());
-            let right_schema = Arc::new(self.schema().project(&indices_with_blob).unwrap());
 
-            let (left, right) = ShareableRecordBatchStream(self)
-                .boxed()
-                // If we are working with blobs then we are probably working with rather large batches
-                // We don't want to read too far ahead.
-                .share(Capacity::Bounded(1));
-
-            let left = left.map(move |batch| match batch {
-                CloneableResult(Ok(batch)) => {
-                    CloneableResult(Ok(batch.project(&indices_without_blob).unwrap()))
-                }
-                CloneableResult(Err(err)) => CloneableResult(Err(err)),
-            });
-
-            let right = right.map(move |batch| match batch {
-                CloneableResult(Ok(batch)) => {
-                    CloneableResult(Ok(batch.project(&indices_with_blob).unwrap()))
-                }
-                CloneableResult(Err(err)) => CloneableResult(Err(err)),
-            });
-
-            let left = ShareableRecordBatchStreamAdapter::new(left_schema, left);
-            let right = ShareableRecordBatchStreamAdapter::new(right_schema, right);
-            (Box::pin(left), Some(Box::pin(right)))
-        }
+        let position = positions.value(idx);
+        let size = sizes.value(idx);
+        files.push(BlobFile::new(
+            dataset.clone(),
+            blob_field_id,
+            *row_addr,
+            position,
+            size,
+        ));
     }
+
+    Ok(files)
 }
 
 #[cfg(test)]

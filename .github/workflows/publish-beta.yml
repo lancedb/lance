@@ -1,0 +1,120 @@
+name: Publish Beta Preview Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to publish beta from (e.g., main or release/v1.3)'
+        required: true
+        default: 'main'
+        type: string
+      dry_run:
+        description: 'Dry run (simulate without pushing)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  publish-beta:
+    runs-on: ubuntu-latest
+    outputs:
+      beta_version: ${{ steps.publish.outputs.BETA_VERSION }}
+      beta_tag: ${{ steps.publish.outputs.BETA_TAG }}
+      release_root_tag: ${{ steps.publish.outputs.RELEASE_ROOT_TAG }}
+      release_notes_from: ${{ steps.publish.outputs.RELEASE_NOTES_FROM }}
+    steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
+
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        fetch-depth: 0
+        lfs: true
+
+    - name: Setup release environment
+      uses: ./.github/actions/setup-release-env
+
+    - name: Publish beta release
+      id: publish
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        bash ci/publish_beta.sh "${{ inputs.branch }}"
+
+    - name: Push changes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      run: |
+        git push origin "${{ inputs.branch }}"
+        git push origin "${{ steps.publish.outputs.BETA_TAG }}"
+        # Push release root tag if it was created (only when breaking changes bump major version)
+        if [ -n "${{ steps.publish.outputs.RELEASE_ROOT_TAG }}" ]; then
+          git push origin "${{ steps.publish.outputs.RELEASE_ROOT_TAG }}"
+        fi
+
+    - name: Generate Release Notes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      id: beta_release_notes
+      env:
+        GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+      run: |
+        RELEASE_NOTES_FROM="${{ steps.publish.outputs.RELEASE_NOTES_FROM }}"
+        BETA_TAG="${{ steps.publish.outputs.BETA_TAG }}"
+
+        if [ -n "${RELEASE_NOTES_FROM}" ]; then
+          echo "Generating release notes from ${RELEASE_NOTES_FROM} to ${BETA_TAG}"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${BETA_TAG}" \
+            -f previous_tag_name="${RELEASE_NOTES_FROM}" \
+            --jq .body)
+        else
+          echo "No release-root tag found, using automatic generation"
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${BETA_TAG}" \
+            --jq .body)
+        fi
+
+        # Save to output
+        echo "notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$NOTES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Pre-Release (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.publish.outputs.BETA_TAG }}
+        name: ${{ steps.publish.outputs.BETA_TAG }}
+        draft: false
+        prerelease: true
+        body: ${{ steps.beta_release_notes.outputs.notes }}
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+
+    - name: Summary
+      run: |
+        echo "## Beta Release Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch:** ${{ inputs.branch }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Beta Version:** ${{ steps.publish.outputs.BETA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Beta Tag:** ${{ steps.publish.outputs.BETA_TAG }}" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ steps.publish.outputs.RELEASE_ROOT_TAG }}" ]; then
+          echo "- **Release Root Tag:** ${{ steps.publish.outputs.RELEASE_ROOT_TAG }} (breaking changes detected)" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This was a dry run. No changes were pushed." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Beta release ${{ steps.publish.outputs.BETA_TAG }} published!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Publishing:** Beta artifacts will be published to fury.io" >> $GITHUB_STEP_SUMMARY
+          echo "**GitHub Pre-Release:** Created with release notes" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.publish.outputs.RELEASE_ROOT_TAG }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**⚠️ Breaking Changes:** Major version bumped due to breaking changes. New release root tag created." >> $GITHUB_STEP_SUMMARY
+          fi
+        fi

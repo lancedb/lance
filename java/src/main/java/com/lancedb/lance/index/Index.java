@@ -31,7 +31,7 @@ public class Index {
   private final List<Integer> fields;
   private final String name;
   private final long datasetVersion;
-  private final byte[] fragmentBitmap;
+  private final List<Integer> fragments;
   private final byte[] indexDetails;
   private final int indexVersion;
   private final Instant createdAt;
@@ -42,7 +42,7 @@ public class Index {
       List<Integer> fields,
       String name,
       long datasetVersion,
-      byte[] fragmentBitmap,
+      List<Integer> fragments,
       byte[] indexDetails,
       int indexVersion,
       Instant createdAt,
@@ -51,7 +51,7 @@ public class Index {
     this.fields = fields;
     this.name = name;
     this.datasetVersion = datasetVersion;
-    this.fragmentBitmap = fragmentBitmap;
+    this.fragments = fragments;
     this.indexDetails = indexDetails;
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
@@ -89,8 +89,8 @@ public class Index {
     return datasetVersion;
   }
 
-  public Optional<byte[]> fragmentBitmap() {
-    return Optional.ofNullable(fragmentBitmap);
+  public Optional<List<Integer>> fragments() {
+    return Optional.ofNullable(fragments);
   }
 
   public Optional<byte[]> indexDetails() {
@@ -129,7 +129,7 @@ public class Index {
         && Objects.equals(uuid, index.uuid)
         && Objects.equals(fields, index.fields)
         && Objects.equals(name, index.name)
-        && Arrays.equals(fragmentBitmap, index.fragmentBitmap)
+        && Objects.equals(fragments, index.fragments)
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId);
@@ -137,8 +137,9 @@ public class Index {
 
   @Override
   public int hashCode() {
-    int result = Objects.hash(uuid, fields, name, datasetVersion, indexVersion, createdAt, baseId);
-    result = 31 * result + Arrays.hashCode(fragmentBitmap);
+    int result =
+        Objects.hash(
+            uuid, fields, name, datasetVersion, indexVersion, createdAt, baseId, fragments);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -171,7 +172,7 @@ public class Index {
     private List<Integer> fields;
     private String name;
     private long datasetVersion;
-    private byte[] fragmentBitmap;
+    private List<Integer> fragments;
     private byte[] indexDetails;
     private int indexVersion;
     private Instant createdAt;
@@ -199,8 +200,8 @@ public class Index {
       return this;
     }
 
-    public Builder fragmentBitmap(byte[] fragmentBitmap) {
-      this.fragmentBitmap = fragmentBitmap;
+    public Builder fragments(List<Integer> fragments) {
+      this.fragments = fragments;
       return this;
     }
 
@@ -230,7 +231,7 @@ public class Index {
           fields,
           name,
           datasetVersion,
-          fragmentBitmap,
+          fragments,
           indexDetails,
           indexVersion,
           createdAt,

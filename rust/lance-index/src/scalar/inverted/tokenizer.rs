@@ -112,6 +112,33 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     }
 }
 
+impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
+    type Error = Error;
+
+    fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            lance_tokenizer: defaults.lance_tokenizer,
+            base_tokenizer: details
+                .base_tokenizer
+                .as_ref()
+                .cloned()
+                .unwrap_or(defaults.base_tokenizer),
+            language: serde_json::from_str(details.language.as_str())?,
+            with_position: details.with_position,
+            max_token_length: details.max_token_length.map(|l| l as usize),
+            lower_case: details.lower_case,
+            stem: details.stem,
+            remove_stop_words: details.remove_stop_words,
+            custom_stop_words: defaults.custom_stop_words,
+            ascii_folding: details.ascii_folding,
+            min_ngram_length: details.min_ngram_length,
+            max_ngram_length: details.max_ngram_length,
+            prefix_only: details.prefix_only,
+        })
+    }
+}
+
 fn bool_true() -> bool {
     true
 }

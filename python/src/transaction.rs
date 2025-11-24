@@ -351,6 +351,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Overwrite {
                 ref fragments,
                 ref schema,
+                ref initial_bases,
                 ..
             } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
@@ -361,7 +362,19 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .getattr("Overwrite")
                     .expect("Failed to get Overwrite class");
 
-                cls.call1((schema_py, fragments_py))
+                let initial_bases_py = if let Some(bases) = initial_bases {
+                    use crate::dataset::DatasetBasePath;
+                    // Convert each Rust BasePath to a Python DatasetBasePath object
+                    let bases_py: Vec<DatasetBasePath> = bases
+                        .iter()
+                        .map(|bp| DatasetBasePath::from(bp.clone()))
+                        .collect();
+                    pyo3::types::PyList::new(py, bases_py)?.into_any()
+                } else {
+                    py.None().into_bound(py)
+                };
+
+                cls.call1((schema_py, fragments_py, initial_bases_py))
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -527,10 +540,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
-        let blobs_op = ob
-            .getattr("blobs_op")?
-            .extract::<Option<PyLance<Operation>>>()?
-            .map(|op| op.0);
         let transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
@@ -540,7 +549,6 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             read_version,
             uuid,
             operation,
-            blobs_op,
             tag: None,
             transaction_properties,
         }))
@@ -560,18 +568,12 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let read_version = self.0.read_version;
         let uuid = &self.0.uuid;
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
-        let blobs_op = self
-            .0
-            .blobs_op
-            .as_ref()
-            .map(|op| PyLance(op).into_pyobject(py))
-            .transpose()?;
 
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
 
-        let py_transaction = cls.call1((read_version, operation, uuid, blobs_op))?;
+        let py_transaction = cls.call1((read_version, operation, uuid))?;
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;

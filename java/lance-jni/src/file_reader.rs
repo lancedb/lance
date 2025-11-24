@@ -22,7 +22,7 @@ use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::{FileReader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},

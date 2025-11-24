@@ -23,8 +23,8 @@ use super::{
     current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
     ManifestNamingScheme, MANIFEST_EXTENSION,
 };
-use crate::format::{IndexMetadata, Manifest};
-use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
+use crate::format::{IndexMetadata, Manifest, Transaction};
+use crate::io::commit::{CommitError, CommitHandler};
 
 /// External manifest store
 ///
@@ -37,7 +37,7 @@ use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
 /// the external store for concurrent commit. Any manifest committed thru this
 /// trait should ultimately be materialized in the object store.
 /// For a visual explanation of the commit loop see
-/// https://github.com/lancedb/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04
+/// https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
@@ -133,7 +133,7 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
 
 /// External manifest commit handler
 /// This handler is used to commit a manifest to an external store
-/// for detailed design, see https://github.com/lancedb/lance/issues/1183
+/// for detailed design, see https://github.com/lance-format/lance/issues/1183
 #[derive(Debug)]
 pub struct ExternalManifestCommitHandler {
     pub external_manifest_store: Arc<dyn ExternalManifestStore>,
@@ -376,8 +376,9 @@ impl CommitHandler for ExternalManifestCommitHandler {
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
-        manifest_writer: ManifestWriter,
+        manifest_writer: super::ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
@@ -385,7 +386,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // step 1: Write the manifest we want to commit to object store with a temporary name
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
-        let write_res = manifest_writer(object_store, manifest, indices, &staging_path).await?;
+        let write_res =
+            manifest_writer(object_store, manifest, indices, &staging_path, transaction).await?;
 
         // step 2 & 3: Try to commit this version to external store, return err on failure
         let res = self

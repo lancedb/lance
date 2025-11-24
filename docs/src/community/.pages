@@ -1,3 +1,8 @@
 nav:
-  - Contributing: contributing
-  - Lancelot Program: lancelot.md
+  - index.md
+  - Maintainers: maintainers.md
+  - PMC: pmc.md
+  - Communication: communication.md
+  - Voting: voting.md
+  - Contributing: contributing.md
+  - Release: release.md

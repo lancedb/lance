@@ -74,8 +74,6 @@ serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
 tantivy.workspace = true
-tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
-prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tracing.workspace = true
 humantime = { workspace = true }
@@ -99,12 +97,14 @@ dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
+lance-io = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.11.7"
 tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
@@ -115,7 +115,6 @@ default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
-tensorflow = ["dep:tfrecord", "dep:prost_old"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
@@ -152,6 +151,10 @@ harness = false
 
 [[bench]]
 name = "take"
+harness = false
+
+[[bench]]
+name = "random_access"
 harness = false
 
 [lints]

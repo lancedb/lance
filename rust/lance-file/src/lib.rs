@@ -3,10 +3,13 @@
 
 pub mod datatypes;
 pub mod format;
-pub mod page_table;
+pub(crate) mod io;
+pub mod previous;
 pub mod reader;
-pub mod v2;
+pub mod testing;
 pub mod writer;
+
+pub use io::LanceEncodingsIo;
 
 use format::MAGIC;
 pub use lance_encoding::version;
