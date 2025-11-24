@@ -184,8 +184,6 @@ def test_namespace_open_dataset(s3_bucket: str):
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=table_id,
-        storage_options=storage_options,
-        ignore_namespace_table_storage_options=True,
     )
 
     assert namespace.get_describe_call_count() == 1
@@ -290,8 +288,6 @@ def test_namespace_append_through_namespace(s3_bucket: str):
     ds_from_namespace = lance.dataset(
         namespace=namespace,
         table_id=table_id,
-        storage_options=storage_options,
-        ignore_namespace_table_storage_options=True,
     )
 
     assert ds_from_namespace.count_rows() == 2
