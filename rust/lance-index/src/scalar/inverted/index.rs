@@ -1716,11 +1716,11 @@ pub struct CompressedPostingList {
 
 impl DeepSizeOf for CompressedPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.blocks.get_array_memory_size()
+        self.blocks.get_buffer_memory_size()
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_array_memory_size())
+                .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
     }
 }
