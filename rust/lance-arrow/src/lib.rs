@@ -744,10 +744,6 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
-        if let Some(column) = self.column_by_name(name) {
-            return Some(column);
-        }
-
         let split = name.split('.').collect::<Vec<_>>();
         if split.is_empty() {
             return None;
