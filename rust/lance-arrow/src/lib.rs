@@ -39,7 +39,7 @@ pub mod r#struct;
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 
-/// Arrow extension metadata key for extension metadata  
+/// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Key used by lance to mark a field as a blob

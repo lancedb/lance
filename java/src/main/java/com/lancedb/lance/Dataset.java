@@ -76,6 +76,39 @@ public class Dataset implements Closeable {
   private Dataset() {}
 
   /**
+   * Creates a builder for writing a dataset.
+   *
+   * <p>This builder supports writing datasets either directly to a URI or through a LanceNamespace.
+   * Data can be provided via reader() or stream() methods.
+   *
+   * <p>Example usage with URI and reader:
+   *
+   * <pre>{@code
+   * Dataset dataset = Dataset.write()
+   *     .reader(myReader)
+   *     .uri("s3://bucket/table.lance")
+   *     .mode(WriteMode.CREATE)
+   *     .execute();
+   * }</pre>
+   *
+   * <p>Example usage with namespace and empty table:
+   *
+   * <pre>{@code
+   * Dataset dataset = Dataset.write()
+   *     .schema(mySchema)
+   *     .namespace(myNamespace)
+   *     .tableId(Arrays.asList("my_table"))
+   *     .mode(WriteMode.CREATE)
+   *     .execute();
+   * }</pre>
+   *
+   * @return A new WriteDatasetBuilder instance
+   */
+  public static WriteDatasetBuilder write() {
+    return new WriteDatasetBuilder();
+  }
+
+  /**
    * Creates an empty dataset.
    *
    * @param allocator the buffer allocator
@@ -83,7 +116,11 @@ public class Dataset implements Closeable {
    * @param schema dataset schema
    * @param params write params
    * @return Dataset
+   * @deprecated Use {@link #write()} builder instead. For example: {@code
+   *     Dataset.write().allocator(allocator).schema(schema).uri(path)
+   *     .mode(WriteMode.CREATE).execute()}
    */
+  @Deprecated
   public static Dataset create(
       BufferAllocator allocator, String path, Schema schema, WriteParams params) {
     Preconditions.checkNotNull(allocator);
@@ -102,7 +139,8 @@ public class Dataset implements Closeable {
               params.getMode(),
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
-              params.getStorageOptions());
+              params.getStorageOptions(),
+              params.getS3CredentialsRefreshOffsetSeconds());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -116,15 +154,41 @@ public class Dataset implements Closeable {
    * @param path dataset uri
    * @param params write parameters
    * @return Dataset
+   * @deprecated Use {@link #write()} builder instead. For example: {@code
+   *     Dataset.write().allocator(allocator).stream(stream).uri(path)
+   *     .mode(WriteMode.CREATE).execute()}
    */
+  @Deprecated
   public static Dataset create(
       BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
+    return create(allocator, stream, path, params, null);
+  }
+
+  /**
+   * Create a dataset with given stream and storage options provider.
+   *
+   * <p>This method supports credential vending through the StorageOptionsProvider interface, which
+   * allows for dynamic credential refresh during long-running write operations.
+   *
+   * @param allocator buffer allocator
+   * @param stream arrow stream
+   * @param path dataset uri
+   * @param params write parameters
+   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
+   * @return Dataset
+   */
+  static Dataset create(
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      String path,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset =
-        createWithFfiStream(
+        createWithFfiStreamAndProvider(
             stream.memoryAddress(),
             path,
             params.getMaxRowsPerFile(),
@@ -133,7 +197,9 @@ public class Dataset implements Closeable {
             params.getMode(),
             params.getEnableStableRowIds(),
             params.getDataStorageVersion(),
-            params.getStorageOptions());
+            params.getStorageOptions(),
+            Optional.ofNullable(storageOptionsProvider),
+            params.getS3CredentialsRefreshOffsetSeconds());
     dataset.allocator = allocator;
     return dataset;
   }
@@ -147,7 +213,8 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
 
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
@@ -158,14 +225,30 @@ public class Dataset implements Closeable {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+
+  private static native Dataset createWithFfiStreamAndProvider(
+      long arrowStreamMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
+      Optional<String> dataStorageVersion,
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
 
   /**
    * Open a dataset from the specified path.
    *
    * @param path file path
    * @return Dataset
+   * @deprecated Use {@link #open()} builder instead: {@code Dataset.open().uri(path).build()}
    */
+  @Deprecated
   public static Dataset open(String path) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
   }
@@ -176,7 +259,10 @@ public class Dataset implements Closeable {
    * @param path file path
    * @param options the open options
    * @return Dataset
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().uri(path).readOptions(options).build()}
    */
+  @Deprecated
   public static Dataset open(String path, ReadOptions options) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
   }
@@ -187,7 +273,10 @@ public class Dataset implements Closeable {
    * @param path file path
    * @param allocator Arrow buffer allocator
    * @return Dataset
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().allocator(allocator).uri(path).build()}
    */
+  @Deprecated
   public static Dataset open(String path, BufferAllocator allocator) {
     return open(allocator, path, new ReadOptions.Builder().build());
   }
@@ -199,7 +288,10 @@ public class Dataset implements Closeable {
    * @param path file path
    * @param options the open options
    * @return Dataset
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().allocator(allocator).uri(path).readOptions(options).build()}
    */
+  @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
     return open(allocator, false, path, options);
   }

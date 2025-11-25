@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.fragment.FragmentMergeResult;
 import com.lancedb.lance.fragment.FragmentUpdateResult;
+import com.lancedb.lance.io.StorageOptionsProvider;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 
@@ -198,6 +199,27 @@ public class Fragment {
       String rightOn);
 
   /**
+   * Create a new fragment writer builder.
+   *
+   * <p>Example usage:
+   *
+   * <pre>{@code
+   * List<FragmentMetadata> fragments = Fragment.write()
+   *     .datasetUri("s3://bucket/dataset.lance")
+   *     .allocator(allocator)
+   *     .data(vectorSchemaRoot)
+   *     .storageOptions(storageOptions)
+   *     .s3CredentialsRefreshOffsetSeconds(10)
+   *     .execute();
+   * }</pre>
+   *
+   * @return a new fragment writer builder
+   */
+  public static WriteFragmentBuilder write() {
+    return new WriteFragmentBuilder();
+  }
+
+  /**
    * Create a fragment from the given data.
    *
    * @param datasetUri the dataset uri
@@ -205,9 +227,36 @@ public class Fragment {
    * @param root the vector schema root
    * @param params the write params
    * @return the fragment metadata
+   * @deprecated Use {@link #write()} builder instead. For example: {@code Fragment.write()
+   *     .datasetUri(uri).allocator(allocator).data(root).writeParams(params).execute()}
    */
+  @Deprecated
   public static List<FragmentMetadata> create(
       String datasetUri, BufferAllocator allocator, VectorSchemaRoot root, WriteParams params) {
+    return create(datasetUri, allocator, root, params, null);
+  }
+
+  /**
+   * Create a fragment from the given data with optional storage options provider.
+   *
+   * @param datasetUri the dataset uri
+   * @param allocator the buffer allocator
+   * @param root the vector schema root
+   * @param params the write params
+   * @param storageOptionsProvider optional provider for dynamic storage options with automatic
+   *     credential refresh
+   * @return the fragment metadata
+   * @deprecated Use {@link #write()} builder instead. For example: {@code Fragment.write()
+   *     .datasetUri(uri).allocator(allocator).data(root).writeParams(params)
+   *     .storageOptionsProvider(provider).execute()}
+   */
+  @Deprecated
+  public static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      VectorSchemaRoot root,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
@@ -225,7 +274,9 @@ public class Fragment {
           params.getMode(),
           params.getEnableStableRowIds(),
           params.getDataStorageVersion(),
-          params.getStorageOptions());
+          params.getStorageOptions(),
+          Optional.ofNullable(storageOptionsProvider),
+          params.getS3CredentialsRefreshOffsetSeconds());
     }
   }
 
@@ -236,9 +287,34 @@ public class Fragment {
    * @param stream the arrow stream
    * @param params the write params
    * @return the fragment metadata
+   * @deprecated Use {@link #write()} builder instead. For example: {@code Fragment.write()
+   *     .datasetUri(uri).data(stream).writeParams(params).execute()}
    */
+  @Deprecated
   public static List<FragmentMetadata> create(
       String datasetUri, ArrowArrayStream stream, WriteParams params) {
+    return create(datasetUri, stream, params, null);
+  }
+
+  /**
+   * Create a fragment from the given arrow stream with optional storage options provider.
+   *
+   * @param datasetUri the dataset uri
+   * @param stream the arrow stream
+   * @param params the write params
+   * @param storageOptionsProvider optional provider for dynamic storage options with automatic
+   *     credential refresh
+   * @return the fragment metadata
+   * @deprecated Use {@link #write()} builder instead. For example: {@code
+   *     Fragment.write().datasetUri(uri).data(stream).writeParams(params)
+   *     .storageOptionsProvider(provider).execute()}
+   */
+  @Deprecated
+  public static List<FragmentMetadata> create(
+      String datasetUri,
+      ArrowArrayStream stream,
+      WriteParams params,
+      StorageOptionsProvider storageOptionsProvider) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
@@ -251,7 +327,9 @@ public class Fragment {
         params.getMode(),
         params.getEnableStableRowIds(),
         params.getDataStorageVersion(),
-        params.getStorageOptions());
+        params.getStorageOptions(),
+        Optional.ofNullable(storageOptionsProvider),
+        params.getS3CredentialsRefreshOffsetSeconds());
   }
 
   /**
@@ -269,7 +347,9 @@ public class Fragment {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
 
   /**
    * Create a fragment from the given arrow stream.
@@ -285,5 +365,7 @@ public class Fragment {
       Optional<String> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<StorageOptionsProvider> storageOptionsProvider,
+      Optional<Long> s3CredentialsRefreshOffsetSeconds);
 }

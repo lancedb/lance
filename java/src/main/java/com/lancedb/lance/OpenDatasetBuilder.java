@@ -129,10 +129,10 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describe_table().
+   * Sets whether to ignore storage options from the namespace's describeTable().
    *
    * @param ignoreNamespaceTableStorageOptions If true, storage options returned from
-   *     describe_table() will be ignored (treated as null)
+   *     describeTable() will be ignored (treated as null)
    * @return this builder instance
    */
   public OpenDatasetBuilder ignoreNamespaceTableStorageOptions(
@@ -145,7 +145,7 @@ public class OpenDatasetBuilder {
    * Opens the dataset with the configured parameters.
    *
    * <p>If a namespace is configured, this automatically fetches the table location and storage
-   * options from the namespace via describe_table().
+   * options from the namespace via describeTable().
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid

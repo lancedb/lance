@@ -1451,10 +1451,6 @@ impl PostingListReader {
 pub struct Positions(ListArray);
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of(&self) -> usize {
-        self.0.get_array_memory_size()
-    }
-
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.0.get_buffer_memory_size()
     }
@@ -1619,7 +1615,7 @@ impl DeepSizeOf for PlainPostingList {
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_array_memory_size())
+                .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
     }
 }
@@ -1716,11 +1712,11 @@ pub struct CompressedPostingList {
 
 impl DeepSizeOf for CompressedPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.blocks.get_array_memory_size()
+        self.blocks.get_buffer_memory_size()
             + self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get_array_memory_size())
+                .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
     }
 }

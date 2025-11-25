@@ -17,6 +17,7 @@ use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
+use lance::io::ObjectStoreParams;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
@@ -678,12 +679,35 @@ fn inner_commit_transaction<'local>(
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
         .l()?;
     let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let write_param = to_rust_map(env, &write_param_jmap)?;
+    let mut write_param = to_rust_map(env, &write_param_jmap)?;
+
+    // Extract s3_credentials_refresh_offset_seconds from write_param
+    let s3_credentials_refresh_offset = write_param
+        .remove("s3_credentials_refresh_offset_seconds")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+
+    // Get the Dataset's storage_options_provider
+    let storage_options_provider = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.get_storage_options_provider()
+    };
+
+    // Build ObjectStoreParams using write_param for storage_options and provider from Dataset
+    let store_params = ObjectStoreParams {
+        storage_options: Some(write_param),
+        storage_options_provider,
+        s3_credentials_refresh_offset,
+        ..Default::default()
+    };
+
     let transaction = convert_to_rust_transaction(env, java_transaction, Some(&java_dataset))?;
     let new_blocking_ds = {
         let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, write_param)?
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.commit_transaction(transaction, store_params)?
     };
     new_blocking_ds.into_java(env)
 }

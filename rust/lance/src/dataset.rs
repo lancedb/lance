@@ -1581,6 +1581,15 @@ impl Dataset {
             .and_then(|params| params.storage_options.as_ref())
     }
 
+    /// Returns the storage options provider used when opening this dataset, if any.
+    pub fn storage_options_provider(
+        &self,
+    ) -> Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.storage_options_provider.clone())
+    }
+
     pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }

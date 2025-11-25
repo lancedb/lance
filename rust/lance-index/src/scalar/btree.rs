@@ -1226,13 +1226,13 @@ impl ScalarIndex for BTreeIndex {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, DEFAULT_BTREE_BATCH_SIZE)
+            .combine_old_new(new_data, self.batch_size)
             .await?;
         train_btree_index(
             merged_data_source,
             self.sub_index.as_ref(),
             dest_store,
-            DEFAULT_BTREE_BATCH_SIZE,
+            self.batch_size,
             None,
         )
         .await?;
