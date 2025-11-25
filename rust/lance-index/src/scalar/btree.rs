@@ -733,7 +733,6 @@ struct LazyRangedIndexReader {
     #[allow(clippy::type_complexity)]
     readers: Arc<DashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>,
     store: Arc<dyn IndexStore>,
-    // for each range, we store the corresponding file name and start offset
     ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
 }
 
@@ -764,7 +763,7 @@ impl LazyRangedIndexReader {
         Ok(reader.clone())
     }
 
-    async fn get_reader_and_inner_offset(
+    async fn get_reader_and_local_page_idx(
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
@@ -779,9 +778,9 @@ impl LazyRangedIndexReader {
 #[async_trait]
 impl IndexReader for LazyRangedIndexReader {
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
-        let (reader, inner_offset) = self.get_reader_and_inner_offset(n as u32).await?;
+        let (reader, local_page_idx) = self.get_reader_and_local_page_idx(n as u32).await?;
         reader
-            .read_record_batch(inner_offset as u64, batch_size)
+            .read_record_batch(local_page_idx as u64, batch_size)
             .await
     }
 
@@ -863,6 +862,35 @@ pub struct BTreeIndex {
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
+
+    /// A map that translates a global_page_idx stored in the single lookup file into the
+    /// specific page file and local_page_idx.
+    ///
+    /// This is the key data structure used for efficiently reading data from a merged,
+    /// range-partitioned index. It stores mappings from a contiguous range of global page
+    /// indices to a tuple containing:
+    ///
+    /// 1. The path to the corresponding page file (e.g., `part_i_page_file.lance`).
+    /// 2. The start offset that was used to calculate the local_page_idx for that partition.
+    ///
+    /// When a query needs to access a specific page using its `global_page_idx`:
+    ///
+    /// 1. The `global_page_idx` is used to look up its range in this `RangeInclusiveMap`,
+    ///    and the map returns the `(file_path, start_offset)` tuple for that range.
+    /// 3. The `local_page_idx` is calculated using the formula:
+    ///    `local_page_idx = global_page_idx - start_offset`.
+    /// 4. With the `file_path` and `local_page_idx`, the system can directly open the
+    ///    correct partition file and read the specific page.
+    ///
+    /// # Example
+    ///
+    /// If the map contains an entry `(100..=199) => ("part_2_page_file.lance", 100)`, and we
+    /// need to find `global_page_idx = 142`:
+    ///
+    /// - The map finds that 142 falls within the range `100..=199`, and it returns
+    ///   `("part_2_page_file.lance", 100)`.
+    /// - The local page_idx is calculated: `142 - 100 = 42`.
+    /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
@@ -1684,8 +1712,8 @@ async fn list_page_lookup_files(
 ///
 /// In a distributed environment, each worker node writes partition page / lookup file for the partitions it processes,
 /// and this function merges these files into a final metadata file.
-/// - For **non-range-partitioned** indices, it performs a full K-way sort-merge of page files to create new global page and lookup files.
-/// - For **range-partitioned** indices, it concatenates lookup files, as data is already globally sorted.
+/// - For fragment-based indices, it performs a full K-way sort-merge of page files to create new global page and lookup files.
+/// - For range-based indices, it concatenates lookup files, as data is already globally sorted.
 async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_page_files: &[String],
@@ -1788,11 +1816,35 @@ async fn merge_metadata_files(
     }
 }
 
-/// Merge lookup files for a range-partitioned index.
+/// Merges multiple lookup files from a range-partitioned index into a single, unified lookup file.
 ///
-/// This function assumes its inputs have been pre-validated. It streams through
-/// each partition file sequentially, adjusts `page_idx` to create a contiguous
-/// global index, and writes the results to a new, single lookup file.
+/// A range-partitioned B-Tree index creates a separate `page_lookup.lance` file for
+/// each partition. Each of these files has its own local `page_idx` column, where the indices
+/// start from 0.
+///
+/// This function's primary goal is to combine these separate files into one large
+/// `page_lookup.lance` file. To do this, it remaps the local `page_idx` from each partition
+/// file into a contiguous, global `page_idx` space. It processes partition files sequentially,
+/// calculating an offset based on the number of pages in all previously processed partitions.
+///
+/// **The reverse operation occurs when the B-Tree index is loaded**: a global `page_idx` is translated
+/// back into a `(partition_id, local_page_idx)` tuple. This translation is made possible by the
+/// metadata stored under the `PAGE_NUM_PER_RANGE_PARTITION_META_KEY`, which this function
+/// is responsible for writing.
+///
+/// # Examples
+///
+/// If we have two partition lookup files:
+/// - `part_0_page_lookup.lance`: Contains 3 pages. Its `page_idx` column is `[0, 1, 2]`.
+/// - `part_1_page_lookup.lance`: Contains 4 pages. Its `page_idx` column is `[0, 1, 2, 3]`.
+///
+/// The merge process works as follows:
+/// 1. Process `part_0`: The offset is 0. The indices `[0, 1, 2]` are written as is.
+/// 2. Process `part_1`: The offset is 3 and the local indices `[0, 1, 2, 3]` are remapped
+/// by adding the offset, resulting in `[3, 4, 5, 6]`.
+///
+/// The final, merged `_page_lookup.lance` will have a single `page_idx` column containing
+/// `[0, 1, 2, 3, 4, 5, 6]`.
 async fn merge_range_partitioned_lookups(
     store: &Arc<dyn IndexStore>,
     part_lookup_files: &[String],
@@ -1806,9 +1858,9 @@ async fn merge_range_partitioned_lookups(
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
 
-    // stores partition id and page num
-    let mut rows_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
-    let mut num_rows_written = 0u32;
+    // stores partition id and the number of pages in that partition
+    let mut pages_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
+    let mut num_pages_written = 0u32;
 
     for (part_id, part_lookup_file) in sorted_part_lookup_files {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
@@ -1816,17 +1868,17 @@ async fn merge_range_partitioned_lookups(
         let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
         while let Some(batch) = stream.next().await {
             let original_batch = batch?;
-            let modified_batch = add_offset_to_page_idx(&original_batch, num_rows_written)?;
+            let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
             lookup_file.write_record_batch(modified_batch).await?;
         }
-        rows_per_file.push((part_id, lookup_reader.num_rows() as u32));
-        num_rows_written += lookup_reader.num_rows() as u32;
+        pages_per_file.push((part_id, lookup_reader.num_rows() as u32));
+        num_pages_written += lookup_reader.num_rows() as u32;
     }
 
     metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
     metadata.insert(
         PAGE_NUM_PER_RANGE_PARTITION_META_KEY.to_string(),
-        serde_json::to_string(&rows_per_file)?,
+        serde_json::to_string(&pages_per_file)?,
     );
 
     lookup_file.finish_with_metadata(metadata).await?;
@@ -1903,6 +1955,7 @@ async fn merge_pages_and_lookups(
     Ok(())
 }
 
+// Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
 fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatch> {
     let (page_idx_pos, _) =
         batch
@@ -2197,24 +2250,29 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// The ordinal ID of a range partition, enabling a two-step distributed index build.
+    /// The ordinal ID of a data partition for building a large, distributed BTree index.
     ///
-    /// This parameter is key to building a **range-partitioned index**, which is composed of
-    /// multiple, independently-built sub-indices that collectively cover the entire dataset.
-    /// The process involves:
+    /// When building an index from multiple, pre-partitioned data chunks (for example,
+    /// in a distributed environment), this ID specifies which partition this particular
+    /// build operation corresponds to.
     ///
-    /// 1.  **Global Sorting & Partitioning (Caller's Responsibility)**: First, the entire
-    ///     dataset must be globally sorted and divided into  *contiguous* partitions
-    ///     based on value ranges.
+    /// # Data Distribution Requirements
     ///
-    /// 2.  **Independent Sub-Index Construction**: This function is called for each
-    ///     partition's data separately. The `range_id` you provide (e.g., `0`, `1`, `2`, ...)
-    ///     identifies which partition this sub-index represents. To ensure global
-    ///     consistency, the data provided must adhere to a strict ordering guarantee:
-    ///     all values used to train `range_id: N` must be **less than or equal to**
-    ///     all values for `range_id: N+1`.
+    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
+    /// is strictly global sorted. The input data, when considered as a whole across all
+    /// partitions ordered by `range_id`, must be sorted.
     ///
-    /// If `None`, a single, monolithic index is built over the provided dataset.
+    /// Concretely, this means:
+    ///
+    /// All values in the data provided for `range_id: N` must be **less than or equal to**
+    /// all values in the data for `range_id: N+1`.
+    ///
+    /// Lance relies on this precondition to ensure the final, merged index is valid and
+    /// correctly ordered.
+    ///
+    /// # `None` Case
+    ///
+    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
     pub range_id: Option<u32>,
 }
 
