@@ -1619,6 +1619,11 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 let under_scheduled = desired_scheduled - actually_scheduled;
                 to_take -= under_scheduled;
             }
+        } else {
+            // Although we have scheduled enough rows, the I/O may not have completed.
+            // We must wait for I/O before draining, otherwise drain_batch may fail
+            // with message 'drain was called ... but the decoder was never awaited ...'.
+            self.wait_for_io(0, to_take)?;
         }
 
         if to_take == 0 {

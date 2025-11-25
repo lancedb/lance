@@ -1584,6 +1584,15 @@ pub mod tests {
     use lance_encoding::decoder::DecoderConfig;
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
+        create_test_file(fs, version, 1000, 100).await
+    }
+
+    async fn create_test_file(
+        fs: &FsFixture,
+        version: LanceFileVersion,
+        row_count: u64,
+        batch_count: u32,
+    ) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
             Field::new("x", DataType::Float64, true),
             Field::new("y", DataType::Float64, true),
@@ -1598,7 +1607,8 @@ pub mod tests {
         if version <= LanceFileVersion::V2_0 {
             reader = reader.col("large_bin", array::rand_type(&DataType::LargeBinary));
         }
-        let reader = reader.into_reader_rows(RowCount::from(1000), BatchCount::from(100));
+        let reader =
+            reader.into_reader_rows(RowCount::from(row_count), BatchCount::from(batch_count));
 
         write_lance_file(
             reader,
@@ -2063,6 +2073,54 @@ pub mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 5);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    /// Test that blocking read works correctly when IO is scheduled but not yet completed.
+    #[rstest]
+    #[tokio::test]
+    async fn test_blocking_take_with_many_rows(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        let fs = FsFixture::default();
+        let WrittenFile { data, schema, .. } = create_test_file(&fs, version, 1000, 1000).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            Some(ReaderProjection::from_column_names(version, &schema, &["categories"]).unwrap()),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Use a small batch_size to ensure multiple drain_batch calls.
+        let batch_size = 1024u32;
+        let batches = tokio::task::spawn_blocking(move || {
+            file_reader
+                .read_stream_projected_blocking(
+                    lance_io::ReadBatchParams::RangeFull,
+                    batch_size,
+                    None,
+                    FilterExpression::no_filter(),
+                )
+                .unwrap()
+                .collect::<ArrowResult<Vec<_>>>()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let total_read_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_read_rows, total_rows);
+        assert_eq!(batches[0].num_rows(), batch_size as usize);
         assert_eq!(batches[0].num_columns(), 1);
     }
 
