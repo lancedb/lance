@@ -29,7 +29,7 @@ env:
 
 jobs:
   Benchmark:
-    runs-on: ubuntu-24.04-arm64-4x
+    runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 120
     steps:
       - name: Apt-get

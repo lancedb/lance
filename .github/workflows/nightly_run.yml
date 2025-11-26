@@ -19,7 +19,7 @@ jobs:
 
   jumbo-tests:
     # jumbo tests need more resources
-    runs-on: ubuntu-24.04-4x
+    runs-on: warp-ubuntu-latest-x64-8x
     if: github.repository == 'lancedb/lance'
     timeout-minutes: 60
     permissions:
