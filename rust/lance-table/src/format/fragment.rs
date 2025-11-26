@@ -36,6 +36,8 @@ pub struct DataFile {
     ///
     /// Columns that lack a field id may still exist as extra entries in
     /// `column_indices`; such columns are ignored by field-id–based projection.
+    /// For example, some fields, such as blob fields, occupy multiple
+    /// columns in the file but only have a single field id.
     #[serde(default)]
     pub column_indices: Vec<i32>,
     /// The major version of the file format used to write this file.
