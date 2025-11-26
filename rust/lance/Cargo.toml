@@ -111,7 +111,7 @@ aws-sdk-s3 = { workspace = true }
 
 
 [features]
-default = ["aws", "azure", "gcp", "oss"]
+default = ["aws", "azure", "gcp", "oss", "huggingface"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -128,6 +128,7 @@ aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
+huggingface = ["lance-io/huggingface"]
 
 [[bin]]
 name = "lq"

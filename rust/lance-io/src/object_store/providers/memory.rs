@@ -45,8 +45,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
 
     fn calculate_object_store_prefix(
         &self,
-        _scheme: &str,
-        _authority: &str,
+        _url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
         Ok("memory".to_string())
@@ -73,7 +72,7 @@ mod tests {
         assert_eq!(
             "memory",
             provider
-                .calculate_object_store_prefix("memory", "etc", None)
+                .calculate_object_store_prefix(&Url::parse("memory://etc").unwrap(), None)
                 .unwrap()
         );
     }
