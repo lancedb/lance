@@ -411,6 +411,21 @@ pub struct ExecutionSummaryCounts {
     pub all_counts: HashMap<String, usize>,
 }
 
+impl ExecutionSummaryCounts {
+    /// Create a new ExecutionSummaryCounts with all values initialized to zero
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new ExecutionSummaryCounts with only custom counts
+    pub fn with_counts(counts: impl IntoIterator<Item = (impl Into<String>, usize)>) -> Self {
+        Self {
+            all_counts: counts.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+            ..Default::default()
+        }
+    }
+}
+
 fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         for (metric_name, count) in metrics.iter_counts() {
