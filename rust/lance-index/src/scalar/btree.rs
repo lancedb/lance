@@ -69,7 +69,7 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
-pub const DEFAULT_RANGE_PARTITIONED: bool = false;
+const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
 const BTREE_INDEX_VERSION: u32 = 0;
@@ -1366,48 +1366,39 @@ impl ScalarIndex for BTreeIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // Remap and write the pages
-        let mut sub_index_file = dest_store
-            .new_index_file(BTREE_PAGES_NAME, self.sub_index.schema().clone())
-            .await?;
-
-        let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
-        let sub_index_reader = lazy_reader.get().await?;
-        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-            .await
-            .buffered(self.store.io_parallelism());
-        while let Some(serialized) = reader_stream.try_next().await? {
-            let remapped = self.sub_index.remap_subindex(serialized, mapping).await?;
-            sub_index_file.write_record_batch(remapped).await?;
-        }
-
-        sub_index_file.finish().await?;
-
-        // Copy the lookup file as-is if not range-partitioned
-        if self.ranges_to_files.is_none() {
-            self.store
-                .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
-                .await?;
+        let part_page_files: Vec<&str> = if let Some(ranges_to_files) = &self.ranges_to_files {
+            // Range-based Index: Directly collect references to the file paths.
+            ranges_to_files
+                .iter()
+                .map(|(_, (path, _))| path.as_str())
+                .collect()
         } else {
-            // else we should remove range-partition configuration options
-            let lookup_file = self.store.open_index_file(BTREE_LOOKUP_NAME).await?;
-            let mut lookup_schema = lookup_file.schema().clone();
-            lookup_schema
-                .metadata
-                .retain(|key, _| key == BATCH_SIZE_META_KEY);
+            // Basic Index: There is only one source page file.
+            vec![BTREE_PAGES_NAME]
+        };
 
-            let mut target_lookup_file = dest_store
-                .new_index_file(BTREE_LOOKUP_NAME, Arc::new(Schema::from(&lookup_schema)))
+        for page_file in part_page_files {
+            // Remap and write the pages
+            let mut sub_index_file = dest_store
+                .new_index_file(page_file, self.sub_index.schema().clone())
                 .await?;
-            let mut reader_stream = IndexReaderStream::new(lookup_file, self.batch_size)
+
+            let sub_index_reader = self.store.open_index_file(page_file).await?;
+            let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
                 .await
                 .buffered(self.store.io_parallelism());
-            while let Some(batch) = reader_stream.try_next().await? {
-                target_lookup_file.write_record_batch(batch).await?;
+            while let Some(serialized) = reader_stream.try_next().await? {
+                let remapped = self.sub_index.remap_subindex(serialized, mapping).await?;
+                sub_index_file.write_record_batch(remapped).await?;
             }
 
-            target_lookup_file.finish().await?;
+            sub_index_file.finish().await?;
         }
+
+        // Copy the lookup file as-is
+        self.store
+            .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
+            .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1841,7 +1832,7 @@ async fn merge_metadata_files(
 /// The merge process works as follows:
 /// 1. Process `part_0`: The offset is 0. The indices `[0, 1, 2]` are written as is.
 /// 2. Process `part_1`: The offset is 3 and the local indices `[0, 1, 2, 3]` are remapped
-/// by adding the offset, resulting in `[3, 4, 5, 6]`.
+///    by adding the offset, resulting in `[3, 4, 5, 6]`.
 ///
 /// The final, merged `_page_lookup.lance` will have a single `page_idx` column containing
 /// `[0, 1, 2, 3, 4, 5, 6]`.
@@ -3591,6 +3582,47 @@ mod tests {
             "Single fragment range query [{}, {}] failed",
             large_range_start, large_range_end
         );
+
+        let remap_dir = TempObjDir::default();
+        let remap_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remap_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Remap with a no-op mapping.  The remapped index should be identical to the original
+        ranged_index
+            .remap(&HashMap::default(), remap_store.as_ref())
+            .await
+            .unwrap();
+
+        let remap_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(remap_index.page_lookup, ranged_index.page_lookup);
+
+        let ranged_pages = range_store
+            .open_index_file(part_page_data_file_path(1 << 32).as_str())
+            .await
+            .unwrap();
+        let remapped_pages = remap_store
+            .open_index_file(part_page_data_file_path(1 << 32).as_str())
+            .await
+            .unwrap();
+
+        assert_eq!(ranged_pages.num_rows(), remapped_pages.num_rows());
+
+        let original_data = ranged_pages
+            .read_record_batch(0, ranged_pages.num_rows() as u64)
+            .await
+            .unwrap();
+        let remapped_data = remapped_pages
+            .read_record_batch(0, remapped_pages.num_rows() as u64)
+            .await
+            .unwrap();
+
+        assert_eq!(original_data, remapped_data);
     }
 
     #[tokio::test]
