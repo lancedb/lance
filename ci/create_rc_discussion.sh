@@ -68,8 +68,8 @@ pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance==$
 Add to your \`pom.xml\`:
 \`\`\`xml
 <dependency>
-  <groupId>com.lancedb</groupId>
-  <artifactId>lance</artifactId>
+  <groupId>org.lance</groupId>
+  <artifactId>lance-core</artifactId>
   <version>${RC_VERSION}</version>
 </dependency>
 \`\`\`

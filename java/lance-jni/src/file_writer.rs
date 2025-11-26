@@ -58,12 +58,12 @@ fn attach_native_writer<'local>(
 }
 
 fn create_java_writer_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let res = env.new_object("com/lancedb/lance/file/LanceFileWriter", "()V", &[])?;
+    let res = env.new_object("org/lance/file/LanceFileWriter", "()V", &[])?;
     Ok(res)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
     file_uri: JString,
@@ -123,7 +123,7 @@ fn inner_open<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_closeNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
 ) -> JObject<'local> {
@@ -150,7 +150,7 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_closeNative<'
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_writeNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_writeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
     batch_address: jlong,

@@ -537,7 +537,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::IndexType;
+    use lance_index::{optimize::OptimizeOptions, IndexType};
     use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
     use lance_table::format::pb::VectorIndexDetails;
 
@@ -846,6 +846,123 @@ mod tests {
 
         // Verify BTree parameters are preserved
         let derived_params = target_scalar_index.derive_index_params().unwrap();
+        if let Some(params_json) = derived_params.params {
+            let params: BTreeParameters = serde_json::from_str(&params_json).unwrap();
+            assert_eq!(params.zone_size, Some(50), "BTree zone_size should be 50");
+        } else {
+            panic!("BTree index should have parameters");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_scalar_index_btree() {
+        use crate::dataset::Dataset;
+        use arrow_array::types::Float32Type;
+        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::DatasetIndexExt;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/source", test_dir.as_str());
+
+        // Create source dataset with BTree index
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        // Create BTree index on source with custom zone_size
+        use lance_index::scalar::btree::BTreeParameters;
+
+        let btree_params = BTreeParameters {
+            zone_size: Some(50),
+        };
+        let params_json = serde_json::to_value(&btree_params).unwrap();
+        let index_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree)
+                .with_params(&params_json);
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_btree".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Target should have 1 index");
+        assert_eq!(indices[0].name, "id_btree", "Index name should match");
+        assert_eq!(
+            indices[0].fields,
+            vec![0],
+            "Index should be on field 0 (id)"
+        );
+
+        // Verify the index type is correct
+        let scalar_index = dataset
+            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::BTree,
+            "Index type should be BTree"
+        );
+
+        // Verify BTree parameters are preserved
+        let derived_params = scalar_index.derive_index_params().unwrap();
+        if let Some(params_json) = derived_params.params {
+            let params: BTreeParameters = serde_json::from_str(&params_json).unwrap();
+            assert_eq!(params.zone_size, Some(50), "BTree zone_size should be 50");
+        } else {
+            panic!("BTree index should have parameters");
+        }
+
+        // Append more data to dataset
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(200), BatchCount::from(1));
+        dataset.append(reader, None).await.unwrap();
+
+        // Optimize BTree index
+        let optimize_index_options =
+            OptimizeOptions::new().index_names(vec!["id_btree".to_string()]);
+        dataset
+            .optimize_indices(&optimize_index_options)
+            .await
+            .unwrap();
+
+        // Verify BTree parameters are same after optimization
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Target should have 1 index");
+        assert_eq!(indices[0].name, "id_btree", "Index name should match");
+        assert_eq!(
+            indices[0].fields,
+            vec![0],
+            "Index should be on field 0 (id)"
+        );
+
+        let scalar_index = dataset
+            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::BTree,
+            "Index type should be BTree"
+        );
+
+        let derived_params = scalar_index.derive_index_params().unwrap();
         if let Some(params_json) = derived_params.params {
             let params: BTreeParameters = serde_json::from_str(&params_json).unwrap();
             assert_eq!(params.zone_size, Some(50), "BTree zone_size should be 50");

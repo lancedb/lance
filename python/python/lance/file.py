@@ -342,6 +342,36 @@ class LanceFileSession:
         """
         return self._session.list(path)
 
+    def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
+        """
+        Upload a file from local filesystem to the object store.
+
+        Parameters
+        ----------
+        local_path : str or Path
+            Local file path to upload.
+        remote_path : str
+            Remote path relative to session's base_path.
+        """
+        if isinstance(local_path, Path):
+            local_path = str(local_path)
+        self._session.upload_file(local_path, remote_path)
+
+    def download_file(self, remote_path: str, local_path: Union[str, Path]) -> None:
+        """
+        Download a file from object store to local filesystem.
+
+        Parameters
+        ----------
+        remote_path : str
+            Remote path relative to session's base_path.
+        local_path : str or Path
+            Local file path where the file will be saved.
+        """
+        if isinstance(local_path, Path):
+            local_path = str(local_path)
+        self._session.download_file(remote_path, local_path)
+
 
 class LanceFileWriter:
     """

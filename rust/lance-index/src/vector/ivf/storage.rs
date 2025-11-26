@@ -92,7 +92,7 @@ impl IvfModel {
     }
 
     pub fn partition_size(&self, part: usize) -> usize {
-        self.lengths[part] as usize
+        self.lengths.get(part).copied().unwrap_or_default() as usize
     }
 
     pub fn num_rows(&self) -> u64 {

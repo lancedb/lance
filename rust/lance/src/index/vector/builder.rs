@@ -255,7 +255,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        debug_assert_eq!(self.existing_indices.len(), 1);
+        if self.existing_indices.is_empty() {
+            return Err(Error::invalid_input(
+                "No existing indices available for remapping",
+                location!(),
+            ));
+        }
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input(
                 "IVF model not set before remapping",
@@ -263,96 +268,39 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let Some(quantizer) = self.quantizer.as_ref() else {
-            return Err(Error::invalid_input(
-                "quantizer not set before remapping",
-                location!(),
-            ));
-        };
-
+        log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].clone();
-
-        let joined_part_idx = Self::should_join(ivf, &self.existing_indices, mapping).await?;
-        let assign_batches = match joined_part_idx {
-            Some(part_idx) => {
-                log::info!("join partition {}", part_idx);
-                let results = self.join_partition(part_idx, ivf).await?;
-                let Some(ivf) = self.ivf.as_mut() else {
-                    return Err(Error::invalid_input(
-                        "IVF model not set before joining partition",
-                        location!(),
-                    ));
-                };
-                ivf.centroids = Some(results.new_centroids);
-                results.assign_batches
-            }
-            None => {
-                vec![None; ivf.num_partitions()]
-            }
-        };
-
         let mapping = Arc::new(mapping.clone());
-        let column = self.column.clone();
-        let distance_type = self.distance_type;
-        let quantizer = quantizer.clone();
-        let build_iter =
-            assign_batches
-                .into_iter()
-                .enumerate()
-                .map(move |(part_id, assign_batch)| {
-                    let original_part_id = match joined_part_idx {
-                        Some(joined_part_idx) if part_id >= joined_part_idx => part_id + 1,
-                        _ => part_id,
-                    };
-                    let existing_index = existing_index.clone();
-                    let mapping = mapping.clone();
-                    let column = column.clone();
-                    let distance_type = distance_type;
-                    let quantizer = quantizer.clone();
-                    async move {
-                        let ivf_index = existing_index
-                            .as_any()
-                            .downcast_ref::<IVFIndex<S, Q>>()
-                            .ok_or(Error::invalid_input(
-                                "existing index is not IVF index",
-                                location!(),
-                            ))?;
-                        let part = ivf_index
-                            .load_partition(original_part_id, false, &NoOpMetricsCollector)
-                            .await?;
-                        let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                            Error::Internal {
-                                message: "failed to downcast partition entry".to_string(),
-                                location: location!(),
-                            },
-                        )?;
+        let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
+            let existing_index = existing_index.clone();
+            let mapping = mapping.clone();
+            async move {
+                let ivf_index = existing_index
+                    .as_any()
+                    .downcast_ref::<IVFIndex<S, Q>>()
+                    .ok_or(Error::invalid_input(
+                        "existing index is not IVF index",
+                        location!(),
+                    ))?;
+                let part = ivf_index
+                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .await?;
+                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
+                    Error::Internal {
+                        message: "failed to downcast partition entry".to_string(),
+                        location: location!(),
+                    },
+                )?;
 
-                        let storage = if let Some((assign_batch, _)) = assign_batch {
-                            let (mut batches, _) = Self::take_partition_batches(
-                                original_part_id,
-                                &[existing_index],
-                                None,
-                            )
-                            .await?;
-                            if assign_batch.num_rows() > 0 {
-                                let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
-                                batches.push(assign_batch);
-                            }
-                            let storage =
-                                StorageBuilder::new(column, distance_type, quantizer, None)?
-                                    .build(batches)?;
-                            storage.remap(&mapping)?
-                        } else {
-                            part.storage.remap(&mapping)?
-                        };
-                        let index = part.index.remap(&mapping, &storage)?;
-                        Result::Ok(Some((storage, index, 0.0)))
-                    }
-                });
+                let storage = part.storage.remap(&mapping)?;
+                let index = part.index.remap(&mapping, &storage)?;
+                Result::Ok(Some((storage, index, 0.0)))
+            }
+        });
 
         self.merge_partitions(
             stream::iter(build_iter)
-                .buffer_unordered(get_num_compute_intensive_cpus())
+                .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
         )
         .await?;
@@ -557,6 +505,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         &mut self,
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
+        let Some(ivf) = self.ivf.as_ref() else {
+            return Err(Error::invalid_input(
+                "IVF not set before shuffle data",
+                location!(),
+            ));
+        };
+
         let Some(data) = data else {
             // If we don't specify the shuffle reader, it's going to re-read the
             // dataset and duplicate the data.
@@ -565,12 +520,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Ok(self);
         };
 
-        let Some(ivf) = self.ivf.as_ref() else {
-            return Err(Error::invalid_input(
-                "IVF not set before shuffle data",
-                location!(),
-            ));
-        };
         let Some(quantizer) = self.quantizer.clone() else {
             return Err(Error::invalid_input(
                 "quantizer not set before shuffle data",
@@ -716,51 +665,77 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .optimize_options
             .as_ref()
             .and_then(|opt| opt.num_indices_to_merge);
-        let (assign_batches, merge_indices, replaced_partition) =
-            match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
-                Some(partition) if num_indices_to_merge.is_none() => {
-                    // Perform split and record the fact for downstream build/merge
-                    log::info!(
-                        "split partition {}, will merge all {} delta indices",
-                        partition,
-                        self.existing_indices.len()
-                    );
-                    let split_results = self.split_partition(partition, ivf).await?;
-                    let Some(ivf) = self.ivf.as_mut() else {
-                        return Err(Error::invalid_input(
-                            "IVF not set before building partitions",
-                            location!(),
-                        ));
-                    };
-                    ivf.centroids = Some(split_results.new_centroids);
-                    (
-                        split_results.assign_batches,
-                        Arc::new(self.existing_indices.clone()),
-                        Some(partition),
-                    )
-                }
-                _ => {
-                    let is_retrain = self
-                        .optimize_options
-                        .as_ref()
-                        .map(|opt| opt.retrain)
-                        .unwrap_or(false);
-                    let num_to_merge = match is_retrain {
-                        true => self.existing_indices.len(), // retrain, merge all indices
-                        false => num_indices_to_merge.unwrap_or(0),
-                    };
-
-                    let indices_to_merge = self.existing_indices
-                        [self.existing_indices.len().saturating_sub(num_to_merge)..]
-                        .to_vec();
-
-                    (
-                        vec![None; ivf.num_partitions()],
-                        Arc::new(indices_to_merge),
-                        None,
-                    )
-                }
+        let no_partition_adjustment = || {
+            let is_retrain = self
+                .optimize_options
+                .as_ref()
+                .map(|opt| opt.retrain)
+                .unwrap_or(false);
+            let num_to_merge = match is_retrain {
+                true => self.existing_indices.len(), // retrain, merge all indices
+                false => num_indices_to_merge.unwrap_or(0),
             };
+
+            let indices_to_merge = self.existing_indices
+                [self.existing_indices.len().saturating_sub(num_to_merge)..]
+                .to_vec();
+
+            (
+                vec![None; ivf.num_partitions()],
+                Arc::new(indices_to_merge),
+                None,
+            )
+        };
+
+        let (assign_batches, merge_indices, partition_adjustment) = if num_indices_to_merge
+            .is_some()
+            || self.optimize_options.is_none()
+        {
+            no_partition_adjustment()
+        } else {
+            match Self::check_partition_adjustment(ivf, reader.as_ref(), &self.existing_indices)? {
+                Some(partition_adjustment) => match partition_adjustment {
+                    PartitionAdjustment::Split(partition) => {
+                        // Perform split and record the fact for downstream build/merge
+                        log::info!(
+                            "split partition {}, will merge all {} delta indices",
+                            partition,
+                            self.existing_indices.len()
+                        );
+                        let split_results = self.split_partition(partition, ivf).await?;
+                        let Some(ivf) = self.ivf.as_mut() else {
+                            return Err(Error::invalid_input(
+                                "IVF not set before building partitions",
+                                location!(),
+                            ));
+                        };
+                        ivf.centroids = Some(split_results.new_centroids);
+                        (
+                            split_results.assign_batches,
+                            Arc::new(self.existing_indices.clone()),
+                            Some(partition_adjustment),
+                        )
+                    }
+                    PartitionAdjustment::Join(partition) => {
+                        log::info!("join partition {}", partition);
+                        let results = self.join_partition(partition, ivf).await?;
+                        let Some(ivf) = self.ivf.as_mut() else {
+                            return Err(Error::invalid_input(
+                                "IVF model not set before joining partition",
+                                location!(),
+                            ));
+                        };
+                        ivf.centroids = Some(results.new_centroids);
+                        (
+                            results.assign_batches,
+                            Arc::new(self.existing_indices.clone()),
+                            Some(partition_adjustment),
+                        )
+                    }
+                },
+                None => no_partition_adjustment(),
+            }
+        };
         self.merged_num = merge_indices.len();
         log::info!(
             "merge {}/{} delta indices",
@@ -783,7 +758,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let sub_index_params = sub_index_params.clone();
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
-                    let skip_existing_batches = replaced_partition == Some(partition);
+                    let skip_existing_batches =
+                        partition_adjustment == Some(PartitionAdjustment::Split(partition));
+                    let partition = match partition_adjustment {
+                        Some(PartitionAdjustment::Join(joined_partition))
+                            if partition >= joined_partition =>
+                        {
+                            partition + 1
+                        }
+                        _ => partition,
+                    };
                     async move {
                         let (mut batches, loss) = if skip_existing_batches {
                             (Vec::new(), 0.0)
@@ -1153,24 +1137,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let batch = Flatten::new(&self.column).transform(&batch)?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let vectors = batch[&self.column].as_fixed_size_list().clone();
+        let vectors = batch
+            .column_by_qualified_name(&self.column)
+            .ok_or(Error::invalid_input(
+                format!(
+                    "vector column {} not found in batch {}",
+                    self.column,
+                    batch.schema()
+                ),
+                location!(),
+            ))?
+            .as_fixed_size_list()
+            .clone();
         Ok(Some((row_ids, vectors)))
     }
 
-    // return the partition ids that should be split.
-    // split at most one partition each building,
-    // return the largest partition if multiple partitions are larger than the threshold
-    fn should_split(
+    // check whether need to split or join partition
+    fn check_partition_adjustment(
         ivf: &IvfModel,
         reader: &dyn ShuffleReader,
         existing_indices: &[Arc<dyn VectorIndex>],
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<PartitionAdjustment>> {
         let index_type = IndexType::try_from(
             index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
         )?;
 
         let mut split_partition = None;
+        let mut join_partition = None;
         let mut max_partition_size = 0;
+        let mut min_partition_size = usize::MAX;
         for partition in 0..ivf.num_partitions() {
             let mut num_rows = reader.partition_size(partition)?;
             for index in existing_indices.iter() {
@@ -1182,8 +1177,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 max_partition_size = num_rows;
                 split_partition = Some(partition);
             }
+            if ivf.num_partitions() > 1
+                && num_rows < min_partition_size
+                && num_rows < MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100
+            {
+                min_partition_size = num_rows;
+                join_partition = Some(partition);
+            }
         }
-        Ok(split_partition)
+
+        if let Some(partition) = split_partition {
+            Ok(Some(PartitionAdjustment::Split(partition)))
+        } else if let Some(partition) = join_partition {
+            Ok(Some(PartitionAdjustment::Join(partition)))
+        } else {
+            Ok(None)
+        }
     }
 
     // split this partition,
@@ -1377,60 +1386,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    // should join the partition if the number of rows in the partition is less than MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100
-    async fn should_join(
-        ivf: &IvfModel,
-        existing_indices: &[Arc<dyn VectorIndex>],
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<Option<usize>> {
-        if ivf.num_partitions() <= 1 {
-            // we have to keep at least one partition
-            return Ok(None);
-        }
-
-        let index_type = IndexType::try_from(
-            index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
-        )?;
-        let mut join_partition = None;
-        let mut min_partition_size = usize::MAX;
-        for part_id in 0..ivf.num_partitions() {
-            let mut num_rows = 0;
-            for index in existing_indices.iter() {
-                let ivf_index =
-                    index
-                        .as_any()
-                        .downcast_ref::<IVFIndex<S, Q>>()
-                        .ok_or(Error::invalid_input(
-                            "existing index is not IVF index",
-                            location!(),
-                        ))?;
-                let part = ivf_index
-                    .load_partition(part_id, true, &NoOpMetricsCollector)
-                    .await?;
-                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                    Error::Internal {
-                        message: "failed to downcast partition entry".to_string(),
-                        location: location!(),
-                    },
-                )?;
-
-                let valid_num_rows = part
-                    .storage
-                    .row_ids()
-                    .filter(|row_id| !matches!(mapping.get(row_id), Some(None)))
-                    .count();
-                num_rows += valid_num_rows;
-            }
-            if num_rows < min_partition_size
-                && num_rows < MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100
-            {
-                min_partition_size = num_rows;
-                join_partition = Some(part_id);
-            }
-        }
-        Ok(join_partition)
-    }
-
     // join the given partition:
     // 1. delete the original parttion
     // 2. reasign all vectors of the original partitions
@@ -1608,7 +1563,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 centroids.clone(),
                 self.distance_type,
-                &self.column,
+                vector_field.name().as_str(),
                 quantizer.into(),
                 None,
             )?,
@@ -1694,6 +1649,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // existing part: read from the existing indices
         let mut row_ids = Vec::new();
         for index in self.existing_indices.iter() {
+            if part_idx >= index.ivf_model().num_partitions() {
+                // there was a bug that may cause delta indices have different number of partitions,
+                // it's safe to skip loading the extra partition, and split/join the existing partitions,
+                // split/join would merge all delta indices into one so it would fix the issue
+                // see https://github.com/lance-format/lance/issues/5312
+                log::warn!(
+                    "partition index is {} but the number of partitions is {}, skip loading it",
+                    part_idx,
+                    index.ivf_model().num_partitions()
+                );
+                continue;
+            }
             let mut reader = index
                 .partition_reader(part_idx, false, &NoOpMetricsCollector)
                 .await?;
@@ -1977,6 +1944,14 @@ enum ReassignPartition {
     NewCentroid1,
     NewCentroid2,
     ReassignCandidate(u32),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum PartitionAdjustment {
+    /// Split partition at given id
+    Split(usize),
+    /// Join partition at given id
+    Join(usize),
 }
 
 pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: QuantizationType) -> String {

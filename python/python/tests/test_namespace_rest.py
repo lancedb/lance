@@ -17,7 +17,7 @@ import uuid
 import lance.namespace
 import pyarrow as pa
 import pytest
-from lance_namespace import (
+from lance.namespace import (
     CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
@@ -31,6 +31,7 @@ from lance_namespace import (
     NamespaceExistsRequest,
     RegisterTableRequest,
     TableExistsRequest,
+    connect,
 )
 
 
@@ -58,18 +59,14 @@ def table_to_ipc_bytes(table):
 @pytest.fixture
 def rest_namespace():
     """Create a REST namespace with adapter for testing."""
-    import lance_namespace
-
     unique_id = uuid.uuid4().hex[:8]
     with tempfile.TemporaryDirectory() as tmpdir:
         backend_config = {"root": tmpdir}
         port = 4000 + hash(unique_id) % 10000
 
         with lance.namespace.RestAdapter("dir", backend_config, port=port):
-            # Use lance_namespace.connect() for consistency
-            client = lance_namespace.connect(
-                "rest", {"uri": f"http://127.0.0.1:{port}"}
-            )
+            # Use lance.namespace.connect() for consistency
+            client = connect("rest", {"uri": f"http://127.0.0.1:{port}"})
             yield client
 
 
@@ -644,21 +641,19 @@ class TestBasicNamespaceOperations:
 
 
 class TestLanceNamespaceConnect:
-    """Tests for lance_namespace.connect integration."""
+    """Tests for lance.namespace.connect integration."""
 
     def test_connect_with_rest(self):
-        """Test creating RestNamespace via lance_namespace.connect()."""
-        import lance_namespace
-
+        """Test creating RestNamespace via lance.namespace.connect()."""
         unique_id = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             backend_config = {"root": tmpdir}
             port = 4000 + hash(unique_id) % 10000
 
             with lance.namespace.RestAdapter("dir", backend_config, port=port):
-                # Connect via lance_namespace.connect
+                # Connect via lance.namespace.connect
                 properties = {"uri": f"http://127.0.0.1:{port}"}
-                ns = lance_namespace.connect("rest", properties)
+                ns = connect("rest", properties)
 
                 # Verify it's a RestNamespace instance
                 assert isinstance(ns, lance.namespace.RestNamespace)
@@ -678,8 +673,6 @@ class TestLanceNamespaceConnect:
 
     def test_connect_with_custom_delimiter(self):
         """Test creating RestNamespace with custom delimiter via connect()."""
-        import lance_namespace
-
         unique_id = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             backend_config = {"root": tmpdir}
@@ -692,7 +685,7 @@ class TestLanceNamespaceConnect:
                     "uri": f"http://127.0.0.1:{port}",
                     "delimiter": "@",
                 }
-                ns = lance_namespace.connect("rest", properties)
+                ns = connect("rest", properties)
 
                 # Verify it's a RestNamespace instance
                 assert isinstance(ns, lance.namespace.RestNamespace)

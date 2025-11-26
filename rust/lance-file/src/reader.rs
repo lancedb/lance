@@ -122,6 +122,7 @@ impl CachedFileMetadata {
     pub fn version(&self) -> LanceFileVersion {
         match (self.major_version, self.minor_version) {
             (0, 3) => LanceFileVersion::V2_0,
+            (2, 0) => LanceFileVersion::V2_0,
             (2, 1) => LanceFileVersion::V2_1,
             (2, 2) => LanceFileVersion::V2_2,
             _ => panic!(

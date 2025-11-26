@@ -49,22 +49,9 @@ jobs:
       matrix:
         java-version: [8, 11, 17]
     name: Build and Test with Java ${{ matrix.java-version }}
-    services:
-      localstack:
-        image: localstack/localstack:4.0
-        ports:
-          - 4566:4566
-        env:
-          SERVICES: s3,dynamodb,kms
-          AWS_ACCESS_KEY_ID: ACCESS_KEY
-          AWS_SECRET_ACCESS_KEY: SECRET_KEY
-        options: >-
-          --health-cmd "curl -s http://localhost:4566/_localstack/health"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 3
-          --health-start-period 10s
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt update
@@ -76,8 +63,6 @@ jobs:
       - uses: rui314/setup-mold@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Checkout repository
-        uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni
@@ -91,6 +76,9 @@ jobs:
         working-directory: java
         run: |
           mvn spotless:check
+      - name: Start localstack
+        run: |
+          docker compose -f docker-compose.yml up -d --wait
       - name: Running tests with Java ${{ matrix.java-version }}
         working-directory: java
         env:

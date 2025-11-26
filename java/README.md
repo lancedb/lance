@@ -32,7 +32,7 @@ Introduce the Lance SDK Java Maven dependency(It is recommended to choose the la
 
 ```shell
 <dependency>
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <version>0.35.0</version>
 </dependency>
