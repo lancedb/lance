@@ -235,7 +235,7 @@ impl ObjectStoreRegistry {
         let url = uri_to_url(uri)?;
         match self.get_provider(url.scheme()) {
             None => {
-                if url.scheme().len() == 1 {
+                if url.scheme() == "file" || url.scheme().len() == 1 {
                     Ok("file".to_string())
                 } else {
                     Err(self.scheme_not_found_error(url.scheme()))
