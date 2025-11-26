@@ -196,6 +196,33 @@ fn auto_migrate_corruption() -> bool {
     })
 }
 
+/// Derive a friendly (but not necessarily unique) type name from a type URL.
+fn friendly_type_name_from_uri(index_uri: &str) -> String {
+    let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
+    type_name
+        .strip_suffix("IndexDetails")
+        .unwrap_or(type_name)
+        .to_string()
+}
+
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+fn legacy_type_name(index_uri: &str) -> String {
+    let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
+    match type_name {
+        "BTreeIndexDetails" => IndexType::BTree.to_string(),
+        "BitmapIndexDetails" => IndexType::Bitmap.to_string(),
+        "LabelListIndexDetails" => IndexType::LabelList.to_string(),
+        "NGramIndexDetails" => IndexType::NGram.to_string(),
+        "ZoneMapIndexDetails" => IndexType::ZoneMap.to_string(),
+        "BloomFilterIndexDetails" => IndexType::BloomFilter.to_string(),
+        "InvertedIndexDetails" => IndexType::Inverted.to_string(),
+        "JsonIndexDetails" => IndexType::Scalar.to_string(),
+        "FlatIndexDetails" => IndexType::Vector.to_string(),
+        "VectorIndexDetails" => IndexType::Vector.to_string(),
+        _ => "N/A".to_string(),
+    }
+}
+
 /// Builds index.
 #[async_trait]
 pub trait IndexBuilder {
@@ -905,16 +932,20 @@ impl DatasetIndexExt for Dataset {
         let field_path = self.schema().field_path(field_id)?;
 
         let mut indices_stats = Vec::with_capacity(metadatas.len());
-        let mut index_type: Option<String> = None;
+        let mut index_uri: Option<String> = None;
+        let mut index_typename: Option<String> = None;
 
         for meta in metadatas.iter() {
             let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
             let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
+            if index_uri.is_none() {
+                index_uri = Some(index_details.type_url.clone());
+            }
             let index_details_wrapper = scalar::IndexDetails(index_details.clone());
 
             if let Ok(plugin) = index_details_wrapper.get_plugin() {
-                if index_type.is_none() {
-                    index_type = Some(plugin.index_type().to_string());
+                if index_typename.is_none() {
+                    index_typename = Some(plugin.name().to_string());
                 }
 
                 if let Some(stats) = plugin
@@ -930,14 +961,21 @@ impl DatasetIndexExt for Dataset {
                 .open_generic_index(&field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
                 .await?;
 
-            if index_type.is_none() {
-                index_type = Some(index.index_type().to_string());
+            if index_typename.is_none() {
+                // Fall back to a friendly name from the type URL if the plugin is unknown
+                let uri = index_uri
+                    .as_deref()
+                    .unwrap_or_else(|| index_details.type_url.as_str());
+                index_typename = Some(friendly_type_name_from_uri(uri));
             }
 
             indices_stats.push(index.statistics()?);
         }
 
-        let index_type = index_type.unwrap_or_else(|| "Unknown".to_string());
+        let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
+        let index_typename =
+            index_typename.unwrap_or_else(|| friendly_type_name_from_uri(&index_uri));
+        let index_type = legacy_type_name(&index_uri);
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
 
@@ -1016,6 +1054,8 @@ impl DatasetIndexExt for Dataset {
 
         let stats = json!({
             "index_type": index_type,
+            "index_uri": index_uri,
+            "index_typename": index_typename,
             "name": index_name,
             "num_indices": metadatas.len(),
             "indices": indices_stats,
