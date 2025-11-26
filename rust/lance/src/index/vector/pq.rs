@@ -587,8 +587,8 @@ pub async fn build_pq_model(
         );
         return Err(Error::Precondition {
             message: format!(
-                "Not enough rows to train PQ. Requires {num_codes} rows but only {} available",
-                training_data.len()
+                "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
+                available = training_data.len()
             ),
             location: location!(),
         });
