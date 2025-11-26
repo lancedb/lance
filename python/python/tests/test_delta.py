@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import pyarrow as pa
+import pytest
 from lance import write_dataset
 
 
@@ -25,7 +26,7 @@ def test_delta_get_inserted_rows():
     ds.insert(table2)
 
     # Build delta compared to v1 and fetch inserted rows
-    delta = ds.delta().compared_against_version(1).build()
+    delta = ds.delta(compared_against=1)
     print(delta.list_transactions())
     reader = delta.get_inserted_rows()
 
@@ -54,7 +55,7 @@ def test_delta_get_updated_rows():
     assert update_stats["num_rows_updated"] == 1
 
     # Build delta compared to v1 and fetch updated rows
-    delta = ds.delta().compared_against_version(1).build()
+    delta = ds.delta(compared_against=1)
 
     # Ensure the transaction is an Update (not an Append/Delete)
     txs = delta.list_transactions()
@@ -76,3 +77,56 @@ def test_delta_get_updated_rows():
     for batch in inserted_reader:
         total_inserted += batch.num_rows
     assert total_inserted == 0
+
+
+def test_delta_with_explicit_version_range():
+    # Create initial dataset (version 1)
+    table1 = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "val": pa.array(["a", "b", "c"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table1, "memory://delta_version_range_test", enable_stable_row_ids=True
+    )
+
+    # Append more rows to create version 2
+    table2 = pa.table(
+        {
+            "id": pa.array([4, 5], type=pa.int32()),
+            "val": pa.array(["d", "e"], type=pa.string()),
+        }
+    )
+    ds.insert(table2)
+
+    # Use explicit version range instead of compared_against
+    delta = ds.delta(begin_version=1, end_version=2)
+    reader = delta.get_inserted_rows()
+
+    total_rows = 0
+    for batch in reader:
+        total_rows += batch.num_rows
+
+    assert total_rows == 2
+
+
+def test_delta_validation_errors():
+    table = pa.table({"id": pa.array([1, 2, 3], type=pa.int32())})
+    ds = write_dataset(table, "memory://delta_validation_test")
+
+    # Error: no parameters specified
+    with pytest.raises(ValueError, match="Must specify either"):
+        ds.delta()
+
+    # Error: both compared_against and version range specified
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        ds.delta(compared_against=1, begin_version=1, end_version=2)
+
+    # Error: only begin_version specified
+    with pytest.raises(ValueError, match="Both 'begin_version' and 'end_version'"):
+        ds.delta(begin_version=1)
+
+    # Error: only end_version specified
+    with pytest.raises(ValueError, match="Both 'begin_version' and 'end_version'"):
+        ds.delta(end_version=2)
