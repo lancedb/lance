@@ -1082,6 +1082,9 @@ impl BTreeIndex {
             .get(RANGE_PARTITIONED_META_KEY)
             .map(|bs| bs.parse().unwrap_or(DEFAULT_RANGE_PARTITIONED))
             .unwrap_or(DEFAULT_RANGE_PARTITIONED);
+        // For range-partitioned indices, construct the `ranges_to_files` map.
+        // This converts the list of (partition ID, page count) from metadata into a map
+        // from a global page range to its corresponding file and starting offset.
         let ranges_to_files = if range_partitioned {
             let part_sizes_str = file_schema
             .metadata
@@ -1094,7 +1097,7 @@ impl BTreeIndex {
                 .into_iter()
                 .map(|(id, size)| {
                     let range = offset..=(offset + size - 1);
-                    let file_with_size = (format!("part_{}_page_data.lance", id), offset);
+                    let file_with_size = (part_page_data_file_path(id), offset);
                     offset += size;
                     (range, file_with_size)
                 })
