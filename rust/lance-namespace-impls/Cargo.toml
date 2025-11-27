@@ -13,7 +13,8 @@ rust-version.workspace = true
 
 [features]
 default = []
-rest = ["dep:reqwest", "dep:serde_json", "dep:url"]
+rest = ["dep:reqwest"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp"]
 dir-aws = ["lance-io/aws"]
@@ -33,26 +34,39 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "stream",
     "rustls-tls-native-roots"
 ] }
-serde_json = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
-
 # Directory implementation dependencies (always enabled)
+url = { workspace = true }
 lance = { workspace = true }
+lance-index = { workspace = true }
 lance-io = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 
+# REST adapter implementation dependencies (optional, enabled by "rest-adapter" feature)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true, features = ["trace", "cors"] }
+serde = { workspace = true, optional = true }
+
 # Common dependencies
 async-trait.workspace = true
 bytes.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["sync", "full"] }
+serde_json = { workspace = true }
+futures.workspace = true
+log.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 wiremock.workspace = true
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+rstest.workspace = true
 
 [lints]
 workspace = true

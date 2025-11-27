@@ -66,6 +66,17 @@ pub struct EvaluatedIndex {
 }
 
 impl EvaluatedIndex {
+    /// Get the row id mask representing which rows matched the index filter.
+    pub fn index_result(&self) -> &IndexExprResult {
+        &self.index_result
+    }
+
+    /// Get a reference to the applicable fragments bitmap, containing the set of fragment IDs
+    /// implicated by the filter.
+    pub fn applicable_fragments(&self) -> &RoaringBitmap {
+        &self.applicable_fragments
+    }
+
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
         if batch.num_rows() != 2 {
             return Err(Error::InvalidInput {

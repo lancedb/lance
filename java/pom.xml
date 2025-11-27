@@ -4,10 +4,10 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>0.40.0-beta.2</version>
+    <version>1.0.0-beta.11</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -16,7 +16,7 @@
     <developers>
         <developer>
             <name>Lance DB Dev Group</name>
-            <email>dev@lancedb.com</email>
+            <email>dev@lance.org</email>
         </developer>
     </developers>
     <licenses>
@@ -40,7 +40,7 @@
         <spotless.delimiter>package</spotless.delimiter>
         <rust.release.build>false</rust.release.build>
         <skip.build.jni>false</skip.build.jni>
-        <shade.base>com.lancedb.lance.shaded</shade.base>
+        <shade.base>org.lance.shaded</shade.base>
         <spotless.license.header>
         /*
         * Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,6 +109,11 @@
             <groupId>com.lancedb</groupId>
             <artifactId>lance-namespace-core</artifactId>
             <version>0.0.20</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.15.2</version>
         </dependency>
         <!-- AWS SDK for S3 integration testing -->
         <dependency>
@@ -312,7 +317,7 @@
                             </googleJavaFormat>
 
                             <importOrder>
-                                <order>com.lancedb.lance,,javax,java,\#</order>
+                                <order>org.lance,,javax,java,\#</order>
                             </importOrder>
 
                             <removeUnusedImports />

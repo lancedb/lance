@@ -17,7 +17,7 @@ use lance_core::{
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::rowids::RowIdSequence;
 
@@ -379,16 +379,12 @@ pub fn wrap_with_row_id_and_delete(
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
-            let task = batch_task.task;
-            tokio::spawn(
-                async move {
-                    let batch = task.await?;
-                    apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
-                }
-                .in_current_span(),
-            )
-            .map(|join_wrapper| join_wrapper.unwrap())
-            .boxed()
+            batch_task
+                .task
+                .map(move |batch| {
+                    apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
+                })
+                .boxed()
         })
         .boxed()
 }

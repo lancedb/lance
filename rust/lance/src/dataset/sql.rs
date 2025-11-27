@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_execute() {
-        let mut ds = gen_batch()
+        let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_count() {
-        let mut ds = gen_batch()
+        let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -211,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_explain() {
-        let mut ds = gen_batch()
+        let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -248,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze() {
-        let mut ds = gen_batch()
+        let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(

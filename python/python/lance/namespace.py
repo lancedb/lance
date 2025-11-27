@@ -1,17 +1,392 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-"""LanceNamespace storage options integration.
+"""LanceNamespace storage options integration and implementations.
 
-This module provides storage options integration with LanceNamespace,
-enabling automatic storage options refresh for namespace-managed tables.
+This module provides:
+1. Native Rust-backed namespace implementations (DirectoryNamespace)
+2. Storage options integration with LanceNamespace for automatic credential refresh
 """
 
 from typing import Dict, List
 
-from lance_namespace import DescribeTableRequest, LanceNamespace
+from lance_namespace import (
+    CreateEmptyTableRequest,
+    CreateEmptyTableResponse,
+    CreateNamespaceRequest,
+    CreateNamespaceResponse,
+    CreateTableRequest,
+    CreateTableResponse,
+    DeregisterTableRequest,
+    DeregisterTableResponse,
+    DescribeNamespaceRequest,
+    DescribeNamespaceResponse,
+    DescribeTableRequest,
+    DescribeTableResponse,
+    DropNamespaceRequest,
+    DropNamespaceResponse,
+    DropTableRequest,
+    DropTableResponse,
+    LanceNamespace,
+    ListNamespacesRequest,
+    ListNamespacesResponse,
+    ListTablesRequest,
+    ListTablesResponse,
+    NamespaceExistsRequest,
+    RegisterTableRequest,
+    RegisterTableResponse,
+    TableExistsRequest,
+)
 
 from .io import StorageOptionsProvider
+from .lance import PyDirectoryNamespace  # Low-level Rust binding
+
+try:
+    from .lance import PyRestNamespace  # Low-level Rust binding
+except ImportError:
+    PyRestNamespace = None
+
+try:
+    from .lance import PyRestAdapter  # Low-level Rust binding
+except ImportError:
+    PyRestAdapter = None
+
+__all__ = [
+    "DirectoryNamespace",
+    "RestNamespace",
+    "RestAdapter",
+    "LanceNamespaceStorageOptionsProvider",
+]
+
+
+class DirectoryNamespace(LanceNamespace):
+    """Directory-based Lance Namespace implementation backed by Rust.
+
+    This namespace stores tables as Lance datasets in a filesystem directory structure.
+    It uses a manifest table to track tables and nested namespaces efficiently.
+
+    This is a Python wrapper around the Rust PyDirectoryNamespace implementation,
+    providing compatibility with the LanceNamespace ABC interface.
+
+    Parameters
+    ----------
+    session : Session, optional
+        Lance session for sharing object store connections. If provided,
+        this namespace will reuse the session's object store registry.
+    **properties : dict
+        Configuration properties as key-value pairs:
+        - root (required): Root directory path or URI
+        - manifest_enabled (optional): Enable manifest tracking (default: "true")
+        - dir_listing_enabled (optional): Enable directory listing fallback
+          (default: "true")
+        - storage.* (optional): Storage options with "storage." prefix
+          (e.g., storage.region="us-west-2" becomes region="us-west-2" in
+          storage options)
+
+    Examples
+    --------
+    >>> import lance.namespace
+    >>> # Create with properties dict
+    >>> ns = lance.namespace.DirectoryNamespace(root="memory://test")
+    >>>
+    >>> # With storage options
+    >>> ns = lance.namespace.DirectoryNamespace(
+    ...     root="/path/to/data",
+    ...     manifest_enabled="true",
+    ...     **{"storage.region": "us-west-2"}
+    ... )
+    >>>
+    >>> # Compatible with lance_namespace.connect()
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
+    """
+
+    def __init__(self, session=None, **properties):
+        # Convert all values to strings as expected by Rust from_properties
+        str_properties = {str(k): str(v) for k, v in properties.items()}
+
+        # Create the underlying Rust namespace
+        self._inner = PyDirectoryNamespace(session=session, **str_properties)
+
+    def namespace_id(self) -> str:
+        """Return a human-readable unique identifier for this namespace instance."""
+        return self._inner.namespace_id()
+
+    def __repr__(self) -> str:
+        return f"DirectoryNamespace({self._inner.namespace_id()})"
+
+    # Namespace operations
+
+    def create_namespace(
+        self, request: CreateNamespaceRequest
+    ) -> CreateNamespaceResponse:
+        response_dict = self._inner.create_namespace(request.model_dump())
+        return CreateNamespaceResponse.from_dict(response_dict)
+
+    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
+        response_dict = self._inner.list_namespaces(request.model_dump())
+        return ListNamespacesResponse.from_dict(response_dict)
+
+    def describe_namespace(
+        self, request: DescribeNamespaceRequest
+    ) -> DescribeNamespaceResponse:
+        response_dict = self._inner.describe_namespace(request.model_dump())
+        return DescribeNamespaceResponse.from_dict(response_dict)
+
+    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
+        response_dict = self._inner.drop_namespace(request.model_dump())
+        return DropNamespaceResponse.from_dict(response_dict)
+
+    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+        self._inner.namespace_exists(request.model_dump())
+
+    # Table operations
+
+    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        response_dict = self._inner.list_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        response_dict = self._inner.describe_table(request.model_dump())
+        return DescribeTableResponse.from_dict(response_dict)
+
+    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
+        response_dict = self._inner.register_table(request.model_dump())
+        return RegisterTableResponse.from_dict(response_dict)
+
+    def table_exists(self, request: TableExistsRequest) -> None:
+        self._inner.table_exists(request.model_dump())
+
+    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
+        response_dict = self._inner.drop_table(request.model_dump())
+        return DropTableResponse.from_dict(response_dict)
+
+    def deregister_table(
+        self, request: DeregisterTableRequest
+    ) -> DeregisterTableResponse:
+        response_dict = self._inner.deregister_table(request.model_dump())
+        return DeregisterTableResponse.from_dict(response_dict)
+
+    def create_table(
+        self, request: CreateTableRequest, request_data: bytes
+    ) -> CreateTableResponse:
+        response_dict = self._inner.create_table(request.model_dump(), request_data)
+        return CreateTableResponse.from_dict(response_dict)
+
+    def create_empty_table(
+        self, request: CreateEmptyTableRequest
+    ) -> CreateEmptyTableResponse:
+        response_dict = self._inner.create_empty_table(request.model_dump())
+        return CreateEmptyTableResponse.from_dict(response_dict)
+
+
+class RestNamespace(LanceNamespace):
+    """REST-based Lance Namespace implementation backed by Rust.
+
+    This namespace communicates with a Lance REST API server to manage
+    namespaces and tables remotely.
+
+    This is a Python wrapper around the Rust PyRestNamespace implementation,
+    providing compatibility with the LanceNamespace ABC interface.
+
+    Parameters
+    ----------
+    **properties : dict
+        Configuration properties as key-value pairs:
+        - uri (required): REST endpoint URI (e.g., "http://localhost:4099")
+        - delimiter (optional): Namespace delimiter, default "$"
+        - header.* (optional): HTTP headers with "header." prefix
+          (e.g., header.Authorization="Bearer token" becomes
+          Authorization="Bearer token" in HTTP headers)
+        - tls.* (optional): TLS configuration with "tls." prefix
+
+    Examples
+    --------
+    >>> import lance.namespace
+    >>> # Create with properties dict
+    >>> ns = lance.namespace.RestNamespace(uri="http://localhost:4099")
+    >>>
+    >>> # With custom delimiter and headers
+    >>> ns = lance.namespace.RestNamespace(
+    ...     uri="http://localhost:4099",
+    ...     delimiter=".",
+    ...     **{"header.Authorization": "Bearer token"}
+    ... )
+    >>>
+    >>> # Compatible with lance_namespace.connect()
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("rest", {"uri": "http://localhost:4099"})
+    """
+
+    def __init__(self, **properties):
+        if PyRestNamespace is None:
+            raise RuntimeError(
+                "RestNamespace is not available. "
+                "Lance was built without REST support. "
+                "Please rebuild with the 'rest' feature enabled."
+            )
+        # Convert all values to strings as expected by Rust from_properties
+        str_properties = {str(k): str(v) for k, v in properties.items()}
+
+        # Create the underlying Rust namespace
+        self._inner = PyRestNamespace(**str_properties)
+
+    def namespace_id(self) -> str:
+        """Return a human-readable unique identifier for this namespace instance."""
+        return self._inner.namespace_id()
+
+    def __repr__(self) -> str:
+        return f"RestNamespace({self._inner.namespace_id()})"
+
+    # Namespace operations
+
+    def create_namespace(
+        self, request: CreateNamespaceRequest
+    ) -> CreateNamespaceResponse:
+        response_dict = self._inner.create_namespace(request.model_dump())
+        return CreateNamespaceResponse.from_dict(response_dict)
+
+    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
+        response_dict = self._inner.list_namespaces(request.model_dump())
+        return ListNamespacesResponse.from_dict(response_dict)
+
+    def describe_namespace(
+        self, request: DescribeNamespaceRequest
+    ) -> DescribeNamespaceResponse:
+        response_dict = self._inner.describe_namespace(request.model_dump())
+        return DescribeNamespaceResponse.from_dict(response_dict)
+
+    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
+        response_dict = self._inner.drop_namespace(request.model_dump())
+        return DropNamespaceResponse.from_dict(response_dict)
+
+    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+        self._inner.namespace_exists(request.model_dump())
+
+    # Table operations
+
+    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        response_dict = self._inner.list_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        response_dict = self._inner.describe_table(request.model_dump())
+        return DescribeTableResponse.from_dict(response_dict)
+
+    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
+        response_dict = self._inner.register_table(request.model_dump())
+        return RegisterTableResponse.from_dict(response_dict)
+
+    def table_exists(self, request: TableExistsRequest) -> None:
+        self._inner.table_exists(request.model_dump())
+
+    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
+        response_dict = self._inner.drop_table(request.model_dump())
+        return DropTableResponse.from_dict(response_dict)
+
+    def deregister_table(
+        self, request: DeregisterTableRequest
+    ) -> DeregisterTableResponse:
+        response_dict = self._inner.deregister_table(request.model_dump())
+        return DeregisterTableResponse.from_dict(response_dict)
+
+    def create_table(
+        self, request: CreateTableRequest, request_data: bytes
+    ) -> CreateTableResponse:
+        response_dict = self._inner.create_table(request.model_dump(), request_data)
+        return CreateTableResponse.from_dict(response_dict)
+
+    def create_empty_table(
+        self, request: CreateEmptyTableRequest
+    ) -> CreateEmptyTableResponse:
+        response_dict = self._inner.create_empty_table(request.model_dump())
+        return CreateEmptyTableResponse.from_dict(response_dict)
+
+
+class RestAdapter:
+    """REST adapter server that creates a namespace backend and exposes it via REST.
+
+    This adapter starts an HTTP server that exposes a Lance namespace backend
+    via the Lance REST API. The backend namespace can be any implementation
+    (DirectoryNamespace, etc.) created from the provided configuration.
+    Useful for testing RestNamespace clients.
+
+    Parameters
+    ----------
+    namespace_impl : str
+        Namespace implementation type ("dir", "rest", etc.)
+    namespace_properties : dict, optional
+        Configuration properties for the backend namespace.
+        For DirectoryNamespace ("dir"):
+        - root (required): Root directory path or URI
+        - manifest_enabled (optional): Enable manifest tracking (default: "true")
+        - dir_listing_enabled (optional): Enable directory listing fallback
+        - storage.* (optional): Storage options with "storage." prefix
+    session : Session, optional
+        Lance session for sharing object store connections with the backend namespace.
+    host : str, optional
+        Host address to bind to, default "127.0.0.1"
+    port : int, optional
+        Port to listen on, default 2333
+
+    Examples
+    --------
+    >>> import lance.namespace
+    >>>
+    >>> # Start REST adapter with DirectoryNamespace backend
+    >>> namespace_config = {"root": "memory://test"}
+    >>> with lance.namespace.RestAdapter("dir", namespace_config, port=4001) as adapter:
+    ...     # Create REST client
+    ...     client = lance.namespace.RestNamespace(uri="http://127.0.0.1:4001")
+    ...     # Use the client...
+    """
+
+    def __init__(
+        self,
+        namespace_impl: str,
+        namespace_properties: Dict[str, str] = None,
+        session=None,
+        host: str = "127.0.0.1",
+        port: int = 2333,
+    ):
+        if PyRestAdapter is None:
+            raise RuntimeError(
+                "RestAdapter is not available. "
+                "Lance was built without REST adapter support. "
+                "Please rebuild with the 'rest-adapter' feature enabled."
+            )
+
+        # Convert to string properties
+        if namespace_properties is None:
+            namespace_properties = {}
+        str_properties = {str(k): str(v) for k, v in namespace_properties.items()}
+
+        # Create the underlying Rust adapter
+        self._inner = PyRestAdapter(namespace_impl, str_properties, session, host, port)
+        self.host = host
+        self.port = port
+        self.namespace_impl = namespace_impl
+
+    def serve(self):
+        """Start the REST server in the background."""
+        self._inner.serve()
+
+    def stop(self):
+        """Stop the REST server."""
+        self._inner.stop()
+
+    def __enter__(self):
+        """Start server when entering context."""
+        self.serve()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Stop server when exiting context."""
+        self.stop()
+        return False
+
+    def __repr__(self) -> str:
+        return f"RestAdapter(host='{self.host}', port={self.port})"
 
 
 class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
@@ -42,11 +417,8 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         import lance
         import lance_namespace
 
-        # Connect to a namespace (e.g., LanceDB Cloud)
-        namespace = lance_namespace.connect("rest", {
-            "url": "https://api.lancedb.com",
-            "api_key": "your-api-key"
-        })
+        # Connect to a namespace (using the lance_namespace package)
+        namespace = lance_namespace.connect("http://localhost:4099")
 
         # Create storage options provider
         provider = lance.LanceNamespaceStorageOptionsProvider(

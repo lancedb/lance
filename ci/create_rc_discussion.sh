@@ -61,15 +61,15 @@ DISCUSSION_BODY="${DISCUSSION_BODY}
 
 #### Python
 \`\`\`bash
-pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==${RC_VERSION}
+pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance==${RC_VERSION}
 \`\`\`
 
 #### Java (Maven)
 Add to your \`pom.xml\`:
 \`\`\`xml
 <dependency>
-  <groupId>com.lancedb</groupId>
-  <artifactId>lance</artifactId>
+  <groupId>org.lance</groupId>
+  <artifactId>lance-core</artifactId>
   <version>${RC_VERSION}</version>
 </dependency>
 \`\`\`

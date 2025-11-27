@@ -462,7 +462,7 @@ impl JNIEnvExt for JNIEnv<'_> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseInts(
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     mut env: JNIEnv,
     _obj: JObject,
     list_obj: JObject, // List<Integer>
@@ -471,7 +471,7 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseInts(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseLongs(
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     mut env: JNIEnv,
     _obj: JObject,
     list_obj: JObject, // List<Long>
@@ -480,7 +480,7 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseLongs(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIntsOpt(
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     mut env: JNIEnv,
     _obj: JObject,
     list_obj: JObject, // Optional<List<Integer>>
@@ -489,7 +489,7 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIntsOpt(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseQuery(
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     mut env: JNIEnv,
     _obj: JObject,
     query_opt: JObject, // Optional<TmpQuery>
@@ -498,7 +498,7 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIndexParams(
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIndexParams(
     mut env: JNIEnv,
     _obj: JObject,
     index_params_obj: JObject, // IndexParams

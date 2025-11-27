@@ -20,9 +20,8 @@ use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
 };
-use lance_file::reader::FileReader;
-use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::reader::FileReaderOptions;
 use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::optimize::OptimizeOptions;
@@ -43,10 +42,12 @@ pub use lance_index::IndexParams;
 use lance_index::{
     is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
-    ScalarIndexCriteria,
+    IndexCriteria,
 };
 use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION};
+use lance_index::{
+    DatasetIndexExt, IndexDescription, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION,
+};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -368,6 +369,134 @@ fn vector_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+struct IndexDescriptionImpl {
+    name: String,
+    field_ids: Vec<u32>,
+    segments: Vec<IndexMetadata>,
+    index_type: String,
+    details: IndexDetails,
+    rows_indexed: u64,
+}
+
+impl IndexDescriptionImpl {
+    fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
+        if segments.is_empty() {
+            return Err(Error::Index {
+                message: "Index metadata is empty".to_string(),
+                location: location!(),
+            });
+        }
+
+        // We assume the type URL and details are the same for all segments
+        let example_metadata = &segments[0];
+
+        let name = example_metadata.name.clone();
+        if !segments.iter().all(|shard| shard.name == name) {
+            return Err(Error::Index {
+                message: "Index name should be identical across all segments".to_string(),
+                location: location!(),
+            });
+        }
+
+        let field_ids = &example_metadata.fields;
+        if !segments.iter().all(|shard| shard.fields == *field_ids) {
+            return Err(Error::Index {
+                message: "Index fields should be identical across all segments".to_string(),
+                location: location!(),
+            });
+        }
+        let field_ids = field_ids.iter().map(|id| *id as u32).collect();
+
+        // This should not fail as we have already filtered out indexes without index details.
+        let index_details = example_metadata.index_details.as_ref().ok_or(Error::Index {
+            message:
+                "Index details are required for index description.  This index must be retrained to support this method."
+                    .to_string(),
+            location: location!(),
+        })?;
+        let type_url = &index_details.type_url;
+        if !segments.iter().all(|shard| {
+            shard
+                .index_details
+                .as_ref()
+                .map(|d| d.type_url == *type_url)
+                .unwrap_or(false)
+        }) {
+            return Err(Error::Index {
+                message: "Index type URL should be present and identical across all segments"
+                    .to_string(),
+                location: location!(),
+            });
+        }
+
+        let details = IndexDetails(index_details.clone());
+        let mut rows_indexed = 0;
+
+        let index_type = details
+            .get_plugin()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
+
+        for shard in &segments {
+            let fragment_bitmap = shard
+            .fragment_bitmap
+            .as_ref()
+            .ok_or_else(|| Error::Index {
+                message: "Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string(),
+                location: location!(),
+            })?;
+
+            for fragment in dataset.get_fragments() {
+                if fragment_bitmap.contains(fragment.id() as u32) {
+                    rows_indexed += fragment.fast_logical_rows()? as u64;
+                }
+            }
+        }
+
+        Ok(Self {
+            name,
+            field_ids,
+            index_type,
+            segments,
+            details,
+            rows_indexed,
+        })
+    }
+}
+
+impl IndexDescription for IndexDescriptionImpl {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn field_ids(&self) -> &[u32] {
+        &self.field_ids
+    }
+
+    fn index_type(&self) -> &str {
+        &self.index_type
+    }
+
+    fn metadata(&self) -> &[IndexMetadata] {
+        &self.segments
+    }
+
+    fn type_url(&self) -> &str {
+        self.details.0.type_url.as_str()
+    }
+
+    fn rows_indexed(&self) -> u64 {
+        self.rows_indexed
+    }
+
+    fn details(&self) -> Result<String> {
+        let plugin = self.details.get_plugin()?;
+        plugin
+            .details_as_json(&self.details.0)
+            .map(|v| v.to_string())
+    }
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -476,6 +605,47 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn describe_indices<'a, 'b>(
+        &'a self,
+        criteria: Option<IndexCriteria<'b>>,
+    ) -> Result<Vec<Arc<dyn IndexDescription>>> {
+        let indices = self.load_indices().await?;
+        let mut indices = if let Some(criteria) = criteria {
+            indices.iter().filter(|idx| {
+                if idx.index_details.is_none() {
+                    log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
+                    return false;
+                }
+                let fields = idx
+                    .fields
+                    .iter()
+                    .filter_map(|id| self.schema().field_by_id(*id))
+                    .collect::<Vec<_>>();
+                match index_matches_criteria(idx, &criteria, &fields, false, self.schema()) {
+                    Ok(matched) => matched,
+                    Err(err) => {
+                        log::warn!("Could not describe index {}: {}", idx.name, err);
+                        false
+                    }
+                }
+            }).collect::<Vec<_>>()
+        } else {
+            indices.iter().collect::<Vec<_>>()
+        };
+        indices.sort_by_key(|idx| &idx.name);
+
+        indices
+            .into_iter()
+            .chunk_by(|idx| &idx.name)
+            .into_iter()
+            .map(|(_, segments)| {
+                let segments = segments.cloned().collect::<Vec<_>>();
+                let desc = IndexDescriptionImpl::try_new(segments, self)?;
+                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
@@ -568,7 +738,7 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_scalar_index<'a, 'b>(
         &'a self,
-        criteria: ScalarIndexCriteria<'b>,
+        criteria: IndexCriteria<'b>,
     ) -> Result<Option<IndexMetadata>> {
         let indices = self.load_indices().await?;
 
@@ -587,8 +757,9 @@ impl DatasetIndexExt for Dataset {
                 }
             })
             .collect::<Vec<_>>();
-        // This sorting & chunking is only needed to provide some backwards compatibility behavior for
-        // old versions of Lance that don't write index details.
+        // This sorting & chunking is only needed to calculate if there are multiple indexes on the same
+        // field.  This fact is only needed for backwards compatibility behavior for indexes that don't have
+        // index details.  At some point we should deprecate indexes without index details.
         //
         // TODO: At some point we should just fail if the index details are missing and ask the user to
         // retrain the index.
@@ -600,7 +771,13 @@ impl DatasetIndexExt for Dataset {
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
-                    if index_matches_criteria(idx, &criteria, field, has_multiple, self.schema())? {
+                    if index_matches_criteria(
+                        idx,
+                        &criteria,
+                        &[field],
+                        has_multiple,
+                        self.schema(),
+                    )? {
                         let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                             bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
                         });
@@ -1106,7 +1283,7 @@ impl DatasetIndexInternalExt for Dataset {
 
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = FileReader::try_new_self_described_from_reader(
+                let reader = PreviousFileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
@@ -1129,7 +1306,7 @@ impl DatasetIndexInternalExt for Dataset {
                 let file = scheduler
                     .open_file(&index_file, &CachedFileSize::unknown())
                     .await?;
-                let reader = v2::reader::FileReader::try_open(
+                let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
                     Default::default(),
@@ -1607,12 +1784,12 @@ fn is_vector_field(data_type: DataType) -> bool {
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::{ReadParams, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::Int32Array;
-    use lance_io::utils::tracking_store::IOTracker;
+
     use lance_io::{assert_io_eq, assert_io_lt};
 
     use super::*;
@@ -1631,7 +1808,7 @@ mod tests {
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-    use lance_io::object_store::ObjectStoreParams;
+
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -2359,12 +2536,7 @@ mod tests {
     #[lance_test_macros::test(tokio::test)]
     async fn test_load_indices() {
         let session = Arc::new(Session::default());
-        let io_tracker = Arc::new(IOTracker::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -2393,10 +2565,10 @@ mod tests {
             )
             .await
             .unwrap();
-        io_tracker.incremental_stats(); // Reset
+        dataset.object_store().io_stats_incremental(); // Reset
 
         let indices = dataset.load_indices().await.unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = dataset.object_store().io_stats_incremental();
         // We should already have this cached since we just wrote it.
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
@@ -2406,24 +2578,16 @@ mod tests {
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session.clone()),
-                ..Default::default()
-            })
             .load()
             .await
             .unwrap();
-        let stats = io_tracker.incremental_stats(); // Reset
+        let stats = dataset2.object_store().io_stats_incremental(); // Reset
         assert_io_lt!(stats, read_bytes, 64 * 1024);
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = dataset2.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices2.len(), 1);
@@ -2458,7 +2622,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_ivf_pq_up_to_date() {
-        // https://github.com/lancedb/lance/issues/4016
+        // https://github.com/lance-format/lance/issues/4016
         let nrows = 256;
         let dimensions = 16;
         let column_name = "vector";

@@ -22,8 +22,8 @@ pub use field::{
     BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
-    Projectable, Projection, Schema,
+    escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,
+    OnMissing, Projectable, Projection, Schema,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -62,15 +62,13 @@ pub static BLOB_V2_DESC_TYPE: LazyLock<DataType> =
 pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
     ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), true).with_metadata(HashMap::from([
         (lance_arrow::BLOB_META_KEY.to_string(), "true".to_string()),
-        (
-            lance_arrow::BLOB_VERSION_META_KEY.to_string(),
-            "2".to_string(),
-        ),
     ]))
 });
 
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
+
+pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
@@ -94,6 +92,10 @@ impl LogicalType {
 
     fn is_struct(&self) -> bool {
         self.0 == "struct"
+    }
+
+    fn is_blob(&self) -> bool {
+        self.0 == BLOB_LOGICAL_TYPE
     }
 }
 
@@ -228,6 +230,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            BLOB_LOGICAL_TYPE => Some(LargeBinary),
             "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),

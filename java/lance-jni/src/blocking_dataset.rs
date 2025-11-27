@@ -60,6 +60,11 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
+    /// Get the storage options provider that was used when opening this dataset
+    pub fn get_storage_options_provider(&self) -> Option<Arc<dyn StorageOptionsProvider>> {
+        self.inner.storage_options_provider()
+    }
+
     pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
         RT.block_on(async move {
             let registry = Arc::new(ObjectStoreRegistry::default());
@@ -123,7 +128,7 @@ impl BlockingDataset {
             builder = builder.with_version(ver as u64);
         }
         builder = builder.with_storage_options(storage_options);
-        if let Some(provider) = storage_options_provider {
+        if let Some(provider) = storage_options_provider.clone() {
             builder = builder.with_storage_options_provider(provider)
         }
         if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
@@ -285,14 +290,11 @@ impl BlockingDataset {
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
-        write_params: HashMap<String, String>,
+        store_params: ObjectStoreParams,
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
-                .with_store_params(ObjectStoreParams {
-                    storage_options: Some(write_params),
-                    ..Default::default()
-                })
+                .with_store_params(store_params)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -323,7 +325,7 @@ impl BlockingDataset {
 // Write Methods //
 ///////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local>(
+pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     arrow_schema_addr: jlong,
@@ -335,6 +337,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -348,7 +351,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             mode,
             enable_stable_row_ids,
             data_storage_version,
-            storage_options_obj
+            storage_options_obj,
+            s3_credentials_refresh_offset_seconds_obj
         )
     )
 }
@@ -365,6 +369,7 @@ fn inner_create_with_ffi_schema<'local>(
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -381,12 +386,14 @@ fn inner_create_with_ffi_schema<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        JObject::null(), // No provider for schema-only creation
+        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_drop<'local>(
+pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString<'local>,
@@ -400,7 +407,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_drop<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local>(
+pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     arrow_array_stream_addr: jlong,
@@ -412,6 +419,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     enable_stable_row_ids: JObject, // Optional<Boolean>
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -425,7 +433,44 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             mode,
             enable_stable_row_ids,
             data_storage_version,
-            storage_options_obj
+            storage_options_obj,
+            JObject::null(),
+            s3_credentials_refresh_offset_seconds_obj
+        )
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    arrow_array_stream_addr: jlong,
+    path: JString,
+    max_rows_per_file: JObject,            // Optional<Integer>
+    max_rows_per_group: JObject,           // Optional<Integer>
+    max_bytes_per_file: JObject,           // Optional<Long>
+    mode: JObject,                         // Optional<String>
+    enable_stable_row_ids: JObject,        // Optional<Boolean>
+    data_storage_version: JObject,         // Optional<String>
+    storage_options_obj: JObject,          // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_with_ffi_stream(
+            &mut env,
+            arrow_array_stream_addr,
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            enable_stable_row_ids,
+            data_storage_version,
+            storage_options_obj,
+            storage_options_provider_obj,
+            s3_credentials_refresh_offset_seconds_obj
         )
     )
 }
@@ -435,13 +480,15 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
+    max_rows_per_file: JObject,            // Optional<Integer>
+    max_rows_per_group: JObject,           // Optional<Integer>
+    max_bytes_per_file: JObject,           // Optional<Long>
+    mode: JObject,                         // Optional<String>
+    enable_stable_row_ids: JObject,        // Optional<Boolean>
+    data_storage_version: JObject,         // Optional<String>
+    storage_options_obj: JObject,          // Map<String, String>
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -455,6 +502,8 @@ fn inner_create_with_ffi_stream<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        storage_options_provider_obj,
+        s3_credentials_refresh_offset_seconds_obj,
         reader,
     )
 }
@@ -470,6 +519,8 @@ fn create_dataset<'local>(
     enable_stable_row_ids: JObject,
     data_storage_version: JObject,
     storage_options_obj: JObject,
+    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    s3_credentials_refresh_offset_seconds_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
@@ -483,6 +534,8 @@ fn create_dataset<'local>(
         &enable_stable_row_ids,
         &data_storage_version,
         &storage_options_obj,
+        &storage_options_provider_obj,
+        &s3_credentials_refresh_offset_seconds_obj,
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
@@ -518,7 +571,7 @@ impl IntoJava for Version {
         }
 
         let java_version = env.new_object(
-            "com/lancedb/lance/Version",
+            "org/lance/Version",
             "(JLjava/time/ZonedDateTime;Ljava/util/TreeMap;)V",
             &[
                 JValue::Long(self.version as i64),
@@ -549,12 +602,12 @@ fn attach_native_dataset<'local>(
 }
 
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let object = env.new_object("com/lancedb/lance/Dataset", "()V", &[])?;
+    let object = env.new_object("org/lance/Dataset", "()V", &[])?;
     Ok(object)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
+pub extern "system" fn Java_org_lance_Dataset_commitAppend<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
@@ -595,7 +648,7 @@ pub fn inner_commit_append<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_commitOverwrite<'local>(
+pub extern "system" fn Java_org_lance_Dataset_commitOverwrite<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
@@ -650,10 +703,7 @@ pub fn inner_commit_overwrite<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
-    mut env: JNIEnv,
-    obj: JObject,
-) {
+pub extern "system" fn Java_org_lance_Dataset_releaseNativeDataset(mut env: JNIEnv, obj: JObject) {
     ok_or_throw_without_return!(env, inner_release_native_dataset(&mut env, obj))
 }
 
@@ -664,7 +714,7 @@ fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> Result<()> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
     mut env: JNIEnv,
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
@@ -820,7 +870,7 @@ fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Res
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_innerMergeIndexMetadata<'local>(
+pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadata<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     index_uuid: JString,
@@ -900,7 +950,7 @@ fn inner_merge_index_metadata(
 // Read Methods //
 //////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
+pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
@@ -1021,7 +1071,7 @@ fn inner_open_native<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsNative<'a>(
+pub extern "system" fn Java_org_lance_Dataset_getFragmentsNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
 ) -> JObject<'a> {
@@ -1045,7 +1095,7 @@ fn inner_get_fragments<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentNative<'a>(
+pub extern "system" fn Java_org_lance_Dataset_getFragmentNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
     fragment_id: jint,
@@ -1071,7 +1121,7 @@ fn inner_get_fragment<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetLanceSchema<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceSchema<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1091,7 +1141,7 @@ fn inner_get_lance_schema<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_importFfiSchema(
+pub extern "system" fn Java_org_lance_Dataset_importFfiSchema(
     mut env: JNIEnv,
     jdataset: JObject,
     arrow_schema_addr: jlong,
@@ -1119,7 +1169,7 @@ fn inner_import_ffi_schema(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUri<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeUri<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JString<'local> {
@@ -1142,7 +1192,7 @@ fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListVersions<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeListVersions<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1178,7 +1228,7 @@ fn inner_list_versions<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetVersion<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1198,7 +1248,7 @@ fn inner_get_version<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetLatestVersionId(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestVersionId(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jlong {
@@ -1212,7 +1262,7 @@ fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u6
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutLatest(
+pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutLatest(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) {
@@ -1226,7 +1276,7 @@ fn inner_checkout_latest(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> 
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutVersion<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     version: jlong,
@@ -1249,7 +1299,7 @@ fn inner_checkout_version<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutTag<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCheckoutTag<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     jtag: JString,
@@ -1273,7 +1323,7 @@ fn inner_checkout_tag<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeRestore(
+pub extern "system" fn Java_org_lance_Dataset_nativeRestore(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) {
@@ -1287,7 +1337,7 @@ fn inner_restore(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeShallowClone<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeShallowClone<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     target_path: JString,
@@ -1360,7 +1410,7 @@ fn inner_shallow_clone<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
+pub extern "system" fn Java_org_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
     filter_jobj: JObject, // Optional<String>
@@ -1384,7 +1434,7 @@ fn inner_count_rows(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetDataStatistics<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetDataStatistics<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1400,20 +1450,20 @@ fn inner_get_data_statistics<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         dataset_guard.calculate_data_stats()?
     };
-    let data_stats = env.new_object("com/lancedb/lance/ipc/DataStatistics", "()V", &[])?;
+    let data_stats = env.new_object("org/lance/ipc/DataStatistics", "()V", &[])?;
 
     for field in stats.fields {
         let id = field.id as jint;
         let byte_size = field.bytes_on_disk as jlong;
         let filed_jobj = env.new_object(
-            "com/lancedb/lance/ipc/FieldStatistics",
+            "org/lance/ipc/FieldStatistics",
             "(IJ)V",
             &[JValue::Int(id), JValue::Long(byte_size)],
         )?;
         env.call_method(
             &data_stats,
             "addFiledStatistics",
-            "(Lcom/lancedb/lance/ipc/FieldStatistics;)V",
+            "(Lorg/lance/ipc/FieldStatistics;)V",
             &[JValue::Object(&filed_jobj)],
         )?;
     }
@@ -1421,7 +1471,7 @@ fn inner_get_data_statistics<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListIndexes<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeListIndexes<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1458,7 +1508,7 @@ fn inner_list_indexes<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetConfig<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetConfig<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1500,7 +1550,7 @@ fn inner_get_config<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
+pub extern "system" fn Java_org_lance_Dataset_nativeTake(
     mut env: JNIEnv,
     java_dataset: JObject,
     indices_obj: JObject, // List<Long>
@@ -1553,7 +1603,7 @@ fn inner_take(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDelete(
+pub extern "system" fn Java_org_lance_Dataset_nativeDelete(
     mut env: JNIEnv,
     java_dataset: JObject,
     predicate: JString,
@@ -1573,7 +1623,7 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
 // Schema evolution Methods //
 //////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDropColumns(
+pub extern "system" fn Java_org_lance_Dataset_nativeDropColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
     columns_obj: JObject, // List<String>
@@ -1595,7 +1645,7 @@ fn inner_drop_columns(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
+pub extern "system" fn Java_org_lance_Dataset_nativeAlterColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
     column_alterations_obj: JObject, // List<ColumnAlteration>
@@ -1700,7 +1750,7 @@ fn inner_alter_columns(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySqlExpressions(
+pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsBySqlExpressions(
     mut env: JNIEnv,
     java_dataset: JObject,
     sql_expressions: JObject, // SqlExpressions
@@ -1767,7 +1817,7 @@ fn inner_add_columns_by_sql_expressions(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsByReader(
+pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsByReader(
     mut env: JNIEnv,
     java_dataset: JObject,
     arrow_array_stream_addr: jlong,
@@ -1814,7 +1864,7 @@ fn inner_add_columns_by_reader(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySchema(
+pub extern "system" fn Java_org_lance_Dataset_nativeAddColumnsBySchema(
     mut env: JNIEnv,
     java_dataset: JObject,
     schema_ptr: jlong, // Schema pointer
@@ -1848,7 +1898,7 @@ fn inner_add_columns_by_schema(
 // Tag operation Methods    //
 //////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListTags<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeListTags<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -1868,7 +1918,7 @@ fn inner_list_tags<'local>(
 
     for (tag_name, tag_contents) in tag_map {
         let java_tag = env.new_object(
-            "com/lancedb/lance/Tag",
+            "org/lance/Tag",
             "(Ljava/lang/String;JI)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
@@ -1887,7 +1937,7 @@ fn inner_list_tags<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateTag(
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateTag(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -1900,7 +1950,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateTag(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateTagOnBranch(
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateTagOnBranch(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -1942,7 +1992,7 @@ fn inner_create_tag_on_branch(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDeleteTag(
+pub extern "system" fn Java_org_lance_Dataset_nativeDeleteTag(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -1958,7 +2008,7 @@ fn inner_delete_tag(env: &mut JNIEnv, java_dataset: JObject, jtag_name: JString)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateTag(
+pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTag(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -1971,7 +2021,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateTag(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateTagOnBranch(
+pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTagOnBranch(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -2013,7 +2063,7 @@ fn inner_update_tag(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetVersionByTag(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionByTag(
     mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
@@ -2040,7 +2090,7 @@ fn inner_get_version_by_tag(
 // Branch operation Methods  //
 //////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListBranches<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeListBranches<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -2066,7 +2116,7 @@ fn inner_list_branches<'local>(
             JObject::null()
         };
         let jbranch = env.new_object(
-            "com/lancedb/lance/Branch",
+            "org/lance/Branch",
             "(Ljava/lang/String;Ljava/lang/String;JJI)V",
             &[
                 JValue::Object(&jname),
@@ -2087,7 +2137,7 @@ fn inner_list_branches<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateBranch<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateBranch<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     jbranch: JString,
@@ -2119,7 +2169,7 @@ fn inner_create_branch<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateBranchOnTag<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateBranchOnTag<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     jbranch: JString,
@@ -2155,7 +2205,7 @@ fn inner_create_branch_on_tag<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDeleteBranch(
+pub extern "system" fn Java_org_lance_Dataset_nativeDeleteBranch(
     mut env: JNIEnv,
     java_dataset: JObject,
     jbranch: JString,
@@ -2171,7 +2221,7 @@ fn inner_delete_branch(env: &mut JNIEnv, java_dataset: JObject, jbranch: JString
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckout<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCheckout<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     reference_obj: JObject, // Reference
@@ -2223,7 +2273,7 @@ fn inner_checkout_ref<'local>(
 // Unified metadata API JNI methods
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetTableMetadata<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetTableMetadata<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JObject<'local> {
@@ -2268,7 +2318,7 @@ fn inner_get_table_metadata<'local>(
 // Compaction Methods       //
 //////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCompact(
+pub extern "system" fn Java_org_lance_Dataset_nativeCompact(
     mut env: JNIEnv,
     java_dataset: JObject,
     compaction_options: JObject, // CompactionOptions
@@ -2369,7 +2419,7 @@ fn convert_java_compaction_options_to_rust(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCleanupWithPolicy<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
@@ -2417,7 +2467,7 @@ fn inner_cleanup_with_policy<'local>(
     }?;
 
     let jstats = env.new_object(
-        "com/lancedb/lance/cleanup/RemovalStats",
+        "org/lance/cleanup/RemovalStats",
         "(JJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),

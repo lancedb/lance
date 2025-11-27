@@ -329,12 +329,24 @@ mod tests {
         prelude::{Expr, SessionContext},
     };
     use datafusion_common::{Column, ScalarValue};
-    use prost::Message;
-    use substrait_expr::functions::functions_comparison::FunctionsComparisonExt;
-    use substrait_expr::{
-        builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
-        helpers::{literals::literal, schema::SchemaInfo},
+    use datafusion_substrait::substrait::proto::{
+        expression::{
+            field_reference::{ReferenceType, RootReference, RootType},
+            literal::LiteralType,
+            reference_segment::{self, StructField},
+            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
+        },
+        expression_reference::ExprType,
+        extensions::{
+            simple_extension_declaration::{ExtensionFunction, MappingType},
+            SimpleExtensionDeclaration, SimpleExtensionUri,
+        },
+        function_argument::ArgType,
+        r#type::{Boolean, Kind, Nullability, Struct, I32},
+        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
+        Version,
     };
+    use prost::Message;
 
     use crate::substrait::{encode_substrait, parse_substrait};
 
@@ -345,24 +357,83 @@ mod tests {
 
     #[tokio::test]
     async fn test_substrait_conversion() {
-        let schema = SchemaInfo::new_full()
-            .field("x", substrait_expr::helpers::types::i32(true))
-            .build();
-        let expr_builder = ExpressionsBuilder::new(schema, BuilderParams::default());
-        expr_builder
-            .add_expression(
-                "filter_mask",
-                expr_builder
-                    .functions()
-                    .lt(
-                        expr_builder.fields().resolve_by_name("x").unwrap(),
-                        literal(0_i32),
-                    )
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap();
-        let expr = expr_builder.build();
+        let expr = ExtendedExpression {
+            version: Some(Version {
+                major_number: 0,
+                minor_number: 63,
+                patch_number: 1,
+                git_hash: "".to_string(),
+                producer: "unit-test".to_string(),
+            }),
+            extension_uris: vec![
+                SimpleExtensionUri {
+                    extension_uri_anchor: 1,
+                    uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml".to_string(),
+                }
+            ],
+            extensions: vec![
+                SimpleExtensionDeclaration {
+                    mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                        extension_uri_reference: 1,
+                        function_anchor: 1,
+                        name: "lt".to_string(),
+                    })),
+                }
+            ],
+            referred_expr: vec![ExpressionReference {
+                output_names: vec!["filter_mask".to_string()],
+                expr_type: Some(ExprType::Expression(Expression {
+                    rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                        function_reference: 1,
+                        arguments: vec![
+                            FunctionArgument {
+                                arg_type: Some(ArgType::Value(Expression {
+                                    rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                                        reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                                            reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(StructField { field: 0, child: None })))
+                                        })),
+                                        root_type: Some(RootType::RootReference(RootReference {}))
+                                    })))
+                                }))
+                            },
+                            FunctionArgument {
+                                arg_type: Some(ArgType::Value(Expression {
+                                    rex_type: Some(RexType::Literal(Literal {
+                                        nullable: false,
+                                        type_variation_reference: 0,
+                                        literal_type: Some(LiteralType::I32(0))
+                                    }))
+                                }))
+                            }
+                        ],
+                        options: vec![],
+                        output_type: Some(Type {
+                            kind: Some(Kind::Bool(Boolean {
+                                type_variation_reference: 0,
+                                nullability: Nullability::Required as i32,
+                            })),
+                        }),
+                        #[allow(deprecated)]
+                        args: vec![],
+                    }))
+                })),
+            }],
+            base_schema: Some(NamedStruct {
+                names: vec!["x".to_string()],
+                r#struct: Some(Struct {
+                    types: vec![Type {
+                        kind: Some(Kind::I32(I32 {
+                            type_variation_reference: 0,
+                            nullability: Nullability::Nullable as i32,
+                        })),
+                    }],
+                    type_variation_reference: 0,
+                    nullability: Nullability::Required as i32,
+                }),
+            }),
+            advanced_extensions: None,
+            expected_type_urls: vec![],
+        };
         let expr_bytes = expr.encode_to_vec();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));

@@ -42,6 +42,12 @@ def pytest_addoption(parser):
         default=False,
         help="Run forward compatibility tests (requires files to be generated already)",
     )
+    parser.addoption(
+        "--run-compat",
+        action="store_true",
+        default=False,
+        help="Run upgrade/downgrade compatibility tests (creates virtual environments)",
+    )
 
 
 def pytest_configure(config):
@@ -55,6 +61,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: mark tests that require large CPU or RAM resources"
     )
+    config.addinivalue_line(
+        "markers",
+        "compat: mark tests that run upgrade/downgrade compatibility checks",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -64,6 +74,8 @@ def pytest_collection_modifyitems(config, items):
         disable_items_with_mark(items, "slow", "--run-slow not specified")
     if not config.getoption("--run-forward"):
         disable_items_with_mark(items, "forward", "--run-forward not specified")
+    if not config.getoption("--run-compat"):
+        disable_items_with_mark(items, "compat", "--run-compat not specified")
     try:
         import torch
 

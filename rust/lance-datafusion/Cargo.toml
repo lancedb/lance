@@ -37,7 +37,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 lance-datagen.workspace = true
-substrait-expr = {version = "0.2.3"}
 
 [features]
 substrait = ["dep:datafusion-substrait"]

@@ -9,7 +9,7 @@ import pyarrow as pa
 from pyarrow import RecordBatch
 
 from . import dataset
-from .dependencies import _check_for_pandas
+from .dependencies import _check_for_hugging_face, _check_for_pandas
 from .dependencies import pandas as pd
 
 if TYPE_CHECKING:
@@ -74,6 +74,37 @@ def _coerce_reader(
         and data_obj.__class__.__name__ == "DataFrame"
     ):
         return data_obj.to_arrow().to_reader()
+    elif _check_for_hugging_face(data_obj):
+        from .dependencies import datasets as hf_datasets
+
+        if isinstance(data_obj, hf_datasets.Dataset):
+            if schema is None:
+                schema = data_obj.features.arrow_schema
+            return data_obj.data.to_reader()
+        elif isinstance(data_obj, hf_datasets.DatasetDict):
+            raise ValueError(
+                "DatasetDict is not yet supported. For now please "
+                "iterate through the DatasetDict and pass in single "
+                "Dataset instances (e.g., from dataset_dict.data) to "
+                "`write_dataset`. "
+            )
+        elif isinstance(data_obj, hf_datasets.IterableDataset):
+            if schema is None:
+                schema = data_obj.features.arrow_schema
+
+            def batch_iter():
+                # Try to provide a reasonable batch size. If the user needs to
+                # override this, they can do the conversion to a reader themselves.
+                for dict_batch in data_obj.iter(batch_size=1000):
+                    yield pa.RecordBatch.from_pydict(dict_batch, schema=schema)
+
+            return pa.RecordBatchReader.from_batches(schema, batch_iter())
+        else:
+            raise TypeError(
+                f"Unknown HuggingFace dataset type: {type(data_obj)}. "
+                "Please provide a single Dataset or DatasetDict."
+            )
+
     elif isinstance(data_obj, dict):
         batch = pa.RecordBatch.from_pydict(data_obj, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])
@@ -98,6 +129,6 @@ def _coerce_reader(
         raise TypeError(
             f"Unknown data type {type(data_obj)}. "
             "Please check "
-            "https://lancedb.github.io/lance/guide/read_and_write/ "
+            "https://lance.org/guide/read_and_write/ "
             "to see supported types."
         )

@@ -44,7 +44,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
-    escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
+    escape_field_path_for_project, format_field_path, BlobHandling, Field, OnMissing, Projection,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -56,7 +56,7 @@ use lance_datafusion::exec::{
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
@@ -64,7 +64,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
-use lance_index::ScalarIndexCriteria;
+use lance_index::IndexCriteria;
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -292,9 +292,10 @@ impl LanceFilter {
                 })
             }
             #[cfg(not(feature = "substrait"))]
-            Self::Substrait(_) => {
-                panic!("Substrait filter is not supported in this build");
-            }
+            Self::Substrait(_) => Err(Error::NotSupported {
+                source: "Substrait filter is not supported in this build".into(),
+                location: location!(),
+            }),
             Self::Datafusion(expr) => Ok(expr.clone()),
         }
     }
@@ -324,6 +325,7 @@ pub struct Scanner {
     /// - Dynamic expressions that are evaluated after the physical projection
     /// - The names of the output columns
     projection_plan: ProjectionPlan,
+    blob_handling: BlobHandling,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
@@ -597,11 +599,13 @@ impl TakeOperation {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
+        let projection_plan =
+            ProjectionPlan::full(dataset.clone(), dataset.blob_version()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
-        Self {
+        let mut scanner = Self {
             dataset,
             projection_plan,
+            blob_handling: BlobHandling::default(),
             prefilter: false,
             materialization_style: MaterializationStyle::Heuristic,
             filter: None,
@@ -627,7 +631,24 @@ impl Scanner {
             legacy_with_row_id: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
-        }
+        };
+        scanner.apply_blob_handling();
+        scanner
+    }
+
+    fn apply_blob_handling(&mut self) {
+        let projection = self
+            .projection_plan
+            .physical_projection
+            .clone()
+            .with_blob_handling(self.blob_handling.clone());
+        self.projection_plan.physical_projection = projection;
+    }
+
+    pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.blob_handling = blob_handling;
+        self.apply_blob_handling();
+        self
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
@@ -703,13 +724,18 @@ impl Scanner {
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
         self.explicit_projection = true;
-        self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
+        self.projection_plan = ProjectionPlan::from_expressions(
+            self.dataset.clone(),
+            columns,
+            self.dataset.blob_version(),
+        )?;
         if self.legacy_with_row_id {
             self.projection_plan.include_row_id();
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
         }
+        self.apply_blob_handling();
         Ok(self)
     }
 
@@ -1473,7 +1499,7 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+    pub fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -2264,11 +2290,7 @@ impl Scanner {
     ) -> Result<bool> {
         let index = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
             .await?;
         match index {
             Some(index) => match &index.fragment_bitmap {
@@ -2420,7 +2442,7 @@ impl Scanner {
                     let has_fts_index = self
                         .dataset
                         .load_scalar_index(
-                            ScalarIndexCriteria::default()
+                            IndexCriteria::default()
                                 .for_column(&column_path)
                                 .supports_fts(),
                         )
@@ -2664,11 +2686,7 @@ impl Scanner {
 
         let index_meta = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?
             .ok_or(Error::invalid_input(
                 format!("No Inverted index found for column {}", column),
@@ -2714,11 +2732,7 @@ impl Scanner {
 
         let index = self
             .dataset
-            .load_scalar_index(
-                ScalarIndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts(),
-            )
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?;
 
         let (match_plan, flat_match_plan) = match &index {
@@ -3025,7 +3039,7 @@ impl Scanner {
             ScalarIndexExpr::Query(search) => {
                 let idx = self
                     .dataset
-                    .load_scalar_index(ScalarIndexCriteria::default().with_name(&search.index_name))
+                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
                     .await?
                     .expect("Index not found even though it must have been found earlier");
                 Ok(idx
@@ -3911,7 +3925,7 @@ mod test {
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_io::utils::tracking_store::IOTracker;
+
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use object_store::throttle::ThrottleConfig;
@@ -6461,15 +6475,10 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(20));
 
-        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
@@ -6489,9 +6498,9 @@ mod test {
             .unwrap();
 
         // First run a full scan to get a baseline
-        let _ = io_tracker.incremental_stats(); // reset
+        let _ = dataset.object_store().io_stats_incremental(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -6503,7 +6512,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -6517,7 +6526,7 @@ mod test {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let io_stats = io_tracker.incremental_stats();
+            let io_stats = dataset.object_store().io_stats_incremental();
             assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
@@ -6531,7 +6540,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let index_scan_bytes = io_stats.read_bytes;
 
@@ -6544,7 +6553,7 @@ mod test {
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
@@ -7608,15 +7617,10 @@ mod test {
             .col("not_indexed", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(5));
 
-        let io_tracker = Arc::new(IOTracker::default());
         let mut dataset = Dataset::write(
             data,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
@@ -7681,7 +7685,7 @@ mod test {
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
@@ -7694,7 +7698,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7706,7 +7710,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7719,7 +7723,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -7732,7 +7736,7 @@ mod test {
             .await
             .unwrap();
 
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
     }
 

@@ -1,25 +1,26 @@
 site_name: Lance
-site_description: Modern columnar data format for ML and LLMs
-site_url: https://lancedb.github.io/lance/
+site_description: Open Lakehouse Format for Multimodal AI
+site_url: https://lance.org/
 docs_dir: src
 
-repo_name: lancedb/lance
-repo_url: https://github.com/lancedb/lance
+repo_name: lance-format/lance
+repo_url: https://github.com/lance-format/lance
 
 theme:
   name: material
+  custom_dir: overrides
   logo: logo/white.png
   favicon: logo/logo.png
   palette:
     - scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -40,7 +41,11 @@ theme:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -62,11 +67,19 @@ plugins:
       proto_dir: ../protos
 
 extra:
+  generator: false
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/lancedb/lance
+      link: https://github.com/lance-format/lance
     - icon: fontawesome/brands/discord
-      link: https://discord.gg/zMM32dvNtd
-    - icon: fontawesome/brands/twitter
-      link: https://twitter.com/lancedb
+      link: https://discord.gg/lance
+
+copyright: © 2025 Lance Format. All rights reserved.
+
+extra_css:
+  - assets/stylesheets/termynal.css
+  - assets/stylesheets/home.css
+
+extra_javascript:
+  - assets/javascript/termynal.js
 
