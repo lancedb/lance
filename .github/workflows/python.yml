@@ -35,7 +35,7 @@ env:
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: "ubuntu-24.04-4x"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -92,7 +92,7 @@ jobs:
       matrix:
         python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: "ubuntu-24.04-4x"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -155,7 +155,7 @@ jobs:
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: ubuntu-24.04-arm64-4x
+    runs-on: warp-ubuntu-latest-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
@@ -187,7 +187,7 @@ jobs:
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
-    runs-on: "macos-14-xlarge"
+    runs-on: "warp-macos-14-arm64-6x"
     defaults:
       run:
         shell: bash
