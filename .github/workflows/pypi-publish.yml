@@ -42,11 +42,11 @@ jobs:
           - platform: aarch64
             manylinux: "2_17"
             extra_args: ""
-            runner: ubuntu-24.04-arm64-4x
+            runner: warp-ubuntu-latest-arm64-4x
           - platform: aarch64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
-            runner: ubuntu-24.04-arm64-4x
+            runner: warp-ubuntu-latest-arm64-4x
     runs-on: ${{ matrix.config.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -98,9 +98,9 @@ jobs:
         python-minor-version: ["9"]
         config:
           - target: x86_64-apple-darwin
-            runner: macos-13-large
+            runner: macos-14
           - target: aarch64-apple-darwin
-            runner: macos-14-xlarge
+            runner: warp-macos-14-arm64-6x
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:

@@ -33,6 +33,11 @@ pub struct DataFile {
     ///
     /// Note that -1 is a possibility and it indices that the field has
     /// no top-level column in the file.
+    ///
+    /// Columns that lack a field id may still exist as extra entries in
+    /// `column_indices`; such columns are ignored by field-id–based projection.
+    /// For example, some fields, such as blob fields, occupy multiple
+    /// columns in the file but only have a single field id.
     #[serde(default)]
     pub column_indices: Vec<i32>,
     /// The major version of the file format used to write this file.
@@ -139,10 +144,12 @@ impl DataFile {
                     location!(),
                 ));
             }
-        } else if self.fields.len() != self.column_indices.len() {
+        } else if self.column_indices.len() < self.fields.len() {
+            // Every recorded field id must have a column index, but not every column needs
+            // to be associated with a field id (extra columns are allowed).
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
-                "contained an unequal number of fields / column_indices",
+                "contained fewer column_indices than fields",
                 location!(),
             ));
         }
@@ -531,6 +538,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use object_store::path::Path;
     use serde_json::{json, Value};
 
     #[test]
@@ -617,5 +625,24 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+    }
+
+    #[test]
+    fn data_file_validate_allows_extra_columns() {
+        let data_file = DataFile {
+            path: "foo.lance".to_string(),
+            fields: vec![1, 2],
+            // One extra column without a field id mapping
+            column_indices: vec![0, 1, 2],
+            file_major_version: MAJOR_VERSION as u32,
+            file_minor_version: MINOR_VERSION as u32,
+            file_size_bytes: Default::default(),
+            base_id: None,
+        };
+
+        let base_path = Path::from("base");
+        data_file
+            .validate(&base_path)
+            .expect("validation should allow extra columns without field ids");
     }
 }
