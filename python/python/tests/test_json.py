@@ -213,6 +213,16 @@ def test_json_path_queries():
         result = dataset.to_table(
             filter="json_extract(data, '$.user.name') = '\"Alice\"'"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_extract(data, '$.user.name') = '\"Alice\"'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -255,19 +265,53 @@ def test_json_get_functions():
 
         # Test json_get_string
         result = dataset.to_table(filter="json_get_string(data, 'name') = 'Alice'")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_string(data, 'name') = 'Alice'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test json_get_int with type coercion
         result = dataset.to_table(filter="json_get_int(data, 'age') > 28")
+        sql = (
+            dataset.sql("SELECT * FROM dataset WHERE json_get_int(data, 'age') > 28")
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (30) and Charlie ("35" -> 35)
 
         # Test json_get_bool with type coercion
         result = dataset.to_table(filter="json_get_bool(data, 'active') = true")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_bool(data, 'active') = true"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (true) and Charlie ("true" -> true)
 
         # Test json_get_float
         result = dataset.to_table(filter="json_get_float(data, 'score') > 90")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_get_float(data, 'score') > 90"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 2  # Alice (95.5) and Charlie ("92" -> 92.0)
 
 
@@ -304,6 +348,18 @@ def test_nested_json_access():
                     'name')
                 = 'Alice'"""
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_get_string("
+                "json_get(json_get(data, 'user'), 'profile'), "
+                "'name') = 'Alice'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -311,6 +367,16 @@ def test_nested_json_access():
         result = dataset.to_table(
             filter="json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -342,16 +408,44 @@ def test_json_array_operations():
         result = dataset.to_table(
             filter="json_array_contains(data, '$.items', 'apple')"
         )
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE "
+                "json_array_contains(data, '$.items', 'apple')"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test array length
         result = dataset.to_table(filter="json_array_length(data, '$.counts') > 3")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_array_length(data, '$.counts') > 3"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
         # Test empty array
         result = dataset.to_table(filter="json_array_length(data, '$.items') = 0")
+        sql = (
+            dataset.sql(
+                "SELECT * FROM dataset WHERE json_array_length(data, '$.items') = 0"
+            )
+            .build()
+            .to_batch_records()
+        )
+        sql_result = pa.Table.from_batches(sql)
+        assert result == sql_result
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 3
 
@@ -400,7 +494,17 @@ def test_json_filter_append_missing_json_cast(tmp_path: Path):
     result = dataset.to_table(
         filter="json_get(article_metadata, 'article_journal') IS NOT NULL"
     )
+    sql = (
+        dataset.sql(
+            "SELECT * FROM dataset WHERE "
+            "json_get(article_metadata, 'article_journal') IS NOT NULL"
+        )
+        .build()
+        .to_batch_records()
+    )
+    sql_result = pa.Table.from_batches(sql)
 
+    assert result == sql_result
     assert result.num_rows == 3
     assert result.column("article_journal").to_pylist() == [
         "Cell",
