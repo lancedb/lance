@@ -35,9 +35,9 @@ fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
         .host_str()
         .ok_or_else(|| Error::invalid_input("Huggingface URL must contain repo type", location!()))?
         .to_string();
-    // Workaround as opendal doesn't accept `datasets` yet.
+    // OpenDAL expects `dataset` instead of `datasets`; keep the workaround here and adapt tests.
     if repo_type == "datasets" {
-        repo_type = "dataset".to_string()
+        repo_type = "dataset".to_string();
     }
 
     let mut segments = url.path().trim_start_matches('/').split('/');
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(
             parsed,
             ParsedHfUrl {
-                repo_type: "datasets".to_string(),
+                repo_type: "dataset".to_string(),
                 repo_id: "acme/repo".to_string(),
                 relative_path: "path/to/table.lance".to_string(),
             }
