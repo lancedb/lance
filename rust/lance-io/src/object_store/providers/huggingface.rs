@@ -31,10 +31,14 @@ struct ParsedHfUrl {
 }
 
 fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
-    let repo_type = url
+    let mut repo_type = url
         .host_str()
         .ok_or_else(|| Error::invalid_input("Huggingface URL must contain repo type", location!()))?
         .to_string();
+    // Workaround as opendal doesn't accept `datasets` yet.
+    if repo_type == "datasets" {
+        repo_type = "dataset".to_string()
+    }
 
     let mut segments = url.path().trim_start_matches('/').split('/');
     let owner = segments
@@ -66,8 +70,9 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 
         // Build OpenDAL config with allowed keys only.
         let mut config_map: HashMap<String, String> = HashMap::new();
+
         config_map.insert("repo_type".to_string(), repo_type);
-        config_map.insert("repo".to_string(), repo_id);
+        config_map.insert("repo_id".to_string(), repo_id);
 
         if let Some(rev) = storage_options.get("hf_revision").cloned() {
             config_map.insert("revision".to_string(), rev);
