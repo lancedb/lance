@@ -585,7 +585,7 @@ pub async fn build_pq_model(
             training_data.len(),
             num_codes
         );
-        return Err(Error::Precondition {
+        return Err(Error::Unprocessable {
             message: format!(
                 "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
                 available = training_data.len()
@@ -794,7 +794,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::Precondition { .. }));
+        assert!(matches!(err, Error::Unprocessable { .. }));
     }
 
     struct TestPreFilter {

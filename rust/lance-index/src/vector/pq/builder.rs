@@ -171,7 +171,7 @@ impl PQBuildParams {
 
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         if data.len() < num_centroids {
-            return Err(Error::Precondition {
+            return Err(Error::Unprocessable {
                 message: format!(
                     "Not enough rows to train PQ. Requires {num_centroids} rows but only {} available",
                     data.len()

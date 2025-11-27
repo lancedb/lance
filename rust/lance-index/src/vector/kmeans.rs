@@ -1319,7 +1319,7 @@ where
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(Error::Precondition {
+        return Err(Error::Unprocessable {
             message: format!(
                 "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
             ),
