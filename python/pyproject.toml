@@ -65,6 +65,10 @@ tests = [
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
+geo = [
+    "geoarrow-rust-core",
+    "geoarrow-rust-io",
+]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]

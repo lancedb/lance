@@ -26,6 +26,7 @@ lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
+lance-geo = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -108,6 +109,9 @@ tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+geo-types = { workspace = true }
 
 
 [features]

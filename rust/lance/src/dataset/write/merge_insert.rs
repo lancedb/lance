@@ -106,6 +106,7 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
+use tracing::error;
 
 mod assign_action;
 mod exec;
@@ -1131,16 +1132,27 @@ impl MergeInsertJob {
             match frag_id.first() {
                 Some(ScalarValue::UInt64(Some(frag_id))) => {
                     let frag_id = *frag_id;
-                    let fragment =
-                        dataset
-                            .get_fragment(frag_id as usize)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!(
-                                    "Got non-existent fragment id from merge result: {}",
-                                    frag_id
-                                ),
-                                location: location!(),
-                            })?;
+                    let fragment = dataset.get_fragment(frag_id as usize).ok_or_else(|| {
+                        error!(
+                            fragment_id = frag_id,
+                            dataset_uri = %dataset.uri(),
+                            manifest_version = dataset.manifest().version,
+                            manifest_path = %dataset.manifest_location().path,
+                            branch = ?dataset.manifest().branch,
+                            "Non-existent fragment id returned from merge result",
+                        );
+                        Error::Internal {
+                            message: format!(
+                                "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
+                                frag_id,
+                                dataset.uri(),
+                                dataset.manifest().version,
+                                dataset.manifest_location().path,
+                                dataset.manifest().branch.as_deref().unwrap_or("main"),
+                            ),
+                            location: location!(),
+                        }
+                    })?;
                     let metadata = fragment.metadata.clone();
 
                     let fut = handle_fragment(

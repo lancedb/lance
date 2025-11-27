@@ -2625,6 +2625,14 @@ impl Dataset {
             .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
             .collect())
     }
+
+    /// Create a delta builder to explore changes between dataset versions.
+    #[pyo3(signature=())]
+    fn delta(&self) -> PyResult<DatasetDeltaBuilder> {
+        let ds = self.ds.as_ref().clone();
+        let builder = ds.delta();
+        Ok(DatasetDeltaBuilder { builder })
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2723,6 +2731,83 @@ impl SqlQueryBuilder {
         Ok(SqlQuery {
             builder: self.builder.clone(),
         })
+    }
+}
+
+// -------------------- Delta API Bindings --------------------
+
+#[pyclass(name = "DatasetDelta", module = "_lib", subclass)]
+pub struct DatasetDelta {
+    inner: lance::dataset::delta::DatasetDelta,
+}
+
+#[pymethods]
+impl DatasetDelta {
+    /// List transactions between begin_version+1 and end_version.
+    fn list_transactions(
+        &self,
+    ) -> PyResult<Vec<PyLance<lance::dataset::transaction::Transaction>>> {
+        let txs = rt()
+            .block_on(None, self.inner.list_transactions())?
+            .infer_error()?;
+        Ok(txs.into_iter().map(PyLance).collect())
+    }
+
+    /// Get inserted rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_inserted_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_inserted_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+
+    /// Get updated rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_updated_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_updated_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+}
+
+#[pyclass(name = "DatasetDeltaBuilder", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct DatasetDeltaBuilder {
+    builder: lance::dataset::delta::DatasetDeltaBuilder,
+}
+
+#[pymethods]
+impl DatasetDeltaBuilder {
+    #[pyo3(signature = (version))]
+    fn compared_against_version(&self, version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().compared_against_version(version),
+        }
+    }
+
+    #[pyo3(signature = (begin_version))]
+    fn with_begin_version(&self, begin_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_begin_version(begin_version),
+        }
+    }
+
+    #[pyo3(signature = (end_version))]
+    fn with_end_version(&self, end_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_end_version(end_version),
+        }
+    }
+
+    fn build(&self) -> PyResult<DatasetDelta> {
+        let delta = self.builder.clone().build().infer_error()?;
+        Ok(DatasetDelta { inner: delta })
     }
 }
 
