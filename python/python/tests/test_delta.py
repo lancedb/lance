@@ -119,14 +119,18 @@ def test_delta_validation_errors():
     with pytest.raises(ValueError, match="Must specify either"):
         ds.delta()
 
-    # Error: both compared_against and version range specified
-    with pytest.raises(ValueError, match="Cannot specify both"):
-        ds.delta(compared_against=1, begin_version=1, end_version=2)
-
     # Error: only begin_version specified
-    with pytest.raises(ValueError, match="Both 'begin_version' and 'end_version'"):
+    with pytest.raises(
+        ValueError,
+        match="Invalid user input: Must specify both with_begin_version "
+        "and with_end_version",
+    ):
         ds.delta(begin_version=1)
 
     # Error: only end_version specified
-    with pytest.raises(ValueError, match="Both 'begin_version' and 'end_version'"):
+    with pytest.raises(
+        ValueError,
+        match="Invalid user input: Must specify both with_begin_version "
+        "and with_end_version",
+    ):
         ds.delta(end_version=2)

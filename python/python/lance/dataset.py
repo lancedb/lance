@@ -3660,8 +3660,11 @@ class LanceDataset(pa.dataset.Dataset):
         if has_compared_against:
             builder = builder.compared_against_version(compared_against)
         else:
-            builder = builder.with_begin_version(begin_version)
-            builder = builder.with_end_version(end_version)
+            if begin_version:
+                builder = builder.with_begin_version(begin_version)
+
+            if end_version:
+                builder = builder.with_end_version(end_version)
 
         return builder.build()
 
