@@ -14,11 +14,10 @@
 package org.lance.namespace;
 
 import org.lance.JniLoader;
+import org.lance.namespace.model.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.lancedb.lance.namespace.LanceNamespace;
-import com.lancedb.lance.namespace.model.*;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;

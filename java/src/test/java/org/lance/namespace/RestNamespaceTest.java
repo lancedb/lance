@@ -13,7 +13,8 @@
  */
 package org.lance.namespace;
 
-import com.lancedb.lance.namespace.model.*;
+import org.lance.namespace.model.*;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;

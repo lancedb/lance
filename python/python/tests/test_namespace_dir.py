@@ -17,7 +17,7 @@ import lance
 import lance.namespace
 import pyarrow as pa
 import pytest
-from lance_namespace import (
+from lance.namespace import (
     CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
@@ -31,6 +31,7 @@ from lance_namespace import (
     NamespaceExistsRequest,
     RegisterTableRequest,
     TableExistsRequest,
+    connect,
 )
 
 
@@ -58,22 +59,18 @@ def table_to_ipc_bytes(table):
 @pytest.fixture
 def temp_namespace():
     """Create a temporary DirectoryNamespace for testing."""
-    import lance_namespace
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Use lance_namespace.connect() for consistency
-        ns = lance_namespace.connect("dir", {"root": f"file://{tmpdir}"})
+        # Use lance.namespace.connect() for consistency
+        ns = connect("dir", {"root": f"file://{tmpdir}"})
         yield ns
 
 
 @pytest.fixture
 def memory_namespace():
     """Create a memory-based DirectoryNamespace for testing."""
-    import lance_namespace
-
     unique_id = uuid.uuid4().hex[:8]
-    # Use lance_namespace.connect() for consistency
-    ns = lance_namespace.connect("dir", {"root": f"memory://test_{unique_id}"})
+    # Use lance.namespace.connect() for consistency
+    ns = connect("dir", {"root": f"memory://test_{unique_id}"})
     yield ns
 
 
@@ -676,13 +673,11 @@ class TestBasicNamespaceOperations:
 
 
 class TestLanceNamespaceConnect:
-    """Tests for lance_namespace.connect integration."""
+    """Tests for lance.namespace.connect integration."""
 
     def test_connect_with_properties(self):
-        """Test creating DirectoryNamespace via lance_namespace.connect()."""
+        """Test creating DirectoryNamespace via lance.namespace.connect()."""
         import uuid
-
-        import lance_namespace
 
         unique_id = uuid.uuid4().hex[:8]
         properties = {
@@ -691,9 +686,9 @@ class TestLanceNamespaceConnect:
             "dir_listing_enabled": "true",
         }
 
-        # Connect via lance_namespace.connect
+        # Connect via lance.namespace.connect
         # should use lance.namespace.DirectoryNamespace
-        ns = lance_namespace.connect("dir", properties)
+        ns = connect("dir", properties)
 
         # Verify it's a DirectoryNamespace instance
         assert isinstance(ns, lance.namespace.DirectoryNamespace)
@@ -716,8 +711,6 @@ class TestLanceNamespaceConnect:
         """Test creating DirectoryNamespace with storage options via connect()."""
         import uuid
 
-        import lance_namespace
-
         unique_id = uuid.uuid4().hex[:8]
         properties = {
             "root": f"memory://test_storage_{unique_id}",
@@ -725,5 +718,5 @@ class TestLanceNamespaceConnect:
         }
 
         # This should work without errors
-        ns = lance_namespace.connect("dir", properties)
+        ns = connect("dir", properties)
         assert isinstance(ns, lance.namespace.DirectoryNamespace)

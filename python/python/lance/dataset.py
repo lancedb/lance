@@ -71,8 +71,9 @@ from .udf import batch_udf as batch_udf
 from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
-    from lance_namespace import LanceNamespace
     from pyarrow._compute import Expression
+
+    from lance.namespace import LanceNamespace
 
     from .commit import CommitLock
     from .io import StorageOptionsProvider
@@ -5368,9 +5369,11 @@ def write_dataset(
         # - APPEND/OVERWRITE mode: calls namespace.describe_table()
         # - Both modes: create storage options provider and merge storage options
 
-        from lance_namespace import CreateEmptyTableRequest, DescribeTableRequest
-
-        from .namespace import LanceNamespaceStorageOptionsProvider
+        from .namespace import (
+            CreateEmptyTableRequest,
+            DescribeTableRequest,
+            LanceNamespaceStorageOptionsProvider,
+        )
 
         # Determine which namespace method to call based on mode
         if mode == "create":

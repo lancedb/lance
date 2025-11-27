@@ -391,3 +391,21 @@ def test_migration_via_fragment_apis(tmp_path):
     ds2 = lance.dataset(tmp_path / "dataset2")
 
     assert ds2.data_storage_version == "2.0"
+
+
+def test_compaction_generates_rewrite_transaction(tmp_path: Path):
+    # Create a small dataset with multiple fragments
+    base_dir = tmp_path / "rewrite_txn"
+    data = pa.table({"a": range(300), "b": range(300)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+
+    # Run compaction: should perform a rewrite (no deletions materialized)
+    dataset.optimize.compact_files(materialize_deletions=False, num_threads=1)
+
+    # Verify at least one transaction is a Rewrite; guard against None entries
+    transactions = dataset.get_transactions()
+    assert any(
+        t is not None and t.operation.__class__.__name__ == "Rewrite"
+        for t in transactions
+    )
