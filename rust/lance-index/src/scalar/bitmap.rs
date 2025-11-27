@@ -442,7 +442,7 @@ impl ScalarIndex for BitmapIndex {
                         let this = self.clone();
                         async move { this.load_bitmap(&key, None).await }
                     }))
-                    .buffered(get_num_compute_intensive_cpus())
+                    .buffer_unordered(get_num_compute_intensive_cpus())
                     .try_collect()
                     .await?;
 
@@ -480,7 +480,7 @@ impl ScalarIndex for BitmapIndex {
                         let this = self.clone();
                         async move { this.load_bitmap(&key, None).await }
                     }))
-                    .buffered(get_num_compute_intensive_cpus())
+                    .buffer_unordered(get_num_compute_intensive_cpus())
                     .try_collect()
                     .await?;
 
