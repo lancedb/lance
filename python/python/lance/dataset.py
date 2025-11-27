@@ -3654,25 +3654,6 @@ class LanceDataset(pa.dataset.Dataset):
             delta = ds_append.delta(begin_version=1, end_version=2)
         """
         has_compared_against = compared_against is not None
-        has_range = begin_version is not None or end_version is not None
-
-        if has_compared_against and has_range:
-            raise ValueError(
-                "Cannot specify both 'compared_against' and "
-                "'begin_version'/'end_version'. Use one or the other."
-            )
-
-        if not has_compared_against and not has_range:
-            raise ValueError(
-                "Must specify either 'compared_against' or both "
-                "'begin_version' and 'end_version'."
-            )
-
-        if has_range:
-            if begin_version is None or end_version is None:
-                raise ValueError(
-                    "Both 'begin_version' and 'end_version' must be specified together."
-                )
 
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
