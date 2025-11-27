@@ -42,6 +42,7 @@ macro_rules! ok_or_throw_with_return {
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
+mod delta;
 pub mod error;
 pub mod ffi;
 mod file_reader;

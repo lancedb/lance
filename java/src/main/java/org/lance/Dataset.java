@@ -1372,6 +1372,43 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Compute the delta between versions.
+   **
+   * <ul>
+   *   <li>Either {@code comparedAgainst} is non-null: compare current version against this version.
+   *   <li>Or both {@code beginVersion} (exclusive) and {@code endVersion} (inclusive) are non-null
+   *       for an explicit range.
+   *   <li>Mutually exclusive: do not specify both modes; do not provide incomplete range.
+   * </ul>
+   *
+   * <p>Examples:
+   *
+   * <pre>{@code
+   * // Shorthand: compare current version against v1
+   * DatasetDelta delta1 = dataset.delta(Optional.of(1L), Optional.empty(), Optional.empty());
+   *
+   * // Explicit range: (1, 2]
+   * DatasetDelta delta2 = dataset.delta(Optional.empty(), Optional.of(1L), Optional.of(2L));
+   * }</pre>
+   *
+   * @param comparedAgainst the version to compare the current dataset against (optional)
+   * @param beginVersion the beginning version (exclusive) for explicit range (optional)
+   * @param endVersion the ending version (inclusive) for explicit range (optional)
+   * @return a DatasetDelta view
+   * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
+   */
+  public org.lance.delta.DatasetDelta delta(
+      Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildDelta(comparedAgainst, beginVersion, endVersion);
+    }
+  }
+
+  private native org.lance.delta.DatasetDelta nativeBuildDelta(
+      Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion);
+
+  /**
    * Merge source data with the existing target data.
    *
    * <p>This will take in the source, merge it with the existing target data, and insert new rows,
