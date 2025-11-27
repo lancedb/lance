@@ -472,7 +472,7 @@ impl ScalarIndex for BitmapIndex {
                     })
                     .collect();
 
-                if keys.is_empty() && !(has_null && !self.null_map.is_empty()) {
+                if keys.is_empty() && (!has_null || self.null_map.is_empty()) {
                     RowIdTreeMap::default()
                 } else {
                     // Load bitmaps in parallel
