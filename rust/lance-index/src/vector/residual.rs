@@ -173,8 +173,9 @@ impl Transformer for ResidualTransform {
         })?;
         let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
             message: format!(
-                "Compute residual vector: original vector column not found: {}",
-                self.vec_col
+                "Compute residual vector: original vector column {} not found in batch {}",
+                self.vec_col,
+                batch.schema(),
             ),
             location: location!(),
         })?;

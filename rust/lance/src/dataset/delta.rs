@@ -35,6 +35,7 @@ use snafu::location;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone, Debug)]
 pub struct DatasetDeltaBuilder {
     dataset: Dataset,
     compared_against_version: Option<u64>,
@@ -293,23 +294,96 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use std::sync::Arc;
 
-    async fn create_test_dataset() -> Dataset {
+    async fn create_test_dataset(
+        rows: usize,
+        batches: usize,
+        value: &str,
+        stable_row_ids: bool,
+    ) -> Dataset {
         let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
+            .col("value", array::fill_utf8(value.to_string()))
+            .into_reader_rows(
+                RowCount::from(rows as u64),
+                BatchCount::from(batches as u32),
+            );
 
         let write_params = WriteParams {
+            enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
-        Dataset::write(data, "memory://", Some(write_params.clone()))
+        Dataset::write(data, "memory://", Some(write_params))
             .await
             .unwrap()
     }
 
+    async fn write_dataset_temp(
+        dir: &lance_core::utils::tempfile::TempStrDir,
+        start_key: i32,
+        rows: usize,
+        batches: usize,
+        value: &str,
+        stable_row_ids: bool,
+        append: bool,
+    ) -> Dataset {
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<Int32Type>(start_key, 1))
+            .col("value", array::fill_utf8(value.to_string()))
+            .into_reader_rows(
+                RowCount::from(rows as u64),
+                BatchCount::from(batches as u32),
+            );
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            mode: if append {
+                crate::dataset::WriteMode::Append
+            } else {
+                crate::dataset::WriteMode::Create
+            },
+            ..Default::default()
+        };
+        Dataset::write(data, dir, Some(write_params)).await.unwrap()
+    }
+
+    async fn update_where<T: Into<Arc<Dataset>>>(ds: T, predicate: &str, value: &str) -> Dataset {
+        let updated = crate::dataset::UpdateBuilder::new(ds.into())
+            .update_where(predicate)
+            .unwrap()
+            .set("value", &format!("'{}'", value))
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        Arc::try_unwrap(updated.new_dataset).unwrap_or_else(|arc| arc.as_ref().clone())
+    }
+
+    async fn scan_project_filter(
+        ds: &Dataset,
+        cols: &[&str],
+        filter: Option<&str>,
+    ) -> arrow_array::RecordBatch {
+        let mut scanner = ds.scan();
+        scanner.project(cols).unwrap();
+        if let Some(f) = filter {
+            scanner.filter(f).unwrap();
+        }
+        scanner.try_into_batch().await.unwrap()
+    }
+
+    // Optional: collect a stream of RecordBatch into a single batch
+    async fn collect_stream(
+        stream: crate::dataset::scanner::DatasetRecordBatchStream,
+    ) -> arrow_array::RecordBatch {
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
     #[tokio::test]
     async fn test_list_no_transaction() {
-        let ds = create_test_dataset().await;
+        let ds = create_test_dataset(1_000, 10, "value", false).await;
         let delta = ds.delta().compared_against_version(1).build().unwrap();
         let result = delta.list_transactions().await;
         assert_eq!(result.unwrap().len(), 0);
@@ -317,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_single_transaction() {
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
         ds.delete("key = 5").await.unwrap();
 
         let delta_struct = ds
@@ -333,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_multiple_transactions() {
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
         ds.delete("key = 5").await.unwrap();
         ds.delete("key = 6").await.unwrap();
 
@@ -351,7 +425,7 @@ mod tests {
     async fn test_list_contains_deleted_transaction() {
         MockClock::set_system_time(std::time::Duration::from_secs(1));
 
-        let mut ds = create_test_dataset().await;
+        let mut ds = create_test_dataset(1_000, 10, "value", false).await;
 
         MockClock::set_system_time(std::time::Duration::from_secs(2));
 
@@ -391,29 +465,12 @@ mod tests {
     #[tokio::test]
     async fn test_row_created_at_version_basic() {
         // Create dataset with stable row IDs enabled
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Scan with _row_created_at_version
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(&ds, &["key", ROW_CREATED_AT_VERSION], None).await;
 
         // All rows should have _row_created_at_version = 1
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -429,71 +486,24 @@ mod tests {
     #[tokio::test]
     async fn test_row_last_updated_at_version_basic() {
         // Create dataset with stable row IDs enabled
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Update some rows (version 2)
-        let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
-            .update_where("key < 30")
-            .unwrap()
-            .set("value", "'updated_v2'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key < 30", "updated_v2").await;
         assert_eq!(ds.version().version, 2);
 
         // Update different rows (version 3)
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 30 AND key < 50")
-            .unwrap()
-            .set("value", "'updated_v3'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 30 AND key < 50", "updated_v3").await;
         assert_eq!(ds.version().version, 3);
 
         // Update some rows again (version 4) - these rows were updated in v2
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 10 AND key < 20")
-            .unwrap()
-            .set("value", "'updated_v4'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 10 AND key < 20", "updated_v4").await;
         assert_eq!(ds.version().version, 4);
 
         // Scan with _row_last_updated_at_version
-        let result = ds
-            .scan()
-            .project(&["key", ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(&ds, &["key", ROW_LAST_UPDATED_AT_VERSION], None).await;
 
         let updated_at = result[ROW_LAST_UPDATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -523,71 +533,29 @@ mod tests {
     #[tokio::test]
     async fn test_row_version_metadata_after_update() {
         // Create dataset with stable row IDs enabled
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Update some rows (version 2)
-        let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
-            .update_where("key < 10")
-            .unwrap()
-            .set("value", "'updated_v2'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key < 10", "updated_v2").await;
         assert_eq!(ds.version().version, 2);
 
         // Update different rows (version 3)
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 20 AND key < 30")
-            .unwrap()
-            .set("value", "'updated_v3'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 20 AND key < 30", "updated_v3").await;
         assert_eq!(ds.version().version, 3);
 
         // Update some of the same rows again (version 4)
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 5 AND key < 15")
-            .unwrap()
-            .set("value", "'updated_v4'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 5 AND key < 15", "updated_v4").await;
         assert_eq!(ds.version().version, 4);
 
         // Scan with both version metadata columns
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            None,
+        )
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -623,48 +591,23 @@ mod tests {
     #[tokio::test]
     async fn test_row_version_metadata_after_append() {
         // Create initial dataset
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let tmp_path = &temp_dir;
-        let ds = Dataset::write(data, tmp_path, Some(write_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 0, 50, 1, "value", true, false).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Append more data
-        let append_data = lance_datagen::gen_batch()
-            .col("key", array::step_custom::<Int32Type>(50, 1))
-            .col("value", array::fill_utf8("appended".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let append_params = WriteParams {
-            enable_stable_row_ids: true,
-            mode: crate::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let ds = Dataset::write(append_data, tmp_path, Some(append_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 50, 50, 1, "appended", true, true).await;
 
         assert_eq!(ds.version().version, 2);
 
         // Scan with both version metadata columns
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            None,
+        )
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -693,18 +636,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_version_metadata_after_delete() {
         // Create dataset with stable row IDs enabled
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let mut ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let mut ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
@@ -713,13 +645,12 @@ mod tests {
         assert_eq!(ds.version().version, 2);
 
         // Scan with both version metadata columns
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            None,
+        )
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -839,50 +770,23 @@ mod tests {
     #[tokio::test]
     async fn test_filter_by_row_created_at_version() {
         // Create initial dataset
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let tmp_path = &temp_dir;
-        let ds = Dataset::write(data, tmp_path, Some(write_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 0, 50, 1, "value", true, false).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Append more data (version 2)
-        let append_data = lance_datagen::gen_batch()
-            .col("key", array::step_custom::<Int32Type>(50, 1))
-            .col("value", array::fill_utf8("appended".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let append_params = WriteParams {
-            enable_stable_row_ids: true,
-            mode: crate::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let ds = Dataset::write(append_data, tmp_path, Some(append_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 50, 50, 1, "appended", true, true).await;
 
         assert_eq!(ds.version().version, 2);
 
         // Test 1: Filter for rows created at version 1
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version = 1")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION],
+            Some("_row_created_at_version = 1"),
+        )
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -896,15 +800,12 @@ mod tests {
         }
 
         // Test 2: Filter for rows created at version 2
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version = 2")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION],
+            Some("_row_created_at_version = 2"),
+        )
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -918,15 +819,12 @@ mod tests {
         }
 
         // Test 3: Filter for rows created at version >= 2
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version >= 2")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION],
+            Some("_row_created_at_version >= 2"),
+        )
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         for i in 0..result.num_rows() {
@@ -1076,65 +974,28 @@ mod tests {
     #[tokio::test]
     async fn test_filter_by_combined_version_columns() {
         // Create initial dataset
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let tmp_path = &temp_dir;
-        let ds = Dataset::write(data, tmp_path, Some(write_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 0, 50, 1, "value", true, false).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Append more data (version 2)
-        let append_data = lance_datagen::gen_batch()
-            .col("key", array::step_custom::<Int32Type>(50, 1))
-            .col("value", array::fill_utf8("appended".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let append_params = WriteParams {
-            enable_stable_row_ids: true,
-            mode: crate::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let ds = Dataset::write(append_data, tmp_path, Some(append_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 50, 50, 1, "appended", true, true).await;
 
         assert_eq!(ds.version().version, 2);
 
         // Update some of the original rows (version 3)
-        let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
-            .update_where("key >= 20 AND key < 30")
-            .unwrap()
-            .set("value", "'updated_v3'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 20 AND key < 30", "updated_v3").await;
         assert_eq!(ds.version().version, 3);
 
         // Test 1: Filter for rows created at v1 AND last updated at v1
         // (Original rows that were never updated)
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version = 1 AND _row_last_updated_at_version = 1")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 1"),
+        )
+        .await;
 
         // Should have 40 rows (keys 0-19 and 30-49)
         assert_eq!(result.num_rows(), 40);
@@ -1155,15 +1016,12 @@ mod tests {
 
         // Test 2: Filter for rows created at v1 AND last updated at v3
         // (Original rows that were updated in v3)
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version = 1 AND _row_last_updated_at_version = 3")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 3"),
+        )
+        .await;
 
         // Should have 10 rows (keys 20-29)
         assert_eq!(result.num_rows(), 10);
@@ -1183,15 +1041,12 @@ mod tests {
 
         // Test 3: Filter for rows where created_at = last_updated_at
         // (Rows that were never updated after creation)
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version = _row_last_updated_at_version")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            Some("_row_created_at_version = _row_last_updated_at_version"),
+        )
+        .await;
 
         // Should have 90 rows (40 from v1 that weren't updated + 50 from v2)
         assert_eq!(result.num_rows(), 90);
@@ -1208,15 +1063,12 @@ mod tests {
 
         // Test 4: Filter for rows where created_at != last_updated_at
         // (Rows that were updated after creation)
-        let result = ds
-            .scan()
-            .project(&["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .filter("_row_created_at_version != _row_last_updated_at_version")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
+            Some("_row_created_at_version != _row_last_updated_at_version"),
+        )
+        .await;
 
         // Should have 10 rows (keys 20-29 that were updated)
         assert_eq!(result.num_rows(), 10);
@@ -1239,43 +1091,19 @@ mod tests {
     #[tokio::test]
     async fn test_filter_version_columns_with_other_columns() {
         // Create dataset
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         // Update some rows (version 2)
-        let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
-            .update_where("key >= 30 AND key < 60")
-            .unwrap()
-            .set("value", "'updated'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 30 AND key < 60", "updated").await;
 
         // Test: Combine version filter with regular column filter
         // Find rows where key < 50 AND last_updated_at_version = 2
-        let result = ds
-            .scan()
-            .project(&["key", "value", ROW_LAST_UPDATED_AT_VERSION])
-            .unwrap()
-            .filter("key < 50 AND _row_last_updated_at_version = 2")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan_project_filter(
+            &ds,
+            &["key", "value", ROW_LAST_UPDATED_AT_VERSION],
+            Some("key < 50 AND _row_last_updated_at_version = 2"),
+        )
+        .await;
 
         // Should have 20 rows (keys 30-49 that were updated in v2)
         assert_eq!(result.num_rows(), 20);
@@ -1293,54 +1121,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_inserted_rows() {
         // Create initial dataset (version 1)
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let tmp_path = &temp_dir;
-        let ds = Dataset::write(data, tmp_path, Some(write_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 0, 50, 1, "value", true, false).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Append more data (version 2)
-        let append_data = lance_datagen::gen_batch()
-            .col("key", array::step_custom::<Int32Type>(50, 1))
-            .col("value", array::fill_utf8("appended_v2".to_string()))
-            .into_reader_rows(RowCount::from(30), BatchCount::from(1));
-
-        let append_params = WriteParams {
-            enable_stable_row_ids: true,
-            mode: crate::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let ds = Dataset::write(append_data, tmp_path, Some(append_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 50, 30, 1, "appended_v2", true, true).await;
 
         assert_eq!(ds.version().version, 2);
 
         // Append more data (version 3)
-        let append_data = lance_datagen::gen_batch()
-            .col("key", array::step_custom::<Int32Type>(80, 1))
-            .col("value", array::fill_utf8("appended_v3".to_string()))
-            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
-
-        let append_params = WriteParams {
-            enable_stable_row_ids: true,
-            mode: crate::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let ds = Dataset::write(append_data, tmp_path, Some(append_params))
-            .await
-            .unwrap();
+        let ds = write_dataset_temp(&temp_dir, 80, 20, 1, "appended_v3", true, true).await;
 
         assert_eq!(ds.version().version, 3);
 
@@ -1353,8 +1145,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_inserted_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have all 100 rows
         assert_eq!(result.num_rows(), 100);
@@ -1371,8 +1162,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_inserted_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have 30 rows (inserted in version 2)
         assert_eq!(result.num_rows(), 30);
@@ -1395,8 +1185,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_inserted_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have 20 rows (inserted in version 3)
         assert_eq!(result.num_rows(), 20);
@@ -1414,61 +1203,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_updated_rows() {
         // Create initial dataset (version 1)
-        let data = lance_datagen::gen_batch()
-            .col("key", array::step::<Int32Type>())
-            .col("value", array::fill_utf8("value".to_string()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let ds = Dataset::write(data, "memory://", Some(write_params))
-            .await
-            .unwrap();
+        let ds = create_test_dataset(100, 1, "value", true).await;
 
         assert_eq!(ds.version().version, 1);
 
         // Update some rows (version 2)
-        let updated = crate::dataset::UpdateBuilder::new(Arc::new(ds))
-            .update_where("key < 30")
-            .unwrap()
-            .set("value", "'updated_v2'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key < 30", "updated_v2").await;
         assert_eq!(ds.version().version, 2);
 
         // Update different rows (version 3)
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 50 AND key < 70")
-            .unwrap()
-            .set("value", "'updated_v3'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 50 AND key < 70", "updated_v3").await;
         assert_eq!(ds.version().version, 3);
 
         // Update some rows again (version 4)
-        let updated = crate::dataset::UpdateBuilder::new(ds)
-            .update_where("key >= 10 AND key < 20")
-            .unwrap()
-            .set("value", "'updated_v4'")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let ds = updated.new_dataset;
+        let ds = update_where(ds, "key >= 10 AND key < 20", "updated_v4").await;
         assert_eq!(ds.version().version, 4);
 
         // Test 1: Get updated rows between version 1 and 2
@@ -1480,8 +1228,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_updated_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have 20 rows (keys 0-9 and 20-29)
         // Note: keys 10-19 were updated in v2 but then updated again in v4,
@@ -1516,8 +1263,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_updated_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have 20 rows (keys 50-69)
         assert_eq!(result.num_rows(), 20);
@@ -1540,8 +1286,7 @@ mod tests {
             .unwrap();
 
         let stream = delta.get_updated_rows().await.unwrap();
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        let result = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let result = collect_stream(stream).await;
 
         // Should have 50 rows total (30 from v2, 20 from v3, 10 from v4)
         // But some rows were updated twice, so we get unique rows

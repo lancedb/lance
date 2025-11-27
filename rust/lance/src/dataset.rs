@@ -13,37 +13,40 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
+use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{
+    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
+};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
-    DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
+    TRACE_DATASET_EVENTS,
 };
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
-use lance_io::traits::WriteExt;
-use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+};
+use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
-    MAJOR_VERSION, MINOR_VERSION,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
+    CommitLock, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -59,7 +62,7 @@ use std::sync::Arc;
 use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
-mod blob;
+pub(crate) mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -98,7 +101,7 @@ use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, read_transaction_file,
+    detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -107,6 +110,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -391,6 +395,7 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
+        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -403,7 +408,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref())
+                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -411,10 +416,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection)
+                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
         }
     }
 }
@@ -677,7 +682,7 @@ impl Dataset {
             });
         }
 
-        // If indices were also the last block, we can take the opportunity to
+        // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section {
             if manifest_size - index_offset <= last_block.len() {
@@ -700,6 +705,29 @@ impl Dataset {
                 };
                 ds_index_cache
                     .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
+            }
+        }
+
+        // If transaction is also in the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(transaction_offset) = manifest.transaction_section {
+            if manifest_size - transaction_offset <= last_block.len() {
+                let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
+                let message_len =
+                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
+                        as usize;
+                let message_data =
+                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+                let transaction: Transaction =
+                    lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
                     .await;
             }
         }
@@ -770,6 +798,143 @@ impl Dataset {
         }
         Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
+    }
+
+    /// Write into a namespace-managed table with automatic credential vending.
+    ///
+    /// For CREATE mode, calls create_empty_table() to initialize the table.
+    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `batches` - The record batches to write
+    /// * `namespace` - The namespace to use for table management
+    /// * `table_id` - The table identifier
+    /// * `params` - Write parameters
+    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
+    ///   by the namespace and only use the storage options in params. The storage options
+    ///   provider will not be created, so credentials will not be automatically refreshed.
+    pub async fn write_into_namespace(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        mut params: Option<WriteParams>,
+        ignore_namespace_table_storage_options: bool,
+    ) -> Result<Self> {
+        let mut write_params = params.take().unwrap_or_default();
+
+        match write_params.mode {
+            WriteMode::Create => {
+                let request = CreateEmptyTableRequest {
+                    id: Some(table_id.clone()),
+                    location: None,
+                    properties: None,
+                };
+                let response =
+                    namespace
+                        .create_empty_table(request)
+                        .await
+                        .map_err(|e| Error::Namespace {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in create_empty_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace, table_id,
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                Self::write(batches, uri.as_str(), Some(write_params)).await
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    version: None,
+                };
+                let response =
+                    namespace
+                        .describe_table(request)
+                        .await
+                        .map_err(|e| Error::Namespace {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in describe_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace.clone(),
+                            table_id.clone(),
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                // For APPEND/OVERWRITE modes, we must open the existing dataset first
+                // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
+                // assumes no dataset exists and converts the mode to CREATE.
+                let mut builder = DatasetBuilder::from_uri(uri.as_str());
+                if let Some(ref store_params) = write_params.store_params {
+                    if let Some(ref storage_options) = store_params.storage_options {
+                        builder = builder.with_storage_options(storage_options.clone());
+                    }
+                    if let Some(ref provider) = store_params.storage_options_provider {
+                        builder = builder.with_storage_options_provider(provider.clone());
+                    }
+                }
+                let dataset = Arc::new(builder.load().await?);
+
+                Self::write(batches, dataset, Some(write_params)).await
+            }
+        }
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -883,7 +1048,11 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((Arc::new(manifest), location))
+        let manifest_arc = Arc::new(manifest);
+        self.metadata_cache
+            .insert_with_key(&manifest_key, manifest_arc.clone())
+            .await;
+        Ok((manifest_arc, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -891,13 +1060,41 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let path = match &self.manifest.transaction_file {
-            Some(path) => self.base.child("_transactions").child(path.as_str()),
-            None => return Ok(None),
+        let transaction_key = TransactionKey {
+            version: self.manifest.version,
         };
-        let data = self.object_store.inner.get(&path).await?.bytes().await?;
-        let transaction = lance_table::format::pb::Transaction::decode(data)?;
-        Transaction::try_from(transaction).map(Some)
+        if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
+            return Ok(Some((*transaction).clone()));
+        }
+
+        // Prefer inline transaction from manifest when available
+        let transaction = if let Some(pos) = self.manifest.transaction_section {
+            let reader = if let Some(size) = self.manifest_location.size {
+                self.object_store
+                    .open_with_size(&self.manifest_location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&self.manifest_location.path).await?
+            };
+
+            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            Transaction::try_from(tx).map(Some)?
+        } else if let Some(path) = &self.manifest.transaction_file {
+            // Fallback: read external transaction file if present
+            let path = self.base.child("_transactions").child(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            Transaction::try_from(transaction).map(Some)?
+        } else {
+            None
+        };
+
+        if let Some(tx) = transaction.as_ref() {
+            self.metadata_cache
+                .insert_with_key(&transaction_key, Arc::new(tx.clone()))
+                .await;
+        }
+        Ok(transaction)
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -1384,6 +1581,15 @@ impl Dataset {
             .and_then(|params| params.storage_options.as_ref())
     }
 
+    /// Returns the storage options provider used when opening this dataset, if any.
+    pub fn storage_options_provider(
+        &self,
+    ) -> Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.storage_options_provider.clone())
+    }
+
     pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -1556,12 +1762,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone())
+        Projection::empty(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone())
+        Projection::full(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Get fragments.
@@ -1945,7 +2151,7 @@ impl Dataset {
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
-    pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
+    pub fn sql(&self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
     }
 
@@ -2053,20 +2259,16 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
                     )?;
-                    let object_store = dataset_version.object_store();
-                    let path = dataset_version
-                        .manifest
-                        .transaction_file
-                        .as_ref()
-                        .ok_or_else(|| Error::Internal {
-                            message: format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ),
-                            location: location!(),
-                        })?;
                     let loaded =
-                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                            Error::Internal {
+                                message: format!(
+                                    "Dataset version {} does not have a transaction file",
+                                    manifest_copy.version
+                                ),
+                                location: location!(),
+                            }
+                        })?);
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())
@@ -2284,6 +2486,10 @@ impl Dataset {
         &self.manifest.config
     }
 
+    pub(crate) fn blob_version(&self) -> BlobVersion {
+        blob_version_from_config(&self.manifest.config)
+    }
+
     /// Delete keys from the config.
     #[deprecated(
         note = "Use the new update_config(values, replace) method - pass None values to delete keys"
@@ -2486,6 +2692,7 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    disable_transaction_file: bool,            // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -2494,13 +2701,21 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_stable_row_ids: false,
+            disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
         }
     }
 }
 
+impl ManifestWriteConfig {
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
@@ -2509,9 +2724,14 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
+    mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_stable_row_ids)?;
+        apply_feature_flags(
+            manifest,
+            config.use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2526,26 +2746,9 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
+            transaction.take().map(|tx| tx.into()),
         )
         .await
-}
-
-fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
-    manifest: &'a mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
-    path: &'a Path,
-) -> BoxFuture<'a, Result<WriteResult>> {
-    Box::pin(async {
-        let mut object_writer = ObjectWriter::new(object_store, path).await?;
-        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-        object_writer
-            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-            .await?;
-        let res = object_writer.shutdown().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(res)
-    })
 }
 
 impl Projectable for Dataset {
@@ -2567,6 +2770,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use mock_instant::thread_local::MockClock;
 
+    use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
     use arrow::datatypes::UInt64Type;
@@ -2589,8 +2793,8 @@ mod tests {
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY};
     use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriter;
     use lance_index::scalar::inverted::{
         query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
@@ -2598,7 +2802,6 @@ mod tests {
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
     use lance_io::assert_io_eq;
-    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2852,9 +3055,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_manifest_iops() {
-        // Need to use in-memory for accurate IOPS tracking.
-        let io_tracker = Arc::new(IOTracker::default());
-
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2872,10 +3072,6 @@ mod tests {
             batches,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 session: Some(session.clone()),
                 ..Default::default()
             }),
@@ -2883,17 +3079,10 @@ mod tests {
         .await
         .unwrap();
 
-        let _ = io_tracker.incremental_stats(); //reset
+        let _ = _original_ds.object_store().io_stats_incremental(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session),
-                ..Default::default()
-            })
+            .with_session(session)
             .load()
             .await
             .unwrap();
@@ -2902,7 +3091,7 @@ mod tests {
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = _dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 2);
     }
 
@@ -3057,8 +3246,10 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                disable_transaction_file: false,
             },
             dataset.manifest_location.naming_scheme,
+            None,
         )
         .await
         .unwrap();
@@ -4888,7 +5079,7 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         // This behavior will be re-introduced once we work on empty vector index handling.
-        // https://github.com/lancedb/lance/issues/4034
+        // https://github.com/lance-format/lance/issues/4034
         // let indices = dataset.load_indices().await.unwrap();
         // // With the new retention behavior, indices are kept even when all fragments are deleted
         // // This allows the index configuration to persist through data changes
@@ -8792,6 +8983,117 @@ mod tests {
         )
     }
 
+    // Test coverage:
+    // Case 1: delete external transaction file → read_transaction should prioritize inline and succeed.
+    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+    // Case 3: manifest does not contain inline → read_transaction should fall back to external transaction file and succeed.
+    #[tokio::test]
+    async fn test_inline_transaction() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        async fn create_dataset(rows: i32) -> Arc<Dataset> {
+            let dir = TempDir::default();
+            let uri = dir.path_str();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
+            Arc::new(ds)
+        }
+
+        fn make_tx(read_version: u64) -> Transaction {
+            Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
+        }
+
+        async fn delete_external_tx_file(ds: &Dataset) {
+            if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
+                let tx_path = ds.base.child("_transactions").child(tx_file.as_str());
+                let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            }
+        }
+
+        let session = Arc::new(Session::default());
+
+        // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
+        let ds = create_dataset(5).await;
+        let read_version = ds.manifest().version;
+        let tx = make_tx(read_version);
+        let ds2 = CommitBuilder::new(ds.clone())
+            .execute(tx.clone())
+            .await
+            .unwrap();
+        delete_external_tx_file(&ds2).await;
+        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx.clone());
+
+        // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+        let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let stats = read_ds2.object_store().io_stats_incremental(); // Reset
+        assert!(stats.read_bytes < 64 * 1024);
+        // Because the manifest is so small, we should have opportunistically
+        // cached the transaction in memory already.
+        let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+        let stats = read_ds2.object_store().io_stats_incremental();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(inline_tx, tx);
+
+        // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
+        let ds = create_dataset(2).await;
+        let tx = make_tx(ds.manifest().version);
+        let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
+            .await
+            .unwrap();
+        let (mut manifest, indices) = tx
+            .build_manifest(
+                Some(ds.manifest.as_ref()),
+                ds.load_indices().await.unwrap().as_ref().clone(),
+                &tx_file,
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        let location = write_manifest_file(
+            ds.object_store(),
+            ds.commit_handler.as_ref(),
+            &ds.base,
+            &mut manifest,
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
+            &ManifestWriteConfig::default(),
+            ds.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        let ds_new = ds.checkout_version(location.version).await.unwrap();
+        assert!(ds_new.manifest.transaction_section.is_none());
+        assert!(ds_new.manifest.transaction_file.is_some());
+        let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx);
+    }
+
     #[tokio::test]
     async fn test_limit_pushdown_in_physical_plan() -> Result<()> {
         use tempfile::tempdir;
@@ -9670,5 +9972,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(1, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_geo_types() {
+        use geo_types::{coord, line_string, Rect};
+        use geoarrow_array::{
+            builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
+            GeoArrowArray,
+        };
+        use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
+
+        // 1. Creates arrow table with spatial data.
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+        let polygon_type = PolygonType::new(Dimension::XY, Default::default());
+
+        let schema = arrow_schema::Schema::new(vec![
+            point_type.clone().to_field("point", true),
+            line_string_type.clone().to_field("linestring", true),
+            polygon_type.clone().to_field("polygon", true),
+        ]);
+        let schema = Arc::new(schema) as arrow_schema::SchemaRef;
+
+        let mut point_builder = PointBuilder::new(point_type.clone());
+        point_builder.push_point(Some(&geo_types::point!(x: -72.1235, y: 42.3521)));
+        let point_arr = point_builder.finish();
+
+        let mut line_string_builder = LineStringBuilder::new(line_string_type.clone());
+        line_string_builder
+            .push_line_string(Some(&line_string![
+            (x: -72.1260, y: 42.45),
+            (x: -72.123, y: 42.1546),
+            (x: -73.123, y: 43.1546),
+            ]))
+            .unwrap();
+        let line_arr = line_string_builder.finish();
+
+        let mut polygon_builder = PolygonBuilder::new(polygon_type.clone());
+        let rect = Rect::new(
+            coord! { x: -72.123, y: 42.146 },
+            coord! { x: -72.126, y: 42.45 },
+        );
+        polygon_builder.push_rect(Some(&rect)).unwrap();
+        let polygon_arr = polygon_builder.finish();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                point_arr.to_array_ref(),
+                line_arr.to_array_ref(),
+                polygon_arr.to_array_ref(),
+            ],
+        )
+        .unwrap();
+
+        // 2. Write to lance
+        let lance_path = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, &lance_path, Some(Default::default()))
+            .await
+            .unwrap();
+
+        // 3. Verifies that the schema fields and extension metadata are preserved
+        assert_eq!(dataset.schema().fields.len(), 3);
+        let fields = &dataset.schema().fields;
+        assert_eq!(
+            fields.first().unwrap().metadata.get("ARROW:extension:name"),
+            Some(&"geoarrow.point".to_owned())
+        );
+        assert_eq!(
+            fields.get(1).unwrap().metadata.get("ARROW:extension:name"),
+            Some(&"geoarrow.linestring".to_owned())
+        );
+        assert_eq!(
+            fields.get(2).unwrap().metadata.get("ARROW:extension:name"),
+            Some(&"geoarrow.polygon".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_geo_sql() {
+        use arrow_array::types::Float64Type;
+        use geo_types::line_string;
+        use geoarrow_array::{
+            builder::{LineStringBuilder, PointBuilder},
+            GeoArrowArray,
+        };
+        use geoarrow_schema::{Dimension, LineStringType, PointType};
+
+        // 1. Creates arrow table with point and linestring spatial data
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+
+        let schema = arrow_schema::Schema::new(vec![
+            point_type.clone().to_field("point", true),
+            line_string_type.clone().to_field("linestring", true),
+        ]);
+        let schema = Arc::new(schema) as arrow_schema::SchemaRef;
+
+        let mut point_builder = PointBuilder::new(point_type.clone());
+        point_builder.push_point(Some(&geo_types::point!(x: -72.1235, y: 42.3521)));
+        let point_arr = point_builder.finish();
+
+        let mut line_string_builder = LineStringBuilder::new(line_string_type.clone());
+        line_string_builder
+            .push_line_string(Some(&line_string![
+            (x: -72.1260, y: 42.45),
+            (x: -72.123, y: 42.1546),
+            (x: -73.123, y: 43.1546),
+            ]))
+            .unwrap();
+        let line_arr = line_string_builder.finish();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![point_arr.to_array_ref(), line_arr.to_array_ref()],
+        )
+        .unwrap();
+
+        // 2. Write to lance
+        let lance_path = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, &lance_path, Some(Default::default()))
+            .await
+            .unwrap();
+
+        // 3. Executes a SQL query with St_Distance function
+        let batches = execute_sql(
+            "SELECT ST_Distance(point, linestring) AS dist FROM dataset",
+            "dataset".to_owned(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = batches.first().unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 1);
+        approx::assert_relative_eq!(
+            batch.column(0).as_primitive::<Float64Type>().value(0),
+            0.0015056772638228177
+        );
     }
 }

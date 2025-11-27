@@ -12,7 +12,7 @@ use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::FilterExpression;
-use lance_file::v2::reader::FileReader;
+use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;

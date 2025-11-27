@@ -30,20 +30,16 @@ use std::sync::Arc;
 
 use std::ffi::CString;
 
-use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
-
-use arrow_array::{RecordBatch, RecordBatchIterator};
-use arrow_schema::ArrowError;
-use datafusion::error::Result;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::CleanupStats;
+use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
@@ -53,10 +49,9 @@ use file::{
     stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
-use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use log::Level;
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
@@ -72,6 +67,7 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+pub(crate) mod namespace;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -258,6 +254,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
     m.add_class::<PyCompactionTask>()?;
@@ -271,14 +268,17 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
+    m.add_class::<namespace::PyDirectoryNamespace>()?;
+    #[cfg(feature = "rest")]
+    m.add_class::<namespace::PyRestNamespace>()?;
+    #[cfg(feature = "rest-adapter")]
+    m.add_class::<namespace::PyRestAdapter>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
-    m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
-    m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
@@ -342,127 +342,6 @@ pub fn language_model_home() -> PyResult<String> {
     Ok(String::from(pstr))
 }
 
-/// Infer schema from tfrecord file
-///
-/// Parameters
-/// ----------
-/// uri: str
-///     URI of the tfrecord file
-/// tensor_features: Optional[List[str]]
-///     Names of features that should be treated as tensors. Currently only
-///     fixed-shape tensors are supported.
-/// string_features: Optional[List[str]]
-///     Names of features that should be treated as strings. Otherwise they
-///     will be treated as binary.
-/// batch_size: Optional[int], default None
-///     Number of records to read to infer the schema. If None, will read the
-///    entire file.
-///
-/// Returns
-/// -------
-/// pyarrow.Schema
-///     An Arrow schema inferred from the tfrecord file. The schema is
-///     alphabetically sorted by field names, since TFRecord doesn't have
-///     a concept of field order.
-#[pyfunction]
-#[pyo3(signature = (uri, *, tensor_features = None, string_features = None, num_rows = None))]
-fn infer_tfrecord_schema(
-    uri: &str,
-    tensor_features: Option<Vec<String>>,
-    string_features: Option<Vec<String>>,
-    num_rows: Option<usize>,
-) -> PyResult<PyArrowType<ArrowSchema>> {
-    let tensor_features = tensor_features.unwrap_or_default();
-    let tensor_features = tensor_features
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>();
-    let string_features = string_features.unwrap_or_default();
-    let string_features = string_features
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>();
-    let schema = rt()
-        .runtime
-        .block_on(::lance::utils::tfrecord::infer_tfrecord_schema(
-            uri,
-            &tensor_features,
-            &string_features,
-            num_rows,
-        ))
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
-    Ok(PyArrowType(schema))
-}
-
-/// Read tfrecord file as an Arrow stream
-///
-/// Parameters
-/// ----------
-/// uri: str
-///     URI of the tfrecord file
-/// schema: pyarrow.Schema
-///     Arrow schema of the tfrecord file. Use :py:func:`infer_tfrecord_schema`
-///     to infer the schema. The schema is allowed to be a subset of fields; the
-///     reader will only parse the fields that are present in the schema.
-/// batch_size: int, default 10k
-///     Number of records to read per batch.
-///
-/// Returns
-/// -------
-/// pyarrow.RecordBatchReader
-///     An Arrow reader, which can be passed directly to
-///     :py:func:`lance.write_dataset`. The output schema will match the schema
-///     provided, including field order.
-#[pyfunction]
-#[pyo3(signature = (uri, schema, *, batch_size = 10_000))]
-fn read_tfrecord(
-    uri: String,
-    schema: PyArrowType<ArrowSchema>,
-    batch_size: usize,
-) -> PyResult<PyArrowType<ArrowArrayStreamReader>> {
-    let schema = Arc::new(schema.0);
-
-    let (init_sender, init_receiver) = std::sync::mpsc::channel::<Result<(), ::lance::Error>>();
-    let (batch_sender, batch_receiver) =
-        std::sync::mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>();
-
-    let schema_ref = schema.clone();
-    rt().spawn_background(None, async move {
-        let mut stream =
-            match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await
-            {
-                Ok(stream) => {
-                    init_sender.send(Ok(())).unwrap();
-                    stream
-                }
-                Err(err) => {
-                    init_sender.send(Err(err)).unwrap();
-                    return;
-                }
-            };
-
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|err| ArrowError::ExternalError(Box::new(err)));
-            batch_sender.send(batch).unwrap();
-        }
-    });
-
-    // Verify initialization happened successfully
-    init_receiver.recv().unwrap().map_err(|err| {
-        PyIOError::new_err(format!("Failed to initialize tfrecord reader: {}", err))
-    })?;
-
-    let batch_reader = RecordBatchIterator::new(batch_receiver, schema);
-
-    // TODO: this should be handled by upstream
-    let stream = FFI_ArrowArrayStream::new(Box::new(batch_reader));
-    let stream_reader = ArrowArrayStreamReader::try_new(stream).map_err(|err| {
-        PyValueError::new_err(format!("Failed to export record batch reader: {}", err))
-    })?;
-
-    Ok(PyArrowType(stream_reader))
-}
-
 #[pyfunction]
 #[pyo3(signature = (dataset,))]
 fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -496,7 +375,7 @@ impl FFILanceTableProvider {
         let py = dataset.py();
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
-        // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
+        // TODO: https://github.com/lance-format/lance/issues/3966 remove this workaround
         let _ = rt().block_on(Some(py), dataset_ref.load_indices())?;
         Ok(Self {
             dataset: dataset_ref.clone(),

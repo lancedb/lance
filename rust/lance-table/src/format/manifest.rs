@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
@@ -75,6 +75,9 @@ pub struct Manifest {
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
+
+    /// The file position of the inline transaction content inside the manifest
+    pub transaction_section: Option<usize>,
 
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
@@ -186,6 +189,7 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: None,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
@@ -216,6 +220,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
@@ -272,6 +277,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
+            transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
@@ -922,6 +928,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
+            transaction_section: p.transaction_section.map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -994,6 +1001,7 @@ impl From<&Manifest> for pb::Manifest {
                     path: base_path.path.clone(),
                 })
                 .collect(),
+            transaction_section: m.transaction_section.map(|i| i as u64),
         }
     }
 }
@@ -1028,7 +1036,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for FileReader {
+impl SelfDescribingFileReader for PreviousFileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,

@@ -62,7 +62,7 @@ pub struct RestNamespaceBuilder {
 
 impl RestNamespaceBuilder {
     /// Default delimiter for object identifiers
-    const DEFAULT_DELIMITER: &'static str = ".";
+    const DEFAULT_DELIMITER: &'static str = "$";
 
     /// Create a new RestNamespaceBuilder with the specified URI.
     ///
@@ -294,6 +294,7 @@ fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct RestNamespace {
     delimiter: String,
     reqwest_config: Configuration,
@@ -373,6 +374,11 @@ impl RestNamespace {
             delimiter,
             reqwest_config,
         }
+    }
+
+    /// Get the base endpoint URL for this namespace
+    pub fn endpoint(&self) -> &str {
+        &self.reqwest_config.base_path
     }
 }
 
@@ -720,13 +726,6 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Create a test REST namespace instance
-    fn create_test_namespace() -> RestNamespace {
-        RestNamespaceBuilder::new("http://localhost:8080")
-            .delimiter(".")
-            .build()
-    }
-
     #[test]
     fn test_rest_namespace_creation() {
         let mut properties = HashMap::new();
@@ -803,7 +802,7 @@ mod tests {
             .expect("Failed to create namespace builder")
             .build();
 
-        // The default delimiter should be "." - test passes if no panic
+        // The default delimiter should be "$" - test passes if no panic
     }
 
     #[test]
@@ -904,7 +903,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -943,7 +942,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -958,30 +957,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_list_namespaces_integration() {
-        let namespace = create_test_namespace();
-        let request = ListNamespacesRequest {
-            id: Some(vec!["test".to_string()]),
-            page_token: None,
-            limit: Some(10),
-        };
-
-        let result = namespace.list_namespaces(request).await;
-
-        // The actual assertion depends on whether the server is running
-        // In a real test, you would either mock the server or ensure it's running
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_create_namespace_success() {
         // Start a mock server
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/namespace/test$newnamespace/create".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/namespace/test.newnamespace/create"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "namespace": {
                     "identifier": ["test", "newnamespace"],
@@ -995,7 +978,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
@@ -1006,7 +989,7 @@ mod tests {
         let result = namespace.create_namespace(request).await;
 
         // Should succeed with mock server
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
 
     #[tokio::test]
@@ -1015,8 +998,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/table/test$namespace$table/create".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/table/test.namespace.table/create"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "table": {
                     "identifier": ["test", "namespace", "table"],
@@ -1031,7 +1015,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -1057,8 +1041,9 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         // Create mock response
+        let path_str = "/v1/table/test$namespace$table/insert".replace("$", "%24");
         Mock::given(method("POST"))
-            .and(path("/v1/table/test.namespace.table/insert"))
+            .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "version": 2
             })))
@@ -1069,7 +1054,7 @@ mod tests {
         let mut reqwest_config = Configuration::new();
         reqwest_config.base_path = mock_server.uri();
 
-        let namespace = RestNamespace::with_configuration(".".to_string(), reqwest_config);
+        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
 
         let request = InsertIntoTableRequest {
             id: Some(vec![
@@ -1087,182 +1072,5 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.version, Some(2));
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_create_namespace_integration() {
-        let namespace = create_test_namespace();
-        let request = CreateNamespaceRequest {
-            id: Some(vec!["test".to_string(), "namespace".to_string()]),
-            properties: None,
-            mode: None,
-        };
-
-        let result = namespace.create_namespace(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_describe_namespace() {
-        let namespace = create_test_namespace();
-        let request = DescribeNamespaceRequest {
-            id: Some(vec!["test".to_string(), "namespace".to_string()]),
-        };
-
-        let result = namespace.describe_namespace(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_list_tables() {
-        let namespace = create_test_namespace();
-        let request = ListTablesRequest {
-            id: Some(vec!["test".to_string(), "namespace".to_string()]),
-            page_token: None,
-            limit: Some(10),
-        };
-
-        let result = namespace.list_tables(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_create_table() {
-        let namespace = create_test_namespace();
-        let request = CreateTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-            location: None,
-            mode: Some(create_table_request::Mode::Create),
-            properties: None,
-        };
-
-        let data = Bytes::from("test data");
-        let result = namespace.create_table(request, data).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_drop_table() {
-        let namespace = create_test_namespace();
-        let request = DropTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-        };
-
-        let result = namespace.drop_table(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_insert_into_table_append() {
-        let namespace = create_test_namespace();
-        let request = InsertIntoTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-            mode: Some(insert_into_table_request::Mode::Append),
-        };
-
-        let data = Bytes::from("test data");
-        let result = namespace.insert_into_table(request, data).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_insert_into_table_overwrite() {
-        let namespace = create_test_namespace();
-        let request = InsertIntoTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-            mode: Some(insert_into_table_request::Mode::Overwrite),
-        };
-
-        let data = Bytes::from("test data");
-        let result = namespace.insert_into_table(request, data).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_merge_insert_into_table() {
-        let namespace = create_test_namespace();
-        let request = MergeInsertIntoTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-            on: Some("id".to_string()),
-            when_matched_update_all: Some(true),
-            when_matched_update_all_filt: None,
-            when_not_matched_insert_all: Some(true),
-            when_not_matched_by_source_delete: Some(false),
-            when_not_matched_by_source_delete_filt: None,
-        };
-
-        let data = Bytes::from("test data");
-        let result = namespace.merge_insert_into_table(request, data).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_delete_from_table() {
-        let namespace = create_test_namespace();
-        let request = DeleteFromTableRequest {
-            id: Some(vec![
-                "test".to_string(),
-                "namespace".to_string(),
-                "table".to_string(),
-            ]),
-            predicate: "id > 10".to_string(),
-        };
-
-        let result = namespace.delete_from_table(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_describe_transaction() {
-        let namespace = create_test_namespace();
-        let request = DescribeTransactionRequest {
-            id: Some(vec!["test".to_string(), "transaction".to_string()]),
-        };
-
-        let result = namespace.describe_transaction(request).await;
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires a running server
-    async fn test_alter_transaction() {
-        let namespace = create_test_namespace();
-        let request = AlterTransactionRequest {
-            id: Some(vec!["test".to_string(), "transaction".to_string()]),
-            actions: vec![],
-        };
-
-        let result = namespace.alter_transaction(request).await;
-        assert!(result.is_err() || result.is_ok());
     }
 }

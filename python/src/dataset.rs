@@ -61,7 +61,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
-use lance_file::v2::reader::FileReaderOptions;
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -86,7 +86,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::PyIndexConfig;
+use crate::indices::{PyIndexConfig, PyIndexDescription};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{logical_schema_from_lance, LanceSchema};
@@ -96,14 +96,16 @@ use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
+use self::io_stats::IoStats;
 
 pub mod blob;
 pub mod cleanup;
 pub mod commit;
+pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBES: usize = 20;
+const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -986,8 +988,9 @@ impl Dataset {
 
             if let Some(nprobes) = nearest.get_item("nprobes")? {
                 if !nprobes.is_none() {
-                    minimum_nprobes = nprobes.extract()?;
-                    maximum_nprobes = Some(minimum_nprobes);
+                    let extracted: usize = nprobes.extract()?;
+                    minimum_nprobes = extracted;
+                    maximum_nprobes = Some(extracted);
                 }
             }
 
@@ -1003,18 +1006,22 @@ impl Dataset {
                 }
             }
 
-            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
-                return Err(PyValueError::new_err(
-                    "minimum_nprobes must be <= maximum_nprobes",
-                ));
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                if minimum_nprobes > maximum_nprobes {
+                    return Err(PyValueError::new_err(
+                        "minimum_nprobes must be <= maximum_nprobes",
+                    ));
+                }
             }
 
             if minimum_nprobes < 1 {
                 return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
             }
 
-            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
-                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                if maximum_nprobes < 1 {
+                    return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+                }
             }
 
             let metric_type: Option<MetricType> =
@@ -2040,6 +2047,18 @@ impl Dataset {
         Session::new(self.ds.session())
     }
 
+    /// Get a snapshot of current IO statistics without resetting counters
+    fn io_stats_snapshot(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_snapshot();
+        IoStats::from_lance(stats)
+    }
+
+    /// Get incremental IO statistics for this dataset
+    fn io_stats_incremental(&self) -> IoStats {
+        let stats = self.ds.object_store().io_stats_incremental();
+        IoStats::from_lance(stats)
+    }
+
     #[staticmethod]
     #[pyo3(signature = (dest, storage_options = None, ignore_not_found = None))]
     fn drop(
@@ -2073,13 +2092,14 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2099,6 +2119,7 @@ impl Dataset {
             PyLance(transaction),
             commit_lock,
             storage_options,
+            storage_options_provider,
             enable_v2_manifest_paths,
             detached,
             max_retries,
@@ -2107,23 +2128,36 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
-        let object_store_params =
-            storage_options
-                .as_ref()
-                .map(|storage_options| ObjectStoreParams {
-                    storage_options: Some(storage_options.clone()),
-                    ..Default::default()
-                });
+        let provider = storage_options_provider.and_then(|py_obj| {
+            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                .ok()
+                .map(|py_provider| {
+                    Arc::new(
+                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
+                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                })
+        });
+
+        let object_store_params = if storage_options.is_some() || provider.is_some() {
+            Some(ObjectStoreParams {
+                storage_options: storage_options.clone(),
+                storage_options_provider: provider,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         let commit_handler = commit_lock
             .as_ref()
@@ -2161,24 +2195,38 @@ impl Dataset {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let object_store_params =
-            storage_options
-                .as_ref()
-                .map(|storage_options| ObjectStoreParams {
-                    storage_options: Some(storage_options.clone()),
-                    ..Default::default()
-                });
+        let provider = storage_options_provider.and_then(|py_obj| {
+            crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                .ok()
+                .map(|py_provider| {
+                    Arc::new(
+                        crate::storage_options::PyStorageOptionsProviderWrapper::new(py_provider),
+                    ) as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                })
+        });
+
+        let object_store_params = if storage_options.is_some() || provider.is_some() {
+            Some(ObjectStoreParams {
+                storage_options: storage_options.clone(),
+                storage_options_provider: provider,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         let commit_handler = commit_lock
             .map(|commit_lock| {
@@ -2562,9 +2610,28 @@ impl Dataset {
 
     #[pyo3(signature=(sql))]
     fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
-        let mut ds = self.ds.as_ref().clone();
-        let builder = ds.sql(&sql);
+        let builder = self.ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
+    }
+
+    #[pyo3(signature=())]
+    fn describe_indices(&self, py: Python<'_>) -> PyResult<Vec<PyIndexDescription>> {
+        let new_self = self.ds.as_ref().clone();
+        let indices = rt()
+            .block_on(Some(py), new_self.describe_indices(None))?
+            .infer_error()?;
+        Ok(indices
+            .into_iter()
+            .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
+            .collect())
+    }
+
+    /// Create a delta builder to explore changes between dataset versions.
+    #[pyo3(signature=())]
+    fn delta(&self) -> PyResult<DatasetDeltaBuilder> {
+        let ds = self.ds.as_ref().clone();
+        let builder = ds.delta();
+        Ok(DatasetDeltaBuilder { builder })
     }
 }
 
@@ -2664,6 +2731,83 @@ impl SqlQueryBuilder {
         Ok(SqlQuery {
             builder: self.builder.clone(),
         })
+    }
+}
+
+// -------------------- Delta API Bindings --------------------
+
+#[pyclass(name = "DatasetDelta", module = "_lib", subclass)]
+pub struct DatasetDelta {
+    inner: lance::dataset::delta::DatasetDelta,
+}
+
+#[pymethods]
+impl DatasetDelta {
+    /// List transactions between begin_version+1 and end_version.
+    fn list_transactions(
+        &self,
+    ) -> PyResult<Vec<PyLance<lance::dataset::transaction::Transaction>>> {
+        let txs = rt()
+            .block_on(None, self.inner.list_transactions())?
+            .infer_error()?;
+        Ok(txs.into_iter().map(PyLance).collect())
+    }
+
+    /// Get inserted rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_inserted_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_inserted_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+
+    /// Get updated rows between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    fn get_updated_rows(&self) -> PyResult<PyObject> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_updated_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+}
+
+#[pyclass(name = "DatasetDeltaBuilder", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct DatasetDeltaBuilder {
+    builder: lance::dataset::delta::DatasetDeltaBuilder,
+}
+
+#[pymethods]
+impl DatasetDeltaBuilder {
+    #[pyo3(signature = (version))]
+    fn compared_against_version(&self, version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().compared_against_version(version),
+        }
+    }
+
+    #[pyo3(signature = (begin_version))]
+    fn with_begin_version(&self, begin_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_begin_version(begin_version),
+        }
+    }
+
+    #[pyo3(signature = (end_version))]
+    fn with_end_version(&self, end_version: u64) -> Self {
+        Self {
+            builder: self.builder.clone().with_end_version(end_version),
+        }
+    }
+
+    fn build(&self) -> PyResult<DatasetDelta> {
+        let delta = self.builder.clone().build().infer_error()?;
+        Ok(DatasetDelta { inner: delta })
     }
 }
 
@@ -2887,11 +3031,36 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
         }
 
-        if let Some(storage_options) =
-            get_dict_opt::<HashMap<String, String>>(options, "storage_options")?
+        let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
+        let storage_options_provider =
+            get_dict_opt::<PyObject>(options, "storage_options_provider")?.and_then(|py_obj| {
+                crate::storage_options::PyStorageOptionsProvider::new(py_obj)
+                    .ok()
+                    .map(|py_provider| {
+                        Arc::new(
+                            crate::storage_options::PyStorageOptionsProviderWrapper::new(
+                                py_provider,
+                            ),
+                        )
+                            as Arc<dyn lance_io::object_store::StorageOptionsProvider>
+                    })
+            });
+
+        let s3_credentials_refresh_offset_seconds =
+            get_dict_opt::<u64>(options, "s3_credentials_refresh_offset_seconds")?;
+
+        if storage_options.is_some()
+            || storage_options_provider.is_some()
+            || s3_credentials_refresh_offset_seconds.is_some()
         {
+            let s3_credentials_refresh_offset = s3_credentials_refresh_offset_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(std::time::Duration::from_secs(60));
+
             p.store_params = Some(ObjectStoreParams {
-                storage_options: Some(storage_options),
+                storage_options,
+                storage_options_provider,
+                s3_credentials_refresh_offset,
                 ..Default::default()
             });
         }

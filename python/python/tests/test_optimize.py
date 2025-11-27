@@ -36,6 +36,38 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_blob_compaction(tmp_path: Path):
+    base_dir = tmp_path / "blob_dataset"
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+    )
+    schema = pa.schema([pa.field("id", pa.int32()), blob_field])
+    blobs = [b"\x01\x02", b"\x03\x04\x05"]
+    table = pa.table(
+        {
+            "id": pa.array([0, 1], type=pa.int32()),
+            "blob": pa.array(blobs, type=pa.large_binary()),
+        },
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(
+        table,
+        base_dir,
+        schema=schema,
+        max_rows_per_file=1,
+        data_storage_version="stable",
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    dataset.optimize.compact_files(num_threads=1)
+    assert len(dataset.get_fragments()) == 1
+
+    blob_files = dataset.take_blobs("blob", indices=[0, 1])
+    contents = [blob_files[0].readall(), blob_files[1].readall()]
+    assert contents == blobs
+
+
 def test_optimize_max_bytes(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     arr = pa.array(range(4 * 1024 * 1024))
@@ -359,3 +391,21 @@ def test_migration_via_fragment_apis(tmp_path):
     ds2 = lance.dataset(tmp_path / "dataset2")
 
     assert ds2.data_storage_version == "2.0"
+
+
+def test_compaction_generates_rewrite_transaction(tmp_path: Path):
+    # Create a small dataset with multiple fragments
+    base_dir = tmp_path / "rewrite_txn"
+    data = pa.table({"a": range(300), "b": range(300)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+
+    # Run compaction: should perform a rewrite (no deletions materialized)
+    dataset.optimize.compact_files(materialize_deletions=False, num_threads=1)
+
+    # Verify at least one transaction is a Rewrite; guard against None entries
+    transactions = dataset.get_transactions()
+    assert any(
+        t is not None and t.operation.__class__.__name__ == "Rewrite"
+        for t in transactions
+    )

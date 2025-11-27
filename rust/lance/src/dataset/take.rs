@@ -178,7 +178,10 @@ async fn do_take_rows(
 
         let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
             Error::invalid_input(
-                format!("_rowaddr belongs to non-existent fragment: {start}"),
+                format!(
+                    "rowaddr start: {} belongs to non-existent fragment: {}",
+                    start, fragment_id
+                ),
                 location!(),
             )
         })?;
@@ -219,7 +222,7 @@ async fn do_take_rows(
                 .ok_or_else(|| {
                     Error::invalid_input(
                         format!(
-                            "_rowaddr {} belongs to non-existent fragment: {}",
+                            "rowaddr {} belongs to non-existent fragment: {}",
                             row_addrs[range.start], fragment_id
                         ),
                         location!(),

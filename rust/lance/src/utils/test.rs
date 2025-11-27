@@ -374,6 +374,12 @@ pub struct NoContextTestFixture {
     pub dataset: Dataset,
 }
 
+impl Default for NoContextTestFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NoContextTestFixture {
     pub fn new() -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()

@@ -25,7 +25,7 @@ impl IntoJava for Schema {
         }
         let metadata = to_java_map(env, &self.metadata)?;
         Ok(env.new_object(
-            "com/lancedb/lance/schema/LanceSchema",
+            "org/lance/schema/LanceSchema",
             "(Ljava/util/List;Ljava/util/Map;)V",
             &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
         )?)
@@ -46,7 +46,7 @@ pub fn convert_to_java_field<'local>(
         + "Ljava/util/Map;"
         + "Ljava/util/List;Z)V";
     let field_obj = env.new_object(
-        "com/lancedb/lance/schema/LanceField",
+        "org/lance/schema/LanceField",
         ctor_sig.as_str(),
         &[
             JValue::Int(lance_field.id as jint),

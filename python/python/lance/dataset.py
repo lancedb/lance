@@ -34,14 +34,12 @@ from typing import (
 
 import pyarrow as pa
 import pyarrow.dataset
-from lance_namespace import DescribeTableRequest, LanceNamespace
 from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
 from .blob import BlobFile
 from .dependencies import (
-    _check_for_hugging_face,
     _check_for_numpy,
     torch,
 )
@@ -54,6 +52,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
+    IOStats,
     LanceSchema,
     ScanStatistics,
     _Dataset,
@@ -74,7 +73,11 @@ from .util import _target_partition_size_to_num_partitions, td_to_micros
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
+    from lance.namespace import LanceNamespace
+
     from .commit import CommitLock
+    from .io import StorageOptionsProvider
+    from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
 
@@ -645,7 +648,26 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.checkout_latest()
 
     def list_indices(self) -> List[Index]:
+        """
+        Returns index information for all indices in the dataset.
+
+        This method is deprecated as it requires loading the statistics for each index
+        which can be a very expensive operation.  Instead use describe_indices() to
+        list index information and index_statistics() to get the statistics for
+        individual indexes of interest.
+        """
+        # TODO: https://github.com/lancedb/lance/issues/5237 deprecate this method
+        # warnings.warn(
+        #     "The 'list_indices' method is deprecated.  It may be removed in a future"
+        #     "version.  Use describe_indices() instead.",
+        #     DeprecationWarning,
+        # )
+
         return self._ds.load_indices()
+
+    def describe_indices(self) -> List[IndexDescription]:
+        """Returns index information for all indices in the dataset."""
+        return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -702,7 +724,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -717,7 +739,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "column": <embedding col name>,
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
@@ -964,7 +986,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
+            `Lance filter pushdown <https://lance.org/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -980,7 +1002,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
                     "metric": "cosine",
-                    "minimum_nprobes": 20,
+                    "minimum_nprobes": 1,
                     "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
@@ -1345,6 +1367,87 @@ class LanceDataset(pa.dataset.Dataset):
         if raw_fragment is None:
             return None
         return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
+
+    def io_stats_snapshot(self) -> IOStats:
+        """
+        Get a snapshot of current IO statistics without resetting counters.
+
+        Returns the current IO statistics without modifying the internal state.
+        Use this when you need to check stats without resetting them. Multiple
+        calls will return the same values until IO operations are performed.
+
+        Returns
+        -------
+        IOStats
+            Object containing IO statistics with the following attributes:
+            - read_iops: Number of read operations
+            - read_bytes: Total bytes read
+            - write_iops: Number of write operations
+            - write_bytes: Total bytes written
+            - num_hops: Number of network hops (for remote storage)
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://test_stats")
+        >>> result = dataset.to_table()
+        >>> # Check stats without resetting
+        >>> stats = dataset.io_stats_snapshot()
+        >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+        Read ... bytes in ... operations
+        >>> # Can check again and see the same values
+        >>> stats2 = dataset.io_stats_snapshot()
+        >>> assert stats.read_bytes == stats2.read_bytes
+
+        See Also
+        --------
+        io_stats_incremental : Get stats and reset counters for incremental tracking
+        """
+        return self._ds.io_stats_snapshot()
+
+    def io_stats_incremental(self) -> IOStats:
+        """
+        Get incremental IO statistics and reset the counters.
+
+        Returns IO statistics (number of operations and bytes) since the last
+        time this method was called, then resets the internal counters to zero.
+        This is useful for tracking IO operations between different stages of
+        processing.
+
+        Returns
+        -------
+        IOStats
+            Object containing IO statistics with the following attributes:
+            - read_iops: Number of read operations
+            - read_bytes: Total bytes read
+            - write_iops: Number of write operations
+            - write_bytes: Total bytes written
+            - num_hops: Number of network hops (for remote storage)
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://test_stats")
+        >>> result = dataset.to_table()
+        >>> # Get incremental stats (and reset)
+        >>> stats = dataset.io_stats_incremental()
+        >>> print(f"Read {stats.read_bytes} bytes in {stats.read_iops} operations")
+        Read ... bytes in ... operations
+        >>> # Next call returns only new stats since last call
+        >>> more_data = dataset.to_table()
+        >>> stats2 = dataset.io_stats_incremental()
+        >>> print(f"Read {stats2.read_bytes} more bytes")
+        Read ... more bytes
+
+        See Also
+        --------
+        io_stats_snapshot : Get stats without resetting counters
+        """
+        return self._ds.io_stats_incremental()
 
     def to_batches(
         self,
@@ -3063,6 +3166,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
@@ -3107,6 +3211,8 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        storage_options_provider : StorageOptionsProvider, optional
+            A provider for dynamic storage options with automatic credential refresh.
         enable_v2_manifest_paths : bool, optional
             If True, and this is a new dataset, uses the new V2 manifest paths.
             These paths provide more efficient opening of datasets with many
@@ -3192,6 +3298,7 @@ class LanceDataset(pa.dataset.Dataset):
                 operation,
                 commit_lock,
                 storage_options=storage_options,
+                storage_options_provider=storage_options_provider,
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
@@ -3203,6 +3310,7 @@ class LanceDataset(pa.dataset.Dataset):
                 read_version,
                 commit_lock,
                 storage_options=storage_options,
+                storage_options_provider=storage_options_provider,
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
@@ -3228,6 +3336,7 @@ class LanceDataset(pa.dataset.Dataset):
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
@@ -3256,6 +3365,8 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        storage_options_provider : StorageOptionsProvider, optional
+            A provider for dynamic storage options with automatic credential refresh.
         enable_v2_manifest_paths : bool, optional
             If True, and this is a new dataset, uses the new V2 manifest paths.
             These paths provide more efficient opening of datasets with many
@@ -3302,6 +3413,7 @@ class LanceDataset(pa.dataset.Dataset):
             transactions,
             commit_lock,
             storage_options=storage_options,
+            storage_options_provider=storage_options_provider,
             enable_v2_manifest_paths=enable_v2_manifest_paths,
             detached=detached,
             max_retries=max_retries,
@@ -3474,6 +3586,88 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def delta(
+        self,
+        compared_against: Optional[int] = None,
+        *,
+        begin_version: Optional[int] = None,
+        end_version: Optional[int] = None,
+    ) -> "DatasetDelta":
+        """
+        Compare changes between two versions of this dataset.
+
+        You must specify either ``compared_against`` (shorthand for comparing the
+        current version against a specific older version) or both ``begin_version``
+        and ``end_version`` for an explicit range.
+
+        Parameters
+        ----------
+        compared_against : int, optional
+            The version to compare the current dataset version against.
+            This is a shorthand for setting ``begin_version=compared_against``
+            and ``end_version=self.version``.
+        begin_version : int, optional
+            The start version (exclusive) for the comparison range.
+            Must be used together with ``end_version``.
+        end_version : int, optional
+            The end version (inclusive) for the comparison range.
+            Must be used together with ``begin_version``.
+
+        Returns
+        -------
+        DatasetDelta
+            An object that can list transactions or stream inserted/updated rows.
+
+        Raises
+        ------
+        ValueError
+            If both ``compared_against`` and version range are specified,
+            or if neither is specified.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            import lance
+            import pyarrow as pa
+
+            # Write initial data (v1)
+            ds = lance.write_dataset(
+                pa.table({"id": [1, 2], "val": ["a", "b"]}),
+                "memory://delta_demo"
+            )
+
+            # Append some data to create v2
+            ds_append = lance.write_dataset(
+                pa.table({"id": [3], "val": ["c"]}),
+                "memory://delta_demo",
+                mode="append"
+            )
+
+            # Compute inserted rows from v1 -> v2 (shorthand)
+            delta = ds_append.delta(compared_against=1)
+            reader = delta.get_inserted_rows()
+            for batch in reader:
+                print(batch)
+
+            # Or using explicit version range
+            delta = ds_append.delta(begin_version=1, end_version=2)
+        """
+        has_compared_against = compared_against is not None
+
+        builder = _DatasetDeltaBuilder(self._ds.delta())
+
+        if has_compared_against:
+            builder = builder.compared_against_version(compared_against)
+        else:
+            if begin_version:
+                builder = builder.with_begin_version(begin_version)
+
+            if end_version:
+                builder = builder.with_end_version(end_version)
+
+        return builder.build()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3638,6 +3832,61 @@ class SqlQueryBuilder:
         return SqlQuery(self._builder.build())
 
 
+class DatasetDelta:
+    """
+    A view of differences between two versions.
+
+    Created by :meth:`LanceDataset.delta`.
+    Provides convenient methods to stream inserted/updated rows or list transactions.
+    """
+
+    def __init__(self, delta):
+        self._delta = delta
+
+    def list_transactions(self) -> List[Transaction]:
+        """
+        List transactions in the range from begin_version + 1 to end_version.
+        """
+        return self._delta.list_transactions()
+
+    def get_inserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted rows.
+        """
+        return self._delta.get_inserted_rows()
+
+    def get_updated_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for updated rows.
+        """
+        return self._delta.get_updated_rows()
+
+
+class _DatasetDeltaBuilder:
+    """Internal builder for :class:`DatasetDelta`.
+
+    This class is not part of the public API. Use :meth:`LanceDataset.delta` instead.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def compared_against_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.compared_against_version(version)
+        return self
+
+    def with_begin_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_begin_version(version)
+        return self
+
+    def with_end_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_end_version(version)
+        return self
+
+    def build(self) -> DatasetDelta:
+        return DatasetDelta(self._builder.build())
+
+
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset
     merged: Transaction
@@ -3740,6 +3989,10 @@ class LanceOperation:
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
             The fragments that make up the new dataset.
+        initial_bases: list[DatasetBasePath], optional
+            Base paths to register when creating a new dataset (CREATE mode only).
+            **Only valid in CREATE mode**. Will raise an error if used with
+            OVERWRITE on existing dataset.
 
         Warning
         -------
@@ -3774,6 +4027,7 @@ class LanceOperation:
 
         new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
+        initial_bases: Optional[List[DatasetBasePath]] = None
 
         def __post_init__(self):
             if isinstance(self.new_schema, pa.Schema):
@@ -4809,7 +5063,6 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
-
         Returns
         -------
         CompactionMetrics
@@ -5099,6 +5352,8 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    ignore_namespace_table_storage_options: bool = False,
+    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5200,15 +5455,29 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
+    ignore_namespace_table_storage_options : bool, default False
+        If True, ignore the storage options returned by the namespace and only use
+        the provided `storage_options` parameter. The storage options provider will
+        not be created, so credentials will not be automatically refreshed.
+        This is useful when you want to use your own credentials instead of the
+        namespace-provided credentials.
+    s3_credentials_refresh_offset_seconds : optional, int
+        The number of seconds before credential expiration to trigger a refresh.
+        Default is 60 seconds. Only applicable when using AWS S3 with temporary
+        credentials. For example, if set to 60, credentials will be refreshed
+        when they have less than 60 seconds remaining before expiration. This
+        should be set shorter than the credential lifetime to avoid using
+        expired credentials.
 
     Notes
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
     - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
-      storage options refresh
+      storage options refresh (unless `ignore_namespace_table_storage_options=True`)
     - Initial storage options from describe_table() will be merged with
-      any provided `storage_options`
+      any provided `storage_options` (unless
+      `ignore_namespace_table_storage_options=True`)
     """
     # Validate that user provides either uri OR (namespace + table_id), not both
     has_uri = uri is not None
@@ -5231,23 +5500,64 @@ def write_dataset(
                 "Both 'namespace' and 'table_id' must be provided together."
             )
 
-        request = DescribeTableRequest(id=table_id, version=None)
-        response = namespace.describe_table(request)
+        # Implement write_into_namespace logic in Python
+        # This follows the same pattern as the Rust implementation:
+        # - CREATE mode: calls namespace.create_empty_table()
+        # - APPEND/OVERWRITE mode: calls namespace.describe_table()
+        # - Both modes: create storage options provider and merge storage options
+
+        from .namespace import (
+            CreateEmptyTableRequest,
+            DescribeTableRequest,
+            LanceNamespaceStorageOptionsProvider,
+        )
+
+        # Determine which namespace method to call based on mode
+        if mode == "create":
+            request = CreateEmptyTableRequest(
+                id=table_id, location=None, properties=None
+            )
+            response = namespace.create_empty_table(request)
+        elif mode in ("append", "overwrite"):
+            request = DescribeTableRequest(id=table_id, version=None)
+            response = namespace.describe_table(request)
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+        # Get table location from response
         uri = response.location
         if not uri:
-            raise ValueError("Namespace did not return a table location")
+            raise ValueError(
+                f"Namespace did not return a table location in {mode} response"
+            )
 
-        namespace_storage_options = response.storage_options
+        # Check if we should ignore namespace storage options
+        if ignore_namespace_table_storage_options:
+            namespace_storage_options = None
+        else:
+            namespace_storage_options = response.storage_options
+
+        # Set up storage options and provider
         if namespace_storage_options:
-            # TODO: support dynamic storage options provider
+            # Create the storage options provider for automatic refresh
+            storage_options_provider = LanceNamespaceStorageOptionsProvider(
+                namespace=namespace, table_id=table_id
+            )
+
+            # Merge namespace storage options with any existing options
+            # Namespace options take precedence (same as Rust implementation)
             if storage_options is None:
-                storage_options = namespace_storage_options
+                storage_options = dict(namespace_storage_options)
             else:
                 merged_options = dict(storage_options)
                 merged_options.update(namespace_storage_options)
                 storage_options = merged_options
+        else:
+            storage_options_provider = None
     elif table_id is not None:
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+    else:
+        storage_options_provider = None
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -5258,15 +5568,6 @@ def write_dataset(
             data_storage_version = "legacy"
         else:
             data_storage_version = "stable"
-
-    if _check_for_hugging_face(data_obj):
-        # Huggingface datasets
-        from .dependencies import datasets
-
-        if isinstance(data_obj, datasets.Dataset):
-            if schema is None:
-                schema = data_obj.features.arrow_schema
-            data_obj = data_obj.data.to_batches()
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
@@ -5292,6 +5593,16 @@ def write_dataset(
         "initial_bases": initial_bases,
         "target_bases": target_bases,
     }
+
+    # Add storage_options_provider if created from namespace
+    if storage_options_provider is not None:
+        params["storage_options_provider"] = storage_options_provider
+
+    # Add s3_credentials_refresh_offset_seconds if specified
+    if s3_credentials_refresh_offset_seconds is not None:
+        params["s3_credentials_refresh_offset_seconds"] = (
+            s3_credentials_refresh_offset_seconds
+        )
 
     if commit_lock:
         if not callable(commit_lock):

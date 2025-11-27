@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -30,6 +30,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
@@ -40,6 +41,15 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         }
         output.push_str(url.path());
         Ok(Path::from(output))
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        _scheme: &str,
+        _authority: &str,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok("memory".to_string())
     }
 }
 
@@ -55,5 +65,16 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = MemoryStoreProvider;
+        assert_eq!(
+            "memory",
+            provider
+                .calculate_object_store_prefix("memory", "etc", None)
+                .unwrap()
+        );
     }
 }

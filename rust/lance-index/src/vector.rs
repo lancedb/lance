@@ -86,7 +86,10 @@ pub struct Query {
     pub upper_bound: Option<f32>,
 
     /// The minimum number of probes to load and search.  More partitions
-    /// will only be loaded if we have not found k results.
+    /// will only be loaded if we have not found k results, or the the algorithm
+    /// determines more partitions are needed to satisfy recall requirements.
+    ///
+    /// The planner will always search at least this many partitions. Defaults to 1.
     pub minimum_nprobes: usize,
 
     /// The maximum number of probes to load and search.  If not set then
@@ -254,6 +257,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
+    fn partition_size(&self, part_id: usize) -> usize;
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);

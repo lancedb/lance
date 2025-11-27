@@ -472,7 +472,12 @@ impl VectorIndex for PQIndex {
     fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
+
     fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for IVF")
+    }
+
+    fn partition_size(&self, _: usize) -> usize {
         unimplemented!("only for IVF")
     }
 
@@ -503,6 +508,8 @@ pub async fn build_pq_model(
     params: &PQBuildParams,
     ivf: Option<&IvfModel>,
 ) -> Result<ProductQuantizer> {
+    let num_codes = 2_usize.pow(params.num_bits as u32);
+
     if let Some(codebook) = &params.codebook {
         let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
@@ -572,13 +579,16 @@ pub async fn build_pq_model(
         training_data
     };
 
-    let num_codes = 2_usize.pow(params.num_bits as u32);
     if training_data.len() < num_codes {
-        return Err(Error::Index {
+        warn!(
+            "Skip PQ training: only {} rows available, needs >= {}",
+            training_data.len(),
+            num_codes
+        );
+        return Err(Error::Unprocessable {
             message: format!(
-                "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
-                num_codes,
-                training_data.len()
+                "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
+                available = training_data.len()
             ),
             location: location!(),
         });
@@ -632,7 +642,9 @@ mod tests {
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowIdMask;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_testing::datagen::generate_random_array_with_range;
+    use lance_testing::datagen::{
+        generate_random_array_with_range, generate_random_array_with_seed,
+    };
 
     const DIM: usize = 128;
     async fn generate_dataset(
@@ -754,6 +766,35 @@ mod tests {
             "distances: {:?}",
             distances
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_model_insufficient_rows_returns_prereq() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = 16;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        )]));
+
+        let vectors = generate_random_array_with_seed::<Float32Type>(dim * 10, [11u8; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let params = PQBuildParams::new(16, 8);
+        let err = build_pq_model(&dataset, "vector", dim, MetricType::L2, &params, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Unprocessable { .. }));
     }
 
     struct TestPreFilter {
