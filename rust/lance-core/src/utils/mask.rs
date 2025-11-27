@@ -433,7 +433,7 @@ impl RowIdTreeMap {
     pub fn len(&self) -> Option<u64> {
         self.inner
             .values()
-            .map(|row_id_selection| match row_id_selection {
+            .map(|row_addr_selection| match row_addr_selection {
                 RowAddrSelection::Full => None,
                 RowAddrSelection::Partial(indices) => Some(indices.len()),
             })
@@ -448,7 +448,7 @@ impl RowIdTreeMap {
         let inner_iters = self
             .inner
             .iter()
-            .filter_map(|(frag_id, row_id_selection)| match row_id_selection {
+            .filter_map(|(frag_id, row_addr_selection)| match row_addr_selection {
                 RowAddrSelection::Full => None,
                 RowAddrSelection::Partial(bitmap) => Some(
                     bitmap
