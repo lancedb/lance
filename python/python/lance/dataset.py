@@ -3586,6 +3586,88 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def delta(
+        self,
+        compared_against: Optional[int] = None,
+        *,
+        begin_version: Optional[int] = None,
+        end_version: Optional[int] = None,
+    ) -> "DatasetDelta":
+        """
+        Compare changes between two versions of this dataset.
+
+        You must specify either ``compared_against`` (shorthand for comparing the
+        current version against a specific older version) or both ``begin_version``
+        and ``end_version`` for an explicit range.
+
+        Parameters
+        ----------
+        compared_against : int, optional
+            The version to compare the current dataset version against.
+            This is a shorthand for setting ``begin_version=compared_against``
+            and ``end_version=self.version``.
+        begin_version : int, optional
+            The start version (exclusive) for the comparison range.
+            Must be used together with ``end_version``.
+        end_version : int, optional
+            The end version (inclusive) for the comparison range.
+            Must be used together with ``begin_version``.
+
+        Returns
+        -------
+        DatasetDelta
+            An object that can list transactions or stream inserted/updated rows.
+
+        Raises
+        ------
+        ValueError
+            If both ``compared_against`` and version range are specified,
+            or if neither is specified.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            import lance
+            import pyarrow as pa
+
+            # Write initial data (v1)
+            ds = lance.write_dataset(
+                pa.table({"id": [1, 2], "val": ["a", "b"]}),
+                "memory://delta_demo"
+            )
+
+            # Append some data to create v2
+            ds_append = lance.write_dataset(
+                pa.table({"id": [3], "val": ["c"]}),
+                "memory://delta_demo",
+                mode="append"
+            )
+
+            # Compute inserted rows from v1 -> v2 (shorthand)
+            delta = ds_append.delta(compared_against=1)
+            reader = delta.get_inserted_rows()
+            for batch in reader:
+                print(batch)
+
+            # Or using explicit version range
+            delta = ds_append.delta(begin_version=1, end_version=2)
+        """
+        has_compared_against = compared_against is not None
+
+        builder = _DatasetDeltaBuilder(self._ds.delta())
+
+        if has_compared_against:
+            builder = builder.compared_against_version(compared_against)
+        else:
+            if begin_version:
+                builder = builder.with_begin_version(begin_version)
+
+            if end_version:
+                builder = builder.with_end_version(end_version)
+
+        return builder.build()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3748,6 +3830,61 @@ class SqlQueryBuilder:
             An executable query object.
         """
         return SqlQuery(self._builder.build())
+
+
+class DatasetDelta:
+    """
+    A view of differences between two versions.
+
+    Created by :meth:`LanceDataset.delta`.
+    Provides convenient methods to stream inserted/updated rows or list transactions.
+    """
+
+    def __init__(self, delta):
+        self._delta = delta
+
+    def list_transactions(self) -> List[Transaction]:
+        """
+        List transactions in the range from begin_version + 1 to end_version.
+        """
+        return self._delta.list_transactions()
+
+    def get_inserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted rows.
+        """
+        return self._delta.get_inserted_rows()
+
+    def get_updated_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for updated rows.
+        """
+        return self._delta.get_updated_rows()
+
+
+class _DatasetDeltaBuilder:
+    """Internal builder for :class:`DatasetDelta`.
+
+    This class is not part of the public API. Use :meth:`LanceDataset.delta` instead.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def compared_against_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.compared_against_version(version)
+        return self
+
+    def with_begin_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_begin_version(version)
+        return self
+
+    def with_end_version(self, version: int) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_end_version(version)
+        return self
+
+    def build(self) -> DatasetDelta:
+        return DatasetDelta(self._builder.build())
 
 
 class BulkCommitResult(TypedDict):

@@ -27,6 +27,7 @@ jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
 lance-datagen.workspace = true
+lance-geo = {workspace = true}
 chrono.workspace = true
 log.workspace = true
 pin-project.workspace = true
