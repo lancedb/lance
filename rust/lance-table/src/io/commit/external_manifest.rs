@@ -196,11 +196,18 @@ impl ExternalManifestCommitHandler {
             e_tag,
         };
 
-        if !copied {
+        // step 2: delete the staging manifest
+        if copied {
+            match store.delete(staging_manifest_path).await {
+                Ok(_) => {}
+                Err(ObjectStoreError::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        } else {
             return Ok(location);
         }
 
-        // step 2: flip the external store to point to the final location
+        // step 3: flip the external store to point to the final location
         self.external_manifest_store
             .put_if_exists(
                 base_path.as_ref(),
@@ -210,13 +217,6 @@ impl ExternalManifestCommitHandler {
                 location.e_tag.clone(),
             )
             .await?;
-
-        // step 3: delete the staging manifest
-        match store.delete(staging_manifest_path).await {
-            Ok(_) => {}
-            Err(ObjectStoreError::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
-        }
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_manifest_path.as_ref());
 
         Ok(location)
