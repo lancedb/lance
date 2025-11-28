@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeMergeInsert<'a>(
+pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,    // Dataset object
     jparam: JObject,      // MergeInsertParams object
@@ -228,11 +228,11 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
     Ok(skip_auto_cleanup)
 }
 
-const MERGE_STATS_CLASS: &str = "com/lancedb/lance/merge/MergeInsertStats";
+const MERGE_STATS_CLASS: &str = "org/lance/merge/MergeInsertStats";
 const MERGE_STATS_CONSTRUCTOR_SIG: &str = "(JJJIJJ)V";
-const MERGE_RESULT_CLASS: &str = "com/lancedb/lance/merge/MergeInsertResult";
+const MERGE_RESULT_CLASS: &str = "org/lance/merge/MergeInsertResult";
 const MERGE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lcom/lancedb/lance/Dataset;Lcom/lancedb/lance/merge/MergeInsertStats;)V";
+    "(Lorg/lance/Dataset;Lorg/lance/merge/MergeInsertStats;)V";
 
 impl IntoJava for MergeStats {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {

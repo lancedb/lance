@@ -4,10 +4,10 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>1.0.0-beta.10</version>
+    <version>1.0.0-beta.13</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -40,7 +40,7 @@
         <spotless.delimiter>package</spotless.delimiter>
         <rust.release.build>false</rust.release.build>
         <skip.build.jni>false</skip.build.jni>
-        <shade.base>com.lancedb.lance.shaded</shade.base>
+        <shade.base>org.lance.shaded</shade.base>
         <spotless.license.header>
         /*
         * Licensed under the Apache License, Version 2.0 (the "License");
@@ -106,9 +106,9 @@
             <version>33.3.1-jre</version>
         </dependency>
         <dependency>
-            <groupId>com.lancedb</groupId>
-            <artifactId>lance-namespace-core</artifactId>
-            <version>0.0.20</version>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-namespace-apache-client</artifactId>
+            <version>0.1.0</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -317,7 +317,7 @@
                             </googleJavaFormat>
 
                             <importOrder>
-                                <order>com.lancedb.lance,,javax,java,\#</order>
+                                <order>org.lance,,javax,java,\#</order>
                             </importOrder>
 
                             <removeUnusedImports />

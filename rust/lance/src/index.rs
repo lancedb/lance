@@ -2491,8 +2491,8 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await;
 
-        assert!(matches!(result, Err(Error::Index { .. })));
-        if let Error::Index { message, .. } = result.unwrap_err() {
+        assert!(matches!(result, Err(Error::Unprocessable { .. })));
+        if let Error::Unprocessable { message, .. } = result.unwrap_err() {
             assert_eq!(
                 message,
                 "Not enough rows to train PQ. Requires 256 rows but only 100 available",

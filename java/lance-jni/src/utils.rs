@@ -234,7 +234,7 @@ pub fn get_vector_index_params(
             .call_method(
                 &vector_index_params_obj,
                 "getIvfParams",
-                "()Lcom/lancedb/lance/index/vector/IvfBuildParams;",
+                "()Lorg/lance/index/vector/IvfBuildParams;",
                 &[],
             )?
             .l()?;

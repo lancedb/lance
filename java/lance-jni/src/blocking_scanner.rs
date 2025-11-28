@@ -55,7 +55,7 @@ impl BlockingScanner {
 // Write Methods //
 ///////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'local>(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject,
     jdataset: JObject,
@@ -240,7 +240,7 @@ fn inner_create_scanner<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_releaseNativeScanner(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_releaseNativeScanner(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) {
@@ -277,7 +277,7 @@ fn attach_native_scanner<'local>(
 }
 
 fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let res = env.new_object("com/lancedb/lance/ipc/LanceScanner", "()V", &[])?;
+    let res = env.new_object("org/lance/ipc/LanceScanner", "()V", &[])?;
     Ok(res)
 }
 
@@ -285,7 +285,7 @@ fn create_java_scanner_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
 // Read Methods //
 //////////////////
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_openStream(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
     mut env: JNIEnv,
     j_scanner: JObject,
     stream_addr: jlong,
@@ -305,7 +305,7 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_importFfiSchema(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_importFfiSchema(
     mut env: JNIEnv,
     j_scanner: JObject,
     schema_addr: jlong,
@@ -328,7 +328,7 @@ fn inner_import_ffi_schema(env: &mut JNIEnv, j_scanner: JObject, schema_addr: jl
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_nativeCountRows(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeCountRows(
     mut env: JNIEnv,
     j_scanner: JObject,
 ) -> jlong {

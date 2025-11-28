@@ -26,6 +26,8 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
+    // GEO functions
+    lance_geo::register_functions(ctx);
 }
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by

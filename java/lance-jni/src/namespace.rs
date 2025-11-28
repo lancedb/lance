@@ -33,7 +33,7 @@ pub struct BlockingRestNamespace {
 // ============================================================================
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_createNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createNative(
     mut env: JNIEnv,
     _obj: JObject,
     properties_map: JObject,
@@ -65,7 +65,7 @@ fn create_directory_namespace_internal(env: &mut JNIEnv, properties_map: JObject
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_releaseNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_releaseNative(
     _env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -78,7 +78,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_relea
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_namespaceIdNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_namespaceIdNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -94,7 +94,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_names
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listNamespacesNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listNamespacesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -111,7 +111,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listN
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_describeNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -128,7 +128,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_descr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_createNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -145,7 +145,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_creat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_dropNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_dropNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -162,7 +162,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_dropN
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_namespaceExistsNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_namespaceExistsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -177,7 +177,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_names
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listTablesNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTablesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -194,7 +194,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listT
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_describeTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -211,7 +211,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_descr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_registerTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_registerTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -228,7 +228,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_regis
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_tableExistsNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_tableExistsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -243,7 +243,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_table
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_dropTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_dropTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -260,7 +260,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_dropT
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_deregisterTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_deregisterTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -277,7 +277,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_dereg
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_countTableRowsNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_countTableRowsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -291,7 +291,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_count
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_createTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -313,7 +313,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_creat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_createEmptyTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createEmptyTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -330,7 +330,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_creat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_insertIntoTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_insertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -352,7 +352,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_inser
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_mergeInsertIntoTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_mergeInsertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -374,7 +374,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_merge
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_updateTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_updateTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -391,7 +391,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_updat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_deleteFromTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_deleteFromTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -408,7 +408,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_delet
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_queryTableNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_queryTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -423,7 +423,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_query
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_createTableIndexNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableIndexNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -440,7 +440,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_creat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listTableIndicesNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableIndicesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -457,7 +457,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_listT
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_describeTableIndexStatsNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTableIndexStatsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -474,7 +474,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_descr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_describeTransactionNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTransactionNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -491,7 +491,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_descr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_alterTransactionNative(
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTransactionNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -512,7 +512,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_DirectoryNamespace_alter
 // ============================================================================
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createNative(
     mut env: JNIEnv,
     _obj: JObject,
     properties_map: JObject,
@@ -542,7 +542,7 @@ fn create_rest_namespace_internal(env: &mut JNIEnv, properties_map: JObject) -> 
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_releaseNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_releaseNative(
     _env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -555,7 +555,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_releaseNat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_namespaceIdNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_namespaceIdNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -571,7 +571,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_namespaceI
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listNamespacesNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listNamespacesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -588,7 +588,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listNamesp
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -605,7 +605,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeNa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -622,7 +622,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createName
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_dropNamespaceNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_dropNamespaceNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -639,7 +639,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_dropNamesp
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_namespaceExistsNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_namespaceExistsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -654,7 +654,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_namespaceE
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listTablesNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTablesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -671,7 +671,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listTables
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -688,7 +688,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_registerTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_registerTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -705,7 +705,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_registerTa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_tableExistsNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_tableExistsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -720,7 +720,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_tableExist
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_dropTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_dropTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -737,7 +737,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_dropTableN
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_deregisterTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_deregisterTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -754,7 +754,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_deregister
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_countTableRowsNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_countTableRowsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -768,7 +768,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_countTable
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -790,7 +790,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createTabl
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createEmptyTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createEmptyTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -807,7 +807,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createEmpt
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_insertIntoTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_insertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -829,7 +829,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_insertInto
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_mergeInsertIntoTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_mergeInsertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -851,7 +851,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_mergeInser
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_updateTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_updateTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -868,7 +868,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_updateTabl
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_deleteFromTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_deleteFromTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -885,7 +885,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_deleteFrom
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_queryTableNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_queryTableNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -900,7 +900,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_queryTable
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createTableIndexNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableIndexNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -917,7 +917,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_createTabl
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listTableIndicesNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTableIndicesNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -934,7 +934,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_listTableI
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTableIndexStatsNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableIndexStatsNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -951,7 +951,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTransactionNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTransactionNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -968,7 +968,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_describeTr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestNamespace_alterTransactionNative(
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTransactionNative(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -1229,7 +1229,7 @@ pub struct BlockingRestAdapter {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestAdapter_createNative(
+pub extern "system" fn Java_org_lance_namespace_RestAdapter_createNative(
     mut env: JNIEnv,
     _obj: JObject,
     namespace_impl: JString,
@@ -1287,7 +1287,7 @@ fn create_rest_adapter_internal(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestAdapter_serve(
+pub extern "system" fn Java_org_lance_namespace_RestAdapter_serve(
     mut env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -1314,7 +1314,7 @@ fn serve_internal(handle: jlong) -> Result<()> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestAdapter_stop(
+pub extern "system" fn Java_org_lance_namespace_RestAdapter_stop(
     _env: JNIEnv,
     _obj: JObject,
     handle: jlong,
@@ -1327,7 +1327,7 @@ pub extern "system" fn Java_com_lancedb_lance_namespace_RestAdapter_stop(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_namespace_RestAdapter_releaseNative(
+pub extern "system" fn Java_org_lance_namespace_RestAdapter_releaseNative(
     _env: JNIEnv,
     _obj: JObject,
     handle: jlong,

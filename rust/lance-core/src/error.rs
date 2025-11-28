@@ -63,6 +63,8 @@ pub enum Error {
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
+    #[snafu(display("Unprocessable: {message}, {location}"))]
+    Unprocessable { message: String, location: Location },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
     Arrow { message: String, location: Location },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]

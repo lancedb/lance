@@ -1,0 +1,22 @@
+[package]
+name = "lance-geo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Lance's geospatial extension providing geospatial UDFs."
+
+[dependencies]
+datafusion.workspace = true
+geoarrow-array.workspace = true
+geoarrow-schema.workspace = true
+geodatafusion.workspace = true
+geo-types.workspace = true
+
+[lints]
+workspace = true

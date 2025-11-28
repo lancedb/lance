@@ -19,7 +19,7 @@ from typing import Dict
 import lance
 import pyarrow as pa
 import pytest
-from lance_namespace import (
+from lance.namespace import (
     CreateEmptyTableRequest,
     CreateEmptyTableResponse,
     DescribeTableRequest,
@@ -433,8 +433,6 @@ def test_namespace_distributed_write(s3_bucket: str):
 
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
-
-    from lance_namespace import CreateEmptyTableRequest
 
     request = CreateEmptyTableRequest(id=table_id, location=None, properties=None)
     response = namespace.create_empty_table(request)

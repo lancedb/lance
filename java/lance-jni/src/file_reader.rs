@@ -88,12 +88,12 @@ fn attach_native_reader<'local>(
 }
 
 fn create_java_reader_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let res = env.new_object("com/lancedb/lance/file/LanceFileReader", "()V", &[])?;
+    let res = env.new_object("org/lance/file/LanceFileReader", "()V", &[])?;
     Ok(res)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_openNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileReader_openNative<'local>(
     mut env: JNIEnv<'local>,
     _reader_class: JObject,
     file_uri: JString,
@@ -143,7 +143,7 @@ fn inner_open<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_closeNative<'local>(
+pub extern "system" fn Java_org_lance_file_LanceFileReader_closeNative<'local>(
     mut env: JNIEnv<'local>,
     reader: JObject,
 ) -> JObject<'local> {
@@ -159,7 +159,7 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_closeNative<'
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_numRowsNative(
+pub extern "system" fn Java_org_lance_file_LanceFileReader_numRowsNative(
     mut env: JNIEnv<'_>,
     reader: JObject,
 ) -> jlong {
@@ -191,7 +191,7 @@ fn inner_num_rows(env: &mut JNIEnv<'_>, reader: JObject) -> Result<jlong> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_populateSchemaNative(
+pub extern "system" fn Java_org_lance_file_LanceFileReader_populateSchemaNative(
     mut env: JNIEnv,
     reader: JObject,
     schema_addr: jlong,
@@ -209,7 +209,7 @@ fn inner_populate_schema(env: &mut JNIEnv, reader: JObject, schema_addr: jlong) 
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative(
+pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
     mut env: JNIEnv<'_>,
     reader: JObject,
     batch_size: jint,
