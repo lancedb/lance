@@ -49,6 +49,7 @@ jobs:
           # TODO: a few benchmarks are failing. Re-enable everything once they are fixed.
           cargo bench --bench sq --bench hnsw --bench inverted --bench pq_dist_table --bench pq_assignment -- --output-format bencher | tee -a ../../output.txt
       - name: Store benchmark result
+        if: github.event_name != 'pull_request'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Lance Rust Benchmarks

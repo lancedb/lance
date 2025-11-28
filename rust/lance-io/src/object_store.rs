@@ -343,6 +343,47 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     })
 }
 
+#[cfg(feature = "huggingface")]
+fn parse_hf_repo_id(url: &Url) -> Result<String> {
+    // Accept forms with repo type prefix (models/datasets/spaces) or legacy without.
+    let mut segments: Vec<String> = Vec::new();
+    if let Some(host) = url.host_str() {
+        segments.push(host.to_string());
+    }
+    segments.extend(
+        url.path()
+            .trim_start_matches('/')
+            .split('/')
+            .map(|s| s.to_string()),
+    );
+
+    if segments.len() < 2 {
+        return Err(Error::invalid_input(
+            "Huggingface URL must contain at least owner and repo",
+            location!(),
+        ));
+    }
+
+    let repo_type_candidates = ["models", "datasets", "spaces"];
+    let (owner, repo_with_rev) = if repo_type_candidates.contains(&segments[0].as_str()) {
+        if segments.len() < 3 {
+            return Err(Error::invalid_input(
+                "Huggingface URL missing owner/repo after repo type",
+                location!(),
+            ));
+        }
+        (segments[1].as_str(), segments[2].as_str())
+    } else {
+        (segments[0].as_str(), segments[1].as_str())
+    };
+
+    let repo = repo_with_rev
+        .split_once('@')
+        .map(|(r, _)| r)
+        .unwrap_or(repo_with_rev);
+    Ok(format!("{owner}/{repo}"))
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
@@ -393,6 +434,7 @@ impl ObjectStore {
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
+
         let store = registry.get_store(url.clone(), params).await?;
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
