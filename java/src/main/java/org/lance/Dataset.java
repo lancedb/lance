@@ -1372,8 +1372,8 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Compute the delta between versions.
-   **
+   * Compute the delta between versions. *
+   *
    * <ul>
    *   <li>Either {@code comparedAgainst} is non-null: compare current version against this version.
    *   <li>Or both {@code beginVersion} (exclusive) and {@code endVersion} (inclusive) are non-null
