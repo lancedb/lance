@@ -146,4 +146,4 @@ def test_binary_vectors_invalid_metric(tmp_path):
                 "k": 1,
                 "metric": "l2",
             }
-        )
+        ).to_table()
