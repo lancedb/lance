@@ -9,7 +9,7 @@ use std::{
 };
 use std::{collections::HashMap, ops::Range};
 
-use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
@@ -255,13 +255,24 @@ impl InvertedIndex {
                 let mask = mask.clone();
                 let metrics = metrics.clone();
                 async move {
-                    part.bm25_search(
-                        tokens.as_ref(),
-                        params.as_ref(),
-                        operator,
-                        mask,
-                        metrics.as_ref(),
-                    )
+                    let postings = part
+                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                        .await?;
+                    if postings.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let params = params.clone();
+                    let mask = mask.clone();
+                    let metrics = metrics.clone();
+                    spawn_cpu(move || {
+                        part.bm25_search(
+                            params.as_ref(),
+                            operator,
+                            mask,
+                            postings,
+                            metrics.as_ref(),
+                        )
+                    })
                     .await
                 }
             })
@@ -624,24 +635,6 @@ pub struct InvertedPartition {
     token_set_format: TokenSetFormat,
 }
 
-#[derive(Copy, Clone)]
-struct PartitionPtr(*const InvertedPartition);
-
-unsafe impl Send for PartitionPtr {}
-unsafe impl Sync for PartitionPtr {}
-
-impl PartitionPtr {
-    fn new(partition: &InvertedPartition) -> Self {
-        Self(partition as *const InvertedPartition)
-    }
-
-    /// # Safety
-    /// Caller must guarantee the referenced partition lives at least as long as the returned borrow.
-    unsafe fn deref(&self) -> &InvertedPartition {
-        &*self.0
-    }
-}
-
 impl InvertedPartition {
     /// Check if this partition belongs to the specified fragment.
     ///
@@ -738,14 +731,12 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    pub async fn bm25_search(
+    pub async fn load_posting_lists(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
-        operator: Operator,
-        mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<PostingIterator>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
@@ -772,7 +763,7 @@ impl InvertedPartition {
         }
 
         let num_docs = self.docs.len();
-        let postings = stream::iter(token_ids)
+        stream::iter(token_ids)
             .enumerate()
             .map(|(position, (token_id, token))| async move {
                 let posting = self
@@ -790,21 +781,28 @@ impl InvertedPartition {
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
-            .await?;
-        let params = params.clone();
-        let partition_ptr = PartitionPtr::new(self);
-        let (candidates, local_metrics) = spawn_cpu(move || {
-            let local_metrics = LocalMetricsCollector::default();
-            // SAFETY: `partition_ptr` points to `self`, which outlives this task because we await it.
-            let partition = unsafe { partition_ptr.deref() };
-            let scorer = IndexBM25Scorer::new(std::iter::once(partition));
-            let mut wand = Wand::new(operator, postings.into_iter(), &partition.docs, scorer);
-            let hits = wand.search(&params, mask, &local_metrics)?;
-            Result::Ok((hits, local_metrics))
-        })
-        .await?;
-        local_metrics.dump_into(metrics);
-        Ok(candidates)
+            .await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn bm25_search(
+        &self,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowIdMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // let local_metrics = LocalMetricsCollector::default();
+        let scorer = IndexBM25Scorer::new(std::iter::once(self));
+        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
+        let hits = wand.search(params, mask, metrics)?;
+        // local_metrics.dump_into(metrics);
+        Ok(hits)
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
