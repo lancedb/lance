@@ -32,7 +32,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "gzip",
     "http2",
     "stream",
-    "rustls-tls-native-roots"
+    "rustls-tls-native-roots",
 ] }
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
