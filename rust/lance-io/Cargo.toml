@@ -70,6 +70,7 @@ aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:op
 azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "dep:object_store_opendal"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
+hdfs = ["dep:opendal", "opendal/services-hdfs-native", "dep:object_store_opendal" ]
 test-util = []
 
 [lints]
