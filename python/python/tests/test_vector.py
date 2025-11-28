@@ -137,7 +137,7 @@ def test_binary_vectors_default_hamming(tmp_path):
 def test_binary_vectors_invalid_metric(tmp_path):
     dataset = lance.write_dataset(_binary_vectors_table(), tmp_path / "bin")
     with pytest.raises(
-        ValueError, match="Distance type l2 does not support .*uint8.*vectors"
+        ValueError, match="Distance type l2 does not support .*UInt8 vectors"
     ):
         dataset.scanner(
             nearest={
