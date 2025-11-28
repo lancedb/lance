@@ -15,11 +15,18 @@ package org.lance;
 
 import org.lance.delta.DatasetDelta;
 
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -47,13 +54,10 @@ public class DeltaTest {
                   Field.nullable(
                       "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
 
-      org.apache.arrow.vector.VectorSchemaRoot root =
-          org.apache.arrow.vector.VectorSchemaRoot.create(schema, allocator);
+      VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
       root.allocateNew();
-      org.apache.arrow.vector.IntVector idVec =
-          (org.apache.arrow.vector.IntVector) root.getVector("id");
-      org.apache.arrow.vector.VarCharVector valVec =
-          (org.apache.arrow.vector.VarCharVector) root.getVector("val");
+      IntVector idVec = (IntVector) root.getVector("id");
+      VarCharVector valVec = (VarCharVector) root.getVector("val");
       idVec.setSafe(0, 1);
       idVec.setSafe(1, 2);
       valVec.setSafe(0, "a".getBytes());
@@ -62,8 +66,7 @@ public class DeltaTest {
       byte[] batch1;
       // Create an output stream explicitly and pass it to ArrowStreamWriter
       ByteArrayOutputStream out = new ByteArrayOutputStream();
-      try (org.apache.arrow.vector.ipc.ArrowStreamWriter writer =
-          new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, out)) {
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
         writer.start();
         writer.writeBatch();
         writer.end();
@@ -71,10 +74,8 @@ public class DeltaTest {
       batch1 = out.toByteArray();
       root.close();
 
-      try (org.apache.arrow.vector.ipc.ArrowStreamReader reader1 =
-              new org.apache.arrow.vector.ipc.ArrowStreamReader(
-                  new org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel(batch1),
-                  allocator);
+      try (ArrowStreamReader reader1 =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch1), allocator);
           org.apache.arrow.c.ArrowArrayStream stream1 =
               org.apache.arrow.c.ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader1, stream1);
@@ -82,20 +83,16 @@ public class DeltaTest {
             Dataset.write().stream(stream1).uri(uri).mode(WriteParams.WriteMode.CREATE).execute();
 
         // Append one row (v2)
-        org.apache.arrow.vector.VectorSchemaRoot root2 =
-            org.apache.arrow.vector.VectorSchemaRoot.create(schema, allocator);
+        VectorSchemaRoot root2 = VectorSchemaRoot.create(schema, allocator);
         root2.allocateNew();
-        org.apache.arrow.vector.IntVector idVec2 =
-            (org.apache.arrow.vector.IntVector) root2.getVector("id");
-        org.apache.arrow.vector.VarCharVector valVec2 =
-            (org.apache.arrow.vector.VarCharVector) root2.getVector("val");
+        IntVector idVec2 = (IntVector) root2.getVector("id");
+        VarCharVector valVec2 = (VarCharVector) root2.getVector("val");
         idVec2.setSafe(0, 3);
         valVec2.setSafe(0, "c".getBytes());
         root2.setRowCount(1);
         byte[] batch2;
         ByteArrayOutputStream out2 = new ByteArrayOutputStream();
-        try (org.apache.arrow.vector.ipc.ArrowStreamWriter writer2 =
-            new org.apache.arrow.vector.ipc.ArrowStreamWriter(root2, null, out2)) {
+        try (ArrowStreamWriter writer2 = new ArrowStreamWriter(root2, null, out2)) {
           writer2.start();
           writer2.writeBatch();
           writer2.end();
@@ -103,12 +100,9 @@ public class DeltaTest {
         batch2 = out2.toByteArray();
         root2.close();
 
-        try (org.apache.arrow.vector.ipc.ArrowStreamReader reader2 =
-                new org.apache.arrow.vector.ipc.ArrowStreamReader(
-                    new org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel(batch2),
-                    allocator);
-            org.apache.arrow.c.ArrowArrayStream stream2 =
-                org.apache.arrow.c.ArrowArrayStream.allocateNew(allocator)) {
+        try (ArrowStreamReader reader2 =
+                new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch2), allocator);
+            ArrowArrayStream stream2 = ArrowArrayStream.allocateNew(allocator)) {
           Data.exportArrayStream(allocator, reader2, stream2);
           Dataset ds2 =
               Dataset.write().stream(stream2).uri(uri).mode(WriteParams.WriteMode.APPEND).execute();
