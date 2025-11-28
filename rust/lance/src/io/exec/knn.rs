@@ -55,7 +55,7 @@ use tokio::sync::Notify;
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::utils::get_vector_type;
+use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -146,7 +146,8 @@ impl KNNVectorDistanceExec {
         distance_type: DistanceType,
     ) -> Result<Self> {
         let mut output_schema = input.schema().as_ref().clone();
-        get_vector_type(&(&output_schema).try_into()?, column)?;
+        let (_, element_type) = get_vector_type(&(&output_schema).try_into()?, column)?;
+        validate_distance_type_for(distance_type, &element_type)?;
 
         // FlatExec appends a distance column to the input schema. The input
         // may already have a distance column (possibly in the wrong position), so
