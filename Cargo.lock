@@ -3215,7 +3215,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4344,9 +4344,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.82"
+version = "0.3.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b011eec8cc36da2aab2d5cff675ec18454fad408585853910a202391cf9f8e65"
+checksum = "464a3709c7f55f1f721e5389aa6ea4e3bc6aba669353300af094b29ffbdde1d8"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
@@ -4398,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4506,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrayref",
  "paste",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4603,7 +4603,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4650,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4718,7 +4718,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "datafusion",
  "geo-types",
@@ -4729,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "approx",
  "arrow",
@@ -4802,7 +4802,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4848,7 +4848,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4869,7 +4869,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4883,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4928,7 +4928,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4974,7 +4974,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4983,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 dependencies = [
  "clap",
  "lance-core",
@@ -5882,12 +5882,13 @@ dependencies = [
 
 [[package]]
 name = "object_store_opendal"
-version = "0.54.1"
+version = "0.55.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0b88fc0e0c4890c1d99e2b8c519c5db40f7d9b69a0f562ff1ad4967a4c8bbc6"
+checksum = "113ab0769e972eee585e57407b98de08bda5354fa28e8ba4d89038d6cb6a8991"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "object_store",
  "opendal",
@@ -5943,20 +5944,20 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendal"
-version = "0.54.1"
+version = "0.55.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42afda58fa2cf50914402d132cc1caacff116a85d10c72ab2082bb7c50021754"
+checksum = "d075ab8a203a6ab4bc1bce0a4b9fe486a72bf8b939037f4b78d95386384bc80a"
 dependencies = [
  "anyhow",
  "backon",
  "base64 0.22.1",
  "bytes",
- "chrono",
  "crc32c",
  "futures",
  "getrandom 0.2.16",
  "http 1.4.0",
  "http-body 1.0.1",
+ "jiff",
  "log",
  "md-5",
  "percent-encoding",
@@ -5967,6 +5968,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -8355,9 +8357,9 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-log"
-version = "0.2.18"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e33b98a582ea0be1168eba097538ee8dd4bbe0f2b01b22ac92ea30054e5be7b"
+checksum = "37d53ac171c92a39e4769491c4b4dde7022c60042254b5fc044ae409d34a24d4"
 dependencies = [
  "env_logger",
  "test-log-macros",
@@ -8366,9 +8368,9 @@ dependencies = [
 
 [[package]]
 name = "test-log-macros"
-version = "0.2.18"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "451b374529930d7601b1eef8d32bc79ae870b6079b069401709c2a8bf9e75f36"
+checksum = "be35209fd0781c5401458ab66e4f98accf63553e8fae7425503e92fdd319783b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9099,9 +9101,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.105"
+version = "0.2.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da95793dfc411fbbd93f5be7715b0578ec61fe87cb1a42b12eb625caa5c5ea60"
+checksum = "0d759f433fa64a2d763d1340820e46e111a7a5ab75f993d1852d70b03dbb80fd"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -9112,9 +9114,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.55"
+version = "0.4.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "551f88106c6d5e7ccc7cd9a16f312dd3b5d36ea8b4954304657d5dfba115d4a0"
+checksum = "836d9622d604feee9e5de25ac10e3ea5f2d65b41eac0d9ce72eb5deae707ce7c"
 dependencies = [
  "cfg-if",
  "js-sys",
@@ -9125,9 +9127,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.105"
+version = "0.2.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04264334509e04a7bf8690f2384ef5265f05143a4bff3889ab7a3269adab59c2"
+checksum = "48cb0d2638f8baedbc542ed444afc0644a29166f1595371af4fecf8ce1e7eeb3"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -9135,9 +9137,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.105"
+version = "0.2.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "420bc339d9f322e562942d52e115d57e950d12d88983a14c79b86859ee6c7ebc"
+checksum = "cefb59d5cd5f92d9dcf80e4683949f15ca4b511f4ac0a6e14d4e1ac60c6ecd40"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -9148,9 +9150,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.105"
+version = "0.2.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76f218a38c84bcb33c25ec7059b07847d465ce0e0a76b995e134a45adcb6af76"
+checksum = "cbc538057e648b67f72a982e708d485b2efa771e1ac05fec311f9f63e5800db4"
 dependencies = [
  "unicode-ident",
 ]
@@ -9170,9 +9172,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.82"
+version = "0.3.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a1f95c0d03a47f4ae1f7a64643a6bb97465d9b740f0fa8f90ea33915c99a9a1"
+checksum = "9b32828d774c412041098d182a8b38b16ea816958e07cf40eec2bc080ae137ac"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
