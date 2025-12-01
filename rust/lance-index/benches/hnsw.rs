@@ -22,10 +22,10 @@ use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
-    const DIMENSION: usize = 512;
-    const TOTAL: usize = 10 * 1024;
+    const DIMENSION: usize = 128;
+    const TOTAL: usize = 100_000;
     const SEED: [u8; 32] = [42; 32];
-    const K: usize = 10;
+    const K: usize = 100;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -34,64 +34,55 @@ fn bench_hnsw(c: &mut Criterion) {
     let vectors = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
 
     let query = fsl.value(0);
-    c.bench_function(
-        format!("create_hnsw({TOTAL}x{DIMENSION},levels=6)").as_str(),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let hnsw =
-                    HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default().max_level(6))
-                        .unwrap();
-                let uids: HashSet<u32> = hnsw
-                    .search_basic(
-                        query.clone(),
-                        K,
-                        &HnswQueryParams {
-                            ef: 300,
-                            lower_bound: None,
-                            upper_bound: None,
-                            dist_q_c: 0.0,
-                        },
-                        None,
-                        vectors.as_ref(),
-                    )
-                    .unwrap()
-                    .iter()
-                    .map(|node| node.id)
-                    .collect();
+    c.bench_function(format!("create_hnsw({TOTAL}x{DIMENSION})").as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let hnsw = HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
+            let uids: HashSet<u32> = hnsw
+                .search_basic(
+                    query.clone(),
+                    K,
+                    &HnswQueryParams {
+                        ef: 300,
+                        lower_bound: None,
+                        upper_bound: None,
+                        dist_q_c: 0.0,
+                    },
+                    None,
+                    vectors.as_ref(),
+                )
+                .unwrap()
+                .iter()
+                .map(|node| node.id)
+                .collect();
 
-                assert_eq!(uids.len(), K);
-            })
-        },
-    );
+            assert_eq!(uids.len(), K);
+        })
+    });
 
-    let hnsw =
-        HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default().max_level(6)).unwrap();
-    c.bench_function(
-        format!("search_hnsw{TOTAL}x{DIMENSION}, levels=6").as_str(),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let uids: HashSet<u32> = hnsw
-                    .search_basic(
-                        query.clone(),
-                        K,
-                        &HnswQueryParams {
-                            ef: 300,
-                            lower_bound: None,
-                            upper_bound: None,
-                            dist_q_c: 0.0,
-                        },
-                        None,
-                        vectors.as_ref(),
-                    )
-                    .unwrap()
-                    .iter()
-                    .map(|node| node.id)
-                    .collect();
+    let hnsw = HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
+    c.bench_function(format!("search_hnsw{TOTAL}x{DIMENSION}").as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let uids: HashSet<u32> = hnsw
+                .search_basic(
+                    query.clone(),
+                    K,
+                    &HnswQueryParams {
+                        ef: 300,
+                        lower_bound: None,
+                        upper_bound: None,
+                        dist_q_c: 0.0,
+                    },
+                    None,
+                    vectors.as_ref(),
+                )
+                .unwrap()
+                .iter()
+                .map(|node| node.id)
+                .collect();
 
-                assert_eq!(uids.len(), K);
-            })
-        },
-    );
+            assert_eq!(uids.len(), K);
+        })
+    });
 }
 
 #[cfg(target_os = "linux")]
