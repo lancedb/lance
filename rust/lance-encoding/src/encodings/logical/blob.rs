@@ -3,11 +3,18 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray, UInt64Array};
+use arrow_array::{
+    builder::{PrimitiveBuilder, StringBuilder},
+    cast::AsArray,
+    types::{UInt32Type, UInt64Type, UInt8Type},
+    Array, ArrayRef, StructArray, UInt64Array,
+};
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::{future::BoxFuture, FutureExt};
-use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
+use lance_core::{
+    datatypes::Field, datatypes::BLOB_V2_DESC_FIELDS, error::LanceOptionExt, Error, Result,
+};
 use snafu::location;
 
 use crate::{
@@ -207,6 +214,174 @@ impl FieldEncoder for BlobStructuralEncoder {
             .unwrap_or_else(|| Arc::new([DefinitionInterpretation::AllValidItem]));
 
         Ok(Self::wrap_tasks(encode_tasks, def_meaning))
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        self.descriptor_encoder.finish(external_buffers)
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.descriptor_encoder.num_columns()
+    }
+}
+
+/// Blob v2 structural encoder
+pub struct BlobV2StructuralEncoder {
+    descriptor_encoder: Box<dyn FieldEncoder>,
+}
+
+impl BlobV2StructuralEncoder {
+    pub fn new(
+        field: &Field,
+        column_index: u32,
+        options: &crate::encoder::EncodingOptions,
+        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+    ) -> Result<Self> {
+        let mut descriptor_metadata = HashMap::with_capacity(1);
+        descriptor_metadata.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+
+        let descriptor_data_type = DataType::Struct(BLOB_V2_DESC_FIELDS.clone());
+
+        let descriptor_field = Field::try_from(
+            ArrowField::new(&field.name, descriptor_data_type, field.nullable)
+                .with_metadata(descriptor_metadata),
+        )?;
+
+        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
+            options,
+            compression_strategy,
+            column_index,
+            descriptor_field,
+            Arc::new(HashMap::new()),
+        )?);
+
+        Ok(Self { descriptor_encoder })
+    }
+}
+
+impl FieldEncoder for BlobV2StructuralEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        _repdef: RepDefBuilder,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        // Supported input: Struct<data:LargeBinary?, uri:Utf8?>
+        let DataType::Struct(fields) = array.data_type() else {
+            return Err(Error::InvalidInput {
+                source: "Blob v2 requires struct<data, uri> input".into(),
+                location: location!(),
+            });
+        };
+
+        let struct_arr = array.as_struct();
+        let mut data_idx = None;
+        let mut uri_idx = None;
+        for (idx, field) in fields.iter().enumerate() {
+            match field.name().as_str() {
+                "data" => data_idx = Some(idx),
+                "uri" => uri_idx = Some(idx),
+                _ => {}
+            }
+        }
+        let (data_idx, uri_idx) = data_idx.zip(uri_idx).ok_or_else(|| Error::InvalidInput {
+            source: "Blob v2 struct must contain 'data' and 'uri' fields".into(),
+            location: location!(),
+        })?;
+
+        let data_col = struct_arr.column(data_idx).as_binary::<i64>();
+        let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
+
+        // Validate XOR(data, uri)
+        for i in 0..struct_arr.len() {
+            if struct_arr.is_null(i) {
+                continue;
+            }
+            let data_is_set = !data_col.is_null(i);
+            let uri_is_set = !uri_col.is_null(i);
+            if data_is_set == uri_is_set {
+                return Err(Error::InvalidInput {
+                    source: "Each blob row must set exactly one of data or uri".into(),
+                    location: location!(),
+                });
+            }
+            if uri_is_set {
+                return Err(Error::NotSupported {
+                    source: "External blob (uri) is not supported yet".into(),
+                    location: location!(),
+                });
+            }
+        }
+
+        let binary_array = data_col;
+
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(binary_array.len());
+        let mut position_builder =
+            PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
+        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
+        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(binary_array.len());
+        let mut uri_builder = StringBuilder::with_capacity(binary_array.len(), 0);
+
+        for i in 0..binary_array.len() {
+            let is_null_row = match array.data_type() {
+                DataType::Struct(_) => array.is_null(i),
+                _ => binary_array.is_null(i),
+            };
+            if is_null_row {
+                kind_builder.append_null();
+                position_builder.append_null();
+                size_builder.append_null();
+                blob_id_builder.append_null();
+                uri_builder.append_null();
+                continue;
+            }
+
+            let value = binary_array.value(i);
+            kind_builder.append_value(0);
+
+            if value.is_empty() {
+                position_builder.append_value(0);
+                size_builder.append_value(0);
+            } else {
+                let position = external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
+                position_builder.append_value(position);
+                size_builder.append_value(value.len() as u64);
+            }
+
+            blob_id_builder.append_null();
+            uri_builder.append_null();
+        }
+
+        let children: Vec<ArrayRef> = vec![
+            Arc::new(kind_builder.finish()),
+            Arc::new(position_builder.finish()),
+            Arc::new(size_builder.finish()),
+            Arc::new(blob_id_builder.finish()),
+            Arc::new(uri_builder.finish()),
+        ];
+
+        let descriptor_array = Arc::new(StructArray::try_new(
+            BLOB_V2_DESC_FIELDS.clone(),
+            children,
+            None,
+        )?) as ArrayRef;
+
+        self.descriptor_encoder.maybe_encode(
+            descriptor_array,
+            external_buffers,
+            RepDefBuilder::default(),
+            row_number,
+            num_rows,
+        )
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        self.descriptor_encoder.flush(external_buffers)
     }
 
     fn finish(

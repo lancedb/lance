@@ -150,8 +150,8 @@ moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.12.3" }
-opendal = { version = "0.54" }
-object_store_opendal = { version = "0.54" }
+opendal = { version = "0.55" }
+object_store_opendal = { version = "0.55" }
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
