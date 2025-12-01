@@ -228,7 +228,7 @@ impl FieldEncoder for BlobStructuralEncoder {
     }
 }
 
-/// Blob v2 structural encoder - emits RFC 2.2 descriptor struct
+/// Blob v2 structural encoder
 pub struct BlobV2StructuralEncoder {
     descriptor_encoder: Box<dyn FieldEncoder>,
 }
