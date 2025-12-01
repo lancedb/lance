@@ -43,12 +43,11 @@ use crate::{
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
-    field.data_type() == &DataType::LargeBinary
-        && field
-            .metadata()
-            .get(ARROW_EXT_NAME_KEY)
-            .map(|name| name == BLOB_V2_EXT_NAME)
-            .unwrap_or(false)
+    field
+        .metadata()
+        .get(ARROW_EXT_NAME_KEY)
+        .map(|name| name == BLOB_V2_EXT_NAME)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
