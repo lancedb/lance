@@ -58,7 +58,7 @@ impl BlobStructuralEncoder {
 
         // Use the original field's name for the descriptor
         let descriptor_field = Field::try_from(
-            ArrowField::new(&field.name, descriptor_data_type, field.nullable)
+            ArrowField::new(&field.name, descriptor_data_type, false)
                 .with_metadata(descriptor_metadata),
         )?;
 
@@ -267,7 +267,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        _repdef: RepDefBuilder,
+        mut repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
@@ -280,6 +280,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         };
 
         let struct_arr = array.as_struct();
+        if let Some(validity) = struct_arr.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(struct_arr.len());
+        }
         let mut data_idx = None;
         let mut uri_idx = None;
         for (idx, field) in fields.iter().enumerate() {
@@ -323,11 +328,12 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
         for i in 0..struct_arr.len() {
             if struct_arr.is_null(i) {
-                kind_builder.append_null();
-                position_builder.append_null();
-                size_builder.append_null();
-                blob_id_builder.append_null();
-                uri_builder.append_null();
+                // Packed struct does not support nullable fields; use empty/default values and rely on rep/def.
+                kind_builder.append_value(0);
+                position_builder.append_value(0);
+                size_builder.append_value(0);
+                blob_id_builder.append_value(0);
+                uri_builder.append_value("");
                 continue;
             }
 
@@ -374,7 +380,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         self.descriptor_encoder.maybe_encode(
             descriptor_array,
             external_buffers,
-            RepDefBuilder::default(),
+            repdef,
             row_number,
             num_rows,
         )
@@ -401,14 +407,15 @@ mod tests {
     use super::*;
     use crate::{
         compression::DefaultCompressionStrategy,
-        constants::PACKED_STRUCT_META_KEY,
         encoder::{ColumnIndexSequence, EncodingOptions},
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{
+            check_round_trip_encoding_of_data, check_round_trip_encoding_of_data_with_expected,
+            TestCases,
+        },
         version::LanceFileVersion,
     };
-    use arrow_array::{ArrayRef, LargeBinaryArray, StringArray, StructArray};
-    use arrow_schema::{DataType, Field as ArrowField, Fields};
-    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+    use arrow_array::{ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
+    use arrow_schema::{DataType, Field as ArrowField};
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -512,9 +519,34 @@ mod tests {
             (uri_field, Arc::new(uri_array) as ArrayRef),
         ]);
 
-        check_round_trip_encoding_of_data(
+        let expected_descriptor = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
+                Arc::new(UInt8Array::from(vec![0, 3, 3])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![6, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["", "file:///tmp/external.bin", "s3://bucket/blob"]))
+                    as ArrayRef,
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
-            &TestCases::default(),
+            Some(Arc::new(expected_descriptor)),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
             blob_metadata,
         )
         .await;
