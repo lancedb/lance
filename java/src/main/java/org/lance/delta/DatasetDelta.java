@@ -31,7 +31,7 @@ import java.util.List;
  * A view of differences between two versions of a dataset.
  *
  * <p>Created by {@link DatasetDeltaBuilder}. Provides methods to list transactions and stream
- * inserted/updated rows between two versions. Mirrors Python semantics and Rust builder behavior.
+ * inserted/updated rows between two versions.
  */
 public class DatasetDelta implements Closeable {
   static {
@@ -42,7 +42,7 @@ public class DatasetDelta implements Closeable {
   private long nativeDeltaHandle;
 
   /** Base dataset used to compute the delta. Also used for Transaction conversion. */
-  Dataset dataset;
+  private Dataset dataset;
 
   private final LockManager lockManager = new LockManager();
 

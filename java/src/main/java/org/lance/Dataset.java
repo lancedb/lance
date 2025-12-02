@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
+import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
@@ -1372,7 +1373,7 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Compute the delta between versions. *
+   * Compute the delta between versions.
    *
    * <ul>
    *   <li>Either {@code comparedAgainst} is non-null: compare current version against this version.
@@ -1397,7 +1398,7 @@ public class Dataset implements Closeable {
    * @return a DatasetDelta view
    * @throws IllegalArgumentException if mutual exclusivity or completeness rules are violated
    */
-  public org.lance.delta.DatasetDelta delta(
+  public DatasetDelta delta(
       Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -1405,7 +1406,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native org.lance.delta.DatasetDelta nativeBuildDelta(
+  private native DatasetDelta nativeBuildDelta(
       Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion);
 
   /**

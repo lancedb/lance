@@ -146,15 +146,15 @@ public class DeltaTest {
         // v2
         WriteParams params =
             new WriteParams.Builder().withMode(WriteParams.WriteMode.APPEND).build();
-        Dataset ds2 = Dataset.create(allocator, uri, schema, params);
-
-        DatasetDelta delta = ds2.delta(Optional.empty(), Optional.of(1L), Optional.of(2L));
-        try {
-          List<Transaction> txs = delta.listTransactions();
-          Assertions.assertTrue(txs.size() >= 1);
-        } catch (UnsatisfiedLinkError e) {
-          Assumptions.assumeTrue(
-              false, "JNI for DatasetDelta.listTransactions not available: " + e.getMessage());
+        try (Dataset ds2 = Dataset.create(allocator, uri, schema, params); ) {
+          DatasetDelta delta = ds2.delta(Optional.empty(), Optional.of(1L), Optional.of(2L));
+          try {
+            List<Transaction> txs = delta.listTransactions();
+            Assertions.assertTrue(txs.size() == 1);
+          } catch (UnsatisfiedLinkError e) {
+            Assumptions.assumeTrue(
+                false, "JNI for DatasetDelta.listTransactions not available: " + e.getMessage());
+          }
         }
       }
     }

@@ -14,6 +14,7 @@
 package org.lance.delta;
 
 import org.lance.Dataset;
+import org.lance.JniLoader;
 
 import java.util.Optional;
 
@@ -27,6 +28,10 @@ import java.util.Optional;
  * </ul>
  */
 public class DatasetDeltaBuilder {
+  static {
+    JniLoader.ensureLoaded();
+  }
+
   private final Dataset dataset;
   private Optional<Long> comparedAgainst = Optional.empty();
   private Optional<Long> beginVersion = Optional.empty();
