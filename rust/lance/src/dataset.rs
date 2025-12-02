@@ -1494,13 +1494,17 @@ impl Dataset {
 
     /// Take [BlobFile] by row indices.
     ///
+    /// This method converts row indices (offsets in the dataset) to row addresses,
+    /// then retrieves the blob data. Unlike `take_blobs` which expects row IDs,
+    /// this method works correctly with `enable_stable_row_ids=true` because it
+    /// uses row addresses directly instead of looking them up via the row ID index.
     pub async fn take_blobs_by_indices(
         self: &Arc<Self>,
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
         let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
-        blob::take_blobs(self, &row_addrs, column.as_ref()).await
+        blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
