@@ -3215,7 +3215,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -3388,9 +3388,9 @@ dependencies = [
 
 [[package]]
 name = "geo-types"
-version = "0.7.17"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a4dcd69d35b2c87a7c83bce9af69fd65c9d68d3833a0ded568983928f3fc99"
+checksum = "24f8647af4005fa11da47cd56252c6ef030be8fa97bdbf355e7dfb6348f0a82c"
 dependencies = [
  "approx",
  "num-traits",
@@ -4398,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4506,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrayref",
  "paste",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4603,7 +4603,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4650,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4718,7 +4718,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "datafusion",
  "geo-types",
@@ -4729,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "approx",
  "arrow",
@@ -4802,7 +4802,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4848,7 +4848,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4869,7 +4869,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4883,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4928,7 +4928,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4974,7 +4974,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4983,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "clap",
  "lance-core",
@@ -9016,13 +9016,13 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.18.1"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
+checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
- "serde",
+ "serde_core",
  "wasm-bindgen",
 ]
 

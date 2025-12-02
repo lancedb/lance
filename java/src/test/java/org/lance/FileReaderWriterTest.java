@@ -27,6 +27,7 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -256,6 +257,51 @@ public class FileReaderWriterTest {
       LanceFileReader.open("", allocator);
       fail("Expected LanceException to be thrown");
     } catch (IOException e) {
+    }
+  }
+
+  @Test
+  void testWriteSchemaMetadata(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("write_schema_metadata.lance").toString();
+    BufferAllocator allocator = new RootAllocator();
+    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
+      try (VectorSchemaRoot batch = createBatch(allocator)) {
+        writer.write(batch);
+        writer.addSchemaMetadata(Collections.singletonMap("testKey", "testValue"));
+        writer.write(batch);
+        // repeatedly write
+        writer.addSchemaMetadata(Collections.singletonMap("testKey1", "testValue1"));
+        // test override
+        writer.addSchemaMetadata(Collections.singletonMap("testKey", "newTestValue"));
+      }
+    }
+
+    try (LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
+      Schema fileSchema = reader.schema();
+      Map<String, String> metadata = fileSchema.getCustomMetadata();
+
+      Assertions.assertTrue(metadata.containsKey("testKey"));
+      Assertions.assertEquals("newTestValue", metadata.get("testKey"));
+
+      Assertions.assertTrue(metadata.containsKey("testKey1"));
+      Assertions.assertEquals("testValue1", metadata.get("testKey1"));
+    }
+  }
+
+  @Test
+  void testWriteNullSchemaMetadata(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("write_null_schema_metadata.lance").toString();
+    BufferAllocator allocator = new RootAllocator();
+    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
+      try (VectorSchemaRoot batch = createBatch(allocator)) {
+        writer.write(batch);
+        Assertions.assertThrows(
+            Exception.class,
+            () -> writer.addSchemaMetadata(Collections.singletonMap("someKey", null)));
+        Assertions.assertThrows(
+            Exception.class,
+            () -> writer.addSchemaMetadata(Collections.singletonMap(null, "someValue")));
+      }
     }
   }
 }
