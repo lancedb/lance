@@ -490,17 +490,18 @@ mod test {
     #[tokio::test]
     async fn prevent_blob_version_upgrade_on_overwrite() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
 
         let dataset = InsertBuilder::new("memory://blob-version-guard")
-            .execute_stream(RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()))
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
             .await
             .unwrap();
 
+        let dataset = Arc::new(dataset);
         let params = WriteParams {
             mode: WriteMode::Overwrite,
             data_storage_version: Some(LanceFileVersion::V2_2),
