@@ -67,48 +67,11 @@ async fn create_float_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scala
 
 /// Create and train a BTree index for float data with low cardinality
 async fn create_float_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
-    // For low cardinality with sorted data, each value should appear consecutively
-    // With 50M rows and 100 unique values, each value appears 500,000 times
-    let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
-
-    // Generate sorted batches where each value appears rows_per_value times consecutively
-    let mut batches = Vec::new();
-    let mut current_row = 0u64;
-
-    for value_idx in 0..LOW_CARDINALITY_COUNT {
-        let value = value_idx as f64;
-        let value_start_row = current_row;
-        let value_end_row = value_start_row + rows_per_value;
-
-        // Generate batches for this value
-        while current_row < value_end_row {
-            let batch_start = current_row;
-            let batch_end = (current_row + BATCH_SIZE).min(value_end_row);
-            let batch_size = (batch_end - batch_start) as usize;
-
-            let mut reader = gen_batch()
-                .col("value", array::fill::<Float64Type>(value))
-                .col("_rowid", array::step::<UInt64Type>())
-                .into_reader_rows(RowCount::from(batch_size as u64), BatchCount::from(1));
-
-            let batch = reader.next().unwrap().unwrap();
-            batches.push(Ok(batch));
-
-            current_row = batch_end;
-        }
-    }
-
-    let stream = futures::stream::iter(batches);
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("value", DataType::Float64, false),
-        arrow_schema::Field::new("_rowid", DataType::UInt64, false),
-    ]));
-    let stream = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream);
-
+    let stream = common::generate_float_low_cardinality_stream();
     let sub_index = FlatIndexMetadata::new(DataType::Float64);
 
     train_btree_index(
-        Box::pin(stream),
+        stream,
         &sub_index,
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
@@ -128,14 +91,7 @@ async fn create_float_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Sca
 
 /// Create and train a BTree index for string data with unique values
 async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
-    let stream = gen_batch()
-        .col("value", array::utf8_prefix_plus_counter("string_", false))
-        .col("_rowid", array::step::<UInt64Type>())
-        .into_df_stream(
-            RowCount::from(BATCH_SIZE),
-            BatchCount::from(NUM_BATCHES as u32),
-        );
-
+    let stream = common::generate_string_unique_stream();
     let sub_index = FlatIndexMetadata::new(DataType::Utf8);
 
     train_btree_index(
@@ -159,48 +115,11 @@ async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scal
 
 /// Create and train a BTree index for string data with low cardinality
 async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
-    // For low cardinality with sorted data, each value should appear consecutively
-    // With 50M rows and 100 unique values, each value appears 500,000 times
-    let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
-
-    // Generate sorted batches where each value appears rows_per_value times consecutively
-    let mut batches = Vec::new();
-    let mut current_row = 0u64;
-
-    for value_idx in 0..LOW_CARDINALITY_COUNT {
-        let value = format!("value_{:03}", value_idx);
-        let value_start_row = current_row;
-        let value_end_row = value_start_row + rows_per_value;
-
-        // Generate batches for this value
-        while current_row < value_end_row {
-            let batch_start = current_row;
-            let batch_end = (current_row + BATCH_SIZE).min(value_end_row);
-            let batch_size = (batch_end - batch_start) as usize;
-
-            let mut reader = gen_batch()
-                .col("value", array::fill_utf8(value.clone()))
-                .col("_rowid", array::step::<UInt64Type>())
-                .into_reader_rows(RowCount::from(batch_size as u64), BatchCount::from(1));
-
-            let batch = reader.next().unwrap().unwrap();
-            batches.push(Ok(batch));
-
-            current_row = batch_end;
-        }
-    }
-
-    let stream = futures::stream::iter(batches);
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("value", DataType::Utf8, false),
-        arrow_schema::Field::new("_rowid", DataType::UInt64, false),
-    ]));
-    let stream = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream);
-
+    let stream = common::generate_string_low_cardinality_stream();
     let sub_index = FlatIndexMetadata::new(DataType::Utf8);
 
     train_btree_index(
-        Box::pin(stream),
+        stream,
         &sub_index,
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
@@ -320,7 +239,7 @@ fn bench_equality(c: &mut Criterion, indices: &BenchmarkIndices) {
             let index = indices.string_unique.clone();
             async move {
                 let query =
-                    SargableQuery::Equals(ScalarValue::Utf8(Some("string_25000000".to_string())));
+                    SargableQuery::Equals(ScalarValue::Utf8(Some("string_0025000000".to_string())));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
@@ -463,18 +382,18 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
     // Sanity check: verify string unique range returns expected count
     let string_unique_query = SargableQuery::Range(
         Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{}",
+            "string_{:010}",
             string_start_row
         )))),
         Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{}",
+            "string_{:010}",
             string_end_row
         )))),
     );
     let string_unique_count = count_range_results(&rt, &indices.string_unique, string_unique_query);
     let expected_string_count = (string_end_row - string_start_row + 1) as usize;
     println!(
-        "[{}] String unique range [string_{}, string_{}]: expected ~{} rows, got {} rows ({}%)",
+        "[{}] String unique range [string_{:010}, string_{:010}]: expected ~{} rows, got {} rows ({}%)",
         selectivity.name(),
         string_start_row,
         string_end_row,

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{Float64Type, UInt64Type};
-use arrow_array::RecordBatchReader;
+use arrow_array::{Float64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -69,6 +69,11 @@ pub fn generate_float_low_cardinality_stream() -> SendableRecordBatchStream {
     let mut batches = Vec::new();
     let mut current_row = 0u64;
 
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Float64, false),
+        Field::new("_rowid", DataType::UInt64, false),
+    ]));
+
     for value_idx in 0..LOW_CARDINALITY_COUNT {
         let value = value_idx as f64;
         let value_end_row = current_row + rows_per_value;
@@ -77,35 +82,63 @@ pub fn generate_float_low_cardinality_stream() -> SendableRecordBatchStream {
             let batch_end = (current_row + BATCH_SIZE).min(value_end_row);
             let batch_size = (batch_end - current_row) as usize;
 
-            let mut reader = gen_batch()
-                .col("value", array::fill::<Float64Type>(value))
-                .col("_rowid", array::step::<UInt64Type>())
-                .into_reader_rows(RowCount::from(batch_size as u64), BatchCount::from(1));
+            // Manually create arrays with proper row IDs
+            let values = vec![value; batch_size];
+            let row_ids: Vec<u64> = (current_row..batch_end).collect();
 
-            let batch = reader.next().unwrap().unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float64Array::from(values)),
+                    Arc::new(UInt64Array::from(row_ids)),
+                ],
+            )
+            .unwrap();
+
             batches.push(Ok(batch));
-
             current_row = batch_end;
         }
     }
 
     let stream = futures::stream::iter(batches);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Float64, false),
-        Field::new("_rowid", DataType::UInt64, false),
-    ]));
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate a stream of string data with unique values
+/// Strings are zero-padded to 10 digits for proper lexicographic sorting
 pub fn generate_string_unique_stream() -> SendableRecordBatchStream {
-    gen_batch()
-        .col("value", array::utf8_prefix_plus_counter("string_", false))
-        .col("_rowid", array::step::<UInt64Type>())
-        .into_df_stream(
-            RowCount::from(BATCH_SIZE),
-            BatchCount::from(NUM_BATCHES as u32),
+    let mut batches = Vec::new();
+    let mut current_row = 0u64;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8, false),
+        Field::new("_rowid", DataType::UInt64, false),
+    ]));
+
+    while current_row < TOTAL_ROWS {
+        let batch_end = (current_row + BATCH_SIZE).min(TOTAL_ROWS);
+
+        // Generate zero-padded strings for proper lexicographic sorting
+        let values: Vec<String> = (current_row..batch_end)
+            .map(|i| format!("string_{:010}", i))
+            .collect();
+        let row_ids: Vec<u64> = (current_row..batch_end).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
         )
+        .unwrap();
+
+        batches.push(Ok(batch));
+        current_row = batch_end;
+    }
+
+    let stream = futures::stream::iter(batches);
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate sorted string data with low cardinality (100 unique values)
@@ -115,6 +148,11 @@ pub fn generate_string_low_cardinality_stream() -> SendableRecordBatchStream {
     let mut batches = Vec::new();
     let mut current_row = 0u64;
 
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8, false),
+        Field::new("_rowid", DataType::UInt64, false),
+    ]));
+
     for value_idx in 0..LOW_CARDINALITY_COUNT {
         let value = format!("value_{:03}", value_idx);
         let value_end_row = current_row + rows_per_value;
@@ -123,22 +161,24 @@ pub fn generate_string_low_cardinality_stream() -> SendableRecordBatchStream {
             let batch_end = (current_row + BATCH_SIZE).min(value_end_row);
             let batch_size = (batch_end - current_row) as usize;
 
-            let mut reader = gen_batch()
-                .col("value", array::fill_utf8(value.clone()))
-                .col("_rowid", array::step::<UInt64Type>())
-                .into_reader_rows(RowCount::from(batch_size as u64), BatchCount::from(1));
+            // Manually create arrays with proper row IDs
+            let values = vec![value.as_str(); batch_size];
+            let row_ids: Vec<u64> = (current_row..batch_end).collect();
 
-            let batch = reader.next().unwrap().unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(values)),
+                    Arc::new(UInt64Array::from(row_ids)),
+                ],
+            )
+            .unwrap();
+
             batches.push(Ok(batch));
-
             current_row = batch_end;
         }
     }
 
     let stream = futures::stream::iter(batches);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Utf8, false),
-        Field::new("_rowid", DataType::UInt64, false),
-    ]));
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }

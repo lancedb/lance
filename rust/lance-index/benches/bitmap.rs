@@ -14,14 +14,12 @@ mod common;
 
 use std::{ops::Bound, sync::Arc, time::Duration};
 
-use arrow_schema::DataType;
 use common::{Selectivity, LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
-use lance_index::scalar::bitmap::train_bitmap_index;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{bitmap::BitmapIndexPlugin, SargableQuery, ScalarIndex};
@@ -44,7 +42,9 @@ struct BenchmarkIndices {
 async fn create_float_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_float_unique_stream();
 
-    train_bitmap_index(stream, store.as_ref()).await.unwrap();
+    BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+        .await
+        .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
@@ -59,7 +59,9 @@ async fn create_float_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scala
 async fn create_float_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_float_low_cardinality_stream();
 
-    train_bitmap_index(stream, store.as_ref()).await.unwrap();
+    BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+        .await
+        .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
@@ -74,7 +76,9 @@ async fn create_float_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Sca
 async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_unique_stream();
 
-    train_bitmap_index(stream, store.as_ref()).await.unwrap();
+    BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+        .await
+        .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
@@ -89,7 +93,9 @@ async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scal
 async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_low_cardinality_stream();
 
-    train_bitmap_index(stream, store.as_ref()).await.unwrap();
+    BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+        .await
+        .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
@@ -205,7 +211,7 @@ fn bench_equality(c: &mut Criterion, indices: &BenchmarkIndices) {
             let index = indices.string_unique.clone();
             async move {
                 let query =
-                    SargableQuery::Equals(ScalarValue::Utf8(Some("string_25000000".to_string())));
+                    SargableQuery::Equals(ScalarValue::Utf8(Some("string_0025000000".to_string())));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
@@ -347,18 +353,18 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
     // Sanity check: verify string unique range returns expected count
     let string_unique_query = SargableQuery::Range(
         Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{}",
+            "string_{:010}",
             string_start_row
         )))),
         Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{}",
+            "string_{:010}",
             string_end_row
         )))),
     );
     let string_unique_count = count_range_results(&rt, &indices.string_unique, string_unique_query);
     let expected_string_count = (string_end_row - string_start_row + 1) as usize;
     println!(
-        "[{}] Bitmap String unique range [string_{}, string_{}]: expected ~{} rows, got {} rows ({}%)",
+        "[{}] Bitmap String unique range [string_{:010}, string_{:010}]: expected ~{} rows, got {} rows ({}%)",
         selectivity.name(),
         string_start_row,
         string_end_row,
