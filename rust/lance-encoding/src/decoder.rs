@@ -712,27 +712,6 @@ impl CoreFieldDecoderStrategy {
         }
         match &data_type {
             DataType::Struct(fields) => {
-                let is_blob_v2_desc = field.children.len() == 5
-                    && field.children[0].name == "kind"
-                    && field.children[1].name == "position"
-                    && field.children[2].name == "size"
-                    && field.children[3].name == "blob_id"
-                    && field.children[4].name == "blob_uri";
-
-                if field.is_blob() || is_blob_v2_desc {
-                    let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                        column_info.as_ref(),
-                        self.decompressor_strategy.as_ref(),
-                        self.cache_repetition_index,
-                        &lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD,
-                    )?);
-
-                    column_infos.next_top_level();
-
-                    return Ok(scheduler);
-                }
-
                 if field.is_packed_struct() {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;

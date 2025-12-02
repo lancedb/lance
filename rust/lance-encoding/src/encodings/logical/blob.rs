@@ -414,7 +414,9 @@ mod tests {
         },
         version::LanceFileVersion,
     };
-    use arrow_array::{ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
+    use arrow_array::{
+        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
 
     #[test]
@@ -538,8 +540,11 @@ mod tests {
             ),
             (
                 Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
-                Arc::new(StringArray::from(vec!["", "file:///tmp/external.bin", "s3://bucket/blob"]))
-                    as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "",
+                    "file:///tmp/external.bin",
+                    "s3://bucket/blob",
+                ])) as ArrayRef,
             ),
         ]);
 
