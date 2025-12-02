@@ -238,14 +238,11 @@ pub(super) async fn take_blobs_by_addresses(
     // Use try_new_from_addresses to bypass row ID index lookup.
     // This is critical when enable_stable_row_ids=true because row addresses
     // (fragment_id << 32 | row_offset) are different from row IDs (sequential integers).
-    let description_and_addr = TakeBuilder::try_new_from_addresses(
-        dataset.clone(),
-        row_addrs.to_vec(),
-        projection_plan,
-    )?
-    .with_row_address(true)
-    .execute()
-    .await?;
+    let description_and_addr =
+        TakeBuilder::try_new_from_addresses(dataset.clone(), row_addrs.to_vec(), projection_plan)?
+            .with_row_address(true)
+            .execute()
+            .await?;
 
     let descriptions = description_and_addr.column(0).as_struct();
     let row_addrs_result = description_and_addr.column(1).as_primitive::<UInt64Type>();
@@ -532,8 +529,8 @@ mod tests {
     /// (sequential integers), causing the row ID index lookup to fail for fragment 1+.
     #[tokio::test]
     pub async fn test_take_blobs_by_indices_with_stable_row_ids() {
-        use arrow_array::RecordBatchIterator;
         use crate::dataset::WriteParams;
+        use arrow_array::RecordBatchIterator;
 
         let test_dir = TempStrDir::default();
 
@@ -553,10 +550,7 @@ mod tests {
             ..Default::default()
         };
 
-        let reader = RecordBatchIterator::new(
-            data.clone().into_iter().map(Ok),
-            data[0].schema(),
-        );
+        let reader = RecordBatchIterator::new(data.clone().into_iter().map(Ok), data[0].schema());
         let dataset = Arc::new(
             Dataset::write(reader, &test_dir, Some(write_params))
                 .await
