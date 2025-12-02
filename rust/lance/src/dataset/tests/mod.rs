@@ -1,5 +1,4 @@
-#![allow(clippy::redundant_pub_crate)]
-pub(crate) mod dataset_common;
+mod dataset_common;
 mod dataset_concurrency_store;
 mod dataset_geo;
 mod dataset_index;

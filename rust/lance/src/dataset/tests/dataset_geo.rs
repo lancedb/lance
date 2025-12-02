@@ -1,4 +1,13 @@
-use super::dataset_common::*;
+use std::sync::Arc;
+use std::vec;
+
+use crate::dataset::tests::dataset_transactions::execute_sql;
+use crate::Dataset;
+
+use arrow_array::cast::AsArray;
+use arrow_array::RecordBatch;
+use arrow_array::RecordBatchIterator;
+use lance_core::utils::tempfile::TempStrDir;
 
 #[tokio::test]
 async fn test_geo_types() {

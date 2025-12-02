@@ -1,4 +1,48 @@
-use super::dataset_common::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::vec;
+
+use crate::dataset::tests::dataset_migrations::scan_dataset;
+use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
+use crate::dataset::ROW_ID;
+use crate::index::vector::VectorIndexParams;
+use crate::{Dataset, Error, Result};
+use lance_arrow::FixedSizeListArrayExt;
+
+use crate::dataset::write::{WriteMode, WriteParams};
+use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
+use arrow::datatypes::UInt64Type;
+use arrow_array::RecordBatch;
+use arrow_array::{
+    builder::StringDictionaryBuilder,
+    types::{Float32Type, Int32Type},
+    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+};
+use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
+use arrow_schema::{
+    DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
+};
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+use lance_file::version::LanceFileVersion;
+use lance_index::scalar::inverted::{
+    query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    tokenizer::InvertedIndexParams,
+};
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::DatasetIndexExt;
+use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
+use lance_linalg::distance::MetricType;
+
+use datafusion::common::{assert_contains, assert_not_contains};
+use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
+use lance_arrow::json::ARROW_JSON_EXT_NAME;
+use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+use lance_testing::datagen::generate_random_array;
+use rand::Rng;
+use rstest::rstest;
 
 #[rstest]
 #[tokio::test]

@@ -1,5 +1,28 @@
-#![allow(clippy::redundant_pub_crate)]
-use super::dataset_common::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::vec;
+
+use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::io::ObjectStoreParams;
+use crate::session::Session;
+use crate::{Dataset, Result};
+use lance_table::io::commit::ManifestNamingScheme;
+
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use arrow_array::Array;
+use arrow_array::RecordBatch;
+use arrow_array::{types::Int32Type, Int32Array, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::utils::tempfile::{TempDir, TempStrDir};
+use lance_datagen::{array, BatchCount, RowCount};
+use lance_index::DatasetIndexExt;
+
+use crate::datafusion::LanceTableProvider;
+use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
+use lance_datafusion::udf::register_functions;
 
 #[tokio::test]
 async fn test_read_transaction_properties() {
@@ -201,7 +224,7 @@ async fn test_migrate_v2_manifest_paths() {
     );
 }
 
-pub(crate) async fn execute_sql(
+pub(super) async fn execute_sql(
     sql: &str,
     table: String,
     dataset: Arc<Dataset>,
@@ -222,7 +245,7 @@ pub(crate) async fn execute_sql(
         .await?)
 }
 
-pub(crate) fn assert_results<T: Array + PartialEq + 'static>(
+pub(super) fn assert_results<T: Array + PartialEq + 'static>(
     results: Vec<RecordBatch>,
     values: &T,
 ) {

@@ -1,4 +1,17 @@
-use super::dataset_common::*;
+use std::sync::Arc;
+use std::vec;
+
+use crate::dataset::WriteDestination;
+use crate::{Dataset, Error, Result};
+
+use crate::dataset::write::{WriteMode, WriteParams};
+use arrow_array::RecordBatch;
+use arrow_array::{Int32Array, RecordBatchIterator};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::TryStreamExt;
+use lance_core::utils::tempfile::TempStrDir;
+use lance_index::DatasetIndexExt;
+use lance_index::{scalar::ScalarIndexParams, IndexType};
 
 #[tokio::test]
 async fn concurrent_create() {

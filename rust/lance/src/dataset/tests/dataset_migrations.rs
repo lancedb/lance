@@ -1,7 +1,23 @@
-#![allow(clippy::redundant_pub_crate)]
-use super::dataset_common::*;
+use std::sync::Arc;
+use std::vec;
 
-pub(crate) async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
+use crate::dataset::optimize::{compact_files, CompactionOptions};
+use crate::utils::test::copy_test_data_to_tmp;
+use crate::{Dataset, Result};
+use lance_table::format::IndexMetadata;
+
+use crate::dataset::write::{WriteMode, WriteParams};
+use arrow::compute::concat_batches;
+use arrow_array::RecordBatch;
+use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
+use arrow_schema::Schema as ArrowSchema;
+use lance_file::version::LanceFileVersion;
+use lance_index::DatasetIndexExt;
+
+use futures::{StreamExt, TryStreamExt};
+use rstest::rstest;
+
+pub(super) async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
     let results = Dataset::open(uri)
         .await?
         .scan()
