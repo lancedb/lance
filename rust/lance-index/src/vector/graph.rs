@@ -181,6 +181,11 @@ impl Visited<'_> {
         self.visited[node_id_usize]
     }
 
+    #[inline(always)]
+    pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
+        self.visited.iter_ones()
+    }
+
     pub fn count_ones(&self) -> usize {
         self.visited.count_ones()
     }
@@ -310,20 +315,15 @@ pub fn beam_search(
         if current.dist > furthest && results.len() == k {
             break;
         }
-        let neighbors = graph.neighbors(current.id);
-
         let furthest = results
             .peek()
             .map(|node| node.dist)
             .unwrap_or(OrderedFloat(f32::INFINITY));
 
-        let unvisited_neighbors: Vec<_> = neighbors
-            .iter()
-            .filter(|&&neighbor| !visited.contains(neighbor))
-            .copied()
-            .collect();
-
         let process_neighbor = |neighbor: u32| {
+            if visited.contains(neighbor) {
+                return;
+            }
             visited.insert(neighbor);
             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
@@ -343,8 +343,9 @@ pub fn beam_search(
                 candidates.push(Reverse((dist, neighbor).into()));
             }
         };
+        let neighbors = graph.neighbors(current.id);
         process_neighbors_with_look_ahead(
-            &unvisited_neighbors,
+            &neighbors,
             process_neighbor,
             prefetch_distance,
             dist_calc,
