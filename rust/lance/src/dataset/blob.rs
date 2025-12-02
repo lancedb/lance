@@ -327,7 +327,12 @@ async fn collect_blob_files_v2(
                 let size = if sizes.is_null(idx) {
                     None
                 } else {
-                    Some(sizes.value(idx))
+                    let value = sizes.value(idx);
+                    if value == 0 {
+                        None
+                    } else {
+                        Some(value)
+                    }
                 };
                 let registry = dataset.session.store_registry();
                 let params = dataset

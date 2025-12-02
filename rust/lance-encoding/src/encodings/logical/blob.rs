@@ -344,15 +344,15 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                     position_builder.append_value(position);
                     size_builder.append_value(value.len() as u64);
                 }
-                blob_id_builder.append_null();
-                uri_builder.append_null();
+                blob_id_builder.append_value(0);
+                uri_builder.append_value("");
             } else {
                 // external uri
                 let uri = uri_col.value(i);
                 kind_builder.append_value(3);
-                position_builder.append_null();
-                size_builder.append_null();
-                blob_id_builder.append_null();
+                position_builder.append_value(0);
+                size_builder.append_value(0);
+                blob_id_builder.append_value(0);
                 uri_builder.append_value(uri);
             }
         }
@@ -401,10 +401,14 @@ mod tests {
     use super::*;
     use crate::{
         compression::DefaultCompressionStrategy,
+        constants::PACKED_STRUCT_META_KEY,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{check_round_trip_encoding_of_data, TestCases},
+        version::LanceFileVersion,
     };
-    use arrow_array::LargeBinaryArray;
+    use arrow_array::{ArrayRef, LargeBinaryArray, StringArray, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields};
+    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -486,5 +490,33 @@ mod tests {
 
         // Use the standard test harness
         check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_round_trip() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+
+        let data_array = LargeBinaryArray::from(vec![Some(b"inline".as_ref()), None, None]);
+        let uri_array = StringArray::from(vec![
+            None,
+            Some("file:///tmp/external.bin"),
+            Some("s3://bucket/blob"),
+        ]);
+
+        let struct_array = StructArray::from(vec![
+            (data_field, Arc::new(data_array) as ArrayRef),
+            (uri_field, Arc::new(uri_array) as ArrayRef),
+        ]);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array)],
+            &TestCases::default(),
+            blob_metadata,
+        )
+        .await;
     }
 }

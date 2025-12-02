@@ -1004,7 +1004,7 @@ impl TryFrom<&ArrowField> for Field {
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
-        } else if is_blob_v2 {
+        } else if is_blob_v2 && !matches!(field.data_type(), DataType::Struct(_)) {
             LogicalType::from(super::BLOB_LOGICAL_TYPE)
         } else {
             LogicalType::try_from(field.data_type())?
