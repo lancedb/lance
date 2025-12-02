@@ -20,31 +20,41 @@ The de facto standard columnar data format for machine learning and large langua
 - Always use English in code, examples, and comments.
 - Features should be implemented concisely, maintainably, and efficiently.
 - Code is not just for execution, but also for readability.
-- Only add meaingful comments and tests.
+- Only add meaningful comments and tests.
 
 ## Architecture
 
-The project is organized as a Rust workspace with Python and Java bindings:
+The project is organized as a Rust workspace with Python and Java bindings. Rust crates (workspace members unless noted) include:
 
-- `rust/lance/` - Main Lance library implementing the columnar format
-- `rust/lance-arrow/` - Apache Arrow integration layer
-- `rust/lance-core/` - Core types, traits, and utilities
-- `rust/lance-encoding/` - Data encoding and compression algorithms
-- `rust/lance-file/` - File format reading/writing
-- `rust/lance-index/` - Vector and scalar indexing implementations
-- `rust/lance-io/` - I/O operations and object store integration
-- `rust/lance-linalg/` - Linear algebra operations for vector search
-- `rust/lance-table/` - Table format and operations
-- `rust/lance-datafusion/` - DataFusion query engine integration
-- `python/` - Python bindings using PyO3/maturin
-- `java/` - Java bindings using JNI
+- `rust/examples/` - Sample binaries and demonstrations.
+- `rust/lance/` - Main Lance library implementing the columnar format.
+- `rust/lance-arrow/` - Apache Arrow integration layer.
+- `rust/lance-core/` - Core types, traits, and utilities.
+- `rust/lance-datagen/` - Data generation helpers for tests and benchmarks.
+- `rust/lance-encoding/` - Data encoding and compression algorithms.
+- `rust/lance-file/` - File format reading/writing.
+- `rust/lance-geo/` - Geospatial data support.
+- `rust/lance-index/` - Vector and scalar indexing implementations.
+- `rust/lance-io/` - I/O operations and object store integration.
+- `rust/lance-linalg/` - Linear algebra operations for vector search.
+- `rust/lance-namespace/` - Namespace/catalog interfaces.
+- `rust/lance-namespace-impls/` - Concrete namespace/catalog implementations.
+- `rust/lance-table/` - Table format and operations.
+- `rust/lance-test-macros/` - Procedural macros for testing.
+- `rust/lance-testing/` - Shared test utilities.
+- `rust/lance-tools/` - CLI and developer tooling.
+- `rust/compression/bitpacking/` - Bit-packing codec implementation.
+- `rust/compression/fsst/` - Fast string compression (FSST).
+- `rust/lance-datafusion/` - DataFusion integration helpers (present in repo; built separately from the default workspace).
+- `python/` - Python bindings using PyO3/maturin.
+- `java/` - Java bindings using JNI.
 
 ## Common Development Commands
 
 ### Rust Development
 
-* Check for build errors: `cargo check --all --tests --benches`
-* Run tests: `cargo test`
+* Check for build errors: `cargo check --workspace --tests --benches`
+* Run tests: `cargo test --workspace`
 * Run specific test: `cargo test -p <package> <test_name>`
 * Lint: `cargo clippy --all --tests --benches -- -D warnings`
 * Format: `cargo fmt --all`
