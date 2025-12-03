@@ -282,10 +282,14 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let struct_arr = array.as_struct();
         let mut data_idx = None;
         let mut uri_idx = None;
+        let mut blob_id_idx = None;
+        let mut blob_size_idx = None;
         for (idx, field) in fields.iter().enumerate() {
             match field.name().as_str() {
                 "data" => data_idx = Some(idx),
                 "uri" => uri_idx = Some(idx),
+                "blob_id" => blob_id_idx = Some(idx),
+                "blob_size" => blob_size_idx = Some(idx),
                 _ => {}
             }
         }
@@ -297,40 +301,20 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let data_col = struct_arr.column(data_idx).as_binary::<i64>();
         let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
 
-        // Validate XOR(data, uri)
-        for i in 0..struct_arr.len() {
-            if struct_arr.is_null(i) {
-                continue;
-            }
-            let data_is_set = !data_col.is_null(i);
-            let uri_is_set = !uri_col.is_null(i);
-            if data_is_set == uri_is_set {
-                return Err(Error::InvalidInput {
-                    source: "Each blob row must set exactly one of data or uri".into(),
-                    location: location!(),
-                });
-            }
-            if uri_is_set {
-                return Err(Error::NotSupported {
-                    source: "External blob (uri) is not supported yet".into(),
-                    location: location!(),
-                });
-            }
-        }
+        let blob_id_col = blob_id_idx.map(|i| struct_arr.column(i).as_primitive::<UInt32Type>());
+        let blob_size_col =
+            blob_size_idx.map(|i| struct_arr.column(i).as_primitive::<UInt64Type>());
 
-        let binary_array = data_col;
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(data_col.len());
+        let mut position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(data_col.len());
+        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(data_col.len());
+        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(data_col.len());
+        let mut uri_builder = StringBuilder::with_capacity(data_col.len(), 0);
 
-        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(binary_array.len());
-        let mut position_builder =
-            PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
-        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
-        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(binary_array.len());
-        let mut uri_builder = StringBuilder::with_capacity(binary_array.len(), 0);
-
-        for i in 0..binary_array.len() {
+        for i in 0..data_col.len() {
             let is_null_row = match array.data_type() {
                 DataType::Struct(_) => array.is_null(i),
-                _ => binary_array.is_null(i),
+                _ => data_col.is_null(i),
             };
             if is_null_row {
                 kind_builder.append_null();
@@ -341,7 +325,52 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                 continue;
             }
 
-            let value = binary_array.value(i);
+            let has_blob_id = blob_id_col
+                .as_ref()
+                .map(|col| col.is_valid(i))
+                .unwrap_or(false);
+            let has_blob_size = blob_size_col
+                .as_ref()
+                .map(|col| col.is_valid(i))
+                .unwrap_or(false);
+
+            if has_blob_id || has_blob_size {
+                if !(has_blob_id && has_blob_size) {
+                    return Err(Error::InvalidInput {
+                        source: "blob_id and blob_size must both be set for dedicated blobs".into(),
+                        location: location!(),
+                    });
+                }
+                let blob_id = blob_id_col.as_ref().unwrap().value(i);
+                let blob_size = blob_size_col.as_ref().unwrap().value(i);
+                kind_builder.append_value(2);
+                position_builder.append_value(0);
+                size_builder.append_value(blob_size);
+                blob_id_builder.append_value(blob_id);
+                uri_builder.append_null();
+                continue;
+            }
+
+            let data_is_set = !data_col.is_null(i);
+            let uri_is_set = !uri_col.is_null(i);
+            if data_is_set == uri_is_set {
+                return Err(Error::InvalidInput {
+                    source: "Each blob row must set exactly one of data or uri".into(),
+                    location: location!(),
+                });
+            }
+
+            if uri_is_set {
+                let uri_val = uri_col.value(i);
+                kind_builder.append_value(3);
+                position_builder.append_value(0);
+                size_builder.append_value(0);
+                blob_id_builder.append_value(0);
+                uri_builder.append_value(uri_val);
+                continue;
+            }
+
+            let value = data_col.value(i);
             kind_builder.append_value(0);
 
             if value.is_empty() {

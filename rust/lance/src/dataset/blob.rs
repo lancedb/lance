@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use super::Dataset;
 use arrow_array::{Array, StructArray};
 use lance_core::datatypes::BlobVersion;
+use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
@@ -64,6 +65,16 @@ impl BlobFile {
             dataset,
             data_file,
             position,
+            size,
+            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
+        }
+    }
+
+    pub fn new_dedicated(dataset: Arc<Dataset>, path: Path, size: u64) -> Self {
+        Self {
+            dataset,
+            data_file: path,
+            position: 0,
             size,
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
@@ -210,6 +221,8 @@ pub(super) async fn take_blobs(
 }
 
 const INLINE_BLOB_KIND: u8 = 0;
+const DEDICATED_BLOB_KIND: u8 = 2;
+const EXTERNAL_BLOB_KIND: u8 = 3;
 
 fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
@@ -245,8 +258,8 @@ fn collect_blob_files_v2(
     let kinds = descriptions.column(0).as_primitive::<UInt8Type>();
     let positions = descriptions.column(1).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
-    let _blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
-    let _uris = descriptions.column(4).as_string::<i32>();
+    let blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
+    let uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
@@ -269,6 +282,41 @@ fn collect_blob_files_v2(
                     position,
                     size,
                 ));
+            }
+            DEDICATED_BLOB_KIND => {
+                if blob_ids.is_null(idx) || sizes.is_null(idx) {
+                    return Err(Error::corrupt_file(
+                        dataset.data_dir(),
+                        "Missing blob_id or size for dedicated blob",
+                        location!(),
+                    ));
+                }
+                let blob_id = blob_ids.value(idx);
+                let size = sizes.value(idx);
+                let frag_id = RowAddress::from(*row_addr).fragment_id();
+                let frag =
+                    dataset
+                        .get_fragment(frag_id as usize)
+                        .ok_or_else(|| Error::Internal {
+                            message: "Fragment not found".to_string(),
+                            location: location!(),
+                        })?;
+                let data_file =
+                    frag.data_file_for_field(blob_field_id)
+                        .ok_or_else(|| Error::Internal {
+                            message: "Data file not found for blob field".to_string(),
+                            location: location!(),
+                        })?;
+                let stem = data_file
+                    .path
+                    .strip_suffix(".lance")
+                    .unwrap_or(&data_file.path);
+                let path = blob_path(&dataset.data_dir(), stem, blob_field_id, blob_id, stem);
+                files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
+            }
+            EXTERNAL_BLOB_KIND => {
+                let _ = uris.value(idx);
+                // External blobs are not fetched; skip emitting BlobFile
             }
             other => {
                 return Err(Error::NotSupported {

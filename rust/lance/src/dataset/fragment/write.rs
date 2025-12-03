@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::do_write_fragments;
+use crate::dataset::write::{do_write_fragments, preprocess_blob_batches, BlobPreprocessor};
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
@@ -147,6 +147,19 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
+        let field_ids = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut preprocessor = BlobPreprocessor::new(
+            object_store.clone(),
+            base_path.child(DATA_DIR),
+            filename.trim_end_matches(".lance").to_string(),
+            id as u32,
+            field_ids,
+        );
+
         let (major, minor) = writer.version().to_numbers();
 
         let data_file = DataFile::new_unstarted(filename, major, minor);
@@ -160,7 +173,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
+            let mut batch_chunk = batched_chunk?;
+            batch_chunk = preprocess_blob_batches(&batch_chunk, &mut preprocessor).await?;
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
