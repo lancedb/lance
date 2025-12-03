@@ -2495,7 +2495,7 @@ class LanceDataset(pa.dataset.Dataset):
             import lance
 
             dataset = lance.dataset("/tmp/images.lance")
-            dataset.create_index(
+            dataset.create_scalar_index(
                 "category",
                 "BTREE",
             )
