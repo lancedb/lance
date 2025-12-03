@@ -750,6 +750,51 @@ def test_ivf_flat_respects_index_metric_float(tmp_path):
     )
 
 
+def test_bruteforce_uses_user_metric(tmp_path):
+    # Even if an index exists, a brute-force scan (use_index=False) should
+    # respect the user-specified metric instead of the index metric.
+    vectors = np.array(
+        [
+            [10.0, 10.0],  # Large magnitude, best under dot product
+            [-1.0, -1.0],
+            [1.0, 1.0],  # Closest under L2
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    # Build an index with L2 metric.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([1.0, 1.0], dtype=np.float32)
+
+    # Brute-force search should honor the requested dot metric (not the index's L2).
+    brute_force = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "dot",
+            "use_index": False,
+        },
+    )
+
+    # Under dot product the largest magnitude vector ranks first; under L2 it is last.
+    assert brute_force["id"].to_pylist() == [0, 2, 1]
+
+
 def test_create_ivf_sq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
