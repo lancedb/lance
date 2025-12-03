@@ -11,7 +11,7 @@
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
-    <url>http://lancedb.com/</url>
+    <url>https://lance.org/</url>
 
     <developers>
         <developer>

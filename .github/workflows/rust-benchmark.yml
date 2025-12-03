@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 9 * * *" # 9AM UTC = 2AM PST
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - ".github/workflows/rust-benchmark.yml"
 

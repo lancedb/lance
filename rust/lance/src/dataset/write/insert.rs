@@ -434,7 +434,7 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::StructArray;
+    use arrow_array::{Int32Array, StructArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::session::Session;
@@ -485,5 +485,34 @@ mod test {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn prevent_blob_version_upgrade_on_overwrite() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://blob-version-guard")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        let dataset = Arc::new(dataset);
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+
+        let result = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
     }
 }

@@ -589,8 +589,6 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let allow_blob_version_change =
-        dataset.is_none() || matches!(params.mode, WriteMode::Overwrite);
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
@@ -641,10 +639,10 @@ pub async fn write_fragments_internal(
     let target_blob_version = blob_version_for(storage_version);
     if let Some(dataset) = dataset {
         let existing_version = dataset.blob_version();
-        if !allow_blob_version_change && existing_version != target_blob_version {
+        if existing_version != target_blob_version {
             return Err(Error::InvalidInput {
                 source: format!(
-                    "Blob column version mismatch. Dataset uses {:?} but write requires {:?}",
+                    "Blob column version mismatch. Existing dataset uses {:?} but requested write requires {:?}. Changing blob version is not allowed",
                     existing_version, target_blob_version
                 )
                 .into(),

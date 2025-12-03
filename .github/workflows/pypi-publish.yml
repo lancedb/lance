@@ -16,6 +16,9 @@ on:
         default: true
         type: boolean
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - ".github/workflows/pypi-publish.yml"
       - ".github/workflows/build_linux_wheel/**"

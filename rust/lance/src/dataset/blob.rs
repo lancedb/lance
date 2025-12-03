@@ -5,14 +5,15 @@ use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
 use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
-use arrow_array::{Array, StructArray};
-use lance_core::datatypes::BlobVersion;
+use arrow_array::StructArray;
+use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
@@ -39,18 +40,20 @@ enum ReaderState {
 /// A file-like object that represents a blob in a dataset
 #[derive(Debug)]
 pub struct BlobFile {
-    dataset: Arc<Dataset>,
+    object_store: Arc<ObjectStore>,
+    path: Path,
     reader: Arc<Mutex<ReaderState>>,
-    data_file: Path,
     position: u64,
     size: u64,
+    kind: BlobKind,
+    uri: Option<String>,
 }
 
 impl BlobFile {
     /// Create a new BlobFile
     ///
     /// See [`crate::dataset::Dataset::take_blobs`]
-    pub fn new(
+    pub fn new_inline(
         dataset: Arc<Dataset>,
         field_id: u32,
         row_addr: u64,
@@ -62,12 +65,38 @@ impl BlobFile {
         let data_file = frag.data_file_for_field(field_id).unwrap();
         let data_file = dataset.data_dir().child(data_file.path.as_str());
         Self {
-            dataset,
-            data_file,
+            object_store: dataset.object_store.clone(),
+            path: data_file,
             position,
             size,
+            kind: BlobKind::Inline,
+            uri: None,
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
+    }
+
+    pub async fn new_external(
+        uri: String,
+        size: u64,
+        registry: Arc<ObjectStoreRegistry>,
+        params: Arc<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (object_store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
+        let size = if size > 0 {
+            size
+        } else {
+            object_store.size(&path).await?
+        };
+        Ok(Self {
+            object_store,
+            path,
+            position: 0,
+            size,
+            kind: BlobKind::External,
+            uri: Some(uri),
+            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
+        })
     }
 
     /// Close the blob file, releasing any associated resources
@@ -92,7 +121,7 @@ impl BlobFile {
     ) -> Result<T> {
         let mut reader = self.reader.lock().await;
         if let ReaderState::Uninitialized(cursor) = *reader {
-            let opened = self.dataset.object_store.open(&self.data_file).await?;
+            let opened = self.object_store.open(&self.path).await?;
             let opened = Arc::<dyn Reader>::from(opened);
             *reader = ReaderState::Open((cursor, opened.clone()));
         }
@@ -179,6 +208,22 @@ impl BlobFile {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn data_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn kind(&self) -> BlobKind {
+        self.kind
+    }
+
+    pub fn uri(&self) -> Option<&str> {
+        self.uri.as_deref()
+    }
 }
 
 pub(super) async fn take_blobs(
@@ -206,7 +251,9 @@ pub(super) async fn take_blobs(
 
     match dataset.blob_version() {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
-        BlobVersion::V2 => collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V2 => {
+            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
+        }
     }
 }
 
@@ -254,12 +301,11 @@ pub async fn take_blobs_by_addresses(
             collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs_result)
         }
         BlobVersion::V2 => {
-            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result)
+            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result).await
         }
     }
 }
 
-const INLINE_BLOB_KIND: u8 = 0;
 
 fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
@@ -281,12 +327,12 @@ fn collect_blob_files_v1(
             Some((*row_addr, position, size))
         })
         .map(|(row_addr, position, size)| {
-            BlobFile::new(dataset.clone(), blob_field_id, row_addr, position, size)
+            BlobFile::new_inline(dataset.clone(), blob_field_id, row_addr, position, size)
         })
         .collect())
 }
 
-fn collect_blob_files_v2(
+async fn collect_blob_files_v2(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     descriptions: &StructArray,
@@ -296,23 +342,22 @@ fn collect_blob_files_v2(
     let positions = descriptions.column(1).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
     let _blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
-    let _uris = descriptions.column(4).as_string::<i32>();
+    let blob_uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
-        if kinds.is_null(idx) {
-            // Null row
+        let kind = BlobKind::try_from(kinds.value(idx))?;
+
+        // Struct is non-nullable; null rows are encoded as inline with zero position/size and empty uri
+        if matches!(kind, BlobKind::Inline) && positions.value(idx) == 0 && sizes.value(idx) == 0 {
             continue;
         }
-        let kind = kinds.value(idx);
+
         match kind {
-            INLINE_BLOB_KIND => {
-                if positions.is_null(idx) || sizes.is_null(idx) {
-                    continue;
-                }
+            BlobKind::Inline => {
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
-                files.push(BlobFile::new(
+                files.push(BlobFile::new_inline(
                     dataset.clone(),
                     blob_field_id,
                     *row_addr,
@@ -320,9 +365,20 @@ fn collect_blob_files_v2(
                     size,
                 ));
             }
+            BlobKind::External => {
+                let uri = blob_uris.value(idx).to_string();
+                let size = sizes.value(idx);
+                let registry = dataset.session.store_registry();
+                let params = dataset
+                    .store_params
+                    .as_ref()
+                    .map(|p| Arc::new((**p).clone()))
+                    .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+                files.push(BlobFile::new_external(uri, size, registry, params).await?);
+            }
             other => {
                 return Err(Error::NotSupported {
-                    source: format!("Blob kind {} is not supported", other).into(),
+                    source: format!("Blob kind {:?} is not supported", other).into(),
                     location: location!(),
                 });
             }
@@ -444,9 +500,9 @@ mod tests {
         let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
 
         for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
-            assert_eq!(blob1.position, blob2.position);
-            assert_eq!(blob1.size, blob2.size);
-            assert_eq!(blob1.data_file, blob2.data_file);
+            assert_eq!(blob1.position(), blob2.position());
+            assert_eq!(blob1.size(), blob2.size());
+            assert_eq!(blob1.data_path(), blob2.data_path());
         }
     }
 

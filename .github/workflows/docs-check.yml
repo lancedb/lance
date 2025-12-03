@@ -2,8 +2,13 @@ name: Check docs
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+      - release/**
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - docs/**
       - .github/workflows/docs-check.yml
