@@ -58,7 +58,7 @@ impl BlobStructuralEncoder {
 
         // Use the original field's name for the descriptor
         let descriptor_field = Field::try_from(
-            ArrowField::new(&field.name, descriptor_data_type, false)
+            ArrowField::new(&field.name, descriptor_data_type, field.nullable)
                 .with_metadata(descriptor_metadata),
         )?;
 
