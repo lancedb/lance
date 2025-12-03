@@ -416,3 +416,34 @@ pub fn lance_supports_nulls(datatype: &DataType) -> bool {
             | DataType::FixedSizeList(_, _)
     )
 }
+
+/// Physical storage mode for blob v2 descriptors (one byte, stored in the packed struct column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlobKind {
+    /// Stored in the main data file’s out-of-line buffer; `position`/`size` point into that file.
+    Inline = 0,
+    /// Stored in a shared packed blob file; `position`/`size` locate the slice, `blob_id` selects the file.
+    Packed = 1,
+    /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
+    Dedicated = 2,
+    /// Not stored by Lance; `blob_uri` holds an absolute external URI, offsets are zero.
+    External = 3,
+}
+
+impl TryFrom<u8> for BlobKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Inline),
+            1 => Ok(Self::Packed),
+            2 => Ok(Self::Dedicated),
+            3 => Ok(Self::External),
+            other => Err(Error::InvalidInput {
+                source: format!("Unknown blob kind {other:?}").into(),
+                location: location!(),
+            }),
+        }
+    }
+}

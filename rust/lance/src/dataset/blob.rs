@@ -12,13 +12,11 @@ use tokio::sync::Mutex;
 
 use super::Dataset;
 use arrow_array::{Array, StructArray};
-use lance_core::datatypes::BlobVersion;
+use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
 pub const BLOB_VERSION_CONFIG_KEY: &str = "lance.blob.version";
-const INLINE_BLOB_KIND: u8 = 0;
-const EXTERNAL_BLOB_KIND: u8 = 3;
 
 pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion {
     config
@@ -36,12 +34,6 @@ enum ReaderState {
     Uninitialized(u64),
     Open((u64, Arc<dyn Reader>)),
     Closed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlobKind {
-    Inline,
-    External,
 }
 
 /// A file-like object that represents a blob in a dataset
@@ -306,9 +298,9 @@ async fn collect_blob_files_v2(
             // Null row
             continue;
         }
-        let kind = kinds.value(idx);
+        let kind = BlobKind::try_from(kinds.value(idx))?;
         match kind {
-            INLINE_BLOB_KIND => {
+            BlobKind::Inline => {
                 if positions.is_null(idx) || sizes.is_null(idx) {
                     continue;
                 }
@@ -322,7 +314,7 @@ async fn collect_blob_files_v2(
                     size,
                 ));
             }
-            EXTERNAL_BLOB_KIND => {
+            BlobKind::External => {
                 let uri = _uris.value(idx).to_string();
                 let size = if sizes.is_null(idx) {
                     None
@@ -344,7 +336,7 @@ async fn collect_blob_files_v2(
             }
             other => {
                 return Err(Error::NotSupported {
-                    source: format!("Blob kind {} is not supported", other).into(),
+                    source: format!("Blob kind {:?} is not supported", other).into(),
                     location: location!(),
                 });
             }

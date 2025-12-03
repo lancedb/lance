@@ -26,6 +26,7 @@ use crate::{
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
+use lance_core::datatypes::BlobKind;
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
@@ -340,7 +341,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             let data_is_set = !data_col.is_null(i);
             if data_is_set {
                 let value = binary_array.value(i);
-                kind_builder.append_value(0);
+                kind_builder.append_value(BlobKind::Inline as u8);
                 if value.is_empty() {
                     position_builder.append_value(0);
                     size_builder.append_value(0);
@@ -355,7 +356,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             } else {
                 // external uri
                 let uri = uri_col.value(i);
-                kind_builder.append_value(3);
+                kind_builder.append_value(BlobKind::External as u8);
                 position_builder.append_value(0);
                 size_builder.append_value(0);
                 blob_id_builder.append_value(0);
@@ -524,7 +525,11 @@ mod tests {
         let expected_descriptor = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
-                Arc::new(UInt8Array::from(vec![0, 3, 3])) as ArrayRef,
+                Arc::new(UInt8Array::from(vec![
+                    BlobKind::Inline as u8,
+                    BlobKind::External as u8,
+                    BlobKind::External as u8,
+                ])) as ArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("position", DataType::UInt64, false)),
