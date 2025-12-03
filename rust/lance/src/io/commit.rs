@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -744,7 +744,7 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowIdTreeMap>,
+    affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.

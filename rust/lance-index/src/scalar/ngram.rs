@@ -38,7 +38,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{utils::mask::RowIdTreeMap, Error};
+use lance_core::{utils::mask::RowAddrTreeMap, Error};
 use lance_core::{Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use log::info;
@@ -451,7 +451,7 @@ impl ScalarIndex for NGramIndex {
             TextQuery::StringContains(substr) => {
                 if substr.len() < NGRAM_N {
                     // We know nothing on short searches, need to recheck all
-                    return Ok(SearchResult::AtLeast(RowIdTreeMap::new()));
+                    return Ok(SearchResult::AtLeast(RowAddrTreeMap::new()));
                 }
 
                 let mut row_offsets = Vec::with_capacity(substr.len() * 3);
@@ -466,7 +466,7 @@ impl ScalarIndex for NGramIndex {
                 });
                 // At least one token was missing, so we know there are zero results
                 if missing {
-                    return Ok(SearchResult::Exact(RowIdTreeMap::new()));
+                    return Ok(SearchResult::Exact(RowAddrTreeMap::new()));
                 }
                 let posting_lists = futures::stream::iter(
                     row_offsets
@@ -479,7 +479,7 @@ impl ScalarIndex for NGramIndex {
                 metrics.record_comparisons(posting_lists.len());
                 let list_refs = posting_lists.iter().map(|list| list.as_ref());
                 let row_ids = NGramPostingList::intersect(list_refs);
-                Ok(SearchResult::AtMost(RowIdTreeMap::from(row_ids)))
+                Ok(SearchResult::AtMost(RowAddrTreeMap::from(row_ids)))
             }
         }
     }
@@ -1341,7 +1341,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::{
         cache::LanceCache,
-        utils::{mask::RowIdTreeMap, tempfile::TempDir},
+        utils::{mask::RowAddrTreeMap, tempfile::TempDir},
         ROW_ID,
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
@@ -1487,7 +1487,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([0, 2, 3]));
+        let expected = SearchResult::AtMost(RowAddrTreeMap::from_iter([0, 2, 3]));
 
         assert_eq!(expected, res);
 
@@ -1499,7 +1499,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
+        let expected = SearchResult::AtMost(RowAddrTreeMap::from_iter([8]));
         assert_eq!(expected, res);
 
         // No matches
@@ -1510,7 +1510,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::Exact(RowIdTreeMap::new());
+        let expected = SearchResult::Exact(RowAddrTreeMap::new());
         assert_eq!(expected, res);
 
         // False positive
@@ -1521,7 +1521,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
+        let expected = SearchResult::AtMost(RowAddrTreeMap::from_iter([8]));
         assert_eq!(expected, res);
 
         // Too short, don't know anything
@@ -1532,7 +1532,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::AtLeast(RowIdTreeMap::new());
+        let expected = SearchResult::AtLeast(RowAddrTreeMap::new());
         assert_eq!(expected, res);
 
         // One short string but we still get at least one trigram, this is ok
@@ -1543,7 +1543,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
+        let expected = SearchResult::AtMost(RowAddrTreeMap::from_iter([8]));
         assert_eq!(expected, res);
     }
 
@@ -1582,7 +1582,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([0, 4]));
+        let expected = SearchResult::AtMost(RowAddrTreeMap::from_iter([0, 4]));
         assert_eq!(expected, res);
 
         let null_posting_list = get_null_posting_list(&index).await;

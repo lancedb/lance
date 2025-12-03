@@ -17,10 +17,10 @@ The label list index uses a bitmap index internally and stores its data in:
 
 ### File Schema
 
-| Column    | Type       | Nullable | Description                                                         |
-|-----------|------------|----------|---------------------------------------------------------------------|
-| `keys`    | {DataType} | true     | The unique label value from the indexed column                      |
-| `bitmaps` | Binary     | true     | Serialized RowIdTreeMap containing row IDs where this label appears |
+| Column    | Type       | Nullable | Description                                                            |
+|-----------|------------|----------|------------------------------------------------------------------------|
+| `keys`    | {DataType} | true     | The unique label value from the indexed column                         |
+| `bitmaps` | Binary     | true     | Serialized RowAddrTreeMap containing row addr where this label appears |
 
 ## Accelerated Queries
 

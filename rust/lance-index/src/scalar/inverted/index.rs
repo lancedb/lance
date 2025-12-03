@@ -35,7 +35,7 @@ use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
@@ -547,7 +547,7 @@ impl ScalarIndex for InvertedIndex {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+                Ok(SearchResult::AtMost(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
     }
