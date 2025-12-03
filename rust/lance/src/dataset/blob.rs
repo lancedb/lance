@@ -306,7 +306,6 @@ pub async fn take_blobs_by_addresses(
     }
 }
 
-
 fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
