@@ -330,7 +330,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         for i in 0..struct_arr.len() {
             if struct_arr.is_null(i) {
                 // Packed struct does not support nullable fields; use empty/default values instead.
-                kind_builder.append_value(0);
+                kind_builder.append_value(BlobKind::Inline as u8);
                 position_builder.append_value(0);
                 size_builder.append_value(0);
                 blob_id_builder.append_value(0);
