@@ -1492,12 +1492,22 @@ impl Dataset {
         blob::take_blobs(self, row_ids, column.as_ref()).await
     }
 
-    /// Take [BlobFile] by row indices.
+    /// Take [BlobFile] by row addresses.
     ///
-    /// This method converts row indices (offsets in the dataset) to row addresses,
-    /// then retrieves the blob data. Unlike `take_blobs` which expects row IDs,
-    /// this method works correctly with `enable_stable_row_ids=true` because it
-    /// uses row addresses directly instead of looking them up via the row ID index.
+    /// Row addresses are `u64` values encoding `(fragment_id << 32) | row_offset`.
+    /// Use this method when you already have row addresses, for example from
+    /// a scan with `with_row_address()`. For row IDs (stable identifiers), use
+    /// [`Self::take_blobs`]. For row indices (offsets), use
+    /// [`Self::take_blobs_by_indices`].
+    pub async fn take_blobs_by_addresses(
+        self: &Arc<Self>,
+        row_addrs: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Take [BlobFile] by row indices (offsets in the dataset).
     pub async fn take_blobs_by_indices(
         self: &Arc<Self>,
         row_indices: &[u64],

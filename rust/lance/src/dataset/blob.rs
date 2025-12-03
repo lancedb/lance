@@ -210,13 +210,14 @@ pub(super) async fn take_blobs(
     }
 }
 
-/// Internal function for taking blobs by row addresses (not row IDs).
+/// Take [BlobFile] by row addresses.
 ///
-/// This is used by `take_blobs_by_indices` which already has row addresses
-/// computed from row indices. Using this function bypasses the row ID index
-/// lookup, which is necessary when `enable_stable_row_ids=true` because
-/// row addresses are not the same as row IDs in that case.
-pub(super) async fn take_blobs_by_addresses(
+/// Row addresses are `u64` values encoding `(fragment_id << 32) | row_offset`.
+/// Use this method when you already have row addresses, for example from
+/// a scan with `with_row_address()`. For row IDs (stable identifiers), use
+/// [`Dataset::take_blobs`]. For row indices (offsets), use
+/// [`Dataset::take_blobs_by_indices`].
+pub async fn take_blobs_by_addresses(
     dataset: &Arc<Dataset>,
     row_addrs: &[u64],
     column: &str,
