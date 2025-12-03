@@ -656,6 +656,100 @@ def test_ivf_flat_over_binary_vector(tmp_path):
     )
 
 
+def test_ivf_flat_respects_index_metric_binary(tmp_path):
+    # Binary vectors indexed with Hamming should ignore a user-specified L2 metric.
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array([[0], [128], [255]], type=pa.list_(pa.uint8(), 1)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="hamming",
+    )
+
+    query = np.array([128], dtype=np.uint8)
+
+    # Search should succeed and use the index's Hamming metric despite the L2 hint.
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "l2",
+        },
+    )
+
+    # A brute-force scan with metric=L2 ranks the second-closest vector differently.
+    brute_force = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "l2",
+            "use_index": False,
+        },
+    )
+
+    assert indexed["id"].to_pylist() == [1, 0, 2]
+    assert brute_force["id"].to_pylist() == [1, 2, 0]
+
+
+def test_ivf_flat_respects_index_metric_float(tmp_path):
+    # Float vectors indexed with L2 should ignore a user-specified Hamming metric.
+    vectors = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([0.5, 0.0], dtype=np.float32)
+
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "hamming",
+        },
+    )
+
+    expected = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 3},
+    )
+
+    assert indexed["id"].to_pylist() == expected["id"].to_pylist()
+    assert np.allclose(
+        indexed["_distance"].to_numpy(), expected["_distance"].to_numpy()
+    )
+
+
 def test_create_ivf_sq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
