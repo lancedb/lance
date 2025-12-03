@@ -11,7 +11,7 @@ use snafu::location;
 use tokio::sync::Mutex;
 
 use super::Dataset;
-use arrow_array::{Array, StructArray};
+use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
@@ -76,15 +76,16 @@ impl BlobFile {
 
     pub async fn new_external(
         uri: String,
-        size: Option<u64>,
+        size: u64,
         registry: Arc<ObjectStoreRegistry>,
         params: Arc<ObjectStoreParams>,
     ) -> Result<Self> {
         let (object_store, path) =
             ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
-        let size = match size {
-            Some(sz) => sz,
-            None => object_store.size(&path).await?,
+        let size = if size > 0 {
+            size
+        } else {
+            object_store.size(&path).await?
         };
         Ok(Self {
             object_store,
@@ -290,20 +291,19 @@ async fn collect_blob_files_v2(
     let positions = descriptions.column(1).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
     let _blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
-    let _uris = descriptions.column(4).as_string::<i32>();
+    let blob_uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
-        if kinds.is_null(idx) {
-            // Null row
+        let kind = BlobKind::try_from(kinds.value(idx))?;
+
+        // Struct is non-nullable; null rows are encoded as inline with zero position/size and empty uri
+        if matches!(kind, BlobKind::Inline) && positions.value(idx) == 0 && sizes.value(idx) == 0 {
             continue;
         }
-        let kind = BlobKind::try_from(kinds.value(idx))?;
+
         match kind {
             BlobKind::Inline => {
-                if positions.is_null(idx) || sizes.is_null(idx) {
-                    continue;
-                }
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
                 files.push(BlobFile::new_inline(
@@ -315,17 +315,8 @@ async fn collect_blob_files_v2(
                 ));
             }
             BlobKind::External => {
-                let uri = _uris.value(idx).to_string();
-                let size = if sizes.is_null(idx) {
-                    None
-                } else {
-                    let value = sizes.value(idx);
-                    if value == 0 {
-                        None
-                    } else {
-                        Some(value)
-                    }
-                };
+                let uri = blob_uris.value(idx).to_string();
+                let size = sizes.value(idx);
                 let registry = dataset.session.store_registry();
                 let params = dataset
                     .store_params
