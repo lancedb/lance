@@ -2841,19 +2841,21 @@ impl Scanner {
 
     // ANN/KNN search execution node with optional prefilter
     async fn vector_search(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(q) = self.nearest.as_ref() else {
+        let Some(nearest) = self.nearest.as_ref() else {
             return Err(Error::invalid_input(
                 "No nearest query".to_string(),
                 location!(),
             ));
         };
 
+        // Clone so we can adjust the metric type based on the available index.
+        let mut q = nearest.clone();
+
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
-        validate_distance_type_for(q.metric_type, &element_type)?;
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-        let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
+        let use_index = q.use_index;
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
@@ -2863,6 +2865,17 @@ impl Scanner {
             log::trace!("index found for vector search");
             // There is an index built for the column.
             // We will use the index.
+            let idx = self
+                .dataset
+                .open_vector_index(
+                    q.column.as_str(),
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            q.metric_type = idx.metric_type();
+            validate_distance_type_for(q.metric_type, &element_type)?;
+
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
                     "Refine factor cannot be zero".to_string(),
@@ -2873,8 +2886,8 @@ impl Scanner {
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
+                DataType::FixedSizeList(_, _) => self.ann(&q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(&q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
 
@@ -2885,28 +2898,18 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                // TODO: now we just open an index to get its metric type.
-                let idx = self
-                    .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                let mut q = q.clone();
-                q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
 
             if !self.fast_search {
-                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
+                knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
             }
 
             Ok(knn_node)
         } else {
+            validate_distance_type_for(q.metric_type, &element_type)?;
             // No index found. use flat search.
             let mut columns = vec![q.column.clone()];
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -2935,7 +2938,7 @@ impl Scanner {
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
-            Ok(self.flat_knn(plan, q)?)
+            Ok(self.flat_knn(plan, &q)?)
         }
     }
 
