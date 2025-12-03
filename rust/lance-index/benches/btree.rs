@@ -5,17 +5,22 @@
 //!
 //! This benchmark measures the performance of BTree index with:
 //! - 50 million data points
-//! - Float and String data types
+//! - int and String data types
 //! - High cardinality (unique values) and low cardinality (100 unique values)
 //! - Equality filters
 //! - Range filters with varying selectivity (few/many/most rows match)
+//! - IN filters with varying size (10, 20, 30 values)
 
 mod common;
 
-use std::{ops::Bound, sync::Arc, time::Duration};
+use std::{
+    ops::Bound,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use arrow_schema::DataType;
-use common::{Selectivity, LOW_CARDINALITY_COUNT, TOTAL_ROWS};
+use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
@@ -31,20 +36,54 @@ use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-/// Container for all benchmark indices
-struct BenchmarkIndices {
-    float_unique: Arc<dyn ScalarIndex>,
-    float_low_card: Arc<dyn ScalarIndex>,
-    string_unique: Arc<dyn ScalarIndex>,
-    string_low_card: Arc<dyn ScalarIndex>,
-    // Keep temp directories alive for the lifetime of the indices
-    _temp_dirs: Vec<tempfile::TempDir>,
+/// Selectivity level for range queries
+#[derive(Clone, Copy, Debug)]
+enum Selectivity {
+    Few,  // ~0.1% of rows
+    Many, // ~10% of rows
+    Most, // ~90% of rows
 }
 
-/// Create and train a BTree index for float data with unique values
-async fn create_float_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
-    let stream = common::generate_float_unique_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Float64);
+impl Selectivity {
+    fn name(&self) -> &'static str {
+        match self {
+            Selectivity::Few => "few",
+            Selectivity::Many => "many",
+            Selectivity::Most => "most",
+        }
+    }
+
+    /// Get the approximate percentage of rows that should match
+    fn percentage(&self) -> f64 {
+        match self {
+            Selectivity::Few => 0.001,
+            Selectivity::Many => 0.10,
+            Selectivity::Most => 0.90,
+        }
+    }
+}
+
+// Lazy static runtime - only created once
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+// Lazy static indices - only created when first accessed
+static INT_UNIQUE_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_LOW_CARD_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_UNIQUE_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_LOW_CARD_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+
+// Keep temp directories alive for the lifetime of the program
+static TEMP_DIRS: OnceLock<Vec<tempfile::TempDir>> = OnceLock::new();
+
+/// Get or create the tokio runtime
+fn get_runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().build().unwrap())
+}
+
+/// Create and train a BTree index for int64 data with unique values
+async fn create_int_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_unique_stream();
+    let sub_index = FlatIndexMetadata::new(DataType::Int64);
 
     train_btree_index(
         stream,
@@ -65,10 +104,10 @@ async fn create_float_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scala
     index
 }
 
-/// Create and train a BTree index for float data with low cardinality
-async fn create_float_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
-    let stream = common::generate_float_low_cardinality_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Float64);
+/// Create and train a BTree index for int64 data with low cardinality
+async fn create_int_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_low_cardinality_stream();
+    let sub_index = FlatIndexMetadata::new(DataType::Int64);
 
     train_btree_index(
         stream,
@@ -137,97 +176,139 @@ async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Sc
     index
 }
 
-/// Set up all benchmark indices
-fn setup_indices(rt: &tokio::runtime::Runtime) -> BenchmarkIndices {
-    println!("Setting up benchmark indices with {} rows...", TOTAL_ROWS);
+/// Setup function for int unique index - creates it only once
+fn setup_int_unique_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
+    INT_UNIQUE_INDEX
+        .get_or_init(|| {
+            println!(
+                "Creating int unique btree index with {} rows...",
+                TOTAL_ROWS
+            );
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    Arc::new(LanceCache::no_cache()),
+                ));
+                let index = create_int_unique_index(store).await;
 
-    let indices = rt.block_on(async {
-        // Create temporary directories for each index
-        let tempdir_float_unique = tempfile::tempdir().unwrap();
-        let tempdir_float_low_card = tempfile::tempdir().unwrap();
-        let tempdir_string_unique = tempfile::tempdir().unwrap();
-        let tempdir_string_low_card = tempfile::tempdir().unwrap();
+                // Store the temp directory to keep it alive
+                TEMP_DIRS.get_or_init(|| Vec::new());
+                // Note: We can't modify TEMP_DIRS after init, but the tempdir staying in scope here
+                // should keep it alive for the program duration due to the static lifetime
+                std::mem::forget(tempdir);
 
-        let store_float_unique = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tempdir_float_unique.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let store_float_low_card = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tempdir_float_low_card.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let store_string_unique = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tempdir_string_unique.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let store_string_low_card = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tempdir_string_low_card.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        println!("Creating float unique index...");
-        let float_unique = create_float_unique_index(store_float_unique).await;
-
-        println!("Creating float low cardinality index...");
-        let float_low_card = create_float_low_card_index(store_float_low_card).await;
-
-        println!("Creating string unique index...");
-        let string_unique = create_string_unique_index(store_string_unique).await;
-
-        println!("Creating string low cardinality index...");
-        let string_low_card = create_string_low_card_index(store_string_low_card).await;
-
-        BenchmarkIndices {
-            float_unique,
-            float_low_card,
-            string_unique,
-            string_low_card,
-            // Keep temp directories alive to prevent deletion of index data
-            _temp_dirs: vec![
-                tempdir_float_unique,
-                tempdir_float_low_card,
-                tempdir_string_unique,
-                tempdir_string_low_card,
-            ],
-        }
-    });
-
-    println!("Setup complete!");
-    indices
+                index
+            })
+        })
+        .clone()
 }
 
-fn bench_equality(c: &mut Criterion, indices: &BenchmarkIndices) {
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+/// Setup function for int low cardinality index - creates it only once
+fn setup_int_low_card_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
+    INT_LOW_CARD_INDEX
+        .get_or_init(|| {
+            println!(
+                "Creating int low cardinality btree index with {} rows...",
+                TOTAL_ROWS
+            );
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    Arc::new(LanceCache::no_cache()),
+                ));
+                let index = create_int_low_card_index(store).await;
+                std::mem::forget(tempdir);
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for string unique index - creates it only once
+fn setup_string_unique_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
+    STRING_UNIQUE_INDEX
+        .get_or_init(|| {
+            println!(
+                "Creating string unique btree index with {} rows...",
+                TOTAL_ROWS
+            );
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    Arc::new(LanceCache::no_cache()),
+                ));
+                let index = create_string_unique_index(store).await;
+                std::mem::forget(tempdir);
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for string low cardinality index - creates it only once
+fn setup_string_low_card_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
+    STRING_LOW_CARD_INDEX
+        .get_or_init(|| {
+            println!(
+                "Creating string low cardinality btree index with {} rows...",
+                TOTAL_ROWS
+            );
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    Arc::new(LanceCache::no_cache()),
+                ));
+                let index = create_string_low_card_index(store).await;
+                std::mem::forget(tempdir);
+                index
+            })
+        })
+        .clone()
+}
+
+fn bench_equality(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    // Calculate test values from constants (middle of range)
+    let int_unique_value = (TOTAL_ROWS / 2) as i64;
+    let string_unique_value = format!("string_{:010}", TOTAL_ROWS / 2);
+    let int_low_card_value = (LOW_CARDINALITY_COUNT / 2) as i64;
+    let string_low_card_value = format!("value_{:03}", LOW_CARDINALITY_COUNT / 2);
 
     let mut group = c.benchmark_group("btree_equality");
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
 
-    // Float unique
-    group.bench_function(BenchmarkId::from_parameter("float_unique"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.float_unique.clone();
+    // int unique
+    group.bench_function(BenchmarkId::from_parameter("int_unique"), |b| {
+        let index = setup_int_unique_index(rt);
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
+            let value = int_unique_value;
             async move {
-                let query = SargableQuery::Equals(ScalarValue::Float64(Some(25_000_000.0)));
+                let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
     });
 
-    // Float low cardinality
-    group.bench_function(BenchmarkId::from_parameter("float_low_card"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.float_low_card.clone();
+    // int low cardinality
+    group.bench_function(BenchmarkId::from_parameter("int_low_card"), |b| {
+        let index = setup_int_low_card_index(rt);
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
+            let value = int_low_card_value;
             async move {
-                let query = SargableQuery::Equals(ScalarValue::Float64(Some(50.0)));
+                let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
@@ -235,11 +316,13 @@ fn bench_equality(c: &mut Criterion, indices: &BenchmarkIndices) {
 
     // String unique
     group.bench_function(BenchmarkId::from_parameter("string_unique"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.string_unique.clone();
+        let index = setup_string_unique_index(rt);
+        let value = string_unique_value.clone();
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
+            let value = value.clone();
             async move {
-                let query =
-                    SargableQuery::Equals(ScalarValue::Utf8(Some("string_0025000000".to_string())));
+                let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
@@ -247,10 +330,13 @@ fn bench_equality(c: &mut Criterion, indices: &BenchmarkIndices) {
 
     // String low cardinality
     group.bench_function(BenchmarkId::from_parameter("string_low_card"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.string_low_card.clone();
+        let index = setup_string_low_card_index(rt);
+        let value = string_low_card_value.clone();
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
+            let value = value.clone();
             async move {
-                let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
+                let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
@@ -276,8 +362,8 @@ fn count_range_results(
     })
 }
 
-fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selectivity) {
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+fn bench_range(c: &mut Criterion, selectivity: Selectivity) {
+    let rt = get_runtime();
 
     let group_name = format!("btree_range_{}", selectivity.name());
     let mut group = c.benchmark_group(&group_name);
@@ -287,88 +373,74 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
 
     let pct = selectivity.percentage();
 
-    // Float unique - range queries
-    let float_range_size = (TOTAL_ROWS as f64 * pct) as u64;
-    let float_start = (TOTAL_ROWS / 2) - (float_range_size / 2);
-    let float_end = float_start + float_range_size;
+    // Int unique - range queries
+    let int_range_size = (TOTAL_ROWS as f64 * pct) as u64;
+    let int_start = (TOTAL_ROWS / 2) - (int_range_size / 2);
+    let int_end = int_start + int_range_size;
 
-    // Sanity check: verify float unique range returns expected count
-    let float_unique_query = SargableQuery::Range(
-        Bound::Included(ScalarValue::Float64(Some(float_start as f64))),
-        Bound::Included(ScalarValue::Float64(Some(float_end as f64))),
-    );
-    let float_unique_count = count_range_results(&rt, &indices.float_unique, float_unique_query);
-    let expected_count = (float_end - float_start + 1) as usize; // +1 because range is inclusive
-    println!(
-        "[{}] Float unique range [{}, {}]: expected ~{} rows, got {} rows ({}%)",
-        selectivity.name(),
-        float_start,
-        float_end,
-        expected_count,
-        float_unique_count,
-        (float_unique_count as f64 / expected_count as f64 * 100.0)
-    );
-    assert!(
-        (float_unique_count as f64 - expected_count as f64).abs() / (expected_count as f64) < 0.01,
-        "Float unique count mismatch: expected {}, got {}",
-        expected_count,
-        float_unique_count
-    );
+    group.bench_function(BenchmarkId::from_parameter("int_unique"), |b| {
+        // Setup index and run sanity check
+        let index = setup_int_unique_index(rt);
 
-    group.bench_function(BenchmarkId::from_parameter("float_unique"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.float_unique.clone();
+        // Sanity check: verify int unique range returns expected count
+        let int_unique_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int64(Some(int_start as i64))),
+            Bound::Included(ScalarValue::Int64(Some(int_end as i64))),
+        );
+        let int_unique_count = count_range_results(rt, &index, int_unique_query);
+        let expected_count = (int_end - int_start + 1) as usize; // +1 because range is inclusive
+        assert!(
+            (int_unique_count as f64 - expected_count as f64).abs() / (expected_count as f64)
+                < 0.01,
+            "int unique count mismatch: expected {}, got {}",
+            expected_count,
+            int_unique_count
+        );
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
             async move {
                 let query = SargableQuery::Range(
-                    Bound::Included(ScalarValue::Float64(Some(float_start as f64))),
-                    Bound::Included(ScalarValue::Float64(Some(float_end as f64))),
+                    Bound::Included(ScalarValue::Int64(Some(int_start as i64))),
+                    Bound::Included(ScalarValue::Int64(Some(int_end as i64))),
                 );
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
         })
     });
 
-    // Float low cardinality - range queries
+    // int low cardinality - range queries
     // With 100 unique values, select appropriate range
     let low_card_range_size = (LOW_CARDINALITY_COUNT as f64 * pct) as usize;
     let low_card_start = (LOW_CARDINALITY_COUNT / 2) - (low_card_range_size / 2);
     let low_card_end = low_card_start + low_card_range_size;
 
-    // Sanity check: verify float low cardinality range returns expected count
-    let float_low_card_query = SargableQuery::Range(
-        Bound::Included(ScalarValue::Float64(Some(low_card_start as f64))),
-        Bound::Included(ScalarValue::Float64(Some(low_card_end as f64))),
-    );
-    let float_low_card_count =
-        count_range_results(&rt, &indices.float_low_card, float_low_card_query);
-    let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
-    let expected_low_card_count =
-        ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
-    println!(
-        "[{}] Float low cardinality range [{}, {}]: expected ~{} rows, got {} rows ({}%)",
-        selectivity.name(),
-        low_card_start,
-        low_card_end,
-        expected_low_card_count,
-        float_low_card_count,
-        (float_low_card_count as f64 / expected_low_card_count as f64 * 100.0)
-    );
-    assert!(
-        (float_low_card_count as f64 - expected_low_card_count as f64).abs()
-            / (expected_low_card_count as f64)
-            < 0.01,
-        "Float low cardinality count mismatch: expected {}, got {}",
-        expected_low_card_count,
-        float_low_card_count
-    );
+    group.bench_function(BenchmarkId::from_parameter("int_low_card"), |b| {
+        // Setup index and run sanity check
+        let index = setup_int_low_card_index(rt);
 
-    group.bench_function(BenchmarkId::from_parameter("float_low_card"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.float_low_card.clone();
+        // Sanity check: verify int low cardinality range returns expected count
+        let int_low_card_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int64(Some(low_card_start as i64))),
+            Bound::Included(ScalarValue::Int64(Some(low_card_end as i64))),
+        );
+        let int_low_card_count = count_range_results(rt, &index, int_low_card_query);
+        let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
+        let expected_low_card_count =
+            ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
+        assert!(
+            (int_low_card_count as f64 - expected_low_card_count as f64).abs()
+                / (expected_low_card_count as f64)
+                < 0.01,
+            "int low cardinality count mismatch: expected {}, got {}",
+            expected_low_card_count,
+            int_low_card_count
+        );
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
             async move {
                 let query = SargableQuery::Range(
-                    Bound::Included(ScalarValue::Float64(Some(low_card_start as f64))),
-                    Bound::Included(ScalarValue::Float64(Some(low_card_end as f64))),
+                    Bound::Included(ScalarValue::Int64(Some(low_card_start as i64))),
+                    Bound::Included(ScalarValue::Int64(Some(low_card_end as i64))),
                 );
                 black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
             }
@@ -376,43 +448,36 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
     });
 
     // String unique - range queries
-    let string_start_row = float_start;
-    let string_end_row = float_end;
-
-    // Sanity check: verify string unique range returns expected count
-    let string_unique_query = SargableQuery::Range(
-        Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{:010}",
-            string_start_row
-        )))),
-        Bound::Included(ScalarValue::Utf8(Some(format!(
-            "string_{:010}",
-            string_end_row
-        )))),
-    );
-    let string_unique_count = count_range_results(&rt, &indices.string_unique, string_unique_query);
-    let expected_string_count = (string_end_row - string_start_row + 1) as usize;
-    println!(
-        "[{}] String unique range [string_{:010}, string_{:010}]: expected ~{} rows, got {} rows ({}%)",
-        selectivity.name(),
-        string_start_row,
-        string_end_row,
-        expected_string_count,
-        string_unique_count,
-        (string_unique_count as f64 / expected_string_count as f64 * 100.0)
-    );
-    assert!(
-        (string_unique_count as f64 - expected_string_count as f64).abs()
-            / (expected_string_count as f64)
-            < 0.01,
-        "String unique count mismatch: expected {}, got {}",
-        expected_string_count,
-        string_unique_count
-    );
+    let string_start_row = int_start;
+    let string_end_row = int_end;
 
     group.bench_function(BenchmarkId::from_parameter("string_unique"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.string_unique.clone();
+        // Setup index and run sanity check
+        let index = setup_string_unique_index(rt);
+
+        // Sanity check: verify string unique range returns expected count
+        let string_unique_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Utf8(Some(format!(
+                "string_{:010}",
+                string_start_row
+            )))),
+            Bound::Included(ScalarValue::Utf8(Some(format!(
+                "string_{:010}",
+                string_end_row
+            )))),
+        );
+        let string_unique_count = count_range_results(rt, &index, string_unique_query);
+        let expected_string_count = (string_end_row - string_start_row + 1) as usize;
+        assert!(
+            (string_unique_count as f64 - expected_string_count as f64).abs()
+                / (expected_string_count as f64)
+                < 0.01,
+            "String unique count mismatch: expected {}, got {}",
+            expected_string_count,
+            string_unique_count
+        );
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
             async move {
                 let query = SargableQuery::Range(
                     Bound::Included(ScalarValue::Utf8(Some(format!(
@@ -430,42 +495,35 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
     });
 
     // String low cardinality - range queries
-    // Sanity check: verify string low cardinality range returns expected count
-    let string_low_card_query = SargableQuery::Range(
-        Bound::Included(ScalarValue::Utf8(Some(format!(
-            "value_{:03}",
-            low_card_start
-        )))),
-        Bound::Included(ScalarValue::Utf8(Some(format!(
-            "value_{:03}",
-            low_card_end
-        )))),
-    );
-    let string_low_card_count =
-        count_range_results(&rt, &indices.string_low_card, string_low_card_query);
-    let expected_string_low_card_count =
-        ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
-    println!(
-        "[{}] String low cardinality range [value_{:03}, value_{:03}]: expected ~{} rows, got {} rows ({}%)",
-        selectivity.name(),
-        low_card_start,
-        low_card_end,
-        expected_string_low_card_count,
-        string_low_card_count,
-        (string_low_card_count as f64 / expected_string_low_card_count as f64 * 100.0)
-    );
-    assert!(
-        (string_low_card_count as f64 - expected_string_low_card_count as f64).abs()
-            / (expected_string_low_card_count as f64)
-            < 0.01,
-        "String low cardinality count mismatch: expected {}, got {}",
-        expected_string_low_card_count,
-        string_low_card_count
-    );
-
     group.bench_function(BenchmarkId::from_parameter("string_low_card"), |b| {
-        b.to_async(&rt).iter(|| {
-            let index = indices.string_low_card.clone();
+        // Setup index and run sanity check
+        let index = setup_string_low_card_index(rt);
+
+        // Sanity check: verify string low cardinality range returns expected count
+        let string_low_card_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Utf8(Some(format!(
+                "value_{:03}",
+                low_card_start
+            )))),
+            Bound::Included(ScalarValue::Utf8(Some(format!(
+                "value_{:03}",
+                low_card_end
+            )))),
+        );
+        let string_low_card_count = count_range_results(rt, &index, string_low_card_query);
+        let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
+        let expected_string_low_card_count =
+            ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
+        assert!(
+            (string_low_card_count as f64 - expected_string_low_card_count as f64).abs()
+                / (expected_string_low_card_count as f64)
+                < 0.01,
+            "String low cardinality count mismatch: expected {}, got {}",
+            expected_string_low_card_count,
+            string_low_card_count
+        );
+        b.to_async(rt).iter(|| {
+            let index = index.clone();
             async move {
                 let query = SargableQuery::Range(
                     Bound::Included(ScalarValue::Utf8(Some(format!(
@@ -485,19 +543,120 @@ fn bench_range(c: &mut Criterion, indices: &BenchmarkIndices, selectivity: Selec
     group.finish();
 }
 
+fn bench_in(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    // Test with different numbers of values in the IN clause
+    let value_counts = [10, 20, 30];
+
+    for &num_values in &value_counts {
+        let mut group = c.benchmark_group(format!("btree_in_{}", num_values));
+        group
+            .sample_size(10)
+            .measurement_time(Duration::from_secs(10));
+
+        // Calculate values around the middle of the range
+        let mid_int = (TOTAL_ROWS / 2) as i64;
+        let mid_string = TOTAL_ROWS / 2;
+        let mid_low_card = LOW_CARDINALITY_COUNT / 2;
+
+        // Int unique - IN query
+        let int_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| ScalarValue::Int64(Some(mid_int + i as i64 - num_values as i64 / 2)))
+            .collect();
+
+        group.bench_function(BenchmarkId::from_parameter("int_unique"), |b| {
+            let index = setup_int_unique_index(rt);
+            let values = int_values.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let values = values.clone();
+                async move {
+                    let query = SargableQuery::IsIn(values);
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // Int low cardinality - IN query
+        let int_low_card_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| ScalarValue::Int64(Some((mid_low_card + i - num_values / 2) as i64)))
+            .collect();
+
+        group.bench_function(BenchmarkId::from_parameter("int_low_card"), |b| {
+            let index = setup_int_low_card_index(rt);
+            let values = int_low_card_values.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let values = values.clone();
+                async move {
+                    let query = SargableQuery::IsIn(values);
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String unique - IN query
+        let string_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| {
+                ScalarValue::Utf8(Some(format!(
+                    "string_{:010}",
+                    (mid_string as i64 + i as i64 - num_values as i64 / 2) as u64
+                )))
+            })
+            .collect();
+
+        group.bench_function(BenchmarkId::from_parameter("string_unique"), |b| {
+            let index = setup_string_unique_index(rt);
+            let values = string_values.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let values = values.clone();
+                async move {
+                    let query = SargableQuery::IsIn(values);
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String low cardinality - IN query
+        let string_low_card_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| {
+                ScalarValue::Utf8(Some(format!(
+                    "value_{:03}",
+                    (mid_low_card as i32 + i as i32 - num_values as i32 / 2) as usize
+                )))
+            })
+            .collect();
+
+        group.bench_function(BenchmarkId::from_parameter("string_low_card"), |b| {
+            let index = setup_string_low_card_index(rt);
+            let values = string_low_card_values.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let values = values.clone();
+                async move {
+                    let query = SargableQuery::IsIn(values);
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        group.finish();
+    }
+}
+
 fn bench_btree(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
-
-    // Set up all indices once
-    let indices = setup_indices(&rt);
-
     // Run equality benchmarks
-    bench_equality(c, &indices);
+    bench_equality(c);
+
+    // Run IN query benchmarks
+    bench_in(c);
 
     // Run range benchmarks with different selectivities
-    bench_range(c, &indices, Selectivity::Few);
-    bench_range(c, &indices, Selectivity::Many);
-    bench_range(c, &indices, Selectivity::Most);
+    bench_range(c, Selectivity::Few);
+    bench_range(c, Selectivity::Many);
+    bench_range(c, Selectivity::Most);
 }
 
 #[cfg(target_os = "linux")]
