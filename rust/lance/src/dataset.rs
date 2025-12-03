@@ -1574,10 +1574,6 @@ impl Dataset {
         &self.object_store
     }
 
-    pub(crate) fn object_store_arc(&self) -> Arc<ObjectStore> {
-        self.object_store.clone()
-    }
-
     /// Returns the storage options used when opening this dataset, if any.
     pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
         self.store_params

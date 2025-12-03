@@ -9,11 +9,12 @@ pub const BLOB_SIDECAR_DIR: &str = "_blob";
 
 /// Format a dedicated blob sidecar path.
 ///
-/// Layout: `_blob/<data_file_stem>/<prefix>-<fid>-<bid>.raw`
-pub fn blob_path(base: &Path, stem: &str, field_id: u32, blob_id: u32, prefix: &str) -> Path {
-    let file_name = format!("{}-{:08x}-{:08x}.raw", prefix, field_id, blob_id);
+/// Layout: `_blob/<fragment_id>/<field_id>/<blob_id>.raw`
+pub fn blob_path(base: &Path, fragment_id: u32, field_id: u32, blob_id: u32) -> Path {
+    let file_name = format!("{:08x}.raw", blob_id);
     base.child(BLOB_SIDECAR_DIR)
-        .child(stem)
+        .child(format!("{:08x}", fragment_id))
+        .child(format!("{:08x}", field_id))
         .child(file_name.as_str())
 }
 
@@ -48,10 +49,10 @@ mod tests {
     #[test]
     fn test_blob_path_formatting() {
         let base = Path::from("base");
-        let path = blob_path(&base, "stem", 1, 2, "pfx");
+        let path = blob_path(&base, 0x10, 1, 2);
         assert_eq!(
             path.to_string(),
-            "base/_blob/stem/pfx-00000001-00000002.raw"
+            "base/_blob/00000010/00000001/00000002.raw"
         );
     }
 }

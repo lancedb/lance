@@ -80,7 +80,6 @@ const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024;
 pub(crate) struct BlobPreprocessor {
     object_store: Arc<ObjectStore>,
     data_dir: Path,
-    data_file_stem: String,
     fragment_id: u32,
     local_counter: u32,
     field_ids: Vec<u32>,
@@ -90,14 +89,12 @@ impl BlobPreprocessor {
     pub(crate) fn new(
         object_store: Arc<ObjectStore>,
         data_dir: Path,
-        data_file_stem: String,
         fragment_id: u32,
         field_ids: Vec<u32>,
     ) -> Self {
         Self {
             object_store,
             data_dir,
-            data_file_stem,
             fragment_id,
             local_counter: 0,
             field_ids,
@@ -111,13 +108,7 @@ impl BlobPreprocessor {
     }
 
     async fn write_blob(&self, field_id: u32, blob_id: u32, data: &[u8]) -> Result<Path> {
-        let path = blob_path(
-            &self.data_dir,
-            &self.data_file_stem,
-            field_id,
-            blob_id,
-            &self.data_file_stem,
-        );
+        let path = blob_path(&self.data_dir, self.fragment_id, field_id, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
         writer.shutdown().await?;
@@ -286,6 +277,13 @@ impl BlobPreprocessor {
         RecordBatch::try_new(new_schema, new_columns)
             .map_err(|e| Error::invalid_input(e.to_string(), location!()))
     }
+}
+
+pub(crate) fn schema_has_blob_v2(schema: &Schema) -> bool {
+    schema
+        .fields
+        .iter()
+        .any(|f| f.is_blob() && matches!(f.data_type(), ArrowDataType::Struct(_)))
 }
 
 pub(crate) async fn preprocess_blob_batches(
@@ -1050,13 +1048,16 @@ pub async fn open_writer_with_options(
             .iter()
             .map(|f| f.id as u32)
             .collect::<Vec<_>>();
-        let preprocessor = Some(BlobPreprocessor::new(
-            object_store.clone(),
-            data_dir.clone(),
-            filename.trim_end_matches(".lance").to_string(),
-            0,
-            field_ids,
-        ));
+        let preprocessor = if schema_has_blob_v2(schema) {
+            Some(BlobPreprocessor::new(
+                object_store.clone(),
+                data_dir.clone(),
+                0,
+                field_ids,
+            ))
+        } else {
+            None
+        };
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,

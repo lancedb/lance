@@ -19,7 +19,9 @@ use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::{do_write_fragments, preprocess_blob_batches, BlobPreprocessor};
+use crate::dataset::write::{
+    do_write_fragments, preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor,
+};
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
@@ -137,6 +139,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let has_blob_v2 = schema_has_blob_v2(&schema);
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -152,13 +155,16 @@ impl<'a> FragmentCreateBuilder<'a> {
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let mut preprocessor = BlobPreprocessor::new(
-            object_store.clone(),
-            base_path.child(DATA_DIR),
-            filename.trim_end_matches(".lance").to_string(),
-            id as u32,
-            field_ids,
-        );
+        let mut preprocessor = if has_blob_v2 {
+            Some(BlobPreprocessor::new(
+                object_store.clone(),
+                base_path.child(DATA_DIR),
+                id as u32,
+                field_ids,
+            ))
+        } else {
+            None
+        };
 
         let (major, minor) = writer.version().to_numbers();
 
@@ -174,7 +180,9 @@ impl<'a> FragmentCreateBuilder<'a> {
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
             let mut batch_chunk = batched_chunk?;
-            batch_chunk = preprocess_blob_batches(&batch_chunk, &mut preprocessor).await?;
+            if let Some(pre) = preprocessor.as_mut() {
+                batch_chunk = preprocess_blob_batches(&batch_chunk, pre).await?;
+            }
             writer.write_batches(batch_chunk.iter()).await?;
         }
 

@@ -301,17 +301,12 @@ fn collect_blob_files_v2(
                             message: "Fragment not found".to_string(),
                             location: location!(),
                         })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
-                let stem = data_file
-                    .path
-                    .strip_suffix(".lance")
-                    .unwrap_or(&data_file.path);
-                let path = blob_path(&dataset.data_dir(), stem, blob_field_id, blob_id, stem);
+                frag.data_file_for_field(blob_field_id)
+                    .ok_or_else(|| Error::Internal {
+                        message: "Data file not found for blob field".to_string(),
+                        location: location!(),
+                    })?;
+                let path = blob_path(&dataset.data_dir(), frag_id, blob_field_id, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
             }
             EXTERNAL_BLOB_KIND => {
