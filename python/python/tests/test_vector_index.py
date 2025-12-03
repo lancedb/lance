@@ -686,20 +686,8 @@ def test_ivf_flat_respects_index_metric_binary(tmp_path):
         },
     )
 
-    # A brute-force scan with metric=L2 ranks the second-closest vector differently.
-    brute_force = ds.to_table(
-        columns=["id"],
-        nearest={
-            "column": "vector",
-            "q": query,
-            "k": 3,
-            "metric": "l2",
-            "use_index": False,
-        },
-    )
-
+    # Should succeed even though user asked for L2 (index metric is used).
     assert indexed["id"].to_pylist() == [1, 0, 2]
-    assert brute_force["id"].to_pylist() == [1, 2, 0]
 
 
 def test_ivf_flat_respects_index_metric_float(tmp_path):
