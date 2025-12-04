@@ -767,7 +767,7 @@ impl GenericWriter for V2WriterAdapter {
 }
 
 pub async fn open_writer(
-    object_store: &Arc<ObjectStore>,
+    object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
@@ -776,7 +776,7 @@ pub async fn open_writer(
 }
 
 pub async fn open_writer_with_options(
-    object_store: &Arc<ObjectStore>,
+    object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
@@ -822,7 +822,7 @@ pub async fn open_writer_with_options(
             .collect::<Vec<_>>();
         let preprocessor = if schema_has_blob_v2(schema) {
             Some(BlobPreprocessor::new(
-                object_store.as_ref().clone(),
+                object_store.clone(),
                 data_dir.clone(),
                 0,
                 field_ids,
