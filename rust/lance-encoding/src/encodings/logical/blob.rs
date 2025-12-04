@@ -272,118 +272,91 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        // Supported input: Struct<data:LargeBinary?, uri:Utf8?>
-        let DataType::Struct(fields) = array.data_type() else {
-            return Err(Error::InvalidInput {
-                source: "Blob v2 requires struct<data, uri> input".into(),
-                location: location!(),
-            });
-        };
-
         let struct_arr = array.as_struct();
         if let Some(validity) = struct_arr.nulls() {
             repdef.add_validity_bitmap(validity.clone());
         } else {
             repdef.add_no_null(struct_arr.len());
         }
-        let mut data_idx = None;
-        let mut uri_idx = None;
-        let mut blob_id_idx = None;
-        let mut blob_size_idx = None;
-        for (idx, field) in fields.iter().enumerate() {
-            match field.name().as_str() {
-                "data" => data_idx = Some(idx),
-                "uri" => uri_idx = Some(idx),
-                "blob_id" => blob_id_idx = Some(idx),
-                "blob_size" => blob_size_idx = Some(idx),
-                _ => {}
-            }
-        }
-        let (data_idx, uri_idx) = data_idx.zip(uri_idx).ok_or_else(|| Error::InvalidInput {
-            source: "Blob v2 struct must contain 'data' and 'uri' fields".into(),
-            location: location!(),
-        })?;
 
-        let data_col = struct_arr.column(data_idx).as_binary::<i64>();
-        let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
-        let blob_id_col = blob_id_idx.map(|i| struct_arr.column(i).as_primitive::<UInt32Type>());
-        let blob_size_col =
-            blob_size_idx.map(|i| struct_arr.column(i).as_primitive::<UInt64Type>());
+        let kind_col = struct_arr
+            .column_by_name("kind")
+            .expect("kind column must exist")
+            .as_primitive::<UInt8Type>();
+        let data_col = struct_arr
+            .column_by_name("data")
+            .expect("data column must exist")
+            .as_binary::<i64>();
+        let uri_col = struct_arr
+            .column_by_name("uri")
+            .expect("uri column must exist")
+            .as_string::<i32>();
+        let blob_id_col = struct_arr
+            .column_by_name("blob_id")
+            .expect("blob_id column must exist")
+            .as_primitive::<UInt32Type>();
+        let blob_size_col = struct_arr
+            .column_by_name("blob_size")
+            .expect("blob_size column must exist")
+            .as_primitive::<UInt64Type>();
 
-        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(struct_arr.len());
-        let mut position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(struct_arr.len());
-        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(struct_arr.len());
-        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(struct_arr.len());
-        let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
+        let row_count = struct_arr.len();
 
-        for i in 0..struct_arr.len() {
-            if struct_arr.is_null(i) {
-                kind_builder.append_value(BlobKind::Inline as u8);
-                position_builder.append_value(0);
-                size_builder.append_value(0);
-                blob_id_builder.append_value(0);
-                uri_builder.append_value("");
-                continue;
-            }
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(row_count);
+        let mut position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(row_count);
+        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(row_count);
+        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(row_count);
+        let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
 
-            let has_blob_id = blob_id_col
-                .as_ref()
-                .map(|col| col.is_valid(i))
-                .unwrap_or(false);
-            let has_blob_size = blob_size_col
-                .as_ref()
-                .map(|col| col.is_valid(i))
-                .unwrap_or(false);
+        for i in 0..row_count {
+            let (kind_value, position_value, size_value, blob_id_value, uri_value) =
+                if struct_arr.is_null(i) || kind_col.is_null(i) {
+                    (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
+                } else {
+                    let kind_val = BlobKind::try_from(kind_col.value(i))?;
+                    match kind_val {
+                        BlobKind::Dedicated => (
+                            BlobKind::Dedicated as u8,
+                            0,
+                            blob_size_col.value(i),
+                            blob_id_col.value(i),
+                            "".to_string(),
+                        ),
+                        BlobKind::External => (
+                            BlobKind::External as u8,
+                            0,
+                            0,
+                            0,
+                            uri_col.value(i).to_string(),
+                        ),
+                        BlobKind::Inline => {
+                            let data_val = data_col.value(i);
+                            let blob_len = data_val.len() as u64;
+                            let position = external_buffers
+                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
 
-            if has_blob_id || has_blob_size {
-                if !(has_blob_id && has_blob_size) {
-                    return Err(Error::InvalidInput {
-                        source: "blob_id and blob_size must both be set for dedicated blobs".into(),
-                        location: location!(),
-                    });
-                }
-                let blob_id = blob_id_col.as_ref().unwrap().value(i);
-                let blob_size = blob_size_col.as_ref().unwrap().value(i);
-                kind_builder.append_value(BlobKind::Dedicated as u8);
-                position_builder.append_value(0);
-                size_builder.append_value(blob_size);
-                blob_id_builder.append_value(blob_id);
-                uri_builder.append_value("");
-                continue;
-            }
+                            (
+                                BlobKind::Inline as u8,
+                                position,
+                                blob_len,
+                                0,
+                                "".to_string(),
+                            )
+                        }
+                        BlobKind::Packed => {
+                            return Err(Error::InvalidInput {
+                                source: "Packed blob kind is not supported for v2 encoder".into(),
+                                location: location!(),
+                            });
+                        }
+                    }
+                };
 
-            let data_is_set = !data_col.is_null(i);
-            let uri_is_set = !uri_col.is_null(i);
-            if data_is_set == uri_is_set {
-                return Err(Error::InvalidInput {
-                    source: "Each blob row must set exactly one of data or uri".into(),
-                    location: location!(),
-                });
-            }
-
-            if uri_is_set {
-                let uri_val = uri_col.value(i);
-                kind_builder.append_value(BlobKind::External as u8);
-                position_builder.append_value(0);
-                size_builder.append_value(0);
-                blob_id_builder.append_value(0);
-                uri_builder.append_value(uri_val);
-                continue;
-            }
-
-            let value = data_col.value(i);
-            kind_builder.append_value(BlobKind::Inline as u8);
-
-            if value.is_empty() {
-                position_builder.append_value(0);
-                size_builder.append_value(0);
-            } else {
-                let position = external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
-                position_builder.append_value(position);
-                size_builder.append_value(value.len() as u64);
-            }
-            blob_id_builder.append_value(0);
-            uri_builder.append_value("");
+            kind_builder.append_value(kind_value);
+            position_builder.append_value(position_value);
+            size_builder.append_value(size_value);
+            blob_id_builder.append_value(blob_id_value);
+            uri_builder.append_value(uri_value);
         }
         let children: Vec<ArrayRef> = vec![
             Arc::new(kind_builder.finish()),

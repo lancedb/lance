@@ -72,10 +72,6 @@ impl BlobPreprocessor {
         Ok(path)
     }
 
-    async fn delete_blob(&self, path: &Path) {
-        let _ = self.object_store.delete(path).await;
-    }
-
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
@@ -133,6 +129,7 @@ impl BlobPreprocessor {
                 PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(struct_arr.len());
             let mut blob_size_builder =
                 PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
+            let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(struct_arr.len());
 
             let struct_nulls = struct_arr.nulls();
 
@@ -142,6 +139,7 @@ impl BlobPreprocessor {
                     uri_builder.append_null();
                     blob_id_builder.append_null();
                     blob_size_builder.append_null();
+                    kind_builder.append_null();
                     continue;
                 }
 
@@ -151,15 +149,12 @@ impl BlobPreprocessor {
                 if has_data && data_col.value(i).len() > DEDICATED_THRESHOLD {
                     let blob_id = self.next_blob_id();
                     let field_id = *self.field_ids.get(col_idx).unwrap_or(&(col_idx as u32));
-                    match self.write_blob(field_id, blob_id, data_col.value(i)).await {
-                        Ok(path) => written_paths.push(path),
-                        Err(err) => {
-                            for path in &written_paths {
-                                self.delete_blob(path).await;
-                            }
-                            return Err(err);
-                        }
-                    }
+                    let path = self
+                        .write_blob(field_id, blob_id, data_col.value(i))
+                        .await?;
+                    written_paths.push(path);
+
+                    kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
                     uri_builder.append_null();
                     blob_id_builder.append_value(blob_id);
@@ -169,6 +164,7 @@ impl BlobPreprocessor {
 
                 if has_uri {
                     let uri_val = uri_col.value(i);
+                    kind_builder.append_value(BlobKind::External as u8);
                     data_builder.append_null();
                     uri_builder.append_value(uri_val);
                     blob_id_builder.append_null();
@@ -177,6 +173,7 @@ impl BlobPreprocessor {
                 }
 
                 if has_data {
+                    kind_builder.append_value(BlobKind::Inline as u8);
                     let value = data_col.value(i);
                     data_builder.append_value(value);
                     uri_builder.append_null();
@@ -187,10 +184,12 @@ impl BlobPreprocessor {
                     uri_builder.append_null();
                     blob_id_builder.append_null();
                     blob_size_builder.append_null();
+                    kind_builder.append_null();
                 }
             }
 
             let child_fields = vec![
+                arrow_schema::Field::new("kind", ArrowDataType::UInt8, true),
                 arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
                 arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
                 arrow_schema::Field::new("blob_id", ArrowDataType::UInt32, true),
@@ -200,6 +199,7 @@ impl BlobPreprocessor {
             let struct_array = arrow_array::StructArray::try_new(
                 child_fields.clone().into(),
                 vec![
+                    Arc::new(kind_builder.finish()),
                     Arc::new(data_builder.finish()),
                     Arc::new(uri_builder.finish()),
                     Arc::new(blob_id_builder.finish()),
