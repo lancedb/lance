@@ -8,7 +8,7 @@
 //! - Int64 and String data types
 //! - High cardinality (unique values) and low cardinality (100 unique values)
 //! - Equality filters
-//! - IN filters with varying size (10, 20, 30 values)
+//! - IN filters with varying size (1, 3, 5 values)
 
 mod common;
 
@@ -34,19 +34,43 @@ use pprof::criterion::{Output, PProfProfiler};
 // Lazy static runtime - only created once
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+// Lazy static cache - only created when cached benchmarks are run
+static CACHE: OnceLock<Arc<LanceCache>> = OnceLock::new();
+
 // Lazy static indices - only created when first accessed
-static INT_UNIQUE_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
-static INT_LOW_CARD_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
-static STRING_UNIQUE_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
-static STRING_LOW_CARD_INDEX: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+// Separate indices for cached and uncached variants
+static INT_UNIQUE_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_UNIQUE_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_LOW_CARD_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_UNIQUE_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_UNIQUE_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_LOW_CARD_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
 
 /// Get or create the tokio runtime
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().build().unwrap())
 }
 
+/// Get the cache - either a singleton cache or no_cache based on use_cache parameter
+fn get_cache(use_cache: bool, key_prefix: &str) -> Arc<LanceCache> {
+    if use_cache {
+        Arc::new(
+            CACHE
+                .get_or_init(|| Arc::new(LanceCache::with_capacity(1024 * 1024 * 1024)))
+                .with_key_prefix(key_prefix),
+        )
+    } else {
+        Arc::new(LanceCache::no_cache())
+    }
+}
+
 /// Create and train a Bitmap index for int64 data with unique values
-async fn create_int_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+async fn create_int_unique_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_unique_stream();
 
     BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
@@ -55,7 +79,7 @@ async fn create_int_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarI
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
-        .load_index(store, &details, None, &LanceCache::no_cache())
+        .load_index(store, &details, None, &get_cache(use_cache, "int_unique"))
         .await
         .unwrap();
 
@@ -63,7 +87,10 @@ async fn create_int_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarI
 }
 
 /// Create and train a Bitmap index for int64 data with low cardinality
-async fn create_int_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+async fn create_int_low_card_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_low_cardinality_stream();
 
     BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
@@ -72,7 +99,7 @@ async fn create_int_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scala
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
-        .load_index(store, &details, None, &LanceCache::no_cache())
+        .load_index(store, &details, None, &get_cache(use_cache, "int_low_card"))
         .await
         .unwrap();
 
@@ -80,7 +107,10 @@ async fn create_int_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scala
 }
 
 /// Create and train a Bitmap index for string data with unique values
-async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+async fn create_string_unique_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_unique_stream();
 
     BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
@@ -89,7 +119,12 @@ async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scal
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
-        .load_index(store, &details, None, &LanceCache::no_cache())
+        .load_index(
+            store,
+            &details,
+            None,
+            &get_cache(use_cache, "string_unique"),
+        )
         .await
         .unwrap();
 
@@ -97,7 +132,10 @@ async fn create_string_unique_index(store: Arc<LanceIndexStore>) -> Arc<dyn Scal
 }
 
 /// Create and train a Bitmap index for string data with low cardinality
-async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn ScalarIndex> {
+async fn create_string_low_card_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_low_cardinality_stream();
 
     BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
@@ -106,7 +144,12 @@ async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Sc
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
     let index = BitmapIndexPlugin
-        .load_index(store, &details, None, &LanceCache::no_cache())
+        .load_index(
+            store,
+            &details,
+            None,
+            &get_cache(use_cache, "string_low_card"),
+        )
         .await
         .unwrap();
 
@@ -114,92 +157,106 @@ async fn create_string_low_card_index(store: Arc<LanceIndexStore>) -> Arc<dyn Sc
 }
 
 /// Set up all benchmark indices
-/// Setup function for int unique index - creates it only once
-fn setup_int_unique_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
-    INT_UNIQUE_INDEX
+/// Setup function for int unique index - creates it only once per cache variant
+fn setup_int_unique_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_UNIQUE_INDEX_CACHED
+    } else {
+        &INT_UNIQUE_INDEX_NO_CACHE
+    };
+
+    static_ref
         .get_or_init(|| {
-            println!(
-                "Creating int unique bitmap index with {} rows...",
-                TOTAL_ROWS
-            );
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
                     Arc::new(ObjectStore::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
-                    Arc::new(LanceCache::no_cache()),
+                    get_cache(use_cache, "int_unique"),
                 ));
-                let index = create_int_unique_index(store).await;
-                std::mem::forget(tempdir);
+                let index = create_int_unique_index(store, use_cache).await;
+                let _ = tempdir.keep();
                 index
             })
         })
         .clone()
 }
 
-/// Setup function for int low cardinality index - creates it only once
-fn setup_int_low_card_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
-    INT_LOW_CARD_INDEX
+/// Setup function for int low cardinality index - creates it only once per cache variant
+fn setup_int_low_card_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_LOW_CARD_INDEX_CACHED
+    } else {
+        &INT_LOW_CARD_INDEX_NO_CACHE
+    };
+
+    static_ref
         .get_or_init(|| {
-            println!(
-                "Creating int low cardinality bitmap index with {} rows...",
-                TOTAL_ROWS
-            );
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
                     Arc::new(ObjectStore::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
-                    Arc::new(LanceCache::no_cache()),
+                    get_cache(use_cache, "int_low_card"),
                 ));
-                let index = create_int_low_card_index(store).await;
-                std::mem::forget(tempdir);
+                let index = create_int_low_card_index(store, use_cache).await;
+                let _ = tempdir.keep();
                 index
             })
         })
         .clone()
 }
 
-/// Setup function for string unique index - creates it only once
-fn setup_string_unique_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
-    STRING_UNIQUE_INDEX
+/// Setup function for string unique index - creates it only once per cache variant
+fn setup_string_unique_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &STRING_UNIQUE_INDEX_CACHED
+    } else {
+        &STRING_UNIQUE_INDEX_NO_CACHE
+    };
+
+    static_ref
         .get_or_init(|| {
-            println!(
-                "Creating string unique bitmap index with {} rows...",
-                TOTAL_ROWS
-            );
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
                     Arc::new(ObjectStore::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
-                    Arc::new(LanceCache::no_cache()),
+                    get_cache(use_cache, "string_unique"),
                 ));
-                let index = create_string_unique_index(store).await;
-                std::mem::forget(tempdir);
+                let index = create_string_unique_index(store, use_cache).await;
+                let _ = tempdir.keep();
                 index
             })
         })
         .clone()
 }
 
-/// Setup function for string low cardinality index - creates it only once
-fn setup_string_low_card_index(rt: &tokio::runtime::Runtime) -> Arc<dyn ScalarIndex> {
-    STRING_LOW_CARD_INDEX
+/// Setup function for string low cardinality index - creates it only once per cache variant
+fn setup_string_low_card_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &STRING_LOW_CARD_INDEX_CACHED
+    } else {
+        &STRING_LOW_CARD_INDEX_NO_CACHE
+    };
+
+    static_ref
         .get_or_init(|| {
-            println!(
-                "Creating string low cardinality bitmap index with {} rows...",
-                TOTAL_ROWS
-            );
             rt.block_on(async {
                 let tempdir = tempfile::tempdir().unwrap();
                 let store = Arc::new(LanceIndexStore::new(
                     Arc::new(ObjectStore::local()),
                     Path::from_filesystem_path(tempdir.path()).unwrap(),
-                    Arc::new(LanceCache::no_cache()),
+                    get_cache(use_cache, "string_low_card"),
                 ));
-                let index = create_string_low_card_index(store).await;
-                std::mem::forget(tempdir);
+                let index = create_string_low_card_index(store, use_cache).await;
+                let _ = tempdir.keep();
                 index
             })
         })
@@ -220,59 +277,64 @@ fn bench_equality(c: &mut Criterion) {
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
 
-    // int unique
-    group.bench_function(BenchmarkId::from_parameter("int_unique"), |b| {
-        let index = setup_int_unique_index(rt);
-        b.to_async(rt).iter(|| {
-            let index = index.clone();
-            let value = int_unique_value;
-            async move {
-                let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
-                black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-            }
-        })
-    });
+    // Benchmark both cached and uncached variants
+    for use_cache in [false, true] {
+        let cache_label = if use_cache { "cached" } else { "no_cache" };
 
-    // int low cardinality
-    group.bench_function(BenchmarkId::from_parameter("int_low_card"), |b| {
-        let index = setup_int_low_card_index(rt);
-        b.to_async(rt).iter(|| {
-            let index = index.clone();
-            let value = int_low_card_value;
-            async move {
-                let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
-                black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-            }
-        })
-    });
+        // int unique
+        group.bench_function(BenchmarkId::new("int_unique", cache_label), |b| {
+            let index = setup_int_unique_index(rt, use_cache);
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = int_unique_value;
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
 
-    // String unique
-    group.bench_function(BenchmarkId::from_parameter("string_unique"), |b| {
-        let index = setup_string_unique_index(rt);
-        let value = string_unique_value.clone();
-        b.to_async(rt).iter(|| {
-            let index = index.clone();
-            let value = value.clone();
-            async move {
-                let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
-                black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-            }
-        })
-    });
+        // int low cardinality
+        group.bench_function(BenchmarkId::new("int_low_card", cache_label), |b| {
+            let index = setup_int_low_card_index(rt, use_cache);
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = int_low_card_value;
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
 
-    // String low cardinality
-    group.bench_function(BenchmarkId::from_parameter("string_low_card"), |b| {
-        let index = setup_string_low_card_index(rt);
-        let value = string_low_card_value.clone();
-        b.to_async(rt).iter(|| {
-            let index = index.clone();
-            let value = value.clone();
-            async move {
-                let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
-                black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-            }
-        })
-    });
+        // String unique
+        group.bench_function(BenchmarkId::new("string_unique", cache_label), |b| {
+            let index = setup_string_unique_index(rt, use_cache);
+            let value = string_unique_value.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = value.clone();
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String low cardinality
+        group.bench_function(BenchmarkId::new("string_low_card", cache_label), |b| {
+            let index = setup_string_low_card_index(rt, use_cache);
+            let value = string_low_card_value.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = value.clone();
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+    }
 
     group.finish();
 }
@@ -281,7 +343,7 @@ fn bench_in(c: &mut Criterion) {
     let rt = get_runtime();
 
     // Test with different numbers of values in the IN clause
-    let value_counts = [1, 2, 3, 4, 5];
+    let value_counts = [1, 3, 5];
 
     for &num_values in &value_counts {
         let mut group = c.benchmark_group(format!("bitmap_in_{}", num_values));
@@ -299,36 +361,10 @@ fn bench_in(c: &mut Criterion) {
             .map(|i| ScalarValue::Int64(Some(mid_int + i as i64 - num_values as i64 / 2)))
             .collect();
 
-        group.bench_function(BenchmarkId::from_parameter("int_unique"), |b| {
-            let index = setup_int_unique_index(rt);
-            let values = int_values.clone();
-            b.to_async(rt).iter(|| {
-                let index = index.clone();
-                let values = values.clone();
-                async move {
-                    let query = SargableQuery::IsIn(values);
-                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-                }
-            })
-        });
-
         // Int low cardinality - IN query
         let int_low_card_values: Vec<ScalarValue> = (0..num_values)
             .map(|i| ScalarValue::Int64(Some((mid_low_card + i - num_values / 2) as i64)))
             .collect();
-
-        group.bench_function(BenchmarkId::from_parameter("int_low_card"), |b| {
-            let index = setup_int_low_card_index(rt);
-            let values = int_low_card_values.clone();
-            b.to_async(rt).iter(|| {
-                let index = index.clone();
-                let values = values.clone();
-                async move {
-                    let query = SargableQuery::IsIn(values);
-                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-                }
-            })
-        });
 
         // String unique - IN query
         let string_values: Vec<ScalarValue> = (0..num_values)
@@ -340,19 +376,6 @@ fn bench_in(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_function(BenchmarkId::from_parameter("string_unique"), |b| {
-            let index = setup_string_unique_index(rt);
-            let values = string_values.clone();
-            b.to_async(rt).iter(|| {
-                let index = index.clone();
-                let values = values.clone();
-                async move {
-                    let query = SargableQuery::IsIn(values);
-                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-                }
-            })
-        });
-
         // String low cardinality - IN query
         let string_low_card_values: Vec<ScalarValue> = (0..num_values)
             .map(|i| {
@@ -363,18 +386,62 @@ fn bench_in(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_function(BenchmarkId::from_parameter("string_low_card"), |b| {
-            let index = setup_string_low_card_index(rt);
-            let values = string_low_card_values.clone();
-            b.to_async(rt).iter(|| {
-                let index = index.clone();
-                let values = values.clone();
-                async move {
-                    let query = SargableQuery::IsIn(values);
-                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
-                }
-            })
-        });
+        // Benchmark both cached and uncached variants
+        for use_cache in [false, true] {
+            let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+            group.bench_function(BenchmarkId::new("int_unique", cache_label), |b| {
+                let index = setup_int_unique_index(rt, use_cache);
+                let values = int_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("int_low_card", cache_label), |b| {
+                let index = setup_int_low_card_index(rt, use_cache);
+                let values = int_low_card_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("string_unique", cache_label), |b| {
+                let index = setup_string_unique_index(rt, use_cache);
+                let values = string_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("string_low_card", cache_label), |b| {
+                let index = setup_string_low_card_index(rt, use_cache);
+                let values = string_low_card_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+        }
 
         group.finish();
     }
