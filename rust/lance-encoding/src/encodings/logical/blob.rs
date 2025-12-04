@@ -317,7 +317,6 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
 
         for i in 0..struct_arr.len() {
-            // Schema is expected to be non-nullable; still handle null defensively.
             if struct_arr.is_null(i) {
                 kind_builder.append_value(BlobKind::Inline as u8);
                 position_builder.append_value(0);
