@@ -53,13 +53,14 @@ impl BlobPreprocessor {
             object_store,
             data_dir,
             fragment_id,
-            local_counter: 0,
+            // Start at 1 to avoid a potential all-zero blob_id value.
+            local_counter: 1,
             field_ids,
         }
     }
 
     fn next_blob_id(&mut self) -> u32 {
-        let id = (self.fragment_id << 16) | self.local_counter;
+        let id = self.local_counter;
         self.local_counter = self.local_counter.wrapping_add(1);
         id
     }
