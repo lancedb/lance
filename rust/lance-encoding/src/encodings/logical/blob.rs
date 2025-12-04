@@ -501,19 +501,32 @@ mod tests {
         let blob_metadata =
             HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
 
+        let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
         let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
         let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+        let blob_id_field = Arc::new(ArrowField::new("blob_id", DataType::UInt32, true));
+        let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
 
+        let kind_array = UInt8Array::from(vec![
+            BlobKind::Inline as u8,
+            BlobKind::External as u8,
+            BlobKind::External as u8,
+        ]);
         let data_array = LargeBinaryArray::from(vec![Some(b"inline".as_ref()), None, None]);
         let uri_array = StringArray::from(vec![
             None,
             Some("file:///tmp/external.bin"),
             Some("s3://bucket/blob"),
         ]);
+        let blob_id_array = UInt32Array::from(vec![0, 0, 0]);
+        let blob_size_array = UInt64Array::from(vec![0, 0, 0]);
 
         let struct_array = StructArray::from(vec![
+            (kind_field, Arc::new(kind_array) as ArrayRef),
             (data_field, Arc::new(data_array) as ArrayRef),
             (uri_field, Arc::new(uri_array) as ArrayRef),
+            (blob_id_field, Arc::new(blob_id_array) as ArrayRef),
+            (blob_size_field, Arc::new(blob_size_array) as ArrayRef),
         ]);
 
         let expected_descriptor = StructArray::from(vec![
