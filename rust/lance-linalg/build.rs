@@ -15,9 +15,8 @@ fn main() -> Result<(), String> {
         println!("cargo:rustc-cfg=feature=\"nightly\"");
     }
 
-    // Let clippy know about our custom cfg attributes
+    // Let clippy know about our custom cfg attribute
     println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
-    println!("cargo::rustc-check-cfg=cfg(kernel_support_dist_table, values(\"avx512\"))");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
@@ -62,9 +61,7 @@ fn main() -> Result<(), String> {
                 err
             );
         } else {
-            // Use a separate cfg flag for dist_table to avoid symbol mismatch
-            // when f16 build succeeds but dist_table build fails (or vice versa)
-            println!("cargo:rustc-cfg=kernel_support_dist_table=\"avx512\"");
+            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
         };
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang

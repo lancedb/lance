@@ -21,7 +21,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
-    utils::{mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ID,
 };
 use roaring::RoaringBitmap;
@@ -100,7 +100,7 @@ pub struct BitmapIndex {
     /// for quickly locating the row and reading it out
     index_map: BTreeMap<OrderableScalarValue, usize>,
 
-    null_map: Arc<RowIdTreeMap>,
+    null_map: Arc<RowAddrTreeMap>,
 
     value_type: DataType,
 
@@ -119,7 +119,7 @@ pub struct BitmapKey {
 }
 
 impl CacheKey for BitmapKey {
-    type ValueType = RowIdTreeMap;
+    type ValueType = RowAddrTreeMap;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("{}", self.value.0).into()
@@ -129,7 +129,7 @@ impl CacheKey for BitmapKey {
 impl BitmapIndex {
     fn new(
         index_map: BTreeMap<OrderableScalarValue, usize>,
-        null_map: Arc<RowIdTreeMap>,
+        null_map: Arc<RowAddrTreeMap>,
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
@@ -160,7 +160,7 @@ impl BitmapIndex {
             let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
                 BTreeMap::new(),
-                Arc::new(RowIdTreeMap::default()),
+                Arc::new(RowAddrTreeMap::default()),
                 data_type,
                 store,
                 WeakLanceCache::from(index_cache),
@@ -169,7 +169,7 @@ impl BitmapIndex {
         }
 
         let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
-        let mut null_map = Arc::new(RowIdTreeMap::default());
+        let mut null_map = Arc::new(RowAddrTreeMap::default());
         let mut value_type: Option<DataType> = None;
         let mut null_location: Option<usize> = None;
         let mut row_offset = 0;
@@ -217,11 +217,11 @@ impl BitmapIndex {
                     location: location!(),
                 })?;
             let bitmap_bytes = binary_bitmaps.value(0);
-            let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+            let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
             // Apply fragment remapping if needed
             if let Some(fri) = &frag_reuse_index {
-                bitmap = fri.remap_row_ids_tree_map(&bitmap);
+                bitmap = fri.remap_row_addrs_tree_map(&bitmap);
             }
 
             null_map = Arc::new(bitmap);
@@ -243,7 +243,7 @@ impl BitmapIndex {
         &self,
         key: &OrderableScalarValue,
         metrics: Option<&dyn MetricsCollector>,
-    ) -> Result<Arc<RowIdTreeMap>> {
+    ) -> Result<Arc<RowAddrTreeMap>> {
         if key.0.is_null() {
             return Ok(self.null_map.clone());
         }
@@ -261,7 +261,7 @@ impl BitmapIndex {
 
         let row_offset = match self.index_map.get(key) {
             Some(loc) => *loc,
-            None => return Ok(Arc::new(RowIdTreeMap::default())),
+            None => return Ok(Arc::new(RowAddrTreeMap::default())),
         };
 
         let page_lookup_file = self.lazy_reader.get().await?;
@@ -278,10 +278,10 @@ impl BitmapIndex {
                 location: location!(),
             })?;
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
-        let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+        let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
         if let Some(fri) = &self.frag_reuse_index {
-            bitmap = fri.remap_row_ids_tree_map(&bitmap);
+            bitmap = fri.remap_row_addrs_tree_map(&bitmap);
         }
 
         self.index_cache
@@ -358,10 +358,10 @@ impl Index for BitmapIndex {
                 }
 
                 let bitmap_bytes = bitmap_binary_array.value(idx);
-                let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+                let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                    bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
+                    bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
                 }
 
                 let cache_key = BitmapKey { value: key };
@@ -436,7 +436,7 @@ impl ScalarIndex for BitmapIndex {
                 metrics.record_comparisons(keys.len());
 
                 if keys.is_empty() {
-                    RowIdTreeMap::default()
+                    RowAddrTreeMap::default()
                 } else {
                     let bitmaps: Vec<_> = stream::iter(keys.into_iter().map(|key| {
                         let this = self.clone();
@@ -447,7 +447,7 @@ impl ScalarIndex for BitmapIndex {
                     .await?;
 
                     let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                    RowIdTreeMap::union_all(&bitmap_refs)
+                    RowAddrTreeMap::union_all(&bitmap_refs)
                 }
             }
             SargableQuery::IsIn(values) => {
@@ -473,7 +473,7 @@ impl ScalarIndex for BitmapIndex {
                     .collect();
 
                 if keys.is_empty() && (!has_null || self.null_map.is_empty()) {
-                    RowIdTreeMap::default()
+                    RowAddrTreeMap::default()
                 } else {
                     // Load bitmaps in parallel
                     let mut bitmaps: Vec<_> = stream::iter(keys.into_iter().map(|key| {
@@ -490,11 +490,11 @@ impl ScalarIndex for BitmapIndex {
                     }
 
                     if bitmaps.is_empty() {
-                        RowIdTreeMap::default()
+                        RowAddrTreeMap::default()
                     } else {
-                        // Convert Arc<RowIdTreeMap> to &RowIdTreeMap for union_all
+                        // Convert Arc<RowAddrTreeMap> to &RowAddrTreeMap for union_all
                         let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                        RowIdTreeMap::union_all(&bitmap_refs)
+                        RowAddrTreeMap::union_all(&bitmap_refs)
                     }
                 }
             }
@@ -528,7 +528,7 @@ impl ScalarIndex for BitmapIndex {
         for key in self.index_map.keys() {
             let bitmap = self.load_bitmap(key, None).await?;
             let remapped_bitmap =
-                RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
+                RowAddrTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
                     let addr_as_u64 = u64::from(addr);
                     mapping
                         .get(&addr_as_u64)
@@ -540,7 +540,7 @@ impl ScalarIndex for BitmapIndex {
 
         if !self.null_map.is_empty() {
             let remapped_null =
-                RowIdTreeMap::from_iter(self.null_map.row_ids().unwrap().filter_map(|addr| {
+                RowAddrTreeMap::from_iter(self.null_map.row_addrs().unwrap().filter_map(|addr| {
                     let addr_as_u64 = u64::from(addr);
                     mapping
                         .get(&addr_as_u64)
@@ -616,7 +616,7 @@ impl BitmapIndexPlugin {
     }
 
     async fn write_bitmap_index(
-        state: HashMap<ScalarValue, RowIdTreeMap>,
+        state: HashMap<ScalarValue, RowAddrTreeMap>,
         index_store: &dyn IndexStore,
         value_type: &DataType,
     ) -> Result<()> {
@@ -680,7 +680,7 @@ impl BitmapIndexPlugin {
 
     async fn do_train_bitmap_index(
         mut data_source: SendableRecordBatchStream,
-        mut state: HashMap<ScalarValue, RowIdTreeMap>,
+        mut state: HashMap<ScalarValue, RowAddrTreeMap>,
         index_store: &dyn IndexStore,
     ) -> Result<()> {
         let value_type = data_source.schema().field(0).data_type().clone();
@@ -706,7 +706,7 @@ impl BitmapIndexPlugin {
         index_store: &dyn IndexStore,
     ) -> Result<()> {
         // mapping from item to list of the row ids where it is present
-        let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
+        let dictionary: HashMap<ScalarValue, RowAddrTreeMap> = HashMap::new();
 
         Self::do_train_bitmap_index(data, dictionary, index_store).await
     }
@@ -854,7 +854,7 @@ pub mod tests {
         // Verify results
         let expected_red_rows = vec![0u64, 3, 6, 10, 11];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         } else {
@@ -864,7 +864,7 @@ pub mod tests {
         // Test 2: Search for "red" again - should hit cache
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         }
@@ -878,7 +878,7 @@ pub mod tests {
 
         let expected_range_rows = vec![1u64, 2, 5, 7, 8, 12, 13];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
             actual.sort();
             assert_eq!(actual, expected_range_rows);
         }
@@ -892,7 +892,7 @@ pub mod tests {
 
         let expected_in_rows = vec![0u64, 3, 4, 6, 9, 10, 11, 14];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
             actual.sort();
             assert_eq!(actual, expected_in_rows);
         }
@@ -909,7 +909,7 @@ pub mod tests {
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
-        use lance_core::utils::mask::RowIdTreeMap;
+        use lance_core::utils::mask::RowAddrTreeMap;
         use lance_io::object_store::ObjectStore;
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -925,7 +925,7 @@ pub mod tests {
         let mut state = HashMap::new();
         for i in 0..m {
             // Create a bitmap that contains, say, 1000 row IDs.
-            let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
+            let bitmap = RowAddrTreeMap::from_iter(0..per_bitmap_size);
 
             let key = ScalarValue::UInt32(Some(i));
             state.insert(key, bitmap);
@@ -990,12 +990,12 @@ pub mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("Key {} should exist", key_val));
 
-            // Convert RowIdTreeMap to a vector for easier assertion
-            let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
+            // Convert RowAddrTreeMap to a vector for easier assertion
+            let row_addrs: Vec<u64> = bitmap.row_addrs().unwrap().map(u64::from).collect();
 
             // Verify length
             assert_eq!(
-                row_ids.len(),
+                row_addrs.len(),
                 per_bitmap_size as usize,
                 "Bitmap for key {} has wrong size",
                 key_val
@@ -1004,7 +1004,7 @@ pub mod tests {
             // Verify first few and last few elements
             for i in 0..5.min(per_bitmap_size) {
                 assert!(
-                    row_ids.contains(&i),
+                    row_addrs.contains(&i),
                     "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
@@ -1013,7 +1013,7 @@ pub mod tests {
 
             for i in (per_bitmap_size - 5)..per_bitmap_size {
                 assert!(
-                    row_ids.contains(&i),
+                    row_addrs.contains(&i),
                     "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
@@ -1023,7 +1023,7 @@ pub mod tests {
             // Verify exact range
             let expected_range: Vec<u64> = (0..per_bitmap_size).collect();
             assert_eq!(
-                row_ids, expected_range,
+                row_addrs, expected_range,
                 "Bitmap for key {} doesn't contain expected values",
                 key_val
             );
@@ -1031,7 +1031,7 @@ pub mod tests {
             tracing::info!(
                 "✓ Verified bitmap for key {}: {} rows as expected",
                 key_val,
-                row_ids.len()
+                row_addrs.len()
             );
         }
 
@@ -1121,7 +1121,7 @@ pub mod tests {
             .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
-        let red_rows: Vec<u64> = cached_red.row_ids().unwrap().map(u64::from).collect();
+        let red_rows: Vec<u64> = cached_red.row_addrs().unwrap().map(u64::from).collect();
         assert_eq!(red_rows, vec![0, 3, 6, 10, 11]);
 
         // Call prewarm again - should be idempotent
@@ -1132,7 +1132,7 @@ pub mod tests {
             .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
-        let red_rows_2: Vec<u64> = cached_red_2.row_ids().unwrap().map(u64::from).collect();
+        let red_rows_2: Vec<u64> = cached_red_2.row_addrs().unwrap().map(u64::from).collect();
         assert_eq!(red_rows_2, vec![0, 3, 6, 10, 11]);
     }
 
@@ -1247,7 +1247,7 @@ pub mod tests {
         ];
         let actual_null_addrs: Vec<u64> = reloaded_idx
             .null_map
-            .row_ids()
+            .row_addrs()
             .unwrap()
             .map(u64::from)
             .collect();
@@ -1263,7 +1263,7 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 2).into(),
@@ -1279,7 +1279,7 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 4).into(),
@@ -1295,7 +1295,7 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             assert_eq!(
                 actual, expected_null_addrs,

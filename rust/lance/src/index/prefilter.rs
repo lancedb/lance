@@ -19,8 +19,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::mask::RowIdMask;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
@@ -107,7 +106,7 @@ impl DatasetPreFilter {
         let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
             .buffer_unordered(dataset.object_store.io_parallelism());
 
-        let mut deleted_ids = RowIdTreeMap::new();
+        let mut deleted_ids = RowAddrTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
             deleted_ids.insert_bitmap(id, deletion_vector);
         }
@@ -152,16 +151,16 @@ impl DatasetPreFilter {
                     // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
                         Ok(row_ids_and_deletions.into_iter().fold(
-                            RowIdTreeMap::new(),
+                            RowAddrTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {
                                     let mut row_ids = row_ids.as_ref().clone();
                                     row_ids.mask(deletion_vector.iter()).unwrap();
-                                    Cow::Owned(row_ids)
+                                    Cow::<RowIdSequence>::Owned(row_ids)
                                 } else {
-                                    Cow::Borrowed(row_ids.as_ref())
+                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
                                 };
-                                let treemap = RowIdTreeMap::from(seq.as_ref());
+                                let treemap = RowAddrTreeMap::from(seq.as_ref());
                                 allow_list |= treemap;
                                 allow_list
                             },
@@ -360,7 +359,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowIdTreeMap::from_iter(vec![(2 << 32) + 2]);
+        let mut expected = RowAddrTreeMap::from_iter(vec![(2 << 32) + 2]);
         expected.insert_fragment(1);
         assert_eq!(&mask.block_list, &Some(expected));
 
@@ -380,7 +379,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_fragment(1);
         expected.insert_fragment(2);
         assert_eq!(&mask.block_list, &Some(expected));
@@ -405,7 +404,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let expected = RowIdTreeMap::from_iter(0..8);
+        let expected = RowAddrTreeMap::from_iter(0..8);
         assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list

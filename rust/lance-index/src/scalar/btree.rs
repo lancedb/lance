@@ -44,7 +44,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::RowIdTreeMap,
+        mask::RowAddrTreeMap,
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -832,7 +832,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<RowAddrTreeMap> {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
@@ -1176,7 +1176,7 @@ impl ScalarIndex for BTreeIndex {
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<RowIdTreeMap>()
+            .try_collect::<RowAddrTreeMap>()
             .await?;
         Ok(SearchResult::Exact(row_ids))
     }
@@ -2014,7 +2014,7 @@ mod tests {
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
@@ -2165,7 +2165,7 @@ mod tests {
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             assert_eq!(
                 result,
-                SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+                SearchResult::Exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
     }

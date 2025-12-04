@@ -5,13 +5,15 @@ use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
-use super::Dataset;
+use super::take::TakeBuilder;
+use super::{Dataset, ProjectionRequest};
 use arrow_array::{Array, StructArray};
-use lance_core::datatypes::BlobVersion;
+use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
@@ -39,18 +41,20 @@ enum ReaderState {
 /// A file-like object that represents a blob in a dataset
 #[derive(Debug)]
 pub struct BlobFile {
-    dataset: Arc<Dataset>,
+    object_store: Arc<ObjectStore>,
+    path: Path,
     reader: Arc<Mutex<ReaderState>>,
-    data_file: Path,
     position: u64,
     size: u64,
+    kind: BlobKind,
+    uri: Option<String>,
 }
 
 impl BlobFile {
     /// Create a new BlobFile
     ///
     /// See [`crate::dataset::Dataset::take_blobs`]
-    pub fn new(
+    pub fn new_inline(
         dataset: Arc<Dataset>,
         field_id: u32,
         row_addr: u64,
@@ -62,22 +66,50 @@ impl BlobFile {
         let data_file = frag.data_file_for_field(field_id).unwrap();
         let data_file = dataset.data_dir().child(data_file.path.as_str());
         Self {
-            dataset,
-            data_file,
+            object_store: dataset.object_store.clone(),
+            path: data_file,
             position,
             size,
+            kind: BlobKind::Inline,
+            uri: None,
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
     }
 
     pub fn new_dedicated(dataset: Arc<Dataset>, path: Path, size: u64) -> Self {
         Self {
-            dataset,
-            data_file: path,
+            object_store: dataset.object_store.clone(),
+            path,
             position: 0,
             size,
+            kind: BlobKind::Dedicated,
+            uri: None,
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
+    }
+
+    pub async fn new_external(
+        uri: String,
+        size: u64,
+        registry: Arc<ObjectStoreRegistry>,
+        params: Arc<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (object_store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
+        let size = if size > 0 {
+            size
+        } else {
+            object_store.size(&path).await?
+        };
+        Ok(Self {
+            object_store,
+            path,
+            position: 0,
+            size,
+            kind: BlobKind::External,
+            uri: Some(uri),
+            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
+        })
     }
 
     /// Close the blob file, releasing any associated resources
@@ -102,7 +134,7 @@ impl BlobFile {
     ) -> Result<T> {
         let mut reader = self.reader.lock().await;
         if let ReaderState::Uninitialized(cursor) = *reader {
-            let opened = self.dataset.object_store.open(&self.data_file).await?;
+            let opened = self.object_store.open(&self.path).await?;
             let opened = Arc::<dyn Reader>::from(opened);
             *reader = ReaderState::Open((cursor, opened.clone()));
         }
@@ -189,6 +221,22 @@ impl BlobFile {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn data_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn kind(&self) -> BlobKind {
+        self.kind
+    }
+
+    pub fn uri(&self) -> Option<&str> {
+        self.uri.as_deref()
+    }
 }
 
 pub(super) async fn take_blobs(
@@ -216,13 +264,60 @@ pub(super) async fn take_blobs(
 
     match dataset.blob_version() {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
-        BlobVersion::V2 => collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V2 => {
+            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
+        }
     }
 }
 
-const INLINE_BLOB_KIND: u8 = 0;
-const DEDICATED_BLOB_KIND: u8 = 2;
-const EXTERNAL_BLOB_KIND: u8 = 3;
+/// Take [BlobFile] by row addresses.
+///
+/// Row addresses are `u64` values encoding `(fragment_id << 32) | row_offset`.
+/// Use this method when you already have row addresses, for example from
+/// a scan with `with_row_address()`. For row IDs (stable identifiers), use
+/// [`Dataset::take_blobs`]. For row indices (offsets), use
+/// [`Dataset::take_blobs_by_indices`].
+pub async fn take_blobs_by_addresses(
+    dataset: &Arc<Dataset>,
+    row_addrs: &[u64],
+    column: &str,
+) -> Result<Vec<BlobFile>> {
+    let projection = dataset.schema().project(&[column])?;
+    let blob_field = &projection.fields[0];
+    let blob_field_id = blob_field.id;
+    if !projection.fields[0].is_blob() {
+        return Err(Error::InvalidInput {
+            location: location!(),
+            source: format!("the column '{}' is not a blob column", column).into(),
+        });
+    }
+
+    // Convert Schema to ProjectionPlan
+    let projection_request = ProjectionRequest::from(projection);
+    let projection_plan = Arc::new(projection_request.into_projection_plan(dataset.clone())?);
+
+    // Use try_new_from_addresses to bypass row ID index lookup.
+    // This is critical when enable_stable_row_ids=true because row addresses
+    // (fragment_id << 32 | row_offset) are different from row IDs (sequential integers).
+    let description_and_addr =
+        TakeBuilder::try_new_from_addresses(dataset.clone(), row_addrs.to_vec(), projection_plan)?
+            .with_row_address(true)
+            .execute()
+            .await?;
+
+    let descriptions = description_and_addr.column(0).as_struct();
+    let row_addrs_result = description_and_addr.column(1).as_primitive::<UInt64Type>();
+    let blob_field_id = blob_field_id as u32;
+
+    match dataset.blob_version() {
+        BlobVersion::V1 => {
+            collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs_result)
+        }
+        BlobVersion::V2 => {
+            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result).await
+        }
+    }
+}
 
 fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
@@ -244,12 +339,12 @@ fn collect_blob_files_v1(
             Some((*row_addr, position, size))
         })
         .map(|(row_addr, position, size)| {
-            BlobFile::new(dataset.clone(), blob_field_id, row_addr, position, size)
+            BlobFile::new_inline(dataset.clone(), blob_field_id, row_addr, position, size)
         })
         .collect())
 }
 
-fn collect_blob_files_v2(
+async fn collect_blob_files_v2(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     descriptions: &StructArray,
@@ -259,23 +354,22 @@ fn collect_blob_files_v2(
     let positions = descriptions.column(1).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
     let blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
-    let uris = descriptions.column(4).as_string::<i32>();
+    let blob_uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
-        if kinds.is_null(idx) {
-            // Null row
+        let kind = BlobKind::try_from(kinds.value(idx))?;
+
+        // Struct is non-nullable; null rows are encoded as inline with zero position/size and empty uri
+        if matches!(kind, BlobKind::Inline) && positions.value(idx) == 0 && sizes.value(idx) == 0 {
             continue;
         }
-        let kind = kinds.value(idx);
+
         match kind {
-            INLINE_BLOB_KIND => {
-                if positions.is_null(idx) || sizes.is_null(idx) {
-                    continue;
-                }
+            BlobKind::Inline => {
                 let position = positions.value(idx);
                 let size = sizes.value(idx);
-                files.push(BlobFile::new(
+                files.push(BlobFile::new_inline(
                     dataset.clone(),
                     blob_field_id,
                     *row_addr,
@@ -283,7 +377,7 @@ fn collect_blob_files_v2(
                     size,
                 ));
             }
-            DEDICATED_BLOB_KIND => {
+            BlobKind::Dedicated => {
                 if blob_ids.is_null(idx) || sizes.is_null(idx) {
                     return Err(Error::corrupt_file(
                         dataset.data_dir(),
@@ -309,13 +403,20 @@ fn collect_blob_files_v2(
                 let path = blob_path(&dataset.data_dir(), frag_id, blob_field_id, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
             }
-            EXTERNAL_BLOB_KIND => {
-                let _ = uris.value(idx);
-                // External blobs are not fetched; skip emitting BlobFile
+            BlobKind::External => {
+                let uri = blob_uris.value(idx).to_string();
+                let size = sizes.value(idx);
+                let registry = dataset.session.store_registry();
+                let params = dataset
+                    .store_params
+                    .as_ref()
+                    .map(|p| Arc::new((**p).clone()))
+                    .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+                files.push(BlobFile::new_external(uri, size, registry, params).await?);
             }
             other => {
                 return Err(Error::NotSupported {
-                    source: format!("Blob kind {} is not supported", other).into(),
+                    source: format!("Blob kind {:?} is not supported", other).into(),
                     location: location!(),
                 });
             }
@@ -437,9 +538,9 @@ mod tests {
         let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
 
         for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
-            assert_eq!(blob1.position, blob2.position);
-            assert_eq!(blob1.size, blob2.size);
-            assert_eq!(blob1.data_file, blob2.data_file);
+            assert_eq!(blob1.position(), blob2.position());
+            assert_eq!(blob1.size(), blob2.size());
+            assert_eq!(blob1.data_path(), blob2.data_path());
         }
     }
 
@@ -511,5 +612,85 @@ mod tests {
             assert_eq!(batch.num_columns(), 1);
             assert!(batch.column(0).data_type().is_struct());
         }
+    }
+
+    /// Test that take_blobs_by_indices works correctly with enable_stable_row_ids=true.
+    ///
+    /// This is a regression test for a bug where take_blobs_by_indices would fail
+    /// with "index out of bounds" for fragment 1+ when stable row IDs are enabled.
+    /// The bug was caused by passing row addresses (from row_offsets_to_row_addresses)
+    /// to blob::take_blobs which expected row IDs. When stable row IDs are enabled,
+    /// row addresses (fragment_id << 32 | offset) are different from row IDs
+    /// (sequential integers), causing the row ID index lookup to fail for fragment 1+.
+    #[tokio::test]
+    pub async fn test_take_blobs_by_indices_with_stable_row_ids() {
+        use crate::dataset::WriteParams;
+        use arrow_array::RecordBatchIterator;
+
+        let test_dir = TempStrDir::default();
+
+        // Create test data with blob column
+        let data = lance_datagen::gen_batch()
+            .col("filterme", array::step::<UInt64Type>())
+            .col("blobs", array::blob())
+            .into_reader_rows(RowCount::from(6), BatchCount::from(1))
+            .map(|batch| Ok(batch.unwrap()))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        // Write with enable_stable_row_ids=true and force multiple fragments
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3, // Force 2 fragments with 3 rows each
+            ..Default::default()
+        };
+
+        let reader = RecordBatchIterator::new(data.clone().into_iter().map(Ok), data[0].schema());
+        let dataset = Arc::new(
+            Dataset::write(reader, &test_dir, Some(write_params))
+                .await
+                .unwrap(),
+        );
+
+        // Verify we have multiple fragments
+        let fragments = dataset.fragments();
+        assert!(
+            fragments.len() >= 2,
+            "Expected at least 2 fragments, got {}",
+            fragments.len()
+        );
+
+        // Test first fragment (indices 0, 1, 2) - this always worked
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 3, "First fragment blobs should have 3 items");
+
+        // Verify we can read the blob content
+        for blob in &blobs {
+            let content = blob.read().await.unwrap();
+            assert!(!content.is_empty(), "Blob content should not be empty");
+        }
+
+        // Test second fragment (indices 3, 4, 5) - this was failing before the fix
+        let blobs = dataset
+            .take_blobs_by_indices(&[3, 4, 5], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 3, "Second fragment blobs should have 3 items");
+
+        // Verify we can read the blob content from second fragment
+        for blob in &blobs {
+            let content = blob.read().await.unwrap();
+            assert!(!content.is_empty(), "Blob content should not be empty");
+        }
+
+        // Test mixed indices from both fragments
+        let blobs = dataset
+            .take_blobs_by_indices(&[1, 4], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2, "Mixed fragment blobs should have 2 items");
     }
 }

@@ -15,7 +15,7 @@ use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -304,7 +304,7 @@ impl ScalarIndex for FlatIndex {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
-        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(
+        Ok(SearchResult::Exact(RowAddrTreeMap::from_iter(
             matching_ids.values(),
         )))
     }
@@ -372,7 +372,7 @@ mod tests {
         let SearchResult::Exact(actual_row_ids) = actual else {
             panic! {"Expected exact search result"}
         };
-        let expected = RowIdTreeMap::from_iter(expected);
+        let expected = RowAddrTreeMap::from_iter(expected);
         assert_eq!(actual_row_ids, expected);
     }
 

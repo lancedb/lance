@@ -14,7 +14,7 @@ use crate::{
 use arrow_array::{make_array, Array, StructArray, UInt64Array};
 use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_ord::ord::make_comparator;
-use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
+use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
@@ -83,6 +83,12 @@ fn column_indices_from_schema_helper(
     // In the old style, every field except FSL gets its own column.  In the new style only primitive
     // leaf fields get their own column.
     for field in fields {
+        if is_structural_encoding && field.metadata().contains_key("lance-encoding:packed") {
+            column_indices.push(*column_counter);
+            *column_counter += 1;
+            continue;
+        }
+
         match field.data_type() {
             DataType::Struct(fields) => {
                 if !is_structural_encoding {
@@ -699,6 +705,15 @@ pub async fn check_round_trip_encoding_of_data(
     test_cases: &TestCases,
     metadata: HashMap<String, String>,
 ) {
+    check_round_trip_encoding_of_data_with_expected(data, None, test_cases, metadata).await
+}
+
+pub async fn check_round_trip_encoding_of_data_with_expected(
+    data: Vec<Arc<dyn Array>>,
+    expected_override: Option<Arc<dyn Array>>,
+    test_cases: &TestCases,
+    metadata: HashMap<String, String>,
+) {
     let example_data = data.first().expect("Data must have at least one array");
     let mut field = Field::new("", example_data.data_type().clone(), true);
     field = field.with_metadata(metadata);
@@ -725,8 +740,15 @@ pub async fn check_round_trip_encoding_of_data(
                 "Testing round trip encoding of data with file version {} and page size {}",
                 file_version, page_size
             );
-            check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases, file_version)
-                .await
+            check_round_trip_encoding_inner(
+                encoder,
+                &field,
+                data.clone(),
+                expected_override.clone(),
+                test_cases,
+                file_version,
+            )
+            .await
         }
     }
 }
@@ -795,6 +817,7 @@ async fn check_round_trip_encoding_inner(
     mut encoder: Box<dyn FieldEncoder>,
     field: &Field,
     data: Vec<Arc<dyn Array>>,
+    expected_override: Option<Arc<dyn Array>>,
     test_cases: &TestCases,
     file_version: LanceFileVersion,
 ) {
@@ -902,8 +925,6 @@ async fn check_round_trip_encoding_inner(
 
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
 
-    let schema = Schema::new(vec![field.clone()]);
-
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
     let concat_data = if test_cases.skip_validation {
         None
@@ -924,7 +945,28 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
+    let expected_data = expected_override.clone().or_else(|| concat_data.clone());
+
     let is_structural_encoding = file_version >= LanceFileVersion::V2_1;
+
+    let decode_field = if is_structural_encoding {
+        let mut lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
+        if lance_field.is_blob() && matches!(lance_field.data_type(), DataType::Struct(_)) {
+            lance_field =
+                lance_field.into_unloaded_with_version(lance_core::datatypes::BlobVersion::V2);
+            let mut arrow_field = ArrowField::from(&lance_field);
+            let mut metadata = arrow_field.metadata().clone();
+            metadata.insert("lance-encoding:packed".to_string(), "true".to_string());
+            arrow_field = arrow_field.with_metadata(metadata);
+            arrow_field
+        } else {
+            field.clone()
+        }
+    } else {
+        field.clone()
+    };
+
+    let schema = Schema::new(vec![decode_field]);
 
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
@@ -933,7 +975,7 @@ async fn check_round_trip_encoding_inner(
         test_cases.batch_size,
         &schema,
         &column_infos,
-        concat_data.clone(),
+        expected_data.clone(),
         scheduler_copy.clone(),
         is_structural_encoding,
         |mut decode_scheduler, tx| {
@@ -954,9 +996,9 @@ async fn check_round_trip_encoding_inner(
     for range in &test_cases.ranges {
         debug!("Testing decode of range {:?}", range);
         let num_rows = range.end - range.start;
-        let expected = concat_data
+        let expected = expected_data
             .as_ref()
-            .map(|concat_data| concat_data.slice(range.start as usize, num_rows as usize));
+            .map(|arr| arr.slice(range.start as usize, num_rows as usize));
         let scheduler = scheduler.clone();
         let range = range.clone();
         test_decode(
@@ -1129,6 +1171,7 @@ async fn check_round_trip_random(
                         encoder_factory(file_version),
                         &field,
                         data,
+                        None,
                         test_cases,
                         file_version,
                     )

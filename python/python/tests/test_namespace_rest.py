@@ -12,7 +12,6 @@ DirectoryNamespace and RestNamespace implementations.
 """
 
 import tempfile
-import uuid
 
 import lance.namespace
 import pyarrow as pa
@@ -59,14 +58,11 @@ def table_to_ipc_bytes(table):
 @pytest.fixture
 def rest_namespace():
     """Create a REST namespace with adapter for testing."""
-    unique_id = uuid.uuid4().hex[:8]
     with tempfile.TemporaryDirectory() as tmpdir:
         backend_config = {"root": tmpdir}
-        port = 4000 + hash(unique_id) % 10000
 
-        with lance.namespace.RestAdapter("dir", backend_config, port=port):
-            # Use lance.namespace.connect() for consistency
-            client = connect("rest", {"uri": f"http://127.0.0.1:{port}"})
+        with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+            client = connect("rest", {"uri": f"http://127.0.0.1:{adapter.port}"})
             yield client
 
 
@@ -645,27 +641,21 @@ class TestLanceNamespaceConnect:
 
     def test_connect_with_rest(self):
         """Test creating RestNamespace via lance.namespace.connect()."""
-        unique_id = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             backend_config = {"root": tmpdir}
-            port = 4000 + hash(unique_id) % 10000
 
-            with lance.namespace.RestAdapter("dir", backend_config, port=port):
-                # Connect via lance.namespace.connect
-                properties = {"uri": f"http://127.0.0.1:{port}"}
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                properties = {"uri": f"http://127.0.0.1:{adapter.port}"}
                 ns = connect("rest", properties)
 
-                # Verify it's a RestNamespace instance
                 assert isinstance(ns, lance.namespace.RestNamespace)
 
-                # Verify it works
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
                 response = ns.create_table(create_req, ipc_data)
                 assert response is not None
 
-                # Verify we can list the table
                 list_req = ListTablesRequest(id=[])
                 list_response = ns.list_tables(list_req)
                 assert len(list_response.tables) == 1
@@ -673,24 +663,18 @@ class TestLanceNamespaceConnect:
 
     def test_connect_with_custom_delimiter(self):
         """Test creating RestNamespace with custom delimiter via connect()."""
-        unique_id = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             backend_config = {"root": tmpdir}
-            port = 4000 + hash(unique_id) % 10000
 
-            with lance.namespace.RestAdapter("dir", backend_config, port=port):
-                # Connect with custom delimiter
-                # Use URL-friendly delimiter instead of default '$'
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
                 properties = {
-                    "uri": f"http://127.0.0.1:{port}",
+                    "uri": f"http://127.0.0.1:{adapter.port}",
                     "delimiter": "@",
                 }
                 ns = connect("rest", properties)
 
-                # Verify it's a RestNamespace instance
                 assert isinstance(ns, lance.namespace.RestNamespace)
 
-                # This should work without errors
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
