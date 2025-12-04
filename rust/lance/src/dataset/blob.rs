@@ -84,8 +84,11 @@ impl BlobPreprocessor {
             .zip(batch.schema().fields())
             .enumerate()
         {
-            let is_blob_struct = matches!(field.data_type(), ArrowDataType::Struct(_))
-                && field.metadata().get(lance_arrow::BLOB_META_KEY).is_some();
+            let is_blob_struct = field
+                .metadata()
+                .get(lance_arrow::ARROW_EXT_NAME_KEY)
+                .map(|v| v == lance_arrow::BLOB_V2_EXT_NAME)
+                .unwrap_or(false);
 
             if !is_blob_struct {
                 new_columns.push(array.clone());
@@ -100,29 +103,18 @@ impl BlobPreprocessor {
                     Error::invalid_input("Blob column was not a struct array", location!())
                 })?;
 
-            let ArrowDataType::Struct(fields) = field.data_type() else {
-                unreachable!();
-            };
-
-            let mut data_idx = None;
-            let mut uri_idx = None;
-            for (idx, child) in fields.iter().enumerate() {
-                match child.name().as_str() {
-                    "data" => data_idx = Some(idx),
-                    "uri" => uri_idx = Some(idx),
-                    _ => {}
-                }
-            }
-
-            let data_idx = data_idx.ok_or_else(|| {
-                Error::invalid_input("Blob struct missing `data` field", location!())
-            })?;
-            let uri_idx = uri_idx.ok_or_else(|| {
-                Error::invalid_input("Blob struct missing `uri` field", location!())
-            })?;
-
-            let data_col = struct_arr.column(data_idx).as_binary::<i64>();
-            let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
+            let data_col = struct_arr
+                .column_by_name("data")
+                .ok_or_else(|| {
+                    Error::invalid_input("Blob struct missing `data` field", location!())
+                })?
+                .as_binary::<i64>();
+            let uri_col = struct_arr
+                .column_by_name("uri")
+                .ok_or_else(|| {
+                    Error::invalid_input("Blob struct missing `uri` field", location!())
+                })?
+                .as_string::<i32>();
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
             let mut uri_builder = LargeStringBuilder::with_capacity(struct_arr.len(), 0);
