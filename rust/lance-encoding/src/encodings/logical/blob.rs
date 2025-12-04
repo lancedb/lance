@@ -568,4 +568,64 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn test_blob_v2_dedicated_round_trip() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
+        let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+        let blob_id_field = Arc::new(ArrowField::new("blob_id", DataType::UInt32, true));
+        let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
+
+        let kind_array = UInt8Array::from(vec![BlobKind::Dedicated as u8, BlobKind::Inline as u8]);
+        let data_array = LargeBinaryArray::from(vec![None, Some(b"abc".as_ref())]);
+        let uri_array = StringArray::from(vec![Option::<&str>::None, None]);
+        let blob_id_array = UInt32Array::from(vec![42, 0]);
+        let blob_size_array = UInt64Array::from(vec![12, 0]);
+
+        let struct_array = StructArray::from(vec![
+            (kind_field, Arc::new(kind_array) as ArrayRef),
+            (data_field, Arc::new(data_array) as ArrayRef),
+            (uri_field, Arc::new(uri_array) as ArrayRef),
+            (blob_id_field, Arc::new(blob_id_array) as ArrayRef),
+            (blob_size_field, Arc::new(blob_size_array) as ArrayRef),
+        ]);
+
+        let expected_descriptor = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
+                Arc::new(UInt8Array::from(vec![
+                    BlobKind::Dedicated as u8,
+                    BlobKind::Inline as u8,
+                ])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![12, 3])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![42, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["", ""])) as ArrayRef,
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data_with_expected(
+            vec![Arc::new(struct_array)],
+            Some(Arc::new(expected_descriptor)),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            blob_metadata,
+        )
+        .await;
+    }
 }
