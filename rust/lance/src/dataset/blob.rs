@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
-use arrow_array::{Array, StructArray};
+use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
@@ -378,13 +378,6 @@ async fn collect_blob_files_v2(
                 ));
             }
             BlobKind::Dedicated => {
-                if blob_ids.is_null(idx) || sizes.is_null(idx) {
-                    return Err(Error::corrupt_file(
-                        dataset.data_dir(),
-                        "Missing blob_id or size for dedicated blob",
-                        location!(),
-                    ));
-                }
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
                 let frag_id = RowAddress::from(*row_addr).fragment_id();
