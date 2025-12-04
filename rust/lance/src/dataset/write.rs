@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{
-    builder::LargeBinaryBuilder, builder::LargeStringBuilder, cast::AsArray, Array, RecordBatch,
-};
-use arrow_schema::DataType as ArrowDataType;
+use arrow_array::RecordBatch;
 use chrono::TimeDelta;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -13,7 +10,6 @@ use lance_core::datatypes::{
     BlobVersion, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
-use lance_core::utils::blob::blob_path;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
@@ -35,9 +31,9 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tracing::{info, instrument};
 
+use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::session::Session;
 use crate::Dataset;
 
@@ -73,224 +69,6 @@ pub enum WriteDestination<'a> {
     Dataset(Arc<Dataset>),
     /// A URI to write to.
     Uri(&'a str),
-}
-
-const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024;
-
-pub(super) struct BlobPreprocessor {
-    object_store: Arc<ObjectStore>,
-    data_dir: Path,
-    fragment_id: u32,
-    local_counter: u32,
-    field_ids: Vec<u32>,
-}
-
-impl BlobPreprocessor {
-    pub(super) fn new(
-        object_store: Arc<ObjectStore>,
-        data_dir: Path,
-        fragment_id: u32,
-        field_ids: Vec<u32>,
-    ) -> Self {
-        Self {
-            object_store,
-            data_dir,
-            fragment_id,
-            local_counter: 0,
-            field_ids,
-        }
-    }
-
-    fn next_blob_id(&mut self) -> u32 {
-        let id = (self.fragment_id << 16) | self.local_counter;
-        self.local_counter = self.local_counter.wrapping_add(1);
-        id
-    }
-
-    async fn write_blob(&self, field_id: u32, blob_id: u32, data: &[u8]) -> Result<Path> {
-        let path = blob_path(&self.data_dir, self.fragment_id, field_id, blob_id);
-        let mut writer = self.object_store.create(&path).await?;
-        writer.write_all(data).await?;
-        writer.shutdown().await?;
-        Ok(path)
-    }
-
-    async fn delete_blob(&self, path: &Path) {
-        let _ = self.object_store.delete(path).await;
-    }
-
-    async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let mut new_columns = Vec::with_capacity(batch.num_columns());
-        let mut new_fields = Vec::with_capacity(batch.num_columns());
-        let mut written_paths = Vec::new();
-
-        for (col_idx, (array, field)) in batch
-            .columns()
-            .iter()
-            .zip(batch.schema().fields())
-            .enumerate()
-        {
-            let is_blob_struct = matches!(field.data_type(), ArrowDataType::Struct(_))
-                && field.metadata().get(lance_arrow::BLOB_META_KEY).is_some();
-
-            if !is_blob_struct {
-                new_columns.push(array.clone());
-                new_fields.push(field.clone());
-                continue;
-            }
-
-            let struct_arr = array
-                .as_any()
-                .downcast_ref::<arrow_array::StructArray>()
-                .ok_or_else(|| {
-                    Error::invalid_input("Blob column was not a struct array", location!())
-                })?;
-
-            let ArrowDataType::Struct(fields) = field.data_type() else {
-                unreachable!();
-            };
-
-            let mut data_idx = None;
-            let mut uri_idx = None;
-            for (idx, child) in fields.iter().enumerate() {
-                match child.name().as_str() {
-                    "data" => data_idx = Some(idx),
-                    "uri" => uri_idx = Some(idx),
-                    _ => {}
-                }
-            }
-
-            let data_idx = data_idx.ok_or_else(|| {
-                Error::invalid_input("Blob struct missing `data` field", location!())
-            })?;
-            let uri_idx = uri_idx.ok_or_else(|| {
-                Error::invalid_input("Blob struct missing `uri` field", location!())
-            })?;
-
-            let data_col = struct_arr.column(data_idx).as_binary::<i64>();
-            let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
-
-            let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
-            let mut uri_builder = LargeStringBuilder::with_capacity(struct_arr.len(), 0);
-            let mut blob_id_builder = arrow_array::builder::PrimitiveBuilder::<
-                arrow_array::types::UInt32Type,
-            >::with_capacity(struct_arr.len());
-            let mut blob_size_builder = arrow_array::builder::PrimitiveBuilder::<
-                arrow_array::types::UInt64Type,
-            >::with_capacity(struct_arr.len());
-
-            let struct_nulls = struct_arr.nulls();
-
-            for i in 0..struct_arr.len() {
-                if struct_arr.is_null(i) {
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    continue;
-                }
-
-                let has_data = !data_col.is_null(i);
-                let has_uri = !uri_col.is_null(i);
-
-                if has_data && data_col.value(i).len() > DEDICATED_THRESHOLD {
-                    let blob_id = self.next_blob_id();
-                    let field_id = *self.field_ids.get(col_idx).unwrap_or(&(col_idx as u32));
-                    match self.write_blob(field_id, blob_id, data_col.value(i)).await {
-                        Ok(path) => written_paths.push(path),
-                        Err(err) => {
-                            for path in &written_paths {
-                                self.delete_blob(path).await;
-                            }
-                            return Err(err);
-                        }
-                    }
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_value(blob_id);
-                    blob_size_builder.append_value(data_col.value(i).len() as u64);
-                    continue;
-                }
-
-                if has_uri {
-                    let uri_val = uri_col.value(i);
-                    data_builder.append_null();
-                    uri_builder.append_value(uri_val);
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    continue;
-                }
-
-                if has_data {
-                    let value = data_col.value(i);
-                    data_builder.append_value(value);
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                } else {
-                    // row null or missing
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                }
-            }
-
-            let child_fields = vec![
-                arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
-                arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
-                arrow_schema::Field::new("blob_id", ArrowDataType::UInt32, true),
-                arrow_schema::Field::new("blob_size", ArrowDataType::UInt64, true),
-            ];
-
-            let struct_array = arrow_array::StructArray::try_new(
-                child_fields.clone().into(),
-                vec![
-                    Arc::new(data_builder.finish()),
-                    Arc::new(uri_builder.finish()),
-                    Arc::new(blob_id_builder.finish()),
-                    Arc::new(blob_size_builder.finish()),
-                ],
-                struct_nulls.cloned(),
-            )?;
-
-            new_columns.push(Arc::new(struct_array));
-            new_fields.push(Arc::new(
-                arrow_schema::Field::new(
-                    field.name(),
-                    ArrowDataType::Struct(child_fields.into()),
-                    field.is_nullable(),
-                )
-                .with_metadata(field.metadata().clone()),
-            ));
-        }
-
-        let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-            new_fields
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<_>>(),
-            batch.schema().metadata().clone(),
-        ));
-
-        RecordBatch::try_new(new_schema, new_columns)
-            .map_err(|e| Error::invalid_input(e.to_string(), location!()))
-    }
-}
-
-pub(super) fn schema_has_blob_v2(schema: &Schema) -> bool {
-    schema.fields.iter().any(|f| f.is_blob_v2())
-}
-
-pub(super) async fn preprocess_blob_batches(
-    batches: &[RecordBatch],
-    pre: &mut BlobPreprocessor,
-) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        out.push(pre.preprocess_batch(batch).await?);
-    }
-    Ok(out)
 }
 
 impl WriteDestination<'_> {

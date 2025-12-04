@@ -18,10 +18,9 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::{
-    do_write_fragments, preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor,
-};
+use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
