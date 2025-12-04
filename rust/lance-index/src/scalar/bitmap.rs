@@ -438,10 +438,10 @@ impl ScalarIndex for BitmapIndex {
                 if keys.is_empty() {
                     RowAddrTreeMap::default()
                 } else {
-                    let bitmaps: Vec<_> = stream::iter(keys.into_iter().map(|key| {
-                        let this = self.clone();
-                        async move { this.load_bitmap(&key, None).await }
-                    }))
+                    let bitmaps: Vec<_> = stream::iter(
+                        keys.into_iter()
+                            .map(|key| async move { self.load_bitmap(&key, None).await }),
+                    )
                     .buffer_unordered(get_num_compute_intensive_cpus())
                     .try_collect()
                     .await?;
@@ -476,10 +476,10 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::default()
                 } else {
                     // Load bitmaps in parallel
-                    let mut bitmaps: Vec<_> = stream::iter(keys.into_iter().map(|key| {
-                        let this = self.clone();
-                        async move { this.load_bitmap(&key, None).await }
-                    }))
+                    let mut bitmaps: Vec<_> = stream::iter(
+                        keys.into_iter()
+                            .map(|key| async move { self.load_bitmap(&key, None).await }),
+                    )
                     .buffer_unordered(get_num_compute_intensive_cpus())
                     .try_collect()
                     .await?;
