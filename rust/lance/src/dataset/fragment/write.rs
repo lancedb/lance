@@ -156,7 +156,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             .collect::<Vec<_>>();
         let mut preprocessor = if has_blob_v2 {
             Some(BlobPreprocessor::new(
-                object_store.clone(),
+                object_store.as_ref().clone(),
                 base_path.child(DATA_DIR),
                 id as u32,
                 field_ids,

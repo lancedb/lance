@@ -822,7 +822,7 @@ pub async fn open_writer_with_options(
             .collect::<Vec<_>>();
         let preprocessor = if schema_has_blob_v2(schema) {
             Some(BlobPreprocessor::new(
-                object_store.clone(),
+                object_store.as_ref().clone(),
                 data_dir.clone(),
                 0,
                 field_ids,

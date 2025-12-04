@@ -35,7 +35,7 @@ pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024;
 
 pub struct BlobPreprocessor {
-    object_store: Arc<ObjectStore>,
+    object_store: ObjectStore,
     data_dir: Path,
     fragment_id: u32,
     local_counter: u32,
@@ -44,7 +44,7 @@ pub struct BlobPreprocessor {
 
 impl BlobPreprocessor {
     pub(crate) fn new(
-        object_store: Arc<ObjectStore>,
+        object_store: ObjectStore,
         data_dir: Path,
         fragment_id: u32,
         field_ids: Vec<u32>,
