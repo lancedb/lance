@@ -279,10 +279,7 @@ impl BlobPreprocessor {
 }
 
 pub(super) fn schema_has_blob_v2(schema: &Schema) -> bool {
-    schema
-        .fields
-        .iter()
-        .any(|f| f.is_blob() && matches!(f.data_type(), ArrowDataType::Struct(_)))
+    schema.fields.iter().any(|f| f.is_blob_v2())
 }
 
 pub(super) async fn preprocess_blob_batches(

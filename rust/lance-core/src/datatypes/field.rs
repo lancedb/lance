@@ -508,6 +508,14 @@ impl Field {
                 .unwrap_or(false)
     }
 
+    /// Returns true if the field is explicitly marked as blob v2 extension.
+    pub fn is_blob_v2(&self) -> bool {
+        self.metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
+    }
+
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
@@ -1560,6 +1568,19 @@ mod tests {
         let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn blob_v2_detection_by_extension() {
+        let metadata = HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+            (BLOB_META_KEY.to_string(), "true".to_string()),
+        ]);
+        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+        assert!(field.is_blob_v2());
     }
 
     #[test]
