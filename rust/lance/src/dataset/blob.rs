@@ -9,6 +9,7 @@ use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
+use lance_arrow::FieldExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
@@ -34,6 +35,11 @@ pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion
 
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024;
 
+/// Preprocesses blob v2 columns on the write path so the encoder only sees lightweight descriptors:
+///
+/// - Spills large blobs to sidecar files before encoding, reducing memory/CPU and avoiding copying huge payloads through page builders.
+/// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a stable path independent of temporary fragment IDs assigned during write.
+/// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     object_store: ObjectStore,
     data_dir: Path,
@@ -54,7 +60,7 @@ impl BlobPreprocessor {
 
     fn next_blob_id(&mut self) -> u32 {
         let id = self.local_counter;
-        self.local_counter = self.local_counter.wrapping_add(1);
+        self.local_counter += 1;
         id
     }
 
@@ -71,13 +77,7 @@ impl BlobPreprocessor {
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
         for (array, field) in batch.columns().iter().zip(batch.schema().fields()) {
-            let is_blob_struct = field
-                .metadata()
-                .get(lance_arrow::ARROW_EXT_NAME_KEY)
-                .map(|v| v == lance_arrow::BLOB_V2_EXT_NAME)
-                .unwrap_or(false);
-
-            if !is_blob_struct {
+            if !field.is_blob_v2() {
                 new_columns.push(array.clone());
                 new_fields.push(field.clone());
                 continue;
