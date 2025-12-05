@@ -5,7 +5,7 @@ use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
-use arrow_array::builder::{LargeBinaryBuilder, LargeStringBuilder, PrimitiveBuilder};
+use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
@@ -104,7 +104,7 @@ impl BlobPreprocessor {
                 .as_string::<i32>();
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
-            let mut uri_builder = LargeStringBuilder::with_capacity(struct_arr.len(), 0);
+            let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
             let mut blob_id_builder =
                 PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(struct_arr.len());
             let mut blob_size_builder =
