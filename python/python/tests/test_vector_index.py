@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import logging
 import platform
 import random
 import string
@@ -459,6 +460,27 @@ def test_create_index_unsupported_accelerator(tmp_path):
             num_sub_vectors=16,
             accelerator="cuda:abc",
         )
+
+
+def test_create_index_accelerator_fallback(tmp_path, caplog):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            num_partitions=4,
+            accelerator="cuda",
+        )
+
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "IVF_HNSW_SQ"
+    assert any(
+        "does not support GPU acceleration; falling back to CPU" in record.message
+        for record in caplog.records
+    )
 
 
 def test_use_index(dataset, tmp_path):

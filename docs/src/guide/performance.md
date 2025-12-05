@@ -165,3 +165,74 @@ across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THRE
 The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
 with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
 can often lead to issues with excessive retries and timeouts from the object store.
+
+## Indexes
+
+Training and searching indexes can have unique requirements for compute and memory. This section provides some
+guidance on what can be expected for different index types.
+
+### BTree Index
+
+The BTree index is a two-level structure that provides efficient range queries and sorted access.
+It strikes a balance between an expensive memory structure containing all values and an expensive disk
+structure that can't be efficiently searched.
+
+Training a BTree index is done by sorting the column. This is done using an [external sort](https://en.wikipedia.org/wiki/External_sorting) to constrain the total memory usage to a reasonable amount. Updating a BTree index does not
+require re-sorting the entire column. The new values are sorted and the existing values are merged into the new sorted
+values in linear time.
+
+#### Storage Requirements
+
+The BTree index is essentially a sorted copy of a column. The storage requirements are therefore the same as the column
+but an additional 4 bytes per value is required to store the row ID and there is a small lookup structure which
+should be roughly 0.001% of the size of the column.
+
+#### Memory Requirements
+
+Training a BTree index requires some RAM but the current implementation spills to disk rather aggressively and so the
+total memory usage is fairly low.
+
+When searching a BTree index, the index is loaded into the index cache in pages. Each page contains 4096 values.
+
+#### Performance
+
+The sort stage is the most expensive step in training a BTree index. The time complexity is O(n log n) where n is the number of rows in the column. At very large scales this can be a bottleneck and a distributed sort may be necessary. Lance currently does
+not have anything builtin for this but work is underway to add this functionality. Training an index in parts as the data grows
+may be slightly more efficient than training the entire index at once if you have the flexibility to do so.
+
+When the BTree index is fully loaded into the index cache, the search time scales linearly with the number of rows that match the
+query. When the BTree index is not fully loaded into the index cache, the search time will be controlled by the number of pages
+that need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+pages were loaded from disk to satisfy a query.
+
+### Bitmap Index
+
+The Bitmap index is an inverted lookup table that stores a bitmap for each possible value in the column. These bitmaps are compressed and serialized as a [Roaring Bitmap](https://roaringbitmap.org/).
+
+A bitmap index is currently trained by accumulating the column into a hash map from value to a vector of row ids. Each value
+is then serialized into a bitmap and stored in a file.
+
+### Storage Requirements
+
+The size of a bitmap index is difficult to calculate precisely but will generally scale with the number of unique values in the
+column since a unique bitmap is required for each value and a single bitmap with all rows will compress more efficiently than
+many bitmaps with a small number of rows.
+
+#### Memory Requirements
+
+Since training a bitmap index requires collecting the values into a hash map you will need at least 8 bytes of memory per row.
+In addition, if you have many unique values, then you will need additional memory for the keys of the hash map. Training large
+bitmaps with many unique values at scale can be memory intensive.
+
+When a bitmap index is searched, bitmaps are loaded into the session cache individually. The size of the bitmap will depend on
+the number of rows that match the token.
+
+### Performance
+
+When the bitmap index is fully loaded into the index cache, the search time scales linearly with the number of values that the
+query requires. This makes the bitmap very fast for equality queries or very small ranges. Queries against large ranges are
+currently extremely slow and the btree index is much faster for large range queries.
+
+When a bitmap index is not fully loaded into the index cache, the search time will be controlled by the number of bitmaps that
+need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+bitmaps were loaded from disk to satisfy a query.

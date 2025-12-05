@@ -38,7 +38,7 @@ arrow-select = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 itertools = { workspace = true }
 futures = { workspace = true }
-lance = { workspace = true }
+lance = { workspace = true, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
 lance-index = { workspace = true }
 lance-core = { workspace = true }
 lance-linalg = { workspace = true }

@@ -4,6 +4,7 @@
 from functools import cache
 from pathlib import Path
 
+import lance
 import requests
 from lance.log import LOGGER
 
@@ -41,3 +42,19 @@ def get_dataset_uri(name: str) -> str:
             raise ValueError("The image_eda dataset is only available on Google Cloud")
         return "gs://lance-benchmarks-ci-datasets/image_eda.lance"
     return f"{_get_base_uri()}{name}"
+
+
+def open_dataset(name: str) -> lance.LanceDataset:
+    if name.startswith("mem-"):
+        if name == "mem-tpch":
+            from ci_benchmarks.datagen.lineitems import gen_mem_tcph
+
+            return gen_mem_tcph(data_storage_version="2.0")
+        elif name == "mem-tpch-2.1":
+            from ci_benchmarks.datagen.lineitems import gen_mem_tcph
+
+            return gen_mem_tcph(data_storage_version="2.1")
+        else:
+            raise ValueError(f"Unknown memory dataset: {name}")
+    else:
+        return lance.dataset(get_dataset_uri(name))

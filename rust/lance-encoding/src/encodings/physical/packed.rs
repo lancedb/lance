@@ -735,13 +735,17 @@ mod tests {
     use crate::{
         compression::CompressionStrategy,
         compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
+        constants::PACKED_STRUCT_META_KEY,
         statistics::ComputeStat,
+        testing::{check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
     use arrow_array::{
         Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StructArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn fixed_block_from_array(array: Int64Array) -> FixedWidthDataBlock {
@@ -945,6 +949,49 @@ mod tests {
         assert_eq!(decoded_payload.data.as_ref(), payload_block.data.as_ref());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn variable_packed_struct_utf8_round_trip() {
+        // schema: Struct<id: UInt32, uri: Utf8, long_text: LargeUtf8>
+        let fields = Fields::from(vec![
+            Arc::new(ArrowField::new("id", DataType::UInt32, false)),
+            Arc::new(ArrowField::new("uri", DataType::Utf8, false)),
+            Arc::new(ArrowField::new("long_text", DataType::LargeUtf8, false)),
+        ]);
+
+        // mark struct as packed
+        let mut meta = HashMap::new();
+        meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+
+        let array = Arc::new(StructArray::from(vec![
+            (
+                fields[0].clone(),
+                Arc::new(UInt32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                fields[1].clone(),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("/tmp/x"),
+                ])) as ArrayRef,
+            ),
+            (
+                fields[2].clone(),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("alpha"),
+                    Some("a considerably longer payload for testing"),
+                    Some("mid"),
+                ])) as ArrayRef,
+            ),
+        ]));
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_expected_encoding("variable_packed_struct");
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
     }
 
     #[test]

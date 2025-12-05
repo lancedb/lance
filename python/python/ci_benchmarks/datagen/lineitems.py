@@ -12,24 +12,27 @@ from ci_benchmarks.datasets import get_dataset_uri
 NUM_ROWS = 59986052
 
 
-def _gen_data():
+def _gen_data(scale_factor: int):
     LOGGER.info("Using DuckDB to generate TPC-H dataset")
     con = duckdb.connect(database=":memory:")
     con.execute("INSTALL tpch; LOAD tpch")
-    con.execute("CALL dbgen(sf=10)")
+    con.execute(f"CALL dbgen(sf={scale_factor})")
     res = con.query("SELECT * FROM lineitem")
     return res.to_arrow_table()
 
 
-def _create(dataset_uri: str):
+def _create(dataset_uri: str, data_storage_version: str, scale_factor: int = 10):
     try:
         ds = lance.dataset(dataset_uri)
         print(ds.count_rows())
         if ds.count_rows() == NUM_ROWS:
             return
         elif ds.count_rows() == 0:
-            lance.write_dataset(
-                _gen_data(), dataset_uri, mode="append", use_legacy_format=False
+            ds = lance.write_dataset(
+                _gen_data(scale_factor),
+                dataset_uri,
+                mode="append",
+                data_storage_version=data_storage_version,
             )
         else:
             raise Exception(
@@ -38,11 +41,24 @@ def _create(dataset_uri: str):
                 "same dataset"
             )
     except ValueError:
-        lance.write_dataset(
-            _gen_data(), dataset_uri, mode="create", use_legacy_format=False
+        ds = lance.write_dataset(
+            _gen_data(scale_factor),
+            dataset_uri,
+            mode="create",
+            data_storage_version=data_storage_version,
         )
+    return ds
 
 
 def gen_tcph():
     dataset_uri = get_dataset_uri("tpch")
-    _create(dataset_uri)
+    _create(dataset_uri, data_storage_version="2.0")
+    dataset_uri = get_dataset_uri("tpch-2.1")
+    _create(dataset_uri, data_storage_version="2.1")
+
+
+def gen_mem_tcph(data_storage_version: str):
+    dataset_uri = "memory://tpch"
+    return _create(
+        dataset_uri, data_storage_version=data_storage_version, scale_factor=1
+    )
