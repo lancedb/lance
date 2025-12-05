@@ -62,7 +62,7 @@ lance-index = { version = "=1.1.0-beta.2", path = "./rust/lance-index" }
 lance-io = { version = "=1.1.0-beta.2", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=1.1.0-beta.2", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=1.1.0-beta.2", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=1.1.0-beta.2", path = "./rust/lance-namespace-impls", default-features = false }
+lance-namespace-impls = { version = "=1.1.0-beta.2", path = "./rust/lance-namespace-impls" }
 lance-namespace-reqwest-client = "0.0.18"
 lance-table = { version = "=1.1.0-beta.2", path = "./rust/lance-table" }
 lance-test-macros = { version = "=1.1.0-beta.2", path = "./rust/lance-test-macros" }
