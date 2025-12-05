@@ -1292,7 +1292,7 @@ impl Scanner {
             });
         }
 
-        Ok(self
+        let mut projection = self
             .dataset
             .empty_projection()
             // Start with the desired schema
@@ -1300,7 +1300,29 @@ impl Scanner {
             // Subtract columns that are expensive
             .subtract_predicate(|f| !self.is_early_field(f))
             // Add back columns that we need for filtering
-            .union_schema(&filter_schema))
+            .union_schema(&filter_schema);
+
+        // If there is ordering, also add narrow sort columns to the eager projection
+        // This avoids redundant takes in Stage 3
+        if let Some(ordering) = &self.ordering {
+            // Collect narrow fields from the ordering columns
+            let narrow_ordering_columns: Vec<&str> = ordering
+                .iter()
+                .filter_map(|col| {
+                    self.dataset
+                        .schema()
+                        .fields_pre_order()
+                        .find(|f| f.name == col.column_name && self.is_early_field(f))
+                        .map(|_| col.column_name.as_str())
+                })
+                .collect();
+
+            if !narrow_ordering_columns.is_empty() {
+                projection = projection.union_columns(narrow_ordering_columns, OnMissing::Error)?;
+            }
+        }
+
+        Ok(projection)
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -1598,6 +1620,12 @@ impl Scanner {
                 ordering.iter().map(|col| &col.column_name),
                 OnMissing::Error,
             )?;
+            // Automatically add _rowid when there is ordering to support take operations
+            // This ensures that subsequent stages can perform row selection even if _rowid
+            // was not manually specified by the user
+            if !pre_filter_projection.with_row_id && !pre_filter_projection.with_row_addr {
+                pre_filter_projection.with_row_id = true;
+            }
         }
 
         plan = self.take(plan, pre_filter_projection)?;
@@ -1611,13 +1639,26 @@ impl Scanner {
 
         // Stage 3: sort
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
+            // Check if all ordering columns are already present in the plan schema
+            // to avoid redundant take operations
+            let all_ordering_columns_present = ordering.iter().all(|col| {
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .any(|f| f.name() == &col.column_name)
+            });
+
+            // Only execute take if some ordering columns are missing
+            // The take logic inside Scanner::take already has optimization to skip unnecessary takes
+            if !all_ordering_columns_present {
+                let ordering_columns = ordering.iter().map(|col| &col.column_name);
+                let projection_with_ordering = self
+                    .dataset
+                    .empty_projection()
+                    .union_columns(ordering_columns, OnMissing::Error)?;
+                plan = self.take(plan, projection_with_ordering)?;
+            }
+
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -6392,5 +6433,75 @@ mod test {
             .unwrap();
 
         assert_eq!(tracker.new_iops(), 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_sort_without_explicit_rowid(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // Test for issue-5290: Sorting without explicit _rowid should work
+        // and should not produce redundant take operations
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen()
+            .col("a", array::cycle::<Int32Type>(vec![1, 2, 3]))
+            .col("b", array::cycle::<Int32Type>(vec![4, 5, 6]));
+
+        Dataset::write(
+            data.into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
+
+        // This should work without manually specifying _rowid
+        let batches = dataset
+            .scan()
+            .project(&["a"])?
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "b".to_string(),
+            )]))?
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Verify results are sorted by column b (which has values 4, 5, 6)
+        // and column a should be [1, 2, 3] in that order
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let a_col = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(a_col.values(), &[1, 2, 3]);
+
+        // Verify the plan doesn't have excessive Take operations
+        // The plan should have _rowid automatically added in Stage 1.5
+        let plan = dataset
+            .scan()
+            .project(&["a"])?
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "b".to_string(),
+            )]))?
+            .explain_plan(false)
+            .await?;
+
+        // Count the number of Take operations in the plan
+        // After the fix, we should have at most 2 Take operations:
+        // - One in Stage 1.5 for loading sort columns and _rowid
+        // - One in Stage 5 for loading remaining projection columns
+        let take_count = plan.matches("Take:").count();
+        // The optimization should reduce redundant takes
+        assert!(take_count <= 2, "Plan has too many Take operations: {}\n{}", take_count, plan);
     }
 }
