@@ -37,25 +37,18 @@ const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024;
 pub struct BlobPreprocessor {
     object_store: ObjectStore,
     data_dir: Path,
-    fragment_id: u32,
+    data_file_key: String,
     local_counter: u32,
-    field_ids: Vec<u32>,
 }
 
 impl BlobPreprocessor {
-    pub(crate) fn new(
-        object_store: ObjectStore,
-        data_dir: Path,
-        fragment_id: u32,
-        field_ids: Vec<u32>,
-    ) -> Self {
+    pub(crate) fn new(object_store: ObjectStore, data_dir: Path, data_file_key: String) -> Self {
         Self {
             object_store,
             data_dir,
-            fragment_id,
+            data_file_key,
             // Start at 1 to avoid a potential all-zero blob_id value.
             local_counter: 1,
-            field_ids,
         }
     }
 
@@ -65,8 +58,8 @@ impl BlobPreprocessor {
         id
     }
 
-    async fn write_blob(&self, field_id: u32, blob_id: u32, data: &[u8]) -> Result<Path> {
-        let path = blob_path(&self.data_dir, self.fragment_id, field_id, blob_id);
+    async fn write_blob(&self, blob_id: u32, data: &[u8]) -> Result<Path> {
+        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
         writer.shutdown().await?;
@@ -76,14 +69,8 @@ impl BlobPreprocessor {
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
-        let mut written_paths = Vec::new();
 
-        for (col_idx, (array, field)) in batch
-            .columns()
-            .iter()
-            .zip(batch.schema().fields())
-            .enumerate()
-        {
+        for (array, field) in batch.columns().iter().zip(batch.schema().fields()) {
             let is_blob_struct = field
                 .metadata()
                 .get(lance_arrow::ARROW_EXT_NAME_KEY)
@@ -141,11 +128,7 @@ impl BlobPreprocessor {
 
                 if has_data && data_col.value(i).len() > DEDICATED_THRESHOLD {
                     let blob_id = self.next_blob_id();
-                    let field_id = *self.field_ids.get(col_idx).unwrap_or(&(col_idx as u32));
-                    let path = self
-                        .write_blob(field_id, blob_id, data_col.value(i))
-                        .await?;
-                    written_paths.push(path);
+                    self.write_blob(blob_id, data_col.value(i)).await?;
 
                     kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
@@ -601,12 +584,15 @@ async fn collect_blob_files_v2(
                             message: "Fragment not found".to_string(),
                             location: location!(),
                         })?;
-                frag.data_file_for_field(blob_field_id)
-                    .ok_or_else(|| Error::Internal {
-                        message: "Data file not found for blob field".to_string(),
-                        location: location!(),
-                    })?;
-                let path = blob_path(&dataset.data_dir(), frag_id, blob_field_id, blob_id);
+                let data_file =
+                    frag.data_file_for_field(blob_field_id)
+                        .ok_or_else(|| Error::Internal {
+                            message: "Data file not found for blob field".to_string(),
+                            location: location!(),
+                        })?;
+
+                let data_file_key = data_file_key_from_path(data_file.path.as_str());
+                let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
             }
             BlobKind::External => {
@@ -632,6 +618,11 @@ async fn collect_blob_files_v2(
     Ok(files)
 }
 
+fn data_file_key_from_path(path: &str) -> &str {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    filename.strip_suffix(".lance").unwrap_or(filename)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -646,6 +637,7 @@ mod tests {
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
 
+    use super::data_file_key_from_path;
     use crate::{utils::test::TestDatasetGenerator, Dataset};
 
     struct BlobTestFixture {
@@ -898,5 +890,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blobs.len(), 2, "Mixed fragment blobs should have 2 items");
+    }
+
+    #[test]
+    fn test_data_file_key_from_path() {
+        assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");
+        assert_eq!(data_file_key_from_path("abc.lance"), "abc");
+        assert_eq!(data_file_key_from_path("nested/path/xyz"), "xyz");
     }
 }

@@ -135,7 +135,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", generate_random_filename());
+        let data_file_key = generate_random_filename();
+        let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let has_blob_v2 = schema_has_blob_v2(&schema);
@@ -149,17 +150,11 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
-        let field_ids = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
         let mut preprocessor = if has_blob_v2 {
             Some(BlobPreprocessor::new(
                 object_store.as_ref().clone(),
                 base_path.child(DATA_DIR),
-                id as u32,
-                field_ids,
+                data_file_key.clone(),
             ))
         } else {
             None

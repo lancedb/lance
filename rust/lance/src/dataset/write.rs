@@ -783,7 +783,8 @@ pub async fn open_writer_with_options(
     add_data_dir: bool,
     base_id: Option<u32>,
 ) -> Result<Box<dyn GenericWriter>> {
-    let filename = format!("{}.lance", generate_random_filename());
+    let data_file_key = generate_random_filename();
+    let filename = format!("{}.lance", data_file_key);
 
     let data_dir = if add_data_dir {
         base_dir.child(DATA_DIR)
@@ -815,17 +816,11 @@ pub async fn open_writer_with_options(
                 ..Default::default()
             },
         )?;
-        let field_ids = schema
-            .fields
-            .iter()
-            .map(|f| f.id as u32)
-            .collect::<Vec<_>>();
         let preprocessor = if schema_has_blob_v2(schema) {
             Some(BlobPreprocessor::new(
                 object_store.clone(),
                 data_dir.clone(),
-                0,
-                field_ids,
+                data_file_key.clone(),
             ))
         } else {
             None
