@@ -953,10 +953,11 @@ mod tests {
 
     #[tokio::test]
     async fn variable_packed_struct_utf8_round_trip() {
-        // schema: Struct<id: UInt32, uri: Utf8>
+        // schema: Struct<id: UInt32, uri: Utf8, long_text: LargeUtf8>
         let fields = Fields::from(vec![
             Arc::new(ArrowField::new("id", DataType::UInt32, false)),
             Arc::new(ArrowField::new("uri", DataType::Utf8, false)),
+            Arc::new(ArrowField::new("long_text", DataType::LargeUtf8, false)),
         ]);
 
         // mark struct as packed
@@ -974,6 +975,14 @@ mod tests {
                     Some("a"),
                     Some("b"),
                     Some("/tmp/x"),
+                ])) as ArrayRef,
+            ),
+            (
+                fields[2].clone(),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("alpha"),
+                    Some("a considerably longer payload for testing"),
+                    Some("mid"),
                 ])) as ArrayRef,
             ),
         ]));
