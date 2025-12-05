@@ -8,14 +8,9 @@ use object_store::path::Path;
 /// Layout: `<base>/<data_file_key>/<blob_id>.raw`
 /// - `base` is typically the dataset's data directory.
 /// - `data_file_key` is the stem of the data file (without extension).
-pub fn blob_path(base: &Path, data_file_key: &str, blob_id: u32) -> Path {
+pub fn dedicated_blob_path(base: &Path, data_file_key: &str, blob_id: u32) -> Path {
     let file_name = format!("{:08x}.raw", blob_id);
     base.child(data_file_key).child(file_name.as_str())
-}
-
-/// Alias kept for readability at call sites that distinguish dedicated blobs.
-pub fn dedicated_blob_path(base: &Path, data_file_key: &str, blob_id: u32) -> Path {
-    blob_path(base, data_file_key, blob_id)
 }
 
 /// Format a packed blob sidecar path for a data file.
@@ -28,13 +23,6 @@ pub fn pack_blob_path(base: &Path, data_file_key: &str, blob_id: u32) -> Path {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_blob_path_formatting() {
-        let base = Path::from("base");
-        let path = blob_path(&base, "deadbeef", 2);
-        assert_eq!(path.to_string(), "base/deadbeef/00000002.raw");
-    }
 
     #[test]
     fn test_dedicated_blob_path_formatting() {
