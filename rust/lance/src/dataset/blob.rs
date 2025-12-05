@@ -209,6 +209,12 @@ impl BlobFile {
         self.size
     }
 
+    /// Return the object-store path holding the blob data
+    /// This is an object_store::path::Path, not a local filesystem path.
+    pub fn data_file(&self) -> &Path {
+        &self.data_file
+    }
+
     pub fn position(&self) -> u64 {
         self.position
     }
