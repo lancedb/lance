@@ -2796,6 +2796,10 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
+
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
@@ -2880,6 +2884,13 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        if accelerator is not None and index_type != "IVF_PQ":
+            LOGGER.warning(
+                "Index type %s does not support GPU acceleration; falling back to CPU",
+                index_type,
+            )
+            accelerator = None
+
         if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
