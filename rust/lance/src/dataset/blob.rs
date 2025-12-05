@@ -20,7 +20,7 @@ use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
-use lance_core::utils::blob::{blob_path, dedicated_blob_path, pack_blob_path};
+use lance_core::utils::blob::{dedicated_blob_path, pack_blob_path};
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
@@ -142,7 +142,7 @@ impl BlobPreprocessor {
         id
     }
 
-    async fn write_blob(&self, blob_id: u32, data: &[u8]) -> Result<Path> {
+    async fn write_blob(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
         let path = dedicated_blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
