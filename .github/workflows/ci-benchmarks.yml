@@ -8,7 +8,7 @@ on:
 
 jobs:
   bench_regress:
-    timeout-minutes: 30
+    timeout-minutes: 120
     runs-on: warp-custom-gcp-storage-benchmark
     env:
       # Need up-to-date compilers for kernels
