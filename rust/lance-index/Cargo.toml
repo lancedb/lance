@@ -144,5 +144,13 @@ harness = false
 name = "rq"
 harness = false
 
+[[bench]]
+name = "btree"
+harness = false
+
+[[bench]]
+name = "bitmap"
+harness = false
+
 [lints]
 workspace = true

@@ -12,6 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+use tracing::instrument;
 
 use lance_core::{
     datatypes::{BlobVersion, OnMissing, Projectable, Projection, Schema},
@@ -422,11 +423,19 @@ impl ProjectionPlan {
         Ok(ArrowSchema::new(fields))
     }
 
+    #[instrument(skip_all, level = "debug")]
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
         let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
-        let stream = execute_plan(projection, LanceExecutionOptions::default())?;
+        // Run dummy plan to execute projection, do not log the plan run
+        let stream = execute_plan(
+            projection,
+            LanceExecutionOptions {
+                skip_logging: true,
+                ..Default::default()
+            },
+        )?;
         let batches = stream.try_collect::<Vec<_>>().await?;
         if batches.len() != 1 {
             Err(Error::Internal {

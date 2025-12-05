@@ -9,6 +9,7 @@ use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType as ArrowDataType;
+use lance_arrow::FieldExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 use snafu::location;
@@ -19,7 +20,7 @@ use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
-use lance_core::utils::blob::{dedicated_blob_path, pack_blob_path};
+use lance_core::utils::blob::{blob_path, dedicated_blob_path, pack_blob_path};
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
@@ -61,8 +62,7 @@ impl PackWriter {
     }
 
     async fn start_new_pack(&mut self, blob_id: u32) -> Result<()> {
-        let path =
-            lance_core::utils::blob::pack_blob_path(&self.data_dir, &self.data_file_key, blob_id);
+        let path = pack_blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let writer = self.object_store.create(&path).await?;
         self.writer = Some(writer);
         self.current_blob_id = Some(blob_id);
@@ -106,6 +106,11 @@ impl PackWriter {
     }
 }
 
+/// Preprocesses blob v2 columns on the write path so the encoder only sees lightweight descriptors:
+///
+/// - Spills large blobs to sidecar files before encoding, reducing memory/CPU and avoiding copying huge payloads through page builders.
+/// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a stable path independent of temporary fragment IDs assigned during write.
+/// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     object_store: ObjectStore,
     data_dir: Path,
@@ -133,11 +138,11 @@ impl BlobPreprocessor {
 
     fn next_blob_id(&mut self) -> u32 {
         let id = self.local_counter;
-        self.local_counter = self.local_counter.wrapping_add(1);
+        self.local_counter += 1;
         id
     }
 
-    async fn write_blob(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
+    async fn write_blob(&self, blob_id: u32, data: &[u8]) -> Result<Path> {
         let path = dedicated_blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
@@ -158,19 +163,12 @@ impl BlobPreprocessor {
             )
             .await
     }
-
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
         for (array, field) in batch.columns().iter().zip(batch.schema().fields()) {
-            let is_blob_struct = field
-                .metadata()
-                .get(lance_arrow::ARROW_EXT_NAME_KEY)
-                .map(|v| v == lance_arrow::BLOB_V2_EXT_NAME)
-                .unwrap_or(false);
-
-            if !is_blob_struct {
+            if !field.is_blob_v2() {
                 new_columns.push(array.clone());
                 new_fields.push(field.clone());
                 continue;
@@ -231,7 +229,7 @@ impl BlobPreprocessor {
                     data_builder.append_null();
                     uri_builder.append_null();
                     blob_id_builder.append_value(blob_id);
-                    blob_size_builder.append_value(data_col.value(i).len() as u64);
+                    blob_size_builder.append_value(data_len as u64);
                     position_builder.append_value(0);
                     continue;
                 }
@@ -402,7 +400,6 @@ impl BlobFile {
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
     }
-
     pub fn new_packed(dataset: Arc<Dataset>, path: Path, position: u64, size: u64) -> Self {
         Self {
             object_store: dataset.object_store.clone(),
@@ -414,7 +411,6 @@ impl BlobFile {
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         }
     }
-
     pub async fn new_external(
         uri: String,
         size: u64,
