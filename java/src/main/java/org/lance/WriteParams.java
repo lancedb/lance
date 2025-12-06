@@ -184,7 +184,7 @@ public class WriteParams {
       return this;
     }
 
-    public Builder getEnableV2ManifestPaths(boolean enableV2ManifestPaths) {
+    public Builder withEnableV2ManifestPaths(boolean enableV2ManifestPaths) {
       this.enableV2ManifestPaths = Optional.of(enableV2ManifestPaths);
       return this;
     }

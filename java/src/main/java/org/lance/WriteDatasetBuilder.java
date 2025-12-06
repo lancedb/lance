@@ -79,6 +79,7 @@ public class WriteDatasetBuilder {
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
   private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+  private Optional<Boolean> enableV2ManifestPaths = Optional.empty();
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -288,6 +289,17 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets enable V2 Manifest path
+   *
+   * @param enableV2ManifestPaths Whether to enable v2 Manifest path
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder enableV2ManifestPaths(boolean enableV2ManifestPaths) {
+    this.enableV2ManifestPaths = Optional.of(enableV2ManifestPaths);
+    return this;
+  }
+
+  /**
    * Executes the write operation and returns the created dataset.
    *
    * <p>If a namespace is configured via namespace()+tableId(), this automatically handles table
@@ -397,6 +409,7 @@ public class WriteDatasetBuilder {
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
     s3CredentialsRefreshOffsetSeconds.ifPresent(
         paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
+    enableV2ManifestPaths.ifPresent(paramsBuilder::withEnableV2ManifestPaths);
 
     WriteParams params = paramsBuilder.build();
 
@@ -421,6 +434,7 @@ public class WriteDatasetBuilder {
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
     s3CredentialsRefreshOffsetSeconds.ifPresent(
         paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
+    enableV2ManifestPaths.ifPresent(paramsBuilder::withEnableV2ManifestPaths);
 
     WriteParams params = paramsBuilder.build();
 
