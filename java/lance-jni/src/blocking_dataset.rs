@@ -148,6 +148,7 @@ impl BlockingDataset {
         operation: Operation,
         read_version: Option<u64>,
         storage_options: HashMap<String, String>,
+        enable_v2_manifest_paths: Option<bool>,
     ) -> Result<Self> {
         let inner = RT.block_on(Dataset::commit(
             uri,
@@ -159,7 +160,7 @@ impl BlockingDataset {
             }),
             None,
             Default::default(),
-            false, // TODO: support enable_v2_manifest_paths
+            enable_v2_manifest_paths.unwrap_or(false),
         ))?;
         Ok(Self { inner })
     }
@@ -290,10 +291,12 @@ impl BlockingDataset {
         &mut self,
         transaction: Transaction,
         store_params: ObjectStoreParams,
+        enable_v2_manifest_paths: bool
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
                 .with_store_params(store_params)
+                .enable_v2_manifest_paths(enable_v2_manifest_paths)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -337,6 +340,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -351,7 +355,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            enable_v2_manifest_paths,
         )
     )
 }
@@ -369,6 +374,7 @@ fn inner_create_with_ffi_schema<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -388,6 +394,7 @@ fn inner_create_with_ffi_schema<'local>(
         JObject::null(), // No provider for schema-only creation
         s3_credentials_refresh_offset_seconds_obj,
         reader,
+        enable_v2_manifest_paths,
     )
 }
 
@@ -419,6 +426,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     data_storage_version: JObject,  // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -434,7 +442,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             data_storage_version,
             storage_options_obj,
             JObject::null(),
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            enable_v2_manifest_paths,
         )
     )
 }
@@ -454,6 +463,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -469,7 +479,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
             data_storage_version,
             storage_options_obj,
             storage_options_provider_obj,
-            s3_credentials_refresh_offset_seconds_obj
+            s3_credentials_refresh_offset_seconds_obj,
+            enable_v2_manifest_paths,
         )
     )
 }
@@ -488,6 +499,7 @@ fn inner_create_with_ffi_stream<'local>(
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -504,6 +516,7 @@ fn inner_create_with_ffi_stream<'local>(
         storage_options_provider_obj,
         s3_credentials_refresh_offset_seconds_obj,
         reader,
+        enable_v2_manifest_paths,
     )
 }
 
@@ -521,6 +534,7 @@ fn create_dataset<'local>(
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
+    enable_v2_manifest_paths: JObject,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
@@ -535,6 +549,7 @@ fn create_dataset<'local>(
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,
+        &enable_v2_manifest_paths,
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
@@ -613,6 +628,7 @@ pub extern "system" fn Java_org_lance_Dataset_commitAppend<'local>(
     read_version_obj: JObject,    // Optional<Long>
     fragments_obj: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
+    enable_v2_manifest_paths_obj: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -621,7 +637,8 @@ pub extern "system" fn Java_org_lance_Dataset_commitAppend<'local>(
             path,
             read_version_obj,
             fragments_obj,
-            storage_options_obj
+            storage_options_obj,
+            enable_v2_manifest_paths_obj,
         )
     )
 }
@@ -632,6 +649,7 @@ pub fn inner_commit_append<'local>(
     read_version_obj: JObject,    // Optional<Long>
     fragment_objs: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
+    enable_v2_manifest_paths_obj: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let fragment_objs = import_vec(env, &fragment_objs)?;
     let mut fragments = Vec::with_capacity(fragment_objs.len());
@@ -642,7 +660,8 @@ pub fn inner_commit_append<'local>(
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;
     let storage_options = extract_storage_options(env, &storage_options_obj)?;
-    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    let enable_v2_manifest_paths = env.get_boolean_opt(&enable_v2_manifest_paths_obj)?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options, enable_v2_manifest_paths)?;
     dataset.into_java(env)
 }
 
@@ -655,6 +674,7 @@ pub extern "system" fn Java_org_lance_Dataset_commitOverwrite<'local>(
     read_version_obj: JObject,    // Optional<Long>
     fragments_obj: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
+    enable_v2_manifest_paths_obj: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -664,7 +684,8 @@ pub extern "system" fn Java_org_lance_Dataset_commitOverwrite<'local>(
             arrow_schema_addr,
             read_version_obj,
             fragments_obj,
-            storage_options_obj
+            storage_options_obj,
+            enable_v2_manifest_paths_obj,
         )
     )
 }
@@ -676,6 +697,7 @@ pub fn inner_commit_overwrite<'local>(
     read_version_obj: JObject,    // Optional<Long>
     fragments_obj: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
+    enable_v2_manifest_paths_obj: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let fragment_objs = import_vec(env, &fragments_obj)?;
     let mut fragments = Vec::with_capacity(fragment_objs.len());
@@ -697,7 +719,8 @@ pub fn inner_commit_overwrite<'local>(
     let read_version = env.get_u64_opt(&read_version_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
-    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    let enable_v2_manifest_paths = env.get_boolean_opt(&enable_v2_manifest_paths_obj)?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options, enable_v2_manifest_paths)?;
     dataset.into_java(env)
 }
 

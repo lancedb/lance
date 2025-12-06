@@ -257,6 +257,7 @@ fn create_fragment<'a>(
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,
+        &JObject::null(),
     )?;
 
     let fragments = RT.block_on(FileFragment::create_fragments(

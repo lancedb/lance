@@ -49,6 +49,7 @@ pub fn extract_write_params(
     storage_options_obj: &JObject,
     storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: &JObject, // Optional<Long>
+    enable_v2_manifest_paths: &JObject, // Optional<Boolean>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -98,6 +99,9 @@ pub fn extract_write_params(
         s3_credentials_refresh_offset,
         ..Default::default()
     });
+    if let Some(enable_v2_manifest_paths_val) = env.get_boolean_opt(enable_v2_manifest_paths)? {
+        write_params.enable_v2_manifest_paths = enable_v2_manifest_paths_val;
+    }
     Ok(write_params)
 }
 

@@ -140,7 +140,8 @@ public class Dataset implements Closeable {
               params.getEnableStableRowIds(),
               params.getDataStorageVersion(),
               params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds());
+              params.getS3CredentialsRefreshOffsetSeconds(),
+              params.getEnableV2ManifestPaths());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -199,7 +200,8 @@ public class Dataset implements Closeable {
             params.getDataStorageVersion(),
             params.getStorageOptions(),
             Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds());
+            params.getS3CredentialsRefreshOffsetSeconds(),
+            params.getEnableV2ManifestPaths());
     dataset.allocator = allocator;
     return dataset;
   }
@@ -214,7 +216,8 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<Boolean> enableV2ManifestPaths);
 
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
@@ -226,7 +229,8 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<Boolean> enableV2ManifestPaths);
 
   private static native Dataset createWithFfiStreamAndProvider(
       long arrowStreamMemoryAddress,
@@ -239,7 +243,8 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<Boolean> enableV2ManifestPaths);
 
   /**
    * Open a dataset from the specified path.

@@ -676,6 +676,12 @@ fn inner_commit_transaction<'local>(
     let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
     let mut write_param = to_rust_map(env, &write_param_jmap)?;
 
+    // Extract enable_v2_manifest_paths from write_param
+    let enable_v2_manifest_paths = match write_param.get("enable_v2_manifest_paths") {
+           Some(value) => value.to_string().to_lowercase().eq("true"),
+           None => false, // Default to false if the key doesn't exist
+        };
+
     // Extract s3_credentials_refresh_offset_seconds from write_param
     let s3_credentials_refresh_offset = write_param
         .remove("s3_credentials_refresh_offset_seconds")
@@ -702,7 +708,7 @@ fn inner_commit_transaction<'local>(
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params)?
+        dataset_guard.commit_transaction(transaction, store_params, enable_v2_manifest_paths)?
     };
     new_blocking_ds.into_java(env)
 }
