@@ -61,6 +61,7 @@ The project is organized as a Rust workspace with Python and Java bindings. Rust
 * Output code coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch`
 * Create HTML coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch --html`
 * Print lines in file missing coverage: `cargo +nightly llvm-cov -q -p lance-core --show-missing-lines | grep rust/lance-core/src/datatypes/schema.rs`
+* Show detailed coverage for a file: `python ci/coverage.py -p lance-core -f rust/lance-core/src/datatypes/schema.rs`
 
 ### Python Development
 
