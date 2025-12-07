@@ -18,14 +18,20 @@ if result.returncode != 0:
     print(result.stderr.decode())
 elif args.file:
     # Look for the specific file's coverage details
+    # Section headers look like: /path/to/file.rs:
     lines = result.stdout.splitlines()
     in_file_section = False
     file_bytes = args.file.encode()
     for line in lines:
-        if file_bytes in line:
-            in_file_section = True
-        elif in_file_section and line.strip() == "":
-            break
+        # Check if this is a section header (path ending with colon)
+        stripped = line.rstrip()
+        is_section_header = stripped.endswith(b":") and b"|" not in line
+        if is_section_header:
+            if file_bytes in line:
+                in_file_section = True
+            elif in_file_section:
+                # Hit a new section, stop
+                break
         if in_file_section:
             print(line.decode())
 else:
