@@ -34,9 +34,8 @@ pub fn blob_version_from_config(config: &HashMap<String, String>) -> BlobVersion
 }
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
-const PACKED_MAX: usize = 1024 * 1024; // 1MB packed cutoff
-const PACK_FILE_MAX_SIZE: usize = 16 * 1024 * 1024; // 16MB per .pack sidecar
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
+const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 
 // Maintains rolling `.pack` sidecar files for packed blobs.
 // Layout: data/{data_file_key}/{blob_id:08x}.pack where each file is an
@@ -240,7 +239,7 @@ impl BlobPreprocessor {
                     continue;
                 }
 
-                if has_data && data_len > INLINE_MAX && data_len <= PACKED_MAX {
+                if has_data && data_len > INLINE_MAX {
                     let (pack_blob_id, position) = self.write_packed(data_col.value(i)).await?;
 
                     kind_builder.append_value(BlobKind::Packed as u8);
