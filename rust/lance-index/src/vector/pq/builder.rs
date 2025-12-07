@@ -158,7 +158,7 @@ impl PQBuildParams {
 
     /// Build a [ProductQuantizer] from the given data.
     ///
-    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
+    /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {

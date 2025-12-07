@@ -55,7 +55,7 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
 
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
-/// A scalar index that can be used on List<T> columns to
+/// A scalar index that can be used on `List<T>` columns to
 /// support queries with array_contains_all and array_contains_any
 /// using an underlying bitmap index.
 #[derive(Clone, Debug, DeepSizeOf)]

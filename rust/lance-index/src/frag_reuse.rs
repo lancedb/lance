@@ -256,7 +256,7 @@ impl FragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Remap a record batch that contains a row_id column at index `row_id_idx`
     /// Currently this assumes there are only 2 columns in the schema,
     /// which is the case for all indexes.
     /// For example, for btree, the schema is (value, row_id).

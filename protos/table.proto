@@ -378,10 +378,10 @@ message DataFile {
   // - dimension: packed-struct (0):
   //   - x: u32 (1)
   //   - y: u32 (2)
-  // - path: list<u32> (3)
-  // - embedding: fsl<768> (4)
+  // - path: `list<u32>` (3)
+  // - embedding: `fsl<768>` (4)
   //   - fp64
-  // - borders: fsl<4> (5)
+  // - borders: `fsl<4>` (5)
   //   - simple-struct (6)
   //     - margin: fp64 (7)
   //     - padding: fp64 (8)

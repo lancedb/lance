@@ -10,7 +10,7 @@ use snafu::location;
 /// Different ways to represent a sequence of distinct u64s.
 ///
 /// This is designed to be especially efficient for sequences that are sorted,
-/// but not meaningfully larger than a Vec<u64> in the worst case.
+/// but not meaningfully larger than a `Vec<u64>` in the worst case.
 ///
 /// The representation is chosen based on the properties of the sequence:
 ///                                                           
@@ -370,7 +370,7 @@ impl U64Segment {
         }
     }
 
-    /// Produce a new segment that has [`val`] as the new highest value in the segment
+    /// Produce a new segment that has `val` as the new highest value in the segment
     pub fn with_new_high(self, val: u64) -> lance_core::Result<Self> {
         // Check that the new value is higher than the current maximum
         if let Some(range) = self.range() {

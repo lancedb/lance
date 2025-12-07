@@ -835,8 +835,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL filter clause.
     ///
-    /// Note: the returned expression must be passed through [optimize_expr()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_expr()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let ast_expr = parse_sql_filter(filter)?;
@@ -854,8 +854,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
-    /// Note: the returned expression must be passed through [optimize_filter()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_filter()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         if self.schema.field_with_name(expr).is_ok() {
             return Ok(col(expr));

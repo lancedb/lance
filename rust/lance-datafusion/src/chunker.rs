@@ -241,12 +241,12 @@ impl<S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin> StrictBatchSizeStr
 ///
 /// # Example
 /// With batch_size=5 and input sequence:
-/// - Fragment 1: 7 rows → splits into [5,2]
+/// - Fragment 1: 7 rows → splits into `[5,2]`
 ///   (queues 5, carries 2)
 /// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
-///   splits into [5,1]
+///   splits into `[5,1]`
 ///
-/// - Output batches: [5], [5], [1]
+/// - Output batches: `[5]`, `[5]`, `[1]`
 impl<S> Stream for StrictBatchSizeStream<S>
 where
     S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin,

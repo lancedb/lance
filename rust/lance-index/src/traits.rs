@@ -184,7 +184,7 @@ pub trait DatasetIndexExt {
 
     /// Read all indices of this Dataset version.
     ///
-    /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.
+    /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>>;
 
@@ -221,7 +221,7 @@ pub trait DatasetIndexExt {
 
     /// Loads a specific index with the given index name.
     /// This function only works for indices that are unique.
-    /// If there are multiple indices sharing the same name, please use [load_indices_by_name]
+    /// If there are multiple indices sharing the same name, please use [`Self::load_indices_by_name`]
     ///
     /// Returns
     /// -------
@@ -248,7 +248,7 @@ pub trait DatasetIndexExt {
     ///
     /// This method should only access the index metadata and should not load the index into memory.
     ///
-    /// More detailed information may be available from [`index_statistics`] but that will require
+    /// More detailed information may be available from `index_statistics` but that will require
     /// loading the index into memory.
     async fn describe_indices<'a, 'b>(
         &'a self,

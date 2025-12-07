@@ -37,7 +37,7 @@ use crate::io::commit::{CommitError, CommitHandler};
 /// the external store for concurrent commit. Any manifest committed thru this
 /// trait should ultimately be materialized in the object store.
 /// For a visual explanation of the commit loop see
-/// https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04
+/// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
@@ -133,7 +133,7 @@ pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNami
 
 /// External manifest commit handler
 /// This handler is used to commit a manifest to an external store
-/// for detailed design, see https://github.com/lance-format/lance/issues/1183
+/// for detailed design, see <https://github.com/lance-format/lance/issues/1183>
 #[derive(Debug)]
 pub struct ExternalManifestCommitHandler {
     pub external_manifest_store: Arc<dyn ExternalManifestStore>,

@@ -22,11 +22,11 @@
 //!
 //! Based on the Apache Arrow Parquet SBBF implementation but with public APIs
 //! for use in Lance indexing. This implementation follows the Parquet spec
-//! https://github.com/apache/arrow-rs/blob/main/parquet/src/bloom_filter/mod.rs
-//! for SBBF as described in https://github.com/apache/parquet-format/blob/master/BloomFilter.md
+//! <https://github.com/apache/arrow-rs/blob/main/parquet/src/bloom_filter/mod.rs>
+//! for SBBF as described in <https://github.com/apache/parquet-format/blob/master/BloomFilter.md>
 //! FIXME: Make the upstream SBBF implementation public so that this file could be
 //! removed from Lance.
-//! https://github.com/apache/arrow-rs/issues/8277
+//! <https://github.com/apache/arrow-rs/issues/8277>
 
 use crate::scalar::bloomfilter::as_bytes::AsBytes;
 use libm::lgamma;

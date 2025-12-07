@@ -4,7 +4,7 @@
 //! Data layouts to represent encoded data in a sub-Arrow format
 //!
 //! These [`DataBlock`] structures represent physical layouts.  They fill a gap somewhere
-//! between [`arrow_data::data::ArrayData`] (which, as a collection of buffers, is too
+//! between [`arrow_data::ArrayData`] (which, as a collection of buffers, is too
 //! generic because it doesn't give us enough information about what those buffers represent)
 //! and [`arrow_array::array::Array`] (which is too specific, because it cares about the
 //! logical data type).

@@ -140,7 +140,7 @@ impl std::fmt::Display for TempStrDir {
 }
 
 impl TempStrDir {
-    /// Create a cloned copy of the string that can be used if Into<String> is needed
+    /// Create a cloned copy of the string that can be used if `Into<String>` is needed
     pub fn as_into_string(&self) -> impl Into<String> {
         self.string.clone()
     }
@@ -212,7 +212,8 @@ impl TempFile {
         Self { temppath }
     }
 
-    fn path_str(&self) -> String {
+    /// Get the path as a string safe to use as a URI on Windows.
+    pub fn path_str(&self) -> String {
         if cfg!(windows) {
             self.temppath.path().to_str().unwrap().replace("\\", "/")
         } else {

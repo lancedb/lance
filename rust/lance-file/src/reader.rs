@@ -184,15 +184,15 @@ pub struct ReaderProjection {
     /// For example, if the goal is to load:
     ///
     ///   x: int32
-    ///   y: struct<z: int32, w: string>
-    ///   z: list<int32>
+    ///   y: `struct<z: int32, w: string>`
+    ///   z: `list<int32>`
     ///
     /// and the schema originally used to store the data was:
     ///
-    ///   a: struct<x: int32>
+    ///   a: `struct<x: int32>`
     ///   b: int64
-    ///   y: struct<z: int32, c: int64, w: string>
-    ///   z: list<int32>
+    ///   y: `struct<z: int32, c: int64, w: string>`
+    ///   z: `list<int32>`
     ///
     /// Then the column_indices should be:
     ///

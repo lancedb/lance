@@ -199,7 +199,7 @@ pub enum Operation {
     ///
     /// e.g. if fragments being replaced contain files with different schema layouts on
     /// the column being replaced, the operation is not allowed.
-    /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
+    /// say `frag_1: [A] [B, C]` and `frag_2: [A, B] [C]` and we are trying to replace column A
     /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
