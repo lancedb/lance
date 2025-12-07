@@ -8,18 +8,14 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-cmd = ["cargo", "+nightly", "llvm-cov", "-q"]
+cmd = ["cargo", "+nightly", "llvm-cov", "-q", "--branch", "--text", "--color", "always"]
 if args.package:
     cmd += ["-p", args.package]
-cmd += ["--branch"]
-if args.file:
-    cmd += ["--text"]
-    cmd += ["--color", "always"]
 
 result = subprocess.run(cmd, capture_output=True)
 if result.returncode != 0:
     print("Error running coverage analysis:")
-    print(result.stderr)
+    print(result.stderr.decode())
 elif args.file:
     # Look for the specific file's coverage details
     lines = result.stdout.splitlines()
@@ -33,4 +29,4 @@ elif args.file:
         if in_file_section:
             print(line.decode())
 else:
-    print(result.stdout)
+    print(result.stdout.decode())
