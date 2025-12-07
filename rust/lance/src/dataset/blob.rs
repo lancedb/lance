@@ -38,6 +38,12 @@ const PACKED_MAX: usize = 1024 * 1024; // 1MB packed cutoff
 const PACK_FILE_MAX_SIZE: usize = 16 * 1024 * 1024; // 16MB per .pack sidecar
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 
+// Maintains rolling `.pack` sidecar files for packed blobs.
+// Layout: data/{data_file_key}/{blob_id:08x}.pack where each file is an
+// unframed concatenation of blob payloads; descriptors store (blob_id,
+// position, size) to locate each slice. A dedicated struct keeps path state
+// and rolling size separate from the per-batch preprocessor logic, so we can
+// reuse the same writer across rows and close/roll files cleanly on finish.
 struct PackWriter {
     object_store: ObjectStore,
     data_dir: Path,
