@@ -164,6 +164,7 @@ mod tests {
 
     #[test]
     fn test_slot_backoff() {
+        #[cfg_attr(coverage, coverage(off))]
         fn assert_in(value: u128, expected: &[u128]) {
             assert!(
                 expected.contains(&value),

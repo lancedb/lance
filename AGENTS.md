@@ -138,6 +138,8 @@ Tests:
   /// # }
   /// ```
   ```
+* Code coverage can be skipped for test utilities and non-critical paths using
+  `#[cfg_attr(coverage, coverage(off))]`.
 
 ## Review Guidelines
 
