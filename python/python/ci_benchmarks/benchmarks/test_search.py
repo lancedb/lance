@@ -5,7 +5,7 @@ import re
 
 import lance
 import pytest
-from ci_benchmarks.datasets import get_dataset_uri
+from ci_benchmarks.datasets import get_dataset_uri, is_on_google
 from ci_benchmarks.utils import wipe_os_cache
 
 COLUMN_LABELS = ["bools", "normals"]
@@ -175,6 +175,13 @@ BASIC_BITMAP_FILTER_LABELS = [
     #     "small_range",
     #     "large_in",
 ]
+
+
+# Don't run the no_cache test on Google Cloud as it is way too expensive at the moment
+def use_cache_param():
+    if is_on_google():
+        return [True]
+    return [True, False]
 
 
 # Repeats the same test for the basic dataset which is easier to test with locally
