@@ -976,7 +976,6 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
-        let index_typename = index_typename.unwrap_or_else(|| type_name_from_uri(&index_uri));
         let index_type = legacy_type_name(&index_uri);
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
@@ -1056,8 +1055,6 @@ impl DatasetIndexExt for Dataset {
 
         let stats = json!({
             "index_type": index_type,
-            "index_uri": index_uri,
-            "index_typename": index_typename,
             "name": index_name,
             "num_indices": metadatas.len(),
             "indices": indices_stats,
