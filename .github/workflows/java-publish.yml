@@ -4,6 +4,9 @@ on:
     # Trigger on published to include both stable and preview/beta releases
     types: [published]
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - .github/workflows/java-publish.yml
   workflow_dispatch:

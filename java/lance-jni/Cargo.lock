@@ -2399,7 +2399,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -2940,9 +2940,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52e9a2a24dc5c6821e71a7030e1e14b7b632acac55c40e9d2e082c621261bb56"
+checksum = "727805d60e7938b76b826a6ef209eb70eaa1812794f9424d4a4e2d740662df5f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3347,7 +3347,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "datafusion",
  "geo-types",
@@ -3602,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3665,7 +3665,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3754,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.1.0-beta.0"
+version = "1.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3945,9 +3945,9 @@ dependencies = [
 
 [[package]]
 name = "libz-rs-sys"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "840db8cf39d9ec4dd794376f38acc40d0fc65eec2a8f484f7fd375b84602becd"
+checksum = "8b484ba8d4f775eeca644c452a56650e544bf7e617f1d170fe7298122ead5222"
 dependencies = [
  "zlib-rs",
 ]
@@ -3981,9 +3981,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.28"
+version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "loom"
@@ -7504,9 +7504,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f06ae92f42f5e5c42443fd094f245eb656abf56dd7cce9b8b263236565e00f2"
+checksum = "36134c44663532e6519d7a6dfdbbe06f6f8192bde8ae9ed076e9b213f0e31df7"
 
 [[package]]
 name = "zstd"

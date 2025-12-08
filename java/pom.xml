@@ -7,11 +7,11 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>1.1.0-beta.0</version>
+    <version>1.1.0-beta.2</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
-    <url>http://lancedb.com/</url>
+    <url>https://lance.org/</url>
 
     <developers>
         <developer>

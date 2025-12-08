@@ -31,12 +31,12 @@ impl MultipartUpload for TracedMultipartUpload {
         Box::pin(fut.instrument(write_span))
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     async fn complete(&mut self) -> OSResult<PutResult> {
         self.target.complete().await
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip_all)]
     async fn abort(&mut self) -> OSResult<()> {
         self.target.abort().await
     }

@@ -55,7 +55,7 @@ if [ -n "$RELEASE_BRANCH" ]; then
 fi
 
 DISCUSSION_BODY="${DISCUSSION_BODY}
-- **Release Notes**: https://github.com/lancedb/lance/releases/tag/${RC_TAG}
+- **Release Notes**: https://github.com/lance-format/lance/releases/tag/${RC_TAG}
 
 ### Testing Instructions
 
@@ -78,7 +78,7 @@ Add to your \`pom.xml\`:
 Add to your \`Cargo.toml\`:
 \`\`\`toml
 [dependencies]
-lance = { version = \"=${RC_VERSION}\", git = \"https://github.com/lancedb/lance\", tag = \"${RC_TAG}\" }
+lance = { version = \"=${RC_VERSION}\", git = \"https://github.com/lance-format/lance\", tag = \"${RC_TAG}\" }
 \`\`\`
 
 ### Voting Instructions

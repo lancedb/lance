@@ -136,9 +136,16 @@ async fn do_take_rows(
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        return Ok(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
+        let empty_batch = RecordBatch::new_empty(Arc::new(builder.projection.output_schema()?));
+        // If row addresses were requested, add an empty row address column.
+        // This ensures callers that expect the _rowaddr column don't panic.
+        if builder.with_row_address {
+            let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
+            let row_addr_field =
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
+            return Ok(empty_batch.try_with_column(row_addr_field, row_addr_col)?);
+        }
+        return Ok(empty_batch);
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);

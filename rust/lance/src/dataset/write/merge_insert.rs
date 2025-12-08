@@ -887,7 +887,7 @@ impl MergeInsertJob {
                         .data_storage_format
                         .lance_file_version()?;
                     let mut writer = open_writer(
-                        dataset.object_store(),
+                        &dataset.object_store,
                         &write_schema,
                         &dataset.base,
                         data_storage_version,

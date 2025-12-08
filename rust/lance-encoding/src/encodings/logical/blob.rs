@@ -26,6 +26,7 @@ use crate::{
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
+use lance_core::datatypes::BlobKind;
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
@@ -267,96 +268,96 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        _repdef: RepDefBuilder,
+        mut repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        // Supported input: Struct<data:LargeBinary?, uri:Utf8?>
-        let DataType::Struct(fields) = array.data_type() else {
-            return Err(Error::InvalidInput {
-                source: "Blob v2 requires struct<data, uri> input".into(),
-                location: location!(),
-            });
-        };
-
         let struct_arr = array.as_struct();
-        let mut data_idx = None;
-        let mut uri_idx = None;
-        for (idx, field) in fields.iter().enumerate() {
-            match field.name().as_str() {
-                "data" => data_idx = Some(idx),
-                "uri" => uri_idx = Some(idx),
-                _ => {}
-            }
-        }
-        let (data_idx, uri_idx) = data_idx.zip(uri_idx).ok_or_else(|| Error::InvalidInput {
-            source: "Blob v2 struct must contain 'data' and 'uri' fields".into(),
-            location: location!(),
-        })?;
-
-        let data_col = struct_arr.column(data_idx).as_binary::<i64>();
-        let uri_col = struct_arr.column(uri_idx).as_string::<i32>();
-
-        // Validate XOR(data, uri)
-        for i in 0..struct_arr.len() {
-            if struct_arr.is_null(i) {
-                continue;
-            }
-            let data_is_set = !data_col.is_null(i);
-            let uri_is_set = !uri_col.is_null(i);
-            if data_is_set == uri_is_set {
-                return Err(Error::InvalidInput {
-                    source: "Each blob row must set exactly one of data or uri".into(),
-                    location: location!(),
-                });
-            }
-            if uri_is_set {
-                return Err(Error::NotSupported {
-                    source: "External blob (uri) is not supported yet".into(),
-                    location: location!(),
-                });
-            }
+        if let Some(validity) = struct_arr.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(struct_arr.len());
         }
 
-        let binary_array = data_col;
+        let kind_col = struct_arr
+            .column_by_name("kind")
+            .expect("kind column must exist")
+            .as_primitive::<UInt8Type>();
+        let data_col = struct_arr
+            .column_by_name("data")
+            .expect("data column must exist")
+            .as_binary::<i64>();
+        let uri_col = struct_arr
+            .column_by_name("uri")
+            .expect("uri column must exist")
+            .as_string::<i32>();
+        let blob_id_col = struct_arr
+            .column_by_name("blob_id")
+            .expect("blob_id column must exist")
+            .as_primitive::<UInt32Type>();
+        let blob_size_col = struct_arr
+            .column_by_name("blob_size")
+            .expect("blob_size column must exist")
+            .as_primitive::<UInt64Type>();
 
-        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(binary_array.len());
-        let mut position_builder =
-            PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
-        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(binary_array.len());
-        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(binary_array.len());
-        let mut uri_builder = StringBuilder::with_capacity(binary_array.len(), 0);
+        let row_count = struct_arr.len();
 
-        for i in 0..binary_array.len() {
-            let is_null_row = match array.data_type() {
-                DataType::Struct(_) => array.is_null(i),
-                _ => binary_array.is_null(i),
-            };
-            if is_null_row {
-                kind_builder.append_null();
-                position_builder.append_null();
-                size_builder.append_null();
-                blob_id_builder.append_null();
-                uri_builder.append_null();
-                continue;
-            }
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(row_count);
+        let mut position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(row_count);
+        let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(row_count);
+        let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(row_count);
+        let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
 
-            let value = binary_array.value(i);
-            kind_builder.append_value(0);
+        for i in 0..row_count {
+            let (kind_value, position_value, size_value, blob_id_value, uri_value) =
+                if struct_arr.is_null(i) || kind_col.is_null(i) {
+                    (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
+                } else {
+                    let kind_val = BlobKind::try_from(kind_col.value(i))?;
+                    match kind_val {
+                        BlobKind::Dedicated => (
+                            BlobKind::Dedicated as u8,
+                            0,
+                            blob_size_col.value(i),
+                            blob_id_col.value(i),
+                            "".to_string(),
+                        ),
+                        BlobKind::External => (
+                            BlobKind::External as u8,
+                            0,
+                            0,
+                            0,
+                            uri_col.value(i).to_string(),
+                        ),
+                        BlobKind::Inline => {
+                            let data_val = data_col.value(i);
+                            let blob_len = data_val.len() as u64;
+                            let position = external_buffers
+                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
 
-            if value.is_empty() {
-                position_builder.append_value(0);
-                size_builder.append_value(0);
-            } else {
-                let position = external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
-                position_builder.append_value(position);
-                size_builder.append_value(value.len() as u64);
-            }
+                            (
+                                BlobKind::Inline as u8,
+                                position,
+                                blob_len,
+                                0,
+                                "".to_string(),
+                            )
+                        }
+                        BlobKind::Packed => {
+                            return Err(Error::InvalidInput {
+                                source: "Packed blob kind is not supported for v2 encoder".into(),
+                                location: location!(),
+                            });
+                        }
+                    }
+                };
 
-            blob_id_builder.append_null();
-            uri_builder.append_null();
+            kind_builder.append_value(kind_value);
+            position_builder.append_value(position_value);
+            size_builder.append_value(size_value);
+            blob_id_builder.append_value(blob_id_value);
+            uri_builder.append_value(uri_value);
         }
-
         let children: Vec<ArrayRef> = vec![
             Arc::new(kind_builder.finish()),
             Arc::new(position_builder.finish()),
@@ -374,7 +375,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         self.descriptor_encoder.maybe_encode(
             descriptor_array,
             external_buffers,
-            RepDefBuilder::default(),
+            repdef,
             row_number,
             num_rows,
         )
@@ -402,9 +403,16 @@ mod tests {
     use crate::{
         compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{
+            check_round_trip_encoding_of_data, check_round_trip_encoding_of_data_with_expected,
+            TestCases,
+        },
+        version::LanceFileVersion,
     };
-    use arrow_array::LargeBinaryArray;
+    use arrow_array::{
+        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow_schema::{DataType, Field as ArrowField};
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -486,5 +494,138 @@ mod tests {
 
         // Use the standard test harness
         check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_round_trip() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
+        let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+        let blob_id_field = Arc::new(ArrowField::new("blob_id", DataType::UInt32, true));
+        let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
+
+        let kind_array = UInt8Array::from(vec![
+            BlobKind::Inline as u8,
+            BlobKind::External as u8,
+            BlobKind::External as u8,
+        ]);
+        let data_array = LargeBinaryArray::from(vec![Some(b"inline".as_ref()), None, None]);
+        let uri_array = StringArray::from(vec![
+            None,
+            Some("file:///tmp/external.bin"),
+            Some("s3://bucket/blob"),
+        ]);
+        let blob_id_array = UInt32Array::from(vec![0, 0, 0]);
+        let blob_size_array = UInt64Array::from(vec![0, 0, 0]);
+
+        let struct_array = StructArray::from(vec![
+            (kind_field, Arc::new(kind_array) as ArrayRef),
+            (data_field, Arc::new(data_array) as ArrayRef),
+            (uri_field, Arc::new(uri_array) as ArrayRef),
+            (blob_id_field, Arc::new(blob_id_array) as ArrayRef),
+            (blob_size_field, Arc::new(blob_size_array) as ArrayRef),
+        ]);
+
+        let expected_descriptor = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
+                Arc::new(UInt8Array::from(vec![
+                    BlobKind::Inline as u8,
+                    BlobKind::External as u8,
+                    BlobKind::External as u8,
+                ])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![6, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec![
+                    "",
+                    "file:///tmp/external.bin",
+                    "s3://bucket/blob",
+                ])) as ArrayRef,
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data_with_expected(
+            vec![Arc::new(struct_array)],
+            Some(Arc::new(expected_descriptor)),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_dedicated_round_trip() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let kind_field = Arc::new(ArrowField::new("kind", DataType::UInt8, true));
+        let data_field = Arc::new(ArrowField::new("data", DataType::LargeBinary, true));
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, true));
+        let blob_id_field = Arc::new(ArrowField::new("blob_id", DataType::UInt32, true));
+        let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
+
+        let kind_array = UInt8Array::from(vec![BlobKind::Dedicated as u8, BlobKind::Inline as u8]);
+        let data_array = LargeBinaryArray::from(vec![None, Some(b"abc".as_ref())]);
+        let uri_array = StringArray::from(vec![Option::<&str>::None, None]);
+        let blob_id_array = UInt32Array::from(vec![42, 0]);
+        let blob_size_array = UInt64Array::from(vec![12, 0]);
+
+        let struct_array = StructArray::from(vec![
+            (kind_field, Arc::new(kind_array) as ArrayRef),
+            (data_field, Arc::new(data_array) as ArrayRef),
+            (uri_field, Arc::new(uri_array) as ArrayRef),
+            (blob_id_field, Arc::new(blob_id_array) as ArrayRef),
+            (blob_size_field, Arc::new(blob_size_array) as ArrayRef),
+        ]);
+
+        let expected_descriptor = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
+                Arc::new(UInt8Array::from(vec![
+                    BlobKind::Dedicated as u8,
+                    BlobKind::Inline as u8,
+                ])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![12, 3])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![42, 0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("blob_uri", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["", ""])) as ArrayRef,
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data_with_expected(
+            vec![Arc::new(struct_array)],
+            Some(Arc::new(expected_descriptor)),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            blob_metadata,
+        )
+        .await;
     }
 }
