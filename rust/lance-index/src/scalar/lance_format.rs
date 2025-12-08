@@ -328,7 +328,7 @@ pub mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
@@ -402,9 +402,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = index
             .search(
@@ -418,9 +418,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(0), row_ids.len());
+        assert_eq!(Some(0), row_addrs.len());
 
         let result = index
             .search(
@@ -434,9 +434,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(100), row_ids.len());
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     #[tokio::test]
@@ -494,10 +494,10 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = updated_index
             .search(
@@ -508,17 +508,17 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(500_000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(500_000));
     }
 
     async fn check(index: &Arc<dyn ScalarIndex>, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(results.row_addrs(), &expected_arr);
     }
 
     #[tokio::test]
@@ -823,13 +823,13 @@ pub mod tests {
                 .unwrap();
 
             assert!(result.is_exact());
-            let row_ids = result.row_ids();
+            let row_addrs = result.row_addrs();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
-            assert!(!row_ids.is_empty());
-            assert!(row_ids.len().unwrap() < data.num_rows() as u64);
-            assert!(row_ids.contains(sample_row_id));
+            assert!(!row_addrs.is_empty());
+            assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
+            assert!(row_addrs.contains(sample_row_id));
         }
     }
 
@@ -886,17 +886,17 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert!(row_ids.is_empty());
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
             .await
             .unwrap();
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(4096));
+        let row_addrs = result.row_addrs();
+        assert_eq!(row_addrs.len(), Some(4096));
     }
 
     async fn train_bitmap(
@@ -962,9 +962,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(2));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(2));
 
         let result = index
             .search(
@@ -975,11 +975,11 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(3), row_ids.len());
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(3));
-        assert!(row_ids.contains(6));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(3), row_addrs.len());
+        assert!(row_addrs.contains(1));
+        assert!(row_addrs.contains(3));
+        assert!(row_addrs.contains(6));
     }
 
     #[tokio::test]
@@ -1004,9 +1004,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = index
             .search(
@@ -1020,8 +1020,8 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert!(row_ids.is_empty());
+        let row_addrs = result.row_addrs();
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(
@@ -1035,15 +1035,15 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(100), row_ids.len());
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(results.row_addrs(), &expected_arr);
     }
 
     #[tokio::test]
@@ -1307,9 +1307,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(5000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(5000));
     }
 
     #[tokio::test]
@@ -1356,7 +1356,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .contains(65));
         // Deleted
         assert!(remapped_index
@@ -1366,7 +1366,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .is_empty());
         // Not remapped
         assert!(remapped_index
@@ -1376,7 +1376,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .contains(3));
     }
 
@@ -1442,10 +1442,10 @@ pub mod tests {
                     .unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
-                let row_ids = result.row_ids();
+                let row_addrs = result.row_addrs();
 
-                let row_ids_set = row_ids
-                    .row_ids()
+                let row_addrs_set = row_addrs
+                    .row_addrs()
                     .unwrap()
                     .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
@@ -1459,7 +1459,7 @@ pub mod tests {
                     let list = list.unwrap();
                     let row_id = row_id.unwrap();
                     let vals = list.as_primitive::<UInt8Type>().values();
-                    if row_ids_set.contains(&row_id) {
+                    if row_addrs_set.contains(&row_id) {
                         assert!(match_fn(vals));
                     } else {
                         assert!(no_match_fn(vals));

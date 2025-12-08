@@ -34,7 +34,7 @@ const LOG_TABLE_256: [u8; 256] = [
 
 /// Returns the number of bits needed to represent the given number
 ///
-/// Inspired by https://graphics.stanford.edu/~seander/bithacks.html
+/// Inspired by <https://graphics.stanford.edu/~seander/bithacks.html>
 pub fn log_2_ceil(val: u32) -> u32 {
     assert!(val > 0);
     let upper_half = val >> 16;

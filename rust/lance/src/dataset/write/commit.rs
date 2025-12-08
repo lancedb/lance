@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
@@ -46,7 +46,7 @@ pub struct CommitBuilder<'a> {
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
-    affected_rows: Option<RowIdTreeMap>,
+    affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
@@ -165,7 +165,7 @@ impl<'a> CommitBuilder<'a> {
 
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
-    pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
+    pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
         self
     }

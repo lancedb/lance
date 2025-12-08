@@ -15,10 +15,10 @@ The bitmap index consists of a single file `bitmap_page_lookup.lance` that store
 
 ### File Schema
 
-| Column    | Type       | Nullable | Description                                                         |
-|-----------|------------|----------|---------------------------------------------------------------------|
-| `keys`    | {DataType} | true     | The unique value from the indexed column                            |
-| `bitmaps` | Binary     | true     | Serialized RowIdTreeMap containing row IDs where this value appears |
+| Column    | Type       | Nullable | Description                                                             |
+|-----------|------------|----------|-------------------------------------------------------------------------|
+| `keys`    | {DataType} | true     | The unique value from the indexed column                                |
+| `bitmaps` | Binary     | true     | Serialized RowAddrTreeMap containing row addrs where this value appears |
 
 ## Accelerated Queries
 

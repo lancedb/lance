@@ -465,7 +465,7 @@ impl Manifest {
     ///
     /// Parameters
     /// ----------
-    /// range: Range<usize>
+    /// range: `Range<usize>`
     ///     Offset range
     ///
     /// Returns

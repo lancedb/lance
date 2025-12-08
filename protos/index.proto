@@ -175,7 +175,7 @@ message VectorIndex {
   //
   // For example, `IVF_PQ` index type can be expressed as:
   //
-  // ```no_run,ignore
+  // ```text
   // let stages = vec![Ivf{}, PQ{num_bits: 8, num_sub_vectors: 16}]
   // ```
   repeated VectorIndexStage stages = 3;

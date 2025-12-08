@@ -1319,9 +1319,12 @@ where
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(Error::Index{message: format!(
-            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
-        ),location: location!()});
+        return Err(Error::Unprocessable {
+            message: format!(
+                "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
+            ),
+            location: location!(),
+        });
     }
 
     // Only sample sample_rate * num_clusters. See Faiss

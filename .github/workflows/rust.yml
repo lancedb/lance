@@ -3,7 +3,11 @@ on:
   push:
     branches:
       - main
+      - release/**
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - rust/**
       - protos/**
@@ -33,6 +37,19 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
+
+  rustdoc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
   clippy:
     permissions:
       checks: write
@@ -62,7 +79,7 @@ jobs:
           command: check
 
   linux-build:
-    runs-on: "ubuntu-24.04-4x"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     timeout-minutes: 60
     strategy:
       matrix:
@@ -104,7 +121,7 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
-    runs-on: ubuntu-24.04-arm64-4x
+    runs-on: warp-ubuntu-latest-arm64-4x
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -129,7 +146,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
   build-no-lock:
-    runs-on: ubuntu-24.04-8x
+    runs-on: warp-ubuntu-latest-x64-8x
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
@@ -150,7 +167,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: macos-14-xlarge
+    runs-on: warp-macos-14-arm64-6x
     timeout-minutes: 45
     strategy:
       matrix:
@@ -182,7 +199,7 @@ jobs:
         run: |
           cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
   windows-build:
-    runs-on: windows-latest-4x
+    runs-on: warp-windows-latest-x64-4x
     defaults:
       run:
         working-directory: rust

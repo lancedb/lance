@@ -69,6 +69,7 @@ gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_st
 aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
 azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "dep:object_store_opendal"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
+huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 test-util = []
 
 [lints]

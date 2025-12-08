@@ -41,7 +41,7 @@ pub struct BFloat16Type {}
 
 /// An array of bfloat16 values
 ///
-/// This implements the [`Array`](arrow_array::Array) trait for bfloat16 values.  Note that
+/// This implements the [`Array`] trait for bfloat16 values.  Note that
 /// bfloat16 is not the same thing as fp16 which is supported natively
 /// by arrow-rs.
 #[derive(Clone)]

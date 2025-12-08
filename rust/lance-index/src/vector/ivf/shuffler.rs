@@ -235,7 +235,7 @@ impl PartitionListBuilder {
 ///
 /// Returns
 /// -------
-///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
+///   `Result<Vec<impl Stream<Item = Result<RecordBatch>>>>`: a vector of streams
 ///   of shuffled partitioned data. Each stream corresponds to a partition and
 ///   is sorted within the stream. Consumer of these streams is expected to merge
 ///   the streams into a single stream by k-list merge algo.

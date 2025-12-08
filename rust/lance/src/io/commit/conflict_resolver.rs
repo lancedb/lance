@@ -9,7 +9,7 @@ use crate::{
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{
-    utils::{deletion::DeletionVector, mask::RowIdTreeMap},
+    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
     Error, Result,
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -31,7 +31,7 @@ pub struct TransactionRebase<'a> {
     initial_fragments: HashMap<u64, (Fragment, bool)>,
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
-    affected_rows: Option<&'a RowIdTreeMap>,
+    affected_rows: Option<&'a RowAddrTreeMap>,
     conflicting_frag_reuse_indices: Vec<IndexMetadata>,
 }
 
@@ -39,7 +39,7 @@ impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
         transaction: Transaction,
-        affected_rows: Option<&'a RowIdTreeMap>,
+        affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
@@ -1398,7 +1398,7 @@ impl<'a> TransactionRebase<'a> {
                     .await?;
 
                 // Check for row-level conflicts
-                let mut existing_deletions = RowIdTreeMap::new();
+                let mut existing_deletions = RowAddrTreeMap::new();
                 for (fragment_id, deletion_vec) in existing_deletion_vecs {
                     existing_deletions
                         .insert_bitmap(fragment_id as u32, deletion_vec.as_ref().into());
@@ -1406,7 +1406,7 @@ impl<'a> TransactionRebase<'a> {
                 let conflicting_rows = existing_deletions.clone() & affected_rows.clone();
                 if conflicting_rows.len().map(|v| v > 0).unwrap_or(true) {
                     let sample_addressed = conflicting_rows
-                        .row_ids()
+                        .row_addrs()
                         .unwrap()
                         .take(5)
                         .collect::<Vec<_>>();
@@ -1945,7 +1945,7 @@ mod tests {
         for (i, transaction) in transactions.iter().enumerate() {
             let previous_transactions = transactions.iter().take(i).cloned().collect::<Vec<_>>();
 
-            let affected_rows = RowIdTreeMap::from_iter([i as u64]);
+            let affected_rows = RowAddrTreeMap::from_iter([i as u64]);
             let mut rebase =
                 TransactionRebase::try_new(&dataset, transaction.clone(), Some(&affected_rows))
                     .await
@@ -2112,7 +2112,7 @@ mod tests {
             .await
             .unwrap();
 
-        let affected_rows = RowIdTreeMap::from_iter([0]);
+        let affected_rows = RowAddrTreeMap::from_iter([0]);
 
         dataset.object_store().io_stats_incremental(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))

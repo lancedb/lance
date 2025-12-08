@@ -16,6 +16,9 @@ on:
         default: true
         type: boolean
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - ".github/workflows/pypi-publish.yml"
       - ".github/workflows/build_linux_wheel/**"
@@ -42,11 +45,11 @@ jobs:
           - platform: aarch64
             manylinux: "2_17"
             extra_args: ""
-            runner: ubuntu-24.04-arm64-4x
+            runner: warp-ubuntu-latest-arm64-4x
           - platform: aarch64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
-            runner: ubuntu-24.04-arm64-4x
+            runner: warp-ubuntu-latest-arm64-4x
     runs-on: ${{ matrix.config.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -97,10 +100,8 @@ jobs:
       matrix:
         python-minor-version: ["9"]
         config:
-          - target: x86_64-apple-darwin
-            runner: macos-13-large
           - target: aarch64-apple-darwin
-            runner: macos-14-xlarge
+            runner: warp-macos-14-arm64-6x
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
@@ -134,7 +135,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: pylance-debug-macosx_${{ matrix.config.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+          name: pylance-debug-macosx_arm64
           path: python/target/wheels/*.whl
           retention-days: 90
       - uses: ./.github/workflows/upload_wheel

@@ -9,15 +9,15 @@
 //! different abilities to handle concurrent writes, so a trait is provided
 //! to allow for different implementations.
 //!
-//! The trait [CommitHandler] can be implemented to provide different commit
+//! The trait [`CommitHandler`] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
+//! `ConditionalPutCommitHandler`, which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
 //! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
-//! terms of a lock. The trait [CommitLock] can be implemented as a simpler
-//! alternative to [CommitHandler].
+//! terms of a lock. The trait `CommitLock` can be implemented as a simpler
+//! alternative to [`CommitHandler`].
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -744,7 +744,7 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowIdTreeMap>,
+    affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.

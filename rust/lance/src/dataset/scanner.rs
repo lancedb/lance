@@ -48,7 +48,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -76,7 +76,9 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::vector::utils::{
+    default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
+};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
@@ -1048,11 +1050,11 @@ impl Scanner {
             }
         };
 
-        let key = match element_type {
-            dt if dt == *q.data_type() => q,
+        let key = match &element_type {
+            dt if dt == q.data_type() => q,
             dt if dt.is_floating() => coerce_float_vector(
                 q.as_any().downcast_ref::<Float32Array>().unwrap(),
-                FloatType::try_from(&dt)?,
+                FloatType::try_from(dt)?,
             )?,
             _ => {
                 return Err(Error::invalid_input(
@@ -1077,7 +1079,7 @@ impl Scanner {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: MetricType::L2,
+            metric_type: default_distance_type_for(&element_type),
             use_index: true,
             dist_q_c: 0.0,
         });
@@ -2152,7 +2154,7 @@ impl Scanner {
     }
 
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids = RowIdTreeMap::from_iter(u64s);
+        let row_ids = RowAddrTreeMap::from_iter(u64s);
         let row_id_mask = RowIdMask::from_allowed(row_ids);
         let index_result = IndexExprResult::Exact(row_id_mask);
         let fragments_covered =
@@ -2839,18 +2841,21 @@ impl Scanner {
 
     // ANN/KNN search execution node with optional prefilter
     async fn vector_search(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(q) = self.nearest.as_ref() else {
+        let Some(nearest) = self.nearest.as_ref() else {
             return Err(Error::invalid_input(
                 "No nearest query".to_string(),
                 location!(),
             ));
         };
 
+        // Clone so we can adjust the metric type based on the available index.
+        let mut q = nearest.clone();
+
         // Sanity check
-        let (vector_type, _) = get_vector_type(self.dataset.schema(), &q.column)?;
+        let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-        let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
+        let use_index = q.use_index;
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
@@ -2860,6 +2865,17 @@ impl Scanner {
             log::trace!("index found for vector search");
             // There is an index built for the column.
             // We will use the index.
+            let idx = self
+                .dataset
+                .open_vector_index(
+                    q.column.as_str(),
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            q.metric_type = idx.metric_type();
+            validate_distance_type_for(q.metric_type, &element_type)?;
+
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
                     "Refine factor cannot be zero".to_string(),
@@ -2870,8 +2886,8 @@ impl Scanner {
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
+                DataType::FixedSizeList(_, _) => self.ann(&q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(&q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
 
@@ -2882,28 +2898,18 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                // TODO: now we just open an index to get its metric type.
-                let idx = self
-                    .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                let mut q = q.clone();
-                q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
 
             if !self.fast_search {
-                knn_node = self.knn_combined(q, index, knn_node, filter_plan).await?;
+                knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
             }
 
             Ok(knn_node)
         } else {
+            validate_distance_type_for(q.metric_type, &element_type)?;
             // No index found. use flat search.
             let mut columns = vec![q.column.clone()];
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -2932,7 +2938,7 @@ impl Scanner {
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
-            Ok(self.flat_knn(plan, q)?)
+            Ok(self.flat_knn(plan, &q)?)
         }
     }
 
@@ -3901,7 +3907,7 @@ mod test {
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        RecordBatchIterator, StringArray, StructArray, UInt8Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -3909,7 +3915,7 @@ mod test {
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
-    use lance_arrow::SchemaExt;
+    use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{
@@ -3940,6 +3946,47 @@ mod test {
     use crate::utils::test::{
         assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
     };
+
+    async fn make_binary_vector_dataset() -> Result<(TempStrDir, Dataset)> {
+        let tmp_dir = TempStrDir::default();
+        let dim = 4;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "bin",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::UInt8, true)),
+                    dim,
+                ),
+                false,
+            ),
+        ]));
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![
+                0b0000_1111u8,
+                0,
+                0,
+                0, //
+                0b0000_0011u8,
+                0,
+                0,
+                0, //
+                0u8,
+                0,
+                0,
+                0,
+            ]),
+            dim,
+        )?;
+        let ids = Int32Array::from(vec![0, 1, 2]);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, &tmp_dir, None).await?;
+        let dataset = Dataset::open(&tmp_dir).await?;
+        Ok((tmp_dir, dataset))
+    }
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -4765,6 +4812,52 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_i, actual_i);
+    }
+
+    #[tokio::test]
+    async fn test_binary_vectors_default_to_hamming() {
+        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+        let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
+
+        let mut scan = dataset.scan();
+        scan.nearest("bin", &query, 3).unwrap();
+
+        assert_eq!(
+            scan.nearest.as_ref().unwrap().metric_type,
+            DistanceType::Hamming
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values();
+        assert_eq!(ids, &[0, 1, 2]);
+        let distances = batch
+            .column_by_name(DIST_COL)
+            .unwrap()
+            .as_primitive::<Float32Type>()
+            .values();
+        assert_eq!(distances, &[0.0, 2.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn test_binary_vectors_invalid_distance_error() {
+        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+        let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
+
+        let mut scan = dataset.scan();
+        scan.nearest("bin", &query, 1).unwrap();
+        scan.distance_metric(DistanceType::L2);
+
+        let err = scan.try_into_batch().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let message = err.to_string();
+        assert!(
+            message.contains("l2") && message.contains("UInt8"),
+            "unexpected message: {message}"
+        );
     }
 
     #[rstest]

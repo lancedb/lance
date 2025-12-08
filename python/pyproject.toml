@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance_namespace_urllib3_client>=0.1.0"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.2.1"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -65,6 +65,10 @@ tests = [
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
+geo = [
+    "geoarrow-rust-core",
+    "geoarrow-rust-io",
+]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]

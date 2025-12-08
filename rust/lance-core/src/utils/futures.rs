@@ -36,7 +36,7 @@ struct InnerState<'a, T> {
     available_buffer: Option<PollSemaphore>,
 }
 
-/// The stream returned by [`share`].
+/// A stream that can be shared between two consumers.
 pub struct SharedStream<'a, T: Clone> {
     state: Arc<Mutex<InnerState<'a, T>>>,
     side: Side,

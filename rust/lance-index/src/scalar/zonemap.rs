@@ -43,7 +43,7 @@ use crate::{Index, IndexType};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_core::{utils::address::RowAddress, utils::mask::RowIdTreeMap, Error};
+use lance_core::{utils::address::RowAddress, utils::mask::RowAddrTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
@@ -553,7 +553,7 @@ impl ScalarIndex for ZoneMapIndex {
         metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
-        let mut row_id_tree_map = RowIdTreeMap::new();
+        let mut row_addr_tree_map = RowAddrTreeMap::new();
 
         // Loop through zones and check each one
         for zone in self.zones.iter() {
@@ -564,11 +564,11 @@ impl ScalarIndex for ZoneMapIndex {
                 let zone_end_addr = zone_start_addr + zone.zone_length as u64;
 
                 // Add all row addresses in this zone to the result
-                row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
+                row_addr_tree_map.insert_range(zone_start_addr..zone_end_addr);
             }
         }
 
-        Ok(SearchResult::AtMost(row_id_tree_map))
+        Ok(SearchResult::AtMost(row_addr_tree_map))
     }
 
     fn can_remap(&self) -> bool {
@@ -1093,7 +1093,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
+    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap, ROW_ADDR};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{array, BatchCount, RowCount};
@@ -1174,7 +1174,7 @@ mod tests {
         // Equals query: null (should match nothing, as there are no nulls)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1223,8 +1223,8 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Create expected RowIdTreeMap with all zones since they contain null values
-        let mut expected = RowIdTreeMap::new();
+        // Create expected RowAddrTreeMap with all zones since they contain null values
+        let mut expected = RowAddrTreeMap::new();
         for fragment_id in 0..10 {
             let start = (fragment_id as u64) << 32;
             let end = start + 5000;
@@ -1282,7 +1282,7 @@ mod tests {
             .unwrap();
 
         // Should match original 10 zones (with nulls) but not the new zone (no nulls)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         for fragment_id in 0..10 {
             let start = (fragment_id as u64) << 32;
             let end = start + 5000;
@@ -1298,7 +1298,7 @@ mod tests {
             .unwrap();
 
         // Should match the new zone (fragment 10)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         let start = 10u64 << 32;
         let end = start + 5000;
         expected.insert_range(start..end);
@@ -1380,7 +1380,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every zone
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1389,7 +1389,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match only the first zone since 5.0 only exists in rows 0-99
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1399,7 +1399,7 @@ mod tests {
 
         // Since zones contain NaN values, their max will be NaN, so they will be included
         // as potential matches for any finite target (false positive, but acceptable for zone maps)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1411,7 +1411,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the first three zones since they contain values in the range [0, 250]
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..300);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1424,7 +1424,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1437,14 +1437,14 @@ mod tests {
 
         // Since zones contain NaN values, their max will be NaN, so they will be included
         // as potential matches for any range query (false positive, but acceptable for zone maps)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test IsNull query (should match nothing since there are no null values)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // Test range queries with NaN bounds
         // Range with NaN as start bound (included)
@@ -1454,7 +1454,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1465,7 +1465,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1476,7 +1476,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since everything is less than NaN
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1487,7 +1487,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match nothing since nothing is greater than NaN
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // Test IsIn query with mixed float types (Float16, Float32, Float64)
         let query = SargableQuery::IsIn(vec![
@@ -1498,7 +1498,7 @@ mod tests {
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
     }
@@ -1624,7 +1624,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=100))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(0..=100))
         );
 
         // 2. Range query: [0, 50]
@@ -1635,7 +1635,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=99))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(0..=99))
         );
 
         // 3. Range query: [101, 200] (should only match the second zone, which is row 100)
@@ -1645,7 +1645,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Only row 100 is in the second zone, but its value is 100, so this should be empty
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // 4. Range query: [100, 100] (should match only the last row)
         let query = SargableQuery::Range(
@@ -1655,7 +1655,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(100..=100))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(100..=100))
         );
 
         // 5. Equals query: 0 (should match first row)
@@ -1663,7 +1663,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..100))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(0..100))
         );
 
         // 6. Equals query: 100 (should match only last row)
@@ -1671,18 +1671,18 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(100..=100))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(100..=100))
         );
 
         // 7. Equals query: 101 (should match nothing)
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(101)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // 8. IsNull query (no nulls in data, should match nothing)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // 9. IsIn query: [0, 100, 101, 50]
         let query = SargableQuery::IsIn(vec![
@@ -1695,7 +1695,7 @@ mod tests {
         // 0 and 50 are in the first zone, 100 in the second, 101 is not present
         assert_eq!(
             result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=100))
+            SearchResult::AtMost(RowAddrTreeMap::from_iter(0..=100))
         );
 
         // 10. IsIn query: [101, 102] (should match nothing)
@@ -1704,17 +1704,17 @@ mod tests {
             ScalarValue::Int32(Some(102)),
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // 11. IsIn query: [null] (should match nothing, as there are no nulls)
         let query = SargableQuery::IsIn(vec![ScalarValue::Int32(None)]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // 12. Equals query: null (should match nothing, as there are no nulls)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1808,7 +1808,7 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(1000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match row 1000 in fragment 0: row address = (0 << 32) + 1000 = 1000
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..=8191);
         assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -1816,14 +1816,14 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(9000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match row 9000 in fragment 0: row address = (0 << 32) + 9000 = 9000
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(8192..=16383);
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Search for a value not present in any zone
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(20000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
         // Search for a range that spans multiple zones
         let query = SargableQuery::Range(
@@ -1832,7 +1832,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all rows from 8000 to 16400 (inclusive)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(8192..=16425);
         assert_eq!(result, SearchResult::AtMost(expected));
     }
@@ -2041,7 +2041,7 @@ mod tests {
             );
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zones from fragments 0 and 1 since they overlap with range 5000-12000
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             // zone 1
             expected.insert_range(5000..8192);
             // zone 2
@@ -2052,7 +2052,7 @@ mod tests {
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(8192)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zone 2 since it contains value 8192
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range((1u64 << 32)..((1u64 << 32) + 5000));
             assert_eq!(result, SearchResult::AtMost(expected));
 
@@ -2060,29 +2060,29 @@ mod tests {
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(16385)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zone 4 since it contains value 16385
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(2u64 << 32..((2u64 << 32) + 42));
             assert_eq!(result, SearchResult::AtMost(expected));
 
             // Test query that matches nothing
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(99999)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+            assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
 
             // Test is_in query
             let query = SargableQuery::IsIn(vec![ScalarValue::Int64(Some(16385))]);
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(2u64 << 32..((2u64 << 32) + 42));
             assert_eq!(result, SearchResult::AtMost(expected));
 
             // Test equals query with null
             let query = SargableQuery::Equals(ScalarValue::Int64(None));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(0..=16425);
             // expected = {:?}", expected
-            assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+            assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
         }
 
         //  Each fragment is its own batch

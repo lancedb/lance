@@ -7,11 +7,11 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>1.0.0-beta.12</version>
+    <version>1.1.0-beta.2</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
-    <url>http://lancedb.com/</url>
+    <url>https://lance.org/</url>
 
     <developers>
         <developer>
@@ -107,8 +107,13 @@
         </dependency>
         <dependency>
             <groupId>org.lance</groupId>
+            <artifactId>lance-namespace-core</artifactId>
+            <version>0.2.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.lance</groupId>
             <artifactId>lance-namespace-apache-client</artifactId>
-            <version>0.1.0</version>
+            <version>0.2.1</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

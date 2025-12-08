@@ -4,61 +4,41 @@
 """LanceNamespace storage options integration and implementations.
 
 This module provides:
-1. LanceNamespace ABC interface for namespace implementations
-2. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
-3. Storage options integration with LanceNamespace for automatic credential refresh
-4. Plugin registry for external namespace implementations
+1. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
+2. Storage options integration with LanceNamespace for automatic credential refresh
+3. Plugin registry for external namespace implementations
+
+The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
-import importlib
-from abc import ABC, abstractmethod
 from typing import Dict, List
 
-from lance_namespace_urllib3_client.models import (
-    AlterTransactionRequest,
-    AlterTransactionResponse,
-    CountTableRowsRequest,
+from lance_namespace import (
     CreateEmptyTableRequest,
     CreateEmptyTableResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
-    CreateTableIndexRequest,
-    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
-    DeleteFromTableRequest,
-    DeleteFromTableResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest,
-    DescribeTableIndexStatsResponse,
     DescribeTableRequest,
     DescribeTableResponse,
-    DescribeTransactionRequest,
-    DescribeTransactionResponse,
     DropNamespaceRequest,
     DropNamespaceResponse,
     DropTableRequest,
     DropTableResponse,
-    InsertIntoTableRequest,
-    InsertIntoTableResponse,
+    LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
-    ListTableIndicesRequest,
-    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
-    MergeInsertIntoTableRequest,
-    MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
-    QueryTableRequest,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
-    UpdateTableRequest,
-    UpdateTableResponse,
 )
 
 from .io import StorageOptionsProvider
@@ -75,216 +55,11 @@ except ImportError:
     PyRestAdapter = None
 
 __all__ = [
-    # Interface and factory
-    "LanceNamespace",
-    "connect",
-    "register_namespace_impl",
-    # Implementations
     "DirectoryNamespace",
     "RestNamespace",
     "RestAdapter",
     "LanceNamespaceStorageOptionsProvider",
-    # Request/Response types (re-exported from lance_namespace_urllib3_client)
-    "AlterTransactionRequest",
-    "AlterTransactionResponse",
-    "CountTableRowsRequest",
-    "CreateEmptyTableRequest",
-    "CreateEmptyTableResponse",
-    "CreateNamespaceRequest",
-    "CreateNamespaceResponse",
-    "CreateTableIndexRequest",
-    "CreateTableIndexResponse",
-    "CreateTableRequest",
-    "CreateTableResponse",
-    "DeleteFromTableRequest",
-    "DeleteFromTableResponse",
-    "DeregisterTableRequest",
-    "DeregisterTableResponse",
-    "DescribeNamespaceRequest",
-    "DescribeNamespaceResponse",
-    "DescribeTableIndexStatsRequest",
-    "DescribeTableIndexStatsResponse",
-    "DescribeTableRequest",
-    "DescribeTableResponse",
-    "DescribeTransactionRequest",
-    "DescribeTransactionResponse",
-    "DropNamespaceRequest",
-    "DropNamespaceResponse",
-    "DropTableRequest",
-    "DropTableResponse",
-    "InsertIntoTableRequest",
-    "InsertIntoTableResponse",
-    "ListNamespacesRequest",
-    "ListNamespacesResponse",
-    "ListTableIndicesRequest",
-    "ListTableIndicesResponse",
-    "ListTablesRequest",
-    "ListTablesResponse",
-    "MergeInsertIntoTableRequest",
-    "MergeInsertIntoTableResponse",
-    "NamespaceExistsRequest",
-    "QueryTableRequest",
-    "RegisterTableRequest",
-    "RegisterTableResponse",
-    "TableExistsRequest",
-    "UpdateTableRequest",
-    "UpdateTableResponse",
 ]
-
-
-class LanceNamespace(ABC):
-    """Base interface for Lance Namespace implementations.
-
-    This abstract base class defines the contract for namespace implementations
-    that manage Lance tables. Implementations can provide different storage backends
-    (directory-based, REST API, cloud catalogs, etc.).
-
-    To create a custom namespace implementation, subclass this ABC and implement
-    at least the `namespace_id()` method. Other methods have default implementations
-    that raise `NotImplementedError`.
-    """
-
-    @abstractmethod
-    def namespace_id(self) -> str:
-        """Return a human-readable unique identifier for this namespace instance.
-
-        This is used for equality comparison and hashing when the namespace is
-        used as part of a storage options provider. Two namespace instances with
-        the same ID are considered equal and will share cached resources.
-
-        The ID should be human-readable for debugging and logging purposes.
-        For example:
-        - REST namespace: "RestNamespace { uri: 'https://api.example.com' }"
-        - Directory namespace: "DirectoryNamespace { root: '/path/to/data' }"
-
-        Returns
-        -------
-        str
-            A human-readable unique identifier string
-        """
-        pass
-
-    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
-        """List namespaces."""
-        raise NotImplementedError("Not supported: list_namespaces")
-
-    def describe_namespace(
-        self, request: DescribeNamespaceRequest
-    ) -> DescribeNamespaceResponse:
-        """Describe a namespace."""
-        raise NotImplementedError("Not supported: describe_namespace")
-
-    def create_namespace(
-        self, request: CreateNamespaceRequest
-    ) -> CreateNamespaceResponse:
-        """Create a new namespace."""
-        raise NotImplementedError("Not supported: create_namespace")
-
-    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
-        """Drop a namespace."""
-        raise NotImplementedError("Not supported: drop_namespace")
-
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
-        """Check if a namespace exists."""
-        raise NotImplementedError("Not supported: namespace_exists")
-
-    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
-        """List tables in a namespace."""
-        raise NotImplementedError("Not supported: list_tables")
-
-    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
-        """Describe a table."""
-        raise NotImplementedError("Not supported: describe_table")
-
-    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
-        """Register a table."""
-        raise NotImplementedError("Not supported: register_table")
-
-    def table_exists(self, request: TableExistsRequest) -> None:
-        """Check if a table exists."""
-        raise NotImplementedError("Not supported: table_exists")
-
-    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
-        """Drop a table."""
-        raise NotImplementedError("Not supported: drop_table")
-
-    def deregister_table(
-        self, request: DeregisterTableRequest
-    ) -> DeregisterTableResponse:
-        """Deregister a table."""
-        raise NotImplementedError("Not supported: deregister_table")
-
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
-        """Count rows in a table."""
-        raise NotImplementedError("Not supported: count_table_rows")
-
-    def create_table(
-        self, request: CreateTableRequest, request_data: bytes
-    ) -> CreateTableResponse:
-        """Create a new table with data from Arrow IPC stream."""
-        raise NotImplementedError("Not supported: create_table")
-
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        """Create an empty table (metadata only operation)."""
-        raise NotImplementedError("Not supported: create_empty_table")
-
-    def insert_into_table(
-        self, request: InsertIntoTableRequest, request_data: bytes
-    ) -> InsertIntoTableResponse:
-        """Insert data into a table."""
-        raise NotImplementedError("Not supported: insert_into_table")
-
-    def merge_insert_into_table(
-        self, request: MergeInsertIntoTableRequest, request_data: bytes
-    ) -> MergeInsertIntoTableResponse:
-        """Merge insert data into a table."""
-        raise NotImplementedError("Not supported: merge_insert_into_table")
-
-    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
-        """Update a table."""
-        raise NotImplementedError("Not supported: update_table")
-
-    def delete_from_table(
-        self, request: DeleteFromTableRequest
-    ) -> DeleteFromTableResponse:
-        """Delete from a table."""
-        raise NotImplementedError("Not supported: delete_from_table")
-
-    def query_table(self, request: QueryTableRequest) -> bytes:
-        """Query a table."""
-        raise NotImplementedError("Not supported: query_table")
-
-    def create_table_index(
-        self, request: CreateTableIndexRequest
-    ) -> CreateTableIndexResponse:
-        """Create a table index."""
-        raise NotImplementedError("Not supported: create_table_index")
-
-    def list_table_indices(
-        self, request: ListTableIndicesRequest
-    ) -> ListTableIndicesResponse:
-        """List table indices."""
-        raise NotImplementedError("Not supported: list_table_indices")
-
-    def describe_table_index_stats(
-        self, request: DescribeTableIndexStatsRequest
-    ) -> DescribeTableIndexStatsResponse:
-        """Describe table index statistics."""
-        raise NotImplementedError("Not supported: describe_table_index_stats")
-
-    def describe_transaction(
-        self, request: DescribeTransactionRequest
-    ) -> DescribeTransactionResponse:
-        """Describe a transaction."""
-        raise NotImplementedError("Not supported: describe_transaction")
-
-    def alter_transaction(
-        self, request: AlterTransactionRequest
-    ) -> AlterTransactionResponse:
-        """Alter a transaction."""
-        raise NotImplementedError("Not supported: alter_transaction")
 
 
 class DirectoryNamespace(LanceNamespace):
@@ -317,16 +92,9 @@ class DirectoryNamespace(LanceNamespace):
     >>> # Create with properties dict
     >>> ns = lance.namespace.DirectoryNamespace(root="memory://test")
     >>>
-    >>> # With storage options
-    >>> ns = lance.namespace.DirectoryNamespace(
-    ...     root="/path/to/data",
-    ...     manifest_enabled="true",
-    ...     **{"storage.region": "us-west-2"}
-    ... )
-    >>>
-    >>> # Using the connect() factory function
-    >>> import lance.namespace
-    >>> ns = lance.namespace.connect("dir", {"root": "memory://test"})
+    >>> # Using the connect() factory function from lance_namespace
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
     """
 
     def __init__(self, session=None, **properties):
@@ -434,16 +202,9 @@ class RestNamespace(LanceNamespace):
     >>> # Create with properties dict
     >>> ns = lance.namespace.RestNamespace(uri="http://localhost:4099")
     >>>
-    >>> # With custom delimiter and headers
-    >>> ns = lance.namespace.RestNamespace(
-    ...     uri="http://localhost:4099",
-    ...     delimiter=".",
-    ...     **{"header.Authorization": "Bearer token"}
-    ... )
-    >>>
-    >>> # Using the connect() factory function
-    >>> import lance.namespace
-    >>> ns = lance.namespace.connect("rest", {"uri": "http://localhost:4099"})
+    >>> # Using the connect() factory function from lance_namespace
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("rest", {"uri": "http://localhost:4099"})
     """
 
     def __init__(self, **properties):
@@ -553,19 +314,21 @@ class RestAdapter:
     session : Session, optional
         Lance session for sharing object store connections with the backend namespace.
     host : str, optional
-        Host address to bind to, default "127.0.0.1"
+        Host address to bind to. Default "127.0.0.1".
     port : int, optional
-        Port to listen on, default 2333
+        Port to listen on. Default 2333 per REST spec.
+        Use 0 to let the OS assign an available ephemeral port.
+        Use the `port` property after `start()` to get the actual port.
 
     Examples
     --------
     >>> import lance.namespace
     >>>
-    >>> # Start REST adapter with DirectoryNamespace backend
+    >>> # Start REST adapter with DirectoryNamespace backend (auto port)
     >>> namespace_config = {"root": "memory://test"}
-    >>> with lance.namespace.RestAdapter("dir", namespace_config, port=4001) as adapter:
-    ...     # Create REST client
-    ...     client = lance.namespace.RestNamespace(uri="http://127.0.0.1:4001")
+    >>> with lance.namespace.RestAdapter("dir", namespace_config) as adapter:
+    ...     # Create REST client using the assigned port
+    ...     client = lance.namespace.RestNamespace(uri=f"http://127.0.0.1:{adapter.port}")
     ...     # Use the client...
     """
 
@@ -574,8 +337,8 @@ class RestAdapter:
         namespace_impl: str,
         namespace_properties: Dict[str, str] = None,
         session=None,
-        host: str = "127.0.0.1",
-        port: int = 2333,
+        host: str = None,
+        port: int = None,
     ):
         if PyRestAdapter is None:
             raise RuntimeError(
@@ -592,12 +355,19 @@ class RestAdapter:
         # Create the underlying Rust adapter
         self._inner = PyRestAdapter(namespace_impl, str_properties, session, host, port)
         self.host = host
-        self.port = port
         self.namespace_impl = namespace_impl
 
-    def serve(self):
+    @property
+    def port(self) -> int:
+        """Get the actual port the server is listening on.
+
+        Returns 0 if the server hasn't been started yet.
+        """
+        return self._inner.port
+
+    def start(self):
         """Start the REST server in the background."""
-        self._inner.serve()
+        self._inner.start()
 
     def stop(self):
         """Stop the REST server."""
@@ -605,7 +375,7 @@ class RestAdapter:
 
     def __enter__(self):
         """Start server when entering context."""
-        self.serve()
+        self.start()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -732,76 +502,3 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
             f"LanceNamespaceStorageOptionsProvider {{ "
             f"namespace: {namespace_id}, table_id: {self._table_id!r} }}"
         )
-
-
-# Native implementations (Rust-backed)
-NATIVE_IMPLS = {
-    "rest": "lance.namespace.RestNamespace",
-    "dir": "lance.namespace.DirectoryNamespace",
-}
-
-# Plugin registry for external implementations
-_REGISTERED_IMPLS: Dict[str, str] = {}
-
-
-def register_namespace_impl(name: str, class_path: str) -> None:
-    """Register a namespace implementation with a short name.
-
-    External libraries can use this to register their implementations,
-    allowing users to use short names like "glue" instead of full class paths.
-
-    Parameters
-    ----------
-    name : str
-        Short name for the implementation (e.g., "glue", "hive2", "unity")
-    class_path : str
-        Full class path (e.g., "lance_glue.GlueNamespace")
-    """
-    _REGISTERED_IMPLS[name] = class_path
-
-
-def connect(impl: str, properties: Dict[str, str]) -> LanceNamespace:
-    """Connect to a Lance namespace implementation.
-
-    This factory function creates namespace instances based on implementation
-    aliases or full class paths. It provides a unified way to instantiate
-    different namespace backends.
-
-    Parameters
-    ----------
-    impl : str
-        Implementation alias or full class path. Built-in aliases:
-        - "rest": RestNamespace (REST API client)
-        - "dir": DirectoryNamespace (local/cloud filesystem)
-        You can also use full class paths like "my.custom.Namespace"
-        External libraries can register additional aliases using
-        `register_namespace_impl()`.
-    properties : Dict[str, str]
-        Configuration properties passed to the namespace constructor
-
-    Returns
-    -------
-    LanceNamespace
-        The connected namespace instance
-
-    Raises
-    ------
-    ValueError
-        If the implementation class cannot be loaded or does not
-        implement LanceNamespace interface
-    """
-    # Check native impls first, then registered plugins, then treat as full class path
-    impl_class = NATIVE_IMPLS.get(impl) or _REGISTERED_IMPLS.get(impl) or impl
-    try:
-        module_name, class_name = impl_class.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        namespace_class = getattr(module, class_name)
-
-        if not issubclass(namespace_class, LanceNamespace):
-            raise ValueError(
-                f"Class {impl_class} does not implement LanceNamespace interface"
-            )
-
-        return namespace_class(**properties)
-    except Exception as e:
-        raise ValueError(f"Failed to construct namespace impl {impl_class}: {e}")
