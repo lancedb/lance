@@ -184,11 +184,17 @@ def use_cache_param():
     return [True, False]
 
 
+def use_cache_ids():
+    if is_on_google():
+        return ["cache"]
+    return ["cache", "no_cache"]
+
+
 # Repeats the same test for the basic dataset which is easier to test with locally
 # This benchmark is not part of the CI job as the EDA dataset is better for that
 @pytest.mark.parametrize("filt", BASIC_BITMAP_FILTERS, ids=BASIC_BITMAP_FILTER_LABELS)
 @pytest.mark.parametrize("payload", [None, "small_strings", "integers"])
-@pytest.mark.parametrize("use_cache", [True, False], ids=["cache", "no_cache"])
+@pytest.mark.parametrize("use_cache", use_cache_param(), ids=use_cache_ids())
 def test_basic_bitmap_search(
     benchmark, filt: str | None, payload: str | None, use_cache: bool
 ):
