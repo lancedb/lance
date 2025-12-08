@@ -72,7 +72,7 @@ impl SpillReceiver {
     /// batches as they are written to the spill. If the spill has already
     /// been finished, the stream will emit all batches in the spill.
     ///
-    /// The stream will not complete until [`Self::finish()`] is called.
+    /// The stream will not complete until [`SpillSender::finish()`] is called.
     ///
     /// If the spill has been dropped, an error will be returned.
     pub fn read(&self) -> SendableRecordBatchStream {
@@ -410,8 +410,7 @@ impl SpillSender {
     }
 
     /// Complete the spill write. This will finalize the Arrow IPC stream file.
-    /// The file will remain available for reading until [`Self::shutdown()`]
-    /// or until the spill is dropped.
+    /// The file will remain available for reading until the spill is dropped.
     pub async fn finish(&mut self) -> Result<(), DataFusionError> {
         // We create a temporary state to get an owned copy of current state.
         // Since we hold an exclusive reference to `self`, no one should be

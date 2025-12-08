@@ -516,7 +516,7 @@ pub trait RecordBatchExt {
     /// Afterwards we add all non-matching right columns to the output.
     ///
     /// Note: This method likely does not handle nested fields correctly and you may want to consider
-    /// using [`merge_with_schema`] instead.
+    /// using [`Self::merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -1409,7 +1409,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 
 /// Interleave multiple RecordBatches into a single RecordBatch.
 ///
-/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+/// Behaves like [`arrow_select::interleave::interleave`], but for RecordBatches.
 pub fn interleave_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],

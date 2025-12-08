@@ -62,7 +62,7 @@ impl SchedulingJob for BinarySchedulingJob<'_> {
     }
 }
 
-/// A logical scheduler for utf8/binary pages which assumes the data are encoded as List<u8>
+/// A logical scheduler for utf8/binary pages which assumes the data are encoded as `List<u8>`
 #[derive(Debug)]
 pub struct BinaryFieldScheduler {
     varbin_scheduler: Arc<dyn FieldScheduler>,

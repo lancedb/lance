@@ -136,7 +136,7 @@ impl DisplayAs for KNNVectorDistanceExec {
 }
 
 impl KNNVectorDistanceExec {
-    /// Create a new [KNNFlatExec] node.
+    /// Create a new [`KNNVectorDistanceExec`] node.
     ///
     /// Returns an error if the preconditions are not met.
     pub fn try_new(

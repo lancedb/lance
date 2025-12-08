@@ -9,15 +9,15 @@
 //! different abilities to handle concurrent writes, so a trait is provided
 //! to allow for different implementations.
 //!
-//! The trait [CommitHandler] can be implemented to provide different commit
+//! The trait [`CommitHandler`] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
+//! `ConditionalPutCommitHandler`, which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
 //! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
-//! terms of a lock. The trait [CommitLock] can be implemented as a simpler
-//! alternative to [CommitHandler].
+//! terms of a lock. The trait `CommitLock` can be implemented as a simpler
+//! alternative to [`CommitHandler`].
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;

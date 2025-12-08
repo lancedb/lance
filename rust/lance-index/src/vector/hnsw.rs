@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 pub static POINTER_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(POINTER_COL, DataType::UInt32, true));
 
-/// Id of the vector in the [VectorStorage].
+/// Id of the vector in the `VectorStorage`.
 pub static VECTOR_ID_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(VECTOR_ID_COL, DataType::UInt32, true));
 

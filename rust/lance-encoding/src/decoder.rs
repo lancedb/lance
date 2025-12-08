@@ -11,7 +11,7 @@
 //!
 //! # Scheduling
 //!
-//! Scheduling is split into [`self::FieldScheduler`] and [`self::PageScheduler`].
+//! Scheduling is split into `FieldScheduler` and `PageScheduler`.
 //! There is one field scheduler for each output field, which may map to many
 //! columns of actual data.  A field scheduler is responsible for figuring out
 //! the order in which pages should be scheduled.  Field schedulers then delegate
@@ -23,8 +23,8 @@
 //!
 //! # Decoding
 //!
-//! Decoders are split into [`self::PhysicalPageDecoder`] and
-//! [`self::LogicalPageDecoder`].  Note that both physical and logical decoding
+//! Decoders are split into `PhysicalPageDecoder` and
+//! [`LogicalPageDecoder`].  Note that both physical and logical decoding
 //! happens on a per-page basis.  There is no concept of a "field decoder" or
 //! "column decoder".
 //!
@@ -60,7 +60,7 @@
 //! encoding.  That encoding can then contain other logical encodings or physical encodings.
 //! Physical encodings can also contain other physical encodings.
 //!
-//! So, for example, a single field in the Arrow schema might have the type List<UInt32>
+//! So, for example, a single field in the Arrow schema might have the type `List<UInt32>`
 //!
 //! The encoding tree could then be:
 //!
@@ -1323,8 +1323,7 @@ impl BatchDecodeStream {
     ///
     /// # Arguments
     ///
-    /// * `scheduled` - an incoming stream of decode tasks from a
-    ///   [`crate::decode::DecodeBatchScheduler`]
+    /// * `scheduled` - an incoming stream of decode tasks from a `DecodeBatchScheduler`
     /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
@@ -1669,8 +1668,7 @@ impl StructuralBatchDecodeStream {
     ///
     /// # Arguments
     ///
-    /// * `scheduled` - an incoming stream of decode tasks from a
-    ///   [`crate::decode::DecodeBatchScheduler`]
+    /// * `scheduled` - an incoming stream of decode tasks from a `DecodeBatchScheduler`
     /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
@@ -2216,7 +2214,7 @@ impl PriorityRange for SimplePriorityRange {
 
 /// Determining the priority of a list request is tricky.  We want
 /// the priority to be the top-level row.  So if we have a
-/// list<list<int>> and each outer list has 10 rows and each inner
+/// `list<list<int>>` and each outer list has 10 rows and each inner
 /// list has 5 rows then the priority of the 100th item is 1 because
 /// it is the 5th item in the 10th item of the *second* row.
 ///

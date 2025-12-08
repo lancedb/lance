@@ -72,7 +72,7 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// [ObjectReader] for local file system.
+/// Object reader for local file system.
 #[derive(Debug)]
 pub struct LocalObjectReader {
     /// File handler.
