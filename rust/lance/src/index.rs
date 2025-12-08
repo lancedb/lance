@@ -197,28 +197,31 @@ fn auto_migrate_corruption() -> bool {
 }
 
 /// Derive a friendly (but not necessarily unique) type name from a type URL.
-fn friendly_type_name_from_uri(index_uri: &str) -> String {
+/// Extract a human-friendly type name from a type URL.
+///
+/// Strips prefixes like `type.googleapis.com/` and package names, then removes
+/// trailing `IndexDetails` / `Index` so callers get a concise display name.
+fn type_name_from_uri(index_uri: &str) -> String {
     let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
-    type_name
-        .strip_suffix("IndexDetails")
-        .unwrap_or(type_name)
-        .to_string()
+    let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
+    type_name.trim_end_matches("IndexDetails").to_string()
 }
 
 /// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
 fn legacy_type_name(index_uri: &str) -> String {
-    let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
-    match type_name {
-        "BTreeIndexDetails" => IndexType::BTree.to_string(),
-        "BitmapIndexDetails" => IndexType::Bitmap.to_string(),
-        "LabelListIndexDetails" => IndexType::LabelList.to_string(),
-        "NGramIndexDetails" => IndexType::NGram.to_string(),
-        "ZoneMapIndexDetails" => IndexType::ZoneMap.to_string(),
-        "BloomFilterIndexDetails" => IndexType::BloomFilter.to_string(),
-        "InvertedIndexDetails" => IndexType::Inverted.to_string(),
-        "JsonIndexDetails" => IndexType::Scalar.to_string(),
-        "FlatIndexDetails" => IndexType::Vector.to_string(),
-        "VectorIndexDetails" => IndexType::Vector.to_string(),
+    let base = type_name_from_uri(index_uri);
+
+    match base.as_str() {
+        "BTree" => IndexType::BTree.to_string(),
+        "Bitmap" => IndexType::Bitmap.to_string(),
+        "LabelList" => IndexType::LabelList.to_string(),
+        "NGram" => IndexType::NGram.to_string(),
+        "ZoneMap" => IndexType::ZoneMap.to_string(),
+        "BloomFilter" => IndexType::BloomFilter.to_string(),
+        "Inverted" => IndexType::Inverted.to_string(),
+        "Json" => IndexType::Scalar.to_string(),
+        "Flat" | "Vector" => IndexType::Vector.to_string(),
+        other if other.contains("Vector") => IndexType::Vector.to_string(),
         _ => "N/A".to_string(),
     }
 }
@@ -966,15 +969,14 @@ impl DatasetIndexExt for Dataset {
                 let uri = index_uri
                     .as_deref()
                     .unwrap_or_else(|| index_details.type_url.as_str());
-                index_typename = Some(friendly_type_name_from_uri(uri));
+                index_typename = Some(type_name_from_uri(uri));
             }
 
             indices_stats.push(index.statistics()?);
         }
 
         let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
-        let index_typename =
-            index_typename.unwrap_or_else(|| friendly_type_name_from_uri(&index_uri));
+        let index_typename = index_typename.unwrap_or_else(|| type_name_from_uri(&index_uri));
         let index_type = legacy_type_name(&index_uri);
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
