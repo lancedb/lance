@@ -208,7 +208,16 @@ fn type_name_from_uri(index_uri: &str) -> String {
 }
 
 /// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
-fn legacy_type_name(index_uri: &str) -> String {
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+///
+/// If `index_type_hint` is provided (e.g. parsed from the index statistics of a concrete
+/// index instance), it takes precedence so callers can surface the exact index type even
+/// when the type URL alone is too generic (such as VectorIndexDetails).
+fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
+    if let Some(hint) = index_type_hint {
+        return hint.to_string();
+    }
+
     let base = type_name_from_uri(index_uri);
 
     match base.as_str() {
@@ -976,7 +985,11 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
-        let index_type = legacy_type_name(&index_uri);
+        let index_type_hint = indices_stats
+            .first()
+            .and_then(|stats| stats.get("index_type"))
+            .and_then(|v| v.as_str());
+        let index_type = legacy_type_name(&index_uri, index_type_hint);
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
 
