@@ -12,7 +12,6 @@ use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{expression::ScalarQueryParser, CreatedIndex, IndexStore, ScalarIndex},
-    IndexType,
 };
 
 pub const VALUE_COLUMN_NAME: &str = "value";
@@ -129,9 +128,6 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
-
-    /// Returns the index type for this plugin
-    fn index_type(&self) -> IndexType;
 
     /// The version of the index plugin
     ///

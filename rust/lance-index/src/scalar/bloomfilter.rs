@@ -1285,10 +1285,6 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         false
     }
 
-    fn index_type(&self) -> IndexType {
-        IndexType::BloomFilter
-    }
-
     fn version(&self) -> u32 {
         BLOOMFILTER_INDEX_VERSION
     }

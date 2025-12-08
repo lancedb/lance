@@ -749,10 +749,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         true
     }
 
-    fn index_type(&self) -> IndexType {
-        IndexType::Bitmap
-    }
-
     fn version(&self) -> u32 {
         BITMAP_INDEX_VERSION
     }

@@ -1278,10 +1278,6 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         false
     }
 
-    fn index_type(&self) -> IndexType {
-        IndexType::NGram
-    }
-
     fn version(&self) -> u32 {
         NGRAM_INDEX_VERSION
     }
