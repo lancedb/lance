@@ -17,7 +17,7 @@ import lance
 import lance.namespace
 import pyarrow as pa
 import pytest
-from lance.namespace import (
+from lance_namespace import (
     CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,

@@ -97,8 +97,6 @@ jobs:
       matrix:
         python-minor-version: ["9"]
         config:
-          - target: x86_64-apple-darwin
-            runner: macos-14
           - target: aarch64-apple-darwin
             runner: warp-macos-14-arm64-6x
     env:
@@ -134,7 +132,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: pylance-debug-macosx_${{ matrix.config.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+          name: pylance-debug-macosx_arm64
           path: python/target/wheels/*.whl
           retention-days: 90
       - uses: ./.github/workflows/upload_wheel

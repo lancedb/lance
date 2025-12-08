@@ -35,12 +35,15 @@ use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
-use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
+use lance_core::{
+    container::list::ExpLinkedList,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -251,16 +254,27 @@ impl InvertedIndex {
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
-                tokio::spawn(async move {
-                    part.bm25_search(
-                        tokens.as_ref(),
-                        params.as_ref(),
-                        operator,
-                        mask,
-                        metrics.as_ref(),
-                    )
+                async move {
+                    let postings = part
+                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                        .await?;
+                    if postings.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let params = params.clone();
+                    let mask = mask.clone();
+                    let metrics = metrics.clone();
+                    spawn_cpu(move || {
+                        part.bm25_search(
+                            params.as_ref(),
+                            operator,
+                            mask,
+                            postings,
+                            metrics.as_ref(),
+                        )
+                    })
                     .await
-                })
+                }
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
@@ -270,7 +284,7 @@ impl InvertedIndex {
                 row_id,
                 freqs,
                 doc_length,
-            } in res?
+            } in res
             {
                 let mut score = 0.0;
                 for (token, freq) in freqs.into_iter() {
@@ -533,7 +547,7 @@ impl ScalarIndex for InvertedIndex {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+                Ok(SearchResult::AtMost(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
     }
@@ -717,14 +731,12 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    pub async fn bm25_search(
+    pub async fn load_posting_lists(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
-        operator: Operator,
-        mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<PostingIterator>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
@@ -751,7 +763,7 @@ impl InvertedPartition {
         }
 
         let num_docs = self.docs.len();
-        let postings = stream::iter(token_ids)
+        stream::iter(token_ids)
             .enumerate()
             .map(|(position, (token_id, token))| async move {
                 let posting = self
@@ -769,10 +781,28 @@ impl InvertedPartition {
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
-            .await?;
+            .await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn bm25_search(
+        &self,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowIdMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // let local_metrics = LocalMetricsCollector::default();
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
-        wand.search(params, mask, metrics)
+        let hits = wand.search(params, mask, metrics)?;
+        // local_metrics.dump_into(metrics);
+        Ok(hits)
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {

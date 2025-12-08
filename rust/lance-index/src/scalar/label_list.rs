@@ -13,7 +13,7 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::cache::LanceCache;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{utils::mask::RowAddrTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
@@ -41,7 +41,7 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         &self,
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<RowAddrTreeMap> {
         let result = self.search(query, metrics).await?;
         match result {
             SearchResult::Exact(row_ids) => Ok(row_ids),
@@ -118,7 +118,7 @@ impl LabelListIndex {
         &'a self,
         values: &'a Vec<ScalarValue>,
         metrics: &'a dyn MetricsCollector,
-    ) -> BoxStream<'a, Result<RowIdTreeMap>> {
+    ) -> BoxStream<'a, Result<RowAddrTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
@@ -129,9 +129,9 @@ impl LabelListIndex {
 
     async fn set_union<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        mut sets: impl TryStream<Ok = RowAddrTreeMap, Error = Error> + 'a + Unpin,
         single_set: bool,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<RowAddrTreeMap> {
         let mut union_bitmap = sets.try_next().await?.unwrap();
         if single_set {
             return Ok(union_bitmap);
@@ -144,9 +144,9 @@ impl LabelListIndex {
 
     async fn set_intersection<'a>(
         &'a self,
-        mut sets: impl TryStream<Ok = RowIdTreeMap, Error = Error> + 'a + Unpin,
+        mut sets: impl TryStream<Ok = RowAddrTreeMap, Error = Error> + 'a + Unpin,
         single_set: bool,
-    ) -> Result<RowIdTreeMap> {
+    ) -> Result<RowAddrTreeMap> {
         let mut intersect_bitmap = sets.try_next().await?.unwrap();
         if single_set {
             return Ok(intersect_bitmap);

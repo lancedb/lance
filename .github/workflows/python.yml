@@ -234,7 +234,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
-    runs-on: "ubuntu-latest"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash

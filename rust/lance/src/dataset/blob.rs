@@ -4,8 +4,7 @@
 use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{UInt64Type, UInt8Type};
-use arrow_schema::DataType;
+use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
@@ -189,7 +188,7 @@ pub(super) async fn take_blobs(
     let projection = dataset.schema().project(&[column])?;
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
-    if blob_field.data_type() != DataType::LargeBinary || !projection.fields[0].is_blob() {
+    if !projection.fields[0].is_blob() {
         return Err(Error::InvalidInput {
             location: location!(),
             source: format!("the column '{}' is not a blob column", column).into(),
@@ -246,32 +245,38 @@ fn collect_blob_files_v2(
     let kinds = descriptions.column(0).as_primitive::<UInt8Type>();
     let positions = descriptions.column(1).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
+    let _blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
+    let _uris = descriptions.column(4).as_string::<i32>();
 
     let mut files = Vec::with_capacity(row_addrs.len());
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
-        if positions.is_null(idx) || sizes.is_null(idx) {
+        if kinds.is_null(idx) {
+            // Null row
             continue;
         }
-
-        if !kinds.is_null(idx) {
-            let kind = kinds.value(idx);
-            if kind != INLINE_BLOB_KIND {
+        let kind = kinds.value(idx);
+        match kind {
+            INLINE_BLOB_KIND => {
+                if positions.is_null(idx) || sizes.is_null(idx) {
+                    continue;
+                }
+                let position = positions.value(idx);
+                let size = sizes.value(idx);
+                files.push(BlobFile::new(
+                    dataset.clone(),
+                    blob_field_id,
+                    *row_addr,
+                    position,
+                    size,
+                ));
+            }
+            other => {
                 return Err(Error::NotSupported {
-                    source: format!("Blob kind {} is not supported", kind).into(),
+                    source: format!("Blob kind {} is not supported", other).into(),
                     location: location!(),
                 });
             }
         }
-
-        let position = positions.value(idx);
-        let size = sizes.value(idx);
-        files.push(BlobFile::new(
-            dataset.clone(),
-            blob_field_id,
-            *row_addr,
-            position,
-            size,
-        ));
     }
 
     Ok(files)
