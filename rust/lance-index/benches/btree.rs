@@ -115,6 +115,7 @@ async fn create_int_unique_index(
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -142,6 +143,7 @@ async fn create_int_low_card_index(
         &sub_index,
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
+        None,
         None,
     )
     .await
@@ -171,6 +173,7 @@ async fn create_string_unique_index(
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -198,6 +201,7 @@ async fn create_string_low_card_index(
         &sub_index,
         store.as_ref(),
         DEFAULT_BTREE_BATCH_SIZE,
+        None,
         None,
     )
     .await
