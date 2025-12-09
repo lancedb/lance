@@ -75,6 +75,14 @@ impl PackWriter {
         Ok(())
     }
 
+    /// Append `data` to the current `.pack` file, rolling to a new file when
+    /// `max_pack_size` would be exceeded.
+    ///
+    /// alloc_blob_id: called only when a new pack file is opened; returns the
+    /// blob_id used as the file name.
+    ///
+    /// Returns `(blob_id, position)` where
+    /// position is the start offset of this payload in that pack file.
     async fn write_with_allocator<F>(
         &mut self,
         alloc_blob_id: &mut F,
