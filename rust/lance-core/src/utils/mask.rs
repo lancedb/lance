@@ -10,6 +10,7 @@ use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
+use itertools::Itertools;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
 use crate::error::ToSnafuLocation;
@@ -605,8 +606,7 @@ impl RowAddrTreeMap {
         while let Some(row_id) = iter.peek() {
             let fragment_id = (row_id >> 32) as u32;
             let next_bitmap_iter = iter
-                .by_ref()
-                .take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
+                .peeking_take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
                 .map(|row_id| row_id as u32);
             let Ok(bitmap) = RoaringBitmap::from_sorted_iter(next_bitmap_iter) else {
                 return Err(Error::Internal {
@@ -1529,6 +1529,17 @@ mod tests {
             left -= &right;
             prop_assert_eq!(expected, left);
         }
+
+        #[test]
+        fn test_from_sorted_iter(
+            mut rows in proptest::collection::vec(0..u64::MAX, 0..1000)
+        ) {
+            rows.sort();
+            let num_rows = rows.len();
+            let mask = RowAddrTreeMap::from_sorted_iter(rows).unwrap();
+            prop_assert_eq!(mask.len(), Some(num_rows as u64));
+        }
+
 
     }
 

@@ -576,6 +576,7 @@ pub struct BTreeLookup {
     null_pages: Vec<u32>,
 }
 
+#[derive(Debug, Copy, Clone)]
 enum Matches {
     Some(u32),
     All(u32),
