@@ -146,7 +146,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
   query-integration-tests:
-    runs-on: ubuntu-2404-8x-arm64
+    runs-on: warp-ubuntu-latest-x64-4x
     timeout-minutes: 75
     env:
       # We use opt-level 1 which makes some tests 5x faster to run.
