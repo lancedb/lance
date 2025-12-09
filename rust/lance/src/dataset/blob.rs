@@ -169,7 +169,7 @@ impl BlobPreprocessor {
             .write_with_allocator(
                 &mut || {
                     let id = *counter;
-                    *counter = counter.wrapping_add(1);
+                    *counter += 1;
                     id
                 },
                 data,
@@ -243,7 +243,7 @@ impl BlobPreprocessor {
                     uri_builder.append_null();
                     blob_id_builder.append_value(blob_id);
                     blob_size_builder.append_value(data_len as u64);
-                    position_builder.append_value(0);
+                    position_builder.append_null();
                     continue;
                 }
 
