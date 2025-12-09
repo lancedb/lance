@@ -12,7 +12,8 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
-use crate::Result;
+use crate::error::ToSnafuLocation;
+use crate::{Error, Result};
 
 use super::address::RowAddress;
 
@@ -594,6 +595,31 @@ impl RowAddrTreeMap {
                     (fragment << 32) | row_offset
                 }),
             })
+    }
+
+    #[track_caller]
+    pub fn from_sorted_iter(iter: impl IntoIterator<Item = u64>) -> Result<Self> {
+        let mut iter = iter.into_iter().peekable();
+        let mut inner = BTreeMap::new();
+
+        while let Some(row_id) = iter.peek() {
+            let fragment_id = (row_id >> 32) as u32;
+            let next_bitmap_iter = iter
+                .by_ref()
+                .take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
+                .map(|row_id| row_id as u32);
+            let Ok(bitmap) = RoaringBitmap::from_sorted_iter(next_bitmap_iter) else {
+                return Err(Error::Internal {
+                    message: "RowAddrTreeMap::from_sorted_iter called with non-sorted input"
+                        .to_string(),
+                    // Use the caller location since we aren't the one that got it out of order
+                    location: std::panic::Location::caller().to_snafu_location(),
+                });
+            };
+            inner.insert(fragment_id, RowAddrSelection::Partial(bitmap));
+        }
+
+        Ok(Self { inner })
     }
 }
 

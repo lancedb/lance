@@ -2,30 +2,23 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, ops::Bound, sync::Arc};
+use std::{ops::Bound, sync::Arc};
 
 use arrow_array::{
     cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
 
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
-use lance_core::error::LanceOptionExt;
+use lance_arrow::RecordBatchExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
-use super::{AnyQuery, MetricsCollector, SargableQuery, SearchResult};
-use crate::scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN};
-use crate::scalar::registry::VALUE_COLUMN_NAME;
-use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::{Index, IndexType};
+use crate::metrics::MetricsCollector;
+use crate::scalar::{AnyQuery, SargableQuery};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -36,6 +29,8 @@ use crate::{Index, IndexType};
 #[derive(Debug)]
 pub struct FlatIndex {
     data: Arc<RecordBatch>,
+    all_addrs_map: RowAddrTreeMap,
+    null_addrs_map: RowAddrTreeMap,
     has_nulls: bool,
 }
 
@@ -46,6 +41,32 @@ impl DeepSizeOf for FlatIndex {
 }
 
 impl FlatIndex {
+    pub fn try_new(data: RecordBatch) -> Result<Self> {
+        // Sort by row id to make bitmap construction more efficient
+        let data = data.sort_by_column(1, None)?;
+        let has_nulls = data.column(1).null_count() > 0;
+        let all_addrs_map = RowAddrTreeMap::from_sorted_iter(
+            data.column(1)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied(),
+        )?;
+
+        let null_addrs_map = if has_nulls {
+            Self::get_null_addrs(&data)?
+        } else {
+            RowAddrTreeMap::default()
+        };
+
+        Ok(Self {
+            data: Arc::new(data),
+            all_addrs_map,
+            null_addrs_map,
+            has_nulls,
+        })
+    }
+
     fn values(&self) -> &ArrayRef {
         self.data.column(0)
     }
@@ -53,177 +74,84 @@ impl FlatIndex {
     fn ids(&self) -> &ArrayRef {
         self.data.column(1)
     }
-}
 
-fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Result<RecordBatch> {
-    let row_ids = batch.column(1).as_primitive::<UInt64Type>();
-    let val_idx_and_new_id = row_ids
-        .values()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, old_id)| {
-            mapping
-                .get(old_id)
-                .copied()
-                .unwrap_or(Some(*old_id))
-                .map(|new_id| (idx, new_id))
-        })
-        .collect::<Vec<_>>();
-    let new_ids = Arc::new(UInt64Array::from_iter_values(
-        val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
-    ));
-    let new_val_indices = UInt64Array::from_iter_values(
-        val_idx_and_new_id
-            .into_iter()
-            .map(|(val_idx, _)| val_idx as u64),
-    );
-    let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
-    Ok(RecordBatch::try_new(
-        batch.schema(),
-        vec![new_vals, new_ids],
-    )?)
-}
-
-/// Trains a flat index from a record batch of values & ids by simply storing the batch
-///
-/// This allows the flat index to be used as a sub-index
-#[derive(Debug)]
-pub struct FlatIndexMetadata {
-    schema: Arc<Schema>,
-}
-
-impl DeepSizeOf for FlatIndexMetadata {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.schema.metadata.deep_size_of_children(context)
-            + self
-                .schema
-                .fields
-                .iter()
-                // This undercounts slightly because it doesn't account for the size of the
-                // field data types
-                .map(|f| {
-                    std::mem::size_of::<Field>()
-                        + f.name().deep_size_of_children(context)
-                        + f.metadata().deep_size_of_children(context)
-                })
-                .sum::<usize>()
-    }
-}
-
-impl FlatIndexMetadata {
-    pub fn new(value_type: DataType) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(BTREE_VALUES_COLUMN, value_type, true),
-            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, true),
-        ]));
-        Self { schema }
-    }
-}
-
-#[async_trait]
-impl BTreeSubIndex for FlatIndexMetadata {
-    fn schema(&self) -> &Arc<Schema> {
-        &self.schema
+    pub fn all(&self) -> NullableRowAddrSet {
+        // Some rows will be in both sets but that is ok, null trumps true
+        NullableRowAddrSet::new(self.all_addrs_map.clone(), self.null_addrs_map.clone())
     }
 
-    async fn train(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // The data source may not call the columns "values" and "row_ids" so we need to replace
-        // the schema
+    pub fn remap_batch(
+        batch: RecordBatch,
+        mapping: &HashMap<u64, Option<u64>>,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        let val_idx_and_new_id = row_ids
+            .values()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, old_id)| {
+                mapping
+                    .get(old_id)
+                    .copied()
+                    .unwrap_or(Some(*old_id))
+                    .map(|new_id| (idx, new_id))
+            })
+            .collect::<Vec<_>>();
+        let new_ids = Arc::new(UInt64Array::from_iter_values(
+            val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
+        ));
+        let new_val_indices = UInt64Array::from_iter_values(
+            val_idx_and_new_id
+                .into_iter()
+                .map(|(val_idx, _)| val_idx as u64),
+        );
+        let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
         Ok(RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
-                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
-            ],
+            batch.schema(),
+            vec![new_vals, new_ids],
         )?)
     }
 
-    async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
-        let has_nulls = serialized.column(0).null_count() > 0;
-        Ok(Arc::new(FlatIndex {
-            data: Arc::new(serialized),
-            has_nulls,
-        }))
+    fn get_null_addrs(sorted_batch: &RecordBatch) -> Result<RowAddrTreeMap> {
+        let null_mask = arrow::compute::is_null(sorted_batch.column(0))?;
+        let null_ids = arrow_select::filter::filter(sorted_batch.column(1), &null_mask)?;
+        let null_ids = null_ids
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        RowAddrTreeMap::from_sorted_iter(null_ids.values().iter().copied())
     }
 
-    async fn remap_subindex(
-        &self,
-        serialized: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<RecordBatch> {
-        remap_batch(serialized, mapping)
-    }
-
-    async fn retrieve_data(&self, serialized: RecordBatch) -> Result<RecordBatch> {
-        Ok(serialized)
-    }
-}
-
-#[async_trait]
-impl Index for FlatIndex {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
-        self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "FlatIndex is not vector index".into(),
-            location: location!(),
-        })
-    }
-
-    fn index_type(&self) -> IndexType {
-        IndexType::Scalar
-    }
-
-    async fn prewarm(&self) -> Result<()> {
-        // There is nothing to pre-warm
-        Ok(())
-    }
-
-    fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "num_values": self.data.num_rows(),
-        }))
-    }
-
-    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let mut frag_ids = self
-            .ids()
-            .as_primitive::<UInt64Type>()
-            .iter()
-            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
-            .collect::<Vec<_>>();
-        frag_ids.sort();
-        frag_ids.dedup();
-        Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
-    }
-}
-
-#[async_trait]
-impl ScalarIndex for FlatIndex {
-    async fn search(
+    pub fn search(
         &self,
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
+    ) -> Result<NullableRowAddrSet> {
         metrics.record_comparisons(self.data.num_rows());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
+
+        let mut null_is_true = false;
         let mut predicate = match query {
             SargableQuery::Equals(value) => {
                 if value.is_null() {
-                    arrow::compute::is_null(self.values())?
+                    // Query is x = NULL, correct SQL behavior is to return all ids as NULL
+                    // We differ a little and return them all as true right now.
+                    return Ok(NullableRowAddrSet::new(
+                        self.null_addrs_map.clone(),
+                        Default::default(),
+                    ));
                 } else {
                     arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
                 }
             }
-            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
+            SargableQuery::IsNull() => {
+                return Ok(NullableRowAddrSet::new(
+                    self.null_addrs_map.clone(),
+                    Default::default(),
+                ));
+            }
             SargableQuery::IsIn(values) => {
                 let mut has_null = false;
                 let choices = values
@@ -246,6 +174,10 @@ impl ScalarIndex for FlatIndex {
                     .downcast_ref::<BooleanArray>()
                     .expect("InList evaluation should return boolean array")
                     .clone();
+
+                // If the IN query has nulls, then don't treat the nulls as null.  This is a little different
+                // than SQL behavior.
+                null_is_true = has_null;
 
                 // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
                 if has_null && self.has_nulls {
@@ -303,23 +235,10 @@ impl ScalarIndex for FlatIndex {
         // Track null row IDs for Kleene logic
         // When querying FOR nulls (IS NULL or Equals(null)), don't track them as "null results"
         // because they are the TRUE result of the query
-        let null_row_ids = if self.has_nulls
-            && !matches!(query, SargableQuery::IsNull())
-            && !matches!(query, SargableQuery::Equals(val) if val.is_null())
-        {
-            let null_mask = arrow::compute::is_null(self.values())?;
-            let null_ids = arrow_select::filter::filter(self.ids(), &null_mask)?;
-            let null_ids = null_ids
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("Result of arrow_select::filter::filter did not match input type");
-            if null_ids.is_empty() {
-                None
-            } else {
-                Some(RowAddrTreeMap::from_iter(null_ids.values()))
-            }
+        let null_row_ids = if null_is_true {
+            self.null_addrs_map.clone()
         } else {
-            None
+            Default::default()
         };
 
         let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
@@ -327,40 +246,20 @@ impl ScalarIndex for FlatIndex {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
-        let selected = RowAddrTreeMap::from_iter(matching_ids.values());
-        let selection = NullableRowAddrSet::new(selected, null_row_ids.unwrap_or_default());
-        Ok(SearchResult::Exact(selection))
+        let selected = RowAddrTreeMap::from_sorted_iter(matching_ids.values().iter().copied())?;
+        Ok(NullableRowAddrSet::new(selected, null_row_ids))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
-    // Same as above, this is dead code at the moment but should work
-    async fn remap(
-        &self,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _dest_store: &dyn IndexStore,
-    ) -> Result<CreatedIndex> {
-        unimplemented!()
-    }
-
-    async fn update(
-        &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
-    ) -> Result<CreatedIndex> {
-        // If this was desired, then you would need to merge new_data and data and write it back out
-        unimplemented!()
-    }
-
-    fn update_criteria(&self) -> UpdateCriteria {
-        unimplemented!()
-    }
-
-    fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
-        // FlatIndex is used internally and doesn't have user-configurable parameters
-        unimplemented!("FlatIndex is an internal index type and cannot be recreated")
+    pub fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = self
+            .ids()
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
+            .collect::<Vec<_>>();
+        frag_ids.sort();
+        frag_ids.dedup();
+        Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
     }
 }
 
@@ -383,21 +282,15 @@ mod tests {
             .into_batch_rows(RowCount::from(4))
             .unwrap();
 
-        FlatIndex {
-            data: Arc::new(batch),
-            has_nulls: false,
-        }
+        FlatIndex::try_new(batch).unwrap()
     }
 
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
-        let actual = index.search(query, &NoOpMetricsCollector).await.unwrap();
-        let SearchResult::Exact(actual_row_ids) = actual else {
-            panic! {"Expected exact search result"}
-        };
+        let actual = index.search(query, &NoOpMetricsCollector).unwrap();
         let expected =
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(expected), Default::default());
-        assert_eq!(actual_row_ids, expected);
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -454,18 +347,19 @@ mod tests {
         // 3 -> delete
         // Keep remaining as is
         let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
-        let metadata = FlatIndexMetadata::new(DataType::Int32);
-        let remapped = metadata
-            .remap_subindex((*index.data).clone(), &mapping)
-            .await
-            .unwrap();
+        let remapped =
+            FlatIndex::try_new(FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap())
+                .unwrap();
 
-        let expected = gen_batch()
-            .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
-            .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
-            .into_batch_rows(RowCount::from(3))
-            .unwrap();
-        assert_eq!(remapped, expected);
+        let expected = FlatIndex::try_new(
+            gen_batch()
+                .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
+                .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
+                .into_batch_rows(RowCount::from(3))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remapped.data, expected.data);
     }
 
     // It's possible, during compaction, that an entire page of values is deleted.  We just serialize
@@ -479,11 +373,7 @@ mod tests {
             (3, None),
             (100, None),
         ]);
-        let metadata = FlatIndexMetadata::new(DataType::Int32);
-        let remapped = metadata
-            .remap_subindex((*index.data).clone(), &mapping)
-            .await
-            .unwrap();
+        let remapped = FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap();
         assert_eq!(remapped.num_rows(), 0);
     }
 }
