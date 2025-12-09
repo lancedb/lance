@@ -1,20 +1,30 @@
-# Java bindings and SDK for Lance Data Format
-
-> :warning: **Under heavy development**
+# Java bindings and SDK for Lance
 
 <div align="center">
 <p align="center">
 
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-Lance is a new columnar data format for data science and machine learning
+**The Open Lakehouse Format for Multimodal AI**
 </p></div>
 
-Why you should use Lance
-1. It is an order of magnitude faster than Parquet for point queries and nested data structures common to DS/ML
-2. It comes with a fast vector index that delivers sub-millisecond nearest neighbor search performance
-3. It is automatically versioned and supports lineage and time-travel for full reproducibility
-4. It is integrated with duckdb/pandas/polars already. Easily convert from/to Parquet in 2 lines of code
+Lance is an open lakehouse format for multimodal AI. It contains a file format, table format, and catalog spec that allows you to build a complete lakehouse on top of object storage to power your AI workflows.
+
+The key features of Lance include:
+
+* **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
+
+* **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
+
+* **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
+
+* **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
+
+* **Zero-copy versioning:** ACID transactions, time travel, and automatic versioning without needing extra infrastructure.
+
+* **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
+
+For more details, see the full [Lance format specification](https://lance.org/format).
 
 ## Quick start
 
@@ -22,9 +32,9 @@ Introduce the Lance SDK Java Maven dependency(It is recommended to choose the la
 
 ```shell
 <dependency>
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
-    <version>0.18.0</version>
+    <version>0.35.0</version>
 </dependency>
 ```
 
@@ -205,22 +215,33 @@ JVM engine connectors can be built using the Lance Java SDK. Here are some conne
 ## Contributing
 
 From the codebase dimension, the lance project is a multiple-lang project. All Java-related code is located in the `java` directory.
-And the whole `java` dir is a standard maven project(named `lance-parent`) can be imported into any IDEs support java project.
+And the whole `java` dir is a standard maven project can be imported into any IDEs support java project.
 
-Overall, it contains one Maven sub-module:
-
-* lance-core: the core module of Lance Java binding, including `lance-jni`.
-
-To build the project, you can run the following command:
+Standard Build (Java + JNI)
 
 ```shell
 mvn clean package
 ```
+This command executes the base Maven build process to compile all Java code in the `java` directory and generate the JNI native library.
 
-if you only want to build rust code(`lance-jni`), you can run the following command:
+Java-Only Build: 
 
 ```shell
-cargo build
+mvn clean package -Dskip.build.jni=true
+ ```
+This will skip the JNI code compilation step and only process the Java module. Useful when focusing on Java feature development without needing native libraries, reducing build time.
+
+Product Release Build:
+
+```shell
+mvn clean package -Drust.release.build=true
+```
+This will enable product environment optimization configurations (e.g., code shrinking, debug symbol removal, performance tuning) to generate deployment packages suitable for production environments. The optimized package is smaller in size and runs more efficiently.
+
+If you only want to build rust code(`lance-jni`), you can run the following command:
+
+```shell
+cd lance-jni && cargo build
 ```
 
 The java module uses `spotless` maven plugin to format the code and check the license header. 

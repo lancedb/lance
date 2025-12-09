@@ -59,10 +59,12 @@ pub enum Error {
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention { message: String, location: Location },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
+    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"))]
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
+    #[snafu(display("Unprocessable: {message}, {location}"))]
+    Unprocessable { message: String, location: Location },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
     Arrow { message: String, location: Location },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
@@ -109,6 +111,11 @@ pub enum Error {
         message: String,
         major_version: u16,
         minor_version: u16,
+        location: Location,
+    },
+    #[snafu(display("Namespace error: {source}, {location}"))]
+    Namespace {
+        source: BoxedError,
         location: Location,
     },
 }
@@ -304,10 +311,7 @@ impl From<serde_json::Error> for Error {
 
 #[track_caller]
 fn arrow_io_error_from_msg(message: String) -> ArrowError {
-    ArrowError::IoError(
-        message.clone(),
-        std::io::Error::new(std::io::ErrorKind::Other, message),
-    )
+    ArrowError::IoError(message.clone(), std::io::Error::other(message))
 }
 
 impl From<Error> for ArrowError {

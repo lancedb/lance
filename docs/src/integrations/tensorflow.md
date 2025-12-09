@@ -24,7 +24,7 @@ for batch in ds.shuffling(32).map(lambda x: tf.io.decode_png(x["image"])):
     print(batch)
 ```
 
-Backed by the Lance [columnar format](../format/format.md), using `lance.tf.data.from_lance` supports
+Backed by the Lance [columnar format](../format/index.md), using `lance.tf.data.from_lance` supports
 efficient column selection, filtering, and more.
 
 ```python
@@ -52,7 +52,7 @@ ds = lance.tf.data.from_lance(
 
 ## Distributed Training and Shuffling
 
-Since [a Lance Dataset is a set of Fragments](../format/format.md), we can distribute and shuffle Fragments to different
+Since [a Lance Dataset is a set of Fragments](../format/index.md), we can distribute and shuffle Fragments to different
 workers.
 
 ```python

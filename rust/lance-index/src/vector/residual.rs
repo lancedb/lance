@@ -5,6 +5,7 @@ use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::{iter, ops::MulAssign};
 
+use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
     cast::AsArray,
@@ -15,15 +16,12 @@ use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;
 use tracing::instrument;
 
 use super::{transform::Transformer, PQ_CODE_COLUMN};
-
-pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
@@ -158,7 +156,7 @@ pub(crate) fn compute_residual(
 impl Transformer for ResidualTransform {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
-    /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
+    /// The new [`RecordBatch`] will have a new column named `RESIDUAL_COLUMN`.
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
@@ -175,8 +173,9 @@ impl Transformer for ResidualTransform {
         })?;
         let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
             message: format!(
-                "Compute residual vector: original vector column not found: {}",
-                self.vec_col
+                "Compute residual vector: original vector column {} not found in batch {}",
+                self.vec_col,
+                batch.schema(),
             ),
             location: location!(),
         })?;
@@ -193,7 +192,6 @@ impl Transformer for ResidualTransform {
         let residual_arr =
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
-        // Replace original column with residual column.
         let batch = if residual_arr.data_type() != original.data_type() {
             batch.replace_column_schema_by_name(
                 &self.vec_col,

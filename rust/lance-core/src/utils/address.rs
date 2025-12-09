@@ -39,14 +39,14 @@ impl RowAddress {
 }
 
 impl From<RowAddress> for u64 {
-    fn from(row_id: RowAddress) -> Self {
-        row_id.0
+    fn from(row_addr: RowAddress) -> Self {
+        row_addr.0
     }
 }
 
 impl From<u64> for RowAddress {
-    fn from(row_id: u64) -> Self {
-        Self(row_id)
+    fn from(row_addr: u64) -> Self {
+        Self(row_addr)
     }
 }
 

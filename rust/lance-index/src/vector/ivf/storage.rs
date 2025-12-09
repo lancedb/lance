@@ -8,7 +8,9 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
-use lance_file::{reader::FileReader, writer::FileWriter};
+use lance_file::previous::{
+    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+};
 use lance_io::{traits::WriteExt, utils::read_message};
 use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
@@ -90,7 +92,7 @@ impl IvfModel {
     }
 
     pub fn partition_size(&self, part: usize) -> usize {
-        self.lengths[part] as usize
+        self.lengths.get(part).copied().unwrap_or_default() as usize
     }
 
     pub fn num_rows(&self) -> u64 {
@@ -107,7 +109,7 @@ impl IvfModel {
         query: &dyn Array,
         nprobes: usize,
         distance_type: DistanceType,
-    ) -> Result<UInt32Array> {
+    ) -> Result<(UInt32Array, Float32Array)> {
         let internal = crate::vector::ivf::new_ivf_transformer(
             self.centroids.clone().unwrap(),
             distance_type,
@@ -132,13 +134,20 @@ impl IvfModel {
         self.lengths.push(len);
     }
 
+    /// Get a reference to all centroids as a [`FixedSizeListArray`].
+    ///
+    /// Returns `None` if the model does not contain centroids
+    pub fn centroids_array(&self) -> Option<&FixedSizeListArray> {
+        self.centroids.as_ref()
+    }
+
     pub fn row_range(&self, partition: usize) -> Range<usize> {
         let start = self.offsets[partition];
         let end = start + self.lengths[partition] as usize;
         start..end
     }
 
-    pub async fn load(reader: &FileReader) -> Result<Self> {
+    pub async fn load(reader: &PreviousFileReader) -> Result<Self> {
         let schema = reader.schema();
         let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
             message: format!("{} not found during search", IVF_METADATA_KEY),
@@ -159,7 +168,7 @@ impl IvfModel {
     }
 
     /// Write the IVF metadata to the lance file.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+    pub async fn write(&self, writer: &mut PreviousFileWriter<ManifestDescribing>) -> Result<()> {
         let pb = PbIvf::try_from(self)?;
         let pos = writer.object_writer.write_protobuf(&pb).await?;
         let ivf_metadata = IvfMetadata { pb_position: pos };
@@ -278,10 +287,14 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         {
-            let mut writer =
-                FileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
-                    .await
-                    .unwrap();
+            let mut writer = PreviousFileWriter::try_new(
+                &object_store,
+                &path,
+                schema.clone(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
             // Write some dummy data
             let batch = RecordBatch::try_new(
                 Arc::new(arrow_schema),
@@ -293,7 +306,7 @@ mod tests {
             writer.finish().await.unwrap();
         }
 
-        let reader = FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));
@@ -319,5 +332,26 @@ mod tests {
         assert_eq!(ivf.dimension(), 3);
         assert_eq!(ivf.centroids.as_ref().unwrap().len(), 2);
         assert_eq!(ivf.centroids.as_ref().unwrap().value_length(), 3);
+    }
+
+    #[test]
+    fn test_centroids_array_getter() {
+        use arrow_array::Float32Array;
+        // two centroids, dim = 2
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let ivf = IvfModel::new(centroids.clone(), None);
+        let out = ivf.centroids_array().unwrap();
+
+        // Validate that the returned array has expected structure
+        assert_eq!(out.len(), centroids.len());
+        assert_eq!(out.value_length(), centroids.value_length());
+
+        // Validate centroid accessor returns correct values for the first partition
+        let first = ivf.centroid(0).unwrap();
+        let first_vals = first.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(first_vals.len(), 2);
+        assert_eq!(first_vals.value(0), 1.0);
+        assert_eq!(first_vals.value(1), 2.0);
     }
 }

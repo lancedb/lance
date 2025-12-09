@@ -18,7 +18,7 @@ Users can register a Lance dataset as a table in DataFusion and run SQL with it:
 
 ```rust
 use datafusion::prelude::SessionContext;
-use crate::datafusion::LanceTableProvider;
+use lance::datafusion::LanceTableProvider;
 
 let ctx = SessionContext::new();
 
@@ -37,7 +37,7 @@ let result = df.collect().await?;
 
 ```rust
 use datafusion::prelude::SessionContext;
-use crate::datafusion::LanceTableProvider;
+use lance::datafusion::LanceTableProvider;
 
 let ctx = SessionContext::new();
 
@@ -65,6 +65,53 @@ let df = ctx.sql("
 let result = df.collect().await?;
 ```
 
+### Register UDF
+Lance provides some built-in UDFs, which users can manually register and use in queries.
+The following example demonstrates how to register and use ```contains_tokens```.
+
+```rust
+use datafusion::prelude::SessionContext;
+use lance::datafusion::LanceTableProvider;
+use lance_datafusion::udf::register_functions;
+
+let ctx = SessionContext::new();
+
+// Register built-in UDFs
+register_functions(&ctx);
+
+ctx.register_table("dataset",
+    Arc::new(LanceTableProvider::new(
+    Arc::new(dataset.clone()),
+    /* with_row_id */ false,
+    /* with_row_addr */ false,
+    )))?;
+
+let df = ctx.sql("SELECT * FROM dataset WHERE contains_tokens(text, 'cat')").await?;
+let result = df.collect().await?;
+```
+
+### JSON Functions
+
+Lance provides comprehensive JSON support through a set of built-in UDFs that are automatically registered when you use `register_functions()`. These functions enable you to query and filter JSON data efficiently.
+
+For a complete guide to JSON functions including:
+- `json_extract` - Extract values using JSONPath
+- `json_get`, `json_get_string`, `json_get_int`, `json_get_float`, `json_get_bool` - Type-safe value extraction
+- `json_exists` - Check if a path exists
+- `json_array_contains`, `json_array_length` - Array operations
+
+See the [JSON Support Guide](../guide/json.md) for detailed documentation and examples.
+
+**Example: Querying JSON in SQL**
+```rust
+// After registering functions as shown above
+let df = ctx.sql("
+    SELECT * FROM dataset 
+    WHERE json_get_string(metadata, 'category') = 'electronics'
+    AND json_array_contains(metadata, '$.tags', 'featured')
+").await?;
+```
+
 ## Python
 
 In Python, this integration is done via [Datafusion FFI](https://docs.rs/datafusion-ffi/latest/datafusion_ffi/).
@@ -80,7 +127,7 @@ ctx = SessionContext()
 table1 = FFILanceTableProvider(
     my_lance_dataset, with_row_id=True, with_row_addr=True
 )
-ctx.register_table_provider("table1", table1)
+ctx.register_table("table1", table1)
 ctx.table("table1")
 ctx.sql("SELECT * FROM table1 LIMIT 10")
 ```

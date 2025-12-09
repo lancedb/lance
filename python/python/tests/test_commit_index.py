@@ -41,7 +41,17 @@ def dataset_with_index(test_table, tmp_path):
     return dataset
 
 
+def _get_field_id_by_name(lance_schema, field_name):
+    fields = lance_schema.fields()
+    for field in fields:
+        if field.name() == field_name:
+            return field.id()
+    return None
+
+
 def test_commit_index(dataset_with_index, test_table, tmp_path):
+    from lance.dataset import Index
+
     index_id = dataset_with_index.list_indices()[0]["uuid"]
 
     # Create a new dataset without index
@@ -54,15 +64,25 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
     shutil.copytree(src_index_dir, dest_index_dir)
 
-    # Commit the index to dataset_without_index
-    field_idx = dataset_without_index.schema.get_field_index("meta")
+    # Get the field id instead of field index
+    # as they are different in nested data
+    field_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+
+    # Create an Index object
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+    )
+
     create_index_op = lance.LanceOperation.CreateIndex(
-        index_id,
-        "meta_idx",
-        [field_idx],
-        dataset_without_index.version,
-        set([f.fragment_id for f in dataset_without_index.get_fragments()]),
-        0,
+        new_indices=[index],
+        removed_indices=[],
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
@@ -84,4 +104,4 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
             fast_search=True, prefilter=True, filter="meta = 'hello'"
         )
         plan = scanner.explain_plan()
-        assert "MaterializeIndex" in plan
+        assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan

@@ -12,7 +12,7 @@
 
 use crate::{
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
-    format::pb,
+    format::pb21::CompressiveEncoding,
 };
 
 use lance_core::Result;
@@ -50,5 +50,5 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
     /// Compress the data into a single buffer
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)>;
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)>;
 }

@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "file.proto";
 import "table.proto";
+import "google/protobuf/any.proto";
 
 package lance.table;
 
@@ -27,6 +28,10 @@ message Transaction {
 
   // Optional version tag.
   string tag = 3;
+
+  // Optional properties for the transaction
+  // __lance_commit_message is a reserved key
+  map<string, string> transaction_properties = 4;
 
   // Add new rows to the dataset.
   message Append {
@@ -63,6 +68,8 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
     // Key-value pairs to merge with existing config.
     map<string, string> config_upsert_values = 4;
+    // The base paths to be added for the initial dataset creation
+    repeated BasePath initial_bases = 5;
   }
 
   // Add or replace a new secondary index.
@@ -99,6 +106,10 @@ message Transaction {
       UUID old_id = 1;
       // the id of the new index
       UUID new_id = 2;
+      // the new index details
+      google.protobuf.Any new_index_details = 3;
+      // the version of the new index
+      uint32 new_index_version = 4;
     }
 
     // A group of rewrite files that are all part of the same rewrite.
@@ -150,6 +161,29 @@ message Transaction {
     uint32 num_fragments = 1;
   }
 
+  // An operation that clones a dataset.
+  message Clone {
+    // - true:  Performs a metadata-only clone (copies manifest without data files).
+    //          The cloned dataset references original data through `base_paths`,
+    //          suitable for experimental scenarios or rapid metadata migration.
+    // - false: Performs a full deep clone using the underlying object storage's native
+    //          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side
+    //          bulk copy operations to bypass download/upload bottlenecks, achieving
+    //          near-linear speedup for large datasets (typically 3-10x faster than
+    //          manual file transfers). The operation maintains atomicity and data
+    //          integrity guarantees provided by the storage backend.
+    bool is_shallow = 1;
+    // the reference name in the source dataset
+    // in most cases it should be the the branch or tag name in the source dataset
+    optional string ref_name = 2;
+    // the version of the source dataset for cloning
+    uint64 ref_version = 3;
+    // the absolute base path of the source dataset for cloning
+    string ref_path = 4;
+    // if the target dataset is a branch, this is the branch name of the target dataset
+    optional string branch_name = 5;
+  }
+  
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -161,10 +195,53 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
+    /// The MemWAL (pre-image) that should be marked as merged after this transaction
+    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// The fields that used to judge whether to preserve the new frag's id into
+    /// the frag bitmap of the specified indices.
+    repeated uint32 fields_for_preserving_frag_bitmap = 6;
+    // The mode of update
+    UpdateMode update_mode = 7;
+  }
+
+  // The mode of update operation
+  enum UpdateMode {
+
+    /// rows are deleted in current fragments and rewritten in new fragments.
+    /// This is most optimal when the majority of columns are being rewritten
+    /// or only a few rows are being updated.
+    REWRITE_ROWS = 0;
+
+    /// within each fragment, columns are fully rewritten and inserted as new data files.
+    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
+    /// but a small subset of columns are affected.
+    REWRITE_COLUMNS = 1;
+  }
+
+  // An entry for a map update. If value is not set, the key will be removed from the map.
+  message UpdateMapEntry {
+    // The key of the map entry to update.
+    string key = 1;
+    // The value to set for the key.
+    optional string value = 2;
+  }
+
+  message UpdateMap {
+    repeated UpdateMapEntry update_entries = 1;
+    // If true, the map will be replaced entirely with the new entries.
+    // If false, the new entries will be merged with the existing map.
+    bool replace = 2;
   }
   
-  // An operation that updates the table config.
+  // An operation that updates the table config, table metadata, schema metadata,
+  // or field metadata.
   message UpdateConfig {
+    UpdateMap config_updates = 6;
+    UpdateMap table_metadata_updates = 7;
+    UpdateMap schema_metadata_updates = 8;
+    map<int32, UpdateMap> field_metadata_updates = 9;
+
+    // Deprecated -------------------------------
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
     map<string, string> schema_metadata = 3;
@@ -185,6 +262,23 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
+  // Update the state of the MemWal index
+  message UpdateMemWalState {
+
+    repeated MemWalIndexDetails.MemWal added = 1;
+
+    repeated MemWalIndexDetails.MemWal updated = 2;
+
+    // If a MemWAL is updated, its pre-image should be in the removed list.
+    repeated MemWalIndexDetails.MemWal removed = 3;
+  }
+
+  // An operation that updates base paths in the dataset.
+  message UpdateBases {
+    // The new base paths to add to the manifest.
+    repeated BasePath new_bases = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -199,11 +293,12 @@ message Transaction {
     Project project = 109;
     UpdateConfig update_config = 110;
     DataReplacement data_replacement = 111;
+    UpdateMemWalState update_mem_wal_state = 112;
+    Clone clone = 113;
+    UpdateBases update_bases = 114;
   }
 
-  // An operation to apply to the blob dataset
-  oneof blob_operation {
-    Append blob_append = 200;
-    Overwrite blob_overwrite = 202;
-  }  
+  // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 200, 202;
+  reserved "blob_append", "blob_overwrite";
 }

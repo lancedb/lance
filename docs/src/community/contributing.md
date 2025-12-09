@@ -1,149 +1,36 @@
-# Guide for New Contributors
+# Guidelines for Contributing
 
-This is a guide for new contributors to the Lance project.
-Even if you have no previous experience with python, rust, and open source, you can still make an non-trivial
-impact by helping us improve documentation, examples, and more.
-For experienced developers, the issues you can work on run the gamut from warm-ups to serious challenges in python and rust.
+In general, code contributions are in the form of GitHub PRs, and require review and approval from maintainers with write access.
 
-If you have any questions, please join our [Discord](https://discord.gg/zMM32dvNtd) for real-time support. Your feedback is always welcome!
+## Conventional Commits
 
-## Getting Started
+Lance projects use the [Conventional Commits](https://www.conventionalcommits.org) standard for commit messages.
+This standard helps differentiate between:
 
-1. Join our Discord and say hi
-2. Setup your development environment
-3. Pick an issue to work on. See https://github.com/lancedb/lance/contribute for good first issues.
-4. Have fun!
+- **Breaking changes** vs **non-breaking changes** (using `!` and `BREAKING CHANGE:` footer)
+- **Features** (`feat:`), **fixes** (`fix:`), **documentation updates** (`docs:`), and other change types
 
-## Development Environment
+Commit messages following this standard are used to automatically generate release notes during each release.
 
-Currently Lance is implemented in Rust and comes with a Python wrapper. So you'll want to make sure you setup both.
+## Feature Design Proposals
 
-1. Install Rust: https://www.rust-lang.org/tools/install
-2. Install Python 3.9+: https://www.python.org/downloads/
-3. Install protoctol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
-4. Install commit hooks:
-    a. Install pre-commit: https://pre-commit.com/#install
-    b. Run `pre-commit install` in the root of the repo
+Designs in Lance evolve naturally with community input and consensus.
+Major technical changes are discussed organically through the following approach:
 
-## Sample Workflow
+- **Start a Discussion**: Create a GitHub Discussion to publish your design proposal and gather community feedback. Use discussion threads to explore different aspects and alternatives
+- **Iterate on Design**: Engage with the community to refine the approach based on their input and expertise
+- **Draft PRs for Details**: Once the general direction is acceptable to the community, publish draft PRs to help hash out implementation details. Draft PRs are encouraged as they facilitate concrete discussions
+- **Break Down Changes**: Split large draft PRs into smaller, incremental PRs for easier review and to demonstrate progress
+- **Formal Voting**: Maintainers with write access can approve code modifications related to the design. If the design requires Lance format spec changes, a separate vote will be conducted on GitHub Discussions following the [voting requirements](./voting.md#voting-requirements)
 
-1. Fork the repo
-2. Pick [Github issue](https://github.com/lancedb/lance/issues)
-3. Create a branch for the issue
-4. Make your changes
-5. Create a pull request from your fork to lancedb/lance
-6. Get feedback and iterate
-7. Merge!
-8. Go back to step 2
+## AI Tooling Integrations
 
-## Python Development
+We encourage contributors to continuously improve integrations with AI tools, including:
 
-The python integration is done via pyo3 + custom python code:
+- Enhancing coding agent guidelines such as `AGENTS.md` and `CLAUDE.md`
+- Providing feedback to AI code reviewers
+- Developing and improving AI-driven GitHub actions
 
-1. The Rust code that directly supports the Python bindings are under `python/src` while the pure Python code lives under `python/python`.
-2. We make wrapper classes in Rust for Dataset/Scanner/RecordBatchReader that's exposed to python.
-3. These are then used by LanceDataset / LanceScanner implementations that extend pyarrow Dataset/Scanner for duckdb compat.
-4. Data is delivered via the Arrow C Data Interface
+## Project Specific Contributing Guidelines
 
-To build the Python bindings, first install requirements:
-
-```bash
-pip install maturin
-```
-
-To make a dev install:
-
-```bash
-cd python
-maturin develop
-```
-
-After installing, you can run `import lance` in a Python shell within the virtual environment.
-
-To run tests and integration tests:
-```bash
-make test
-make integtest
-```
-
-## Rust Development
-
-To format and lint Rust code:
-
-```bash
-cargo fmt --all
-cargo clippy --all-features --tests --benches
-```
-
-### Core Format
-
-The core format is implemented in Rust under the `rust` directory. Once you've setup Rust you can build the core format with:
-
-```bash
-cargo build
-```
-
-This builds the debug build. For the optimized release build:
-
-```bash
-cargo build -r
-```
-
-To run the Rust unit tests:
-
-```bash
-cargo test
-```
-
-If you're working on a performance related feature, benchmarks can be run via:
-
-```bash
-cargo bench
-```
-
-
-## Documentation
-
-### Main website
-
-The main documentation website is built using [mkdocs-material](https://squidfunk.github.io/mkdocs-material/).
-To build the docs, first install requirements:
-
-```bash
-pip install -r docs/requirements.txt
-```
-
-Then build and start the docs server:
-
-```bash
-cd docs
-mkdocs serve
-```
-
-### Python Generated Doc
-
-Python code documentation is built using Sphinx in [lance-python-doc](https://github.com/lancedb/lance-python-doc),
-and published through [Github Pages](https://lancedb.github.io/lance-python-doc/) in ReadTheDocs style.
-
-### Rust Generated Doc
-
-Rust code documentation is built and published to the [Rust official docs website](https://docs.rs/lance/latest/lance/)
-as a part of the release process.
-
-
-## Example Notebooks
-
-Example notebooks are under `examples`. 
-These are standalone notebooks you should be able to download and run.
-
-## Benchmarks
-
-Our Rust benchmarks are run multiple times a day and the history can be found [here](https://github.com/lancedb/lance-benchmark-results).
-
-Separately, we have vector index benchmarks that test against the sift1m dataset, as well as benchmarks for tpch.
-These live under `benchmarks`.
-
-## Code of Conduct
-
-We follow the Code of Conduct of [Python Foundation](https://www.python.org/psf/conduct/) and 
-[Rust Foundation](https://www.rust-lang.org/policies/code-of-conduct). 
+Each project maintains its own detailed contributing guidelines in files named `CONTRIBUTING.md`.

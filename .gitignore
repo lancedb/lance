@@ -1,6 +1,13 @@
 # Prerequisites
 *.d
 
+# vim swap files
+*.swp
+
+# cargo config files
+.cargo/config
+python/.cargo/config
+
 # Compiled Object files
 *.slo
 *.lo
@@ -96,3 +103,10 @@ test_data/venv
 
 **/*.profraw
 *.lance
+
+# Pytest benchmarks
+.benchmarks/
+
+# Auto-built docs
+docs/src/format/namespace/**
+docs/src/integrations/spark/**

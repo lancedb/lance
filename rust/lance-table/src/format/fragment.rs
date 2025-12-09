@@ -14,6 +14,9 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::rowids::version::{
+    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+};
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -30,6 +33,11 @@ pub struct DataFile {
     ///
     /// Note that -1 is a possibility and it indices that the field has
     /// no top-level column in the file.
+    ///
+    /// Columns that lack a field id may still exist as extra entries in
+    /// `column_indices`; such columns are ignored by field-id–based projection.
+    /// For example, some fields, such as blob fields, occupy multiple
+    /// columns in the file but only have a single field id.
     #[serde(default)]
     pub column_indices: Vec<i32>,
     /// The major version of the file format used to write this file.
@@ -41,6 +49,9 @@ pub struct DataFile {
 
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
+
+    /// The base path of the datafile, when the datafile is outside the dataset.
+    pub base_id: Option<u32>,
 }
 
 impl DataFile {
@@ -51,6 +62,7 @@ impl DataFile {
         file_major_version: u32,
         file_minor_version: u32,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -59,6 +71,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            base_id,
         }
     }
 
@@ -75,10 +88,15 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            base_id: None,
         }
     }
 
-    pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
+    pub fn new_legacy_from_fields(
+        path: impl Into<String>,
+        fields: Vec<i32>,
+        base_id: Option<u32>,
+    ) -> Self {
         Self::new(
             path,
             fields,
@@ -86,6 +104,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             None,
+            base_id,
         )
     }
 
@@ -93,6 +112,7 @@ impl DataFile {
         path: impl Into<String>,
         schema: &Schema,
         file_size_bytes: Option<NonZero<u64>>,
+        base_id: Option<u32>,
     ) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
@@ -103,6 +123,7 @@ impl DataFile {
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
             file_size_bytes,
+            base_id,
         )
     }
 
@@ -123,10 +144,12 @@ impl DataFile {
                     location!(),
                 ));
             }
-        } else if self.fields.len() != self.column_indices.len() {
+        } else if self.column_indices.len() < self.fields.len() {
+            // Every recorded field id must have a column index, but not every column needs
+            // to be associated with a field id (extra columns are allowed).
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
-                "contained an unequal number of fields / column_indices",
+                "contained fewer column_indices than fields",
                 location!(),
             ));
         }
@@ -143,6 +166,7 @@ impl From<&DataFile> for pb::DataFile {
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
+            base_id: df.base_id,
         }
     }
 }
@@ -158,6 +182,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
+            base_id: proto.base_id,
         })
     }
 }
@@ -186,6 +211,7 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
+    pub base_id: Option<u32>,
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -212,6 +238,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             id: value.id,
             file_type,
             num_deleted_rows,
+            base_id: value.base_id,
         })
     }
 }
@@ -272,6 +299,14 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Last updated at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Created at version metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
 }
 
 impl Fragment {
@@ -282,6 +317,8 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -315,10 +352,12 @@ impl Fragment {
     ) -> Self {
         Self {
             id,
-            files: vec![DataFile::new_legacy(path, schema, None)],
+            files: vec![DataFile::new_legacy(path, schema, None, None)],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 
@@ -338,6 +377,7 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         );
         self.files.push(data_file);
         self
@@ -364,12 +404,14 @@ impl Fragment {
             major,
             minor,
             file_size_bytes,
+            None,
         ));
     }
 
     /// Add a new [`DataFile`] to this fragment.
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
-        self.files.push(DataFile::new_legacy(path, schema, None));
+        self.files
+            .push(DataFile::new_legacy(path, schema, None, None));
     }
 
     // True if this fragment is made up of legacy v1 files, false otherwise
@@ -437,6 +479,14 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            last_updated_at_version_meta: p
+                .last_updated_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
+            created_at_version_meta: p
+                .created_at_version_sequence
+                .map(RowDatasetVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -453,6 +503,7 @@ impl From<&Fragment> for pb::DataFragment {
                 id: f.id,
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
+                base_id: f.base_id,
             }
         });
 
@@ -466,13 +517,17 @@ impl From<&Fragment> for pb::DataFragment {
                 })
             }
         });
-
+        let last_updated_at_version_sequence =
+            last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
+        let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            last_updated_at_version_sequence,
+            created_at_version_sequence,
         }
     }
 }
@@ -483,6 +538,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use object_store::path::Path;
     use serde_json::{json, Value};
 
     #[test]
@@ -509,6 +565,7 @@ mod tests {
             vec![DataFile::new_legacy_from_fields(
                 path.to_string(),
                 vec![0, 1, 2, 3],
+                None,
             )]
         )
     }
@@ -523,6 +580,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            base_id: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -545,6 +603,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            base_id: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
@@ -557,14 +616,33 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null }
+                     "file_size_bytes": null, "base_id": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
-                                  "num_deleted_rows": 10},
+                                  "num_deleted_rows": 10, "base_id": null},
                 "physical_rows": None::<usize>}),
         );
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+    }
+
+    #[test]
+    fn data_file_validate_allows_extra_columns() {
+        let data_file = DataFile {
+            path: "foo.lance".to_string(),
+            fields: vec![1, 2],
+            // One extra column without a field id mapping
+            column_indices: vec![0, 1, 2],
+            file_major_version: MAJOR_VERSION as u32,
+            file_minor_version: MINOR_VERSION as u32,
+            file_size_bytes: Default::default(),
+            base_id: None,
+        };
+
+        let base_path = Path::from("base");
+        data_file
+            .validate(&base_path)
+            .expect("validation should allow extra columns without field ids");
     }
 }

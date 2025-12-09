@@ -1,30 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::{Display, Formatter};
-use std::ops::Range;
-use std::sync::atomic::AtomicU16;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use lance_core::utils::tempfile::{TempDir, TempStrDir};
+use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
-use bytes::Bytes;
 use datafusion_physical_plan::ExecutionPlan;
-use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
-use object_store::path::Path;
-use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
-};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tempfile::{tempdir, TempDir};
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -82,7 +73,7 @@ impl TestDatasetGenerator {
     ///    consistent across fragments.
     ///
     pub async fn make_hostile(&self, uri: &str) -> Dataset {
-        let seed = self.seed.unwrap_or_else(|| rand::thread_rng().gen());
+        let seed = self.seed.unwrap_or_else(|| rand::rng().random());
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
         let schema = self.make_schema(&mut rng);
 
@@ -122,6 +113,7 @@ impl TestDatasetGenerator {
             fragments,
             schema,
             config_upsert_values: None,
+            initial_bases: None,
         };
 
         Dataset::commit(
@@ -145,7 +137,7 @@ impl TestDatasetGenerator {
         let mut new_ids = field_ids.clone();
         // Add a hole
         if new_ids.len() > 2 {
-            let hole_pos = rng.gen_range(1..new_ids.len() - 1);
+            let hole_pos = rng.random_range(1..new_ids.len() - 1);
             for id in new_ids.iter_mut().skip(hole_pos) {
                 *id += 1;
             }
@@ -178,7 +170,7 @@ impl TestDatasetGenerator {
         let num_files = if batch.num_columns() == 1 {
             1
         } else {
-            rng.gen_range(min_num_files..=batch.num_columns())
+            rng.random_range(min_num_files..=batch.num_columns())
         };
 
         // Randomly assign top level fields to files.
@@ -253,6 +245,8 @@ impl TestDatasetGenerator {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
         }
     }
 }
@@ -271,280 +265,6 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
         .iter()
         .map(|file| file.fields.clone())
         .collect::<Vec<_>>()
-}
-
-#[derive(Debug, Default)]
-pub struct IoStats {
-    pub read_iops: u64,
-    pub read_bytes: u64,
-    pub write_iops: u64,
-    pub write_bytes: u64,
-    /// Number of disjoint periods where at least one IO is in-flight.
-    pub num_hops: u64,
-}
-
-impl Display for IoStats {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#?}", self)
-    }
-}
-
-#[derive(Debug)]
-pub struct IoTrackingStore {
-    target: Arc<dyn ObjectStore>,
-    stats: Arc<Mutex<IoStats>>,
-    active_requests: Arc<AtomicU16>,
-}
-
-impl Display for IoTrackingStore {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#?}", self)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct StatsHolder(Arc<Mutex<IoStats>>);
-
-impl StatsHolder {
-    pub fn incremental_stats(&self) -> IoStats {
-        std::mem::take(&mut *self.0.lock().unwrap())
-    }
-}
-
-impl WrappingObjectStore for StatsHolder {
-    fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        Arc::new(IoTrackingStore {
-            target,
-            stats: self.0.clone(),
-            active_requests: Arc::new(AtomicU16::new(0)),
-        })
-    }
-}
-
-impl IoTrackingStore {
-    pub fn new_wrapper() -> (Arc<dyn WrappingObjectStore>, Arc<Mutex<IoStats>>) {
-        let stats = Arc::new(Mutex::new(IoStats::default()));
-        (Arc::new(StatsHolder(stats.clone())), stats)
-    }
-
-    fn record_read(&self, num_bytes: u64) {
-        let mut stats = self.stats.lock().unwrap();
-        stats.read_iops += 1;
-        stats.read_bytes += num_bytes;
-    }
-
-    fn record_write(&self, num_bytes: u64) {
-        let mut stats = self.stats.lock().unwrap();
-        stats.write_iops += 1;
-        stats.write_bytes += num_bytes;
-    }
-
-    fn hop_guard(&self) -> HopGuard {
-        HopGuard::new(self.active_requests.clone(), self.stats.clone())
-    }
-}
-
-#[async_trait::async_trait]
-#[deny(clippy::missing_trait_methods)]
-impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        let _guard = self.hop_guard();
-        self.record_write(bytes.content_length() as u64);
-        self.target.put(location, bytes).await
-    }
-
-    async fn put_opts(
-        &self,
-        location: &Path,
-        bytes: PutPayload,
-        opts: PutOptions,
-    ) -> OSResult<PutResult> {
-        let _guard = self.hop_guard();
-        self.record_write(bytes.content_length() as u64);
-        self.target.put_opts(location, bytes, opts).await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        let _guard = self.hop_guard();
-        let target = self.target.put_multipart(location).await?;
-        Ok(Box::new(IoTrackingMultipartUpload {
-            target,
-            stats: self.stats.clone(),
-            _guard,
-        }))
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOpts,
-    ) -> OSResult<Box<dyn MultipartUpload>> {
-        let _guard = self.hop_guard();
-        let target = self.target.put_multipart_opts(location, opts).await?;
-        Ok(Box::new(IoTrackingMultipartUpload {
-            target,
-            stats: self.stats.clone(),
-            _guard,
-        }))
-    }
-
-    async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        let _guard = self.hop_guard();
-        let result = self.target.get(location).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes);
-        }
-        result
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        let _guard = self.hop_guard();
-        let result = self.target.get_opts(location, options).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes);
-        }
-        result
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        let _guard = self.hop_guard();
-        let result = self.target.get_range(location, range).await;
-        if let Ok(result) = &result {
-            self.record_read(result.len() as u64);
-        }
-        result
-    }
-
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
-        let _guard = self.hop_guard();
-        let result = self.target.get_ranges(location, ranges).await;
-        if let Ok(result) = &result {
-            self.record_read(result.iter().map(|b| b.len() as u64).sum());
-        }
-        result
-    }
-
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        let _guard = self.hop_guard();
-        self.record_read(0);
-        self.target.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        let _guard = self.hop_guard();
-        self.record_write(0);
-        self.target.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, OSResult<Path>>,
-    ) -> BoxStream<'a, OSResult<Path>> {
-        self.target.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        let _guard = self.hop_guard();
-        self.record_read(0);
-        self.target.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.record_read(0);
-        self.target.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
-        let _guard = self.hop_guard();
-        self.record_read(0);
-        self.target.list_with_delimiter(prefix).await
-    }
-
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.hop_guard();
-        self.record_write(0);
-        self.target.copy(from, to).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.hop_guard();
-        self.record_write(0);
-        self.target.rename(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.hop_guard();
-        self.record_write(0);
-        self.target.rename_if_not_exists(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.hop_guard();
-        self.record_write(0);
-        self.target.copy_if_not_exists(from, to).await
-    }
-}
-
-#[derive(Debug)]
-struct IoTrackingMultipartUpload {
-    target: Box<dyn MultipartUpload>,
-    stats: Arc<Mutex<IoStats>>,
-    _guard: HopGuard,
-}
-
-#[async_trait::async_trait]
-impl MultipartUpload for IoTrackingMultipartUpload {
-    async fn abort(&mut self) -> OSResult<()> {
-        self.target.abort().await
-    }
-
-    async fn complete(&mut self) -> OSResult<PutResult> {
-        self.target.complete().await
-    }
-
-    fn put_part(&mut self, payload: PutPayload) -> UploadPart {
-        {
-            let mut stats = self.stats.lock().unwrap();
-            stats.write_iops += 1;
-            stats.write_bytes += payload.content_length() as u64;
-        }
-        self.target.put_part(payload)
-    }
-}
-
-#[derive(Debug)]
-struct HopGuard {
-    active_requests: Arc<AtomicU16>,
-    stats: Arc<Mutex<IoStats>>,
-}
-
-impl HopGuard {
-    fn new(active_requests: Arc<AtomicU16>, stats: Arc<Mutex<IoStats>>) -> Self {
-        active_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self {
-            active_requests,
-            stats,
-        }
-    }
-}
-
-impl Drop for HopGuard {
-    fn drop(&mut self) {
-        if self
-            .active_requests
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            == 1
-        {
-            let mut stats = self.stats.lock().unwrap();
-            stats.num_hops += 1;
-        }
-    }
 }
 
 pub struct FragmentCount(pub u32);
@@ -570,7 +290,43 @@ pub trait DatagenExt {
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        let rows_per_fragment_val = rows_per_fragment.0;
+        self.into_dataset_with_params(
+            path,
+            frag_count,
+            rows_per_fragment,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment_val as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn into_dataset_with_params(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset_with_params(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset_with_params("memory://", frag_count, rows_per_fragment, write_params)
+            .await
+    }
 
     async fn into_ram_dataset(
         self,
@@ -587,31 +343,41 @@ pub trait DatagenExt {
 
 #[async_trait::async_trait]
 impl DatagenExt for BatchGeneratorBuilder {
-    async fn into_dataset(
+    async fn into_dataset_with_params(
         self,
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
-    ) -> crate::Result<Dataset> {
+        write_params: Option<WriteParams>,
+    ) -> lance_core::Result<Dataset> {
+        // Need to verify that max_rows_per_file has been set otherwise the frag_count won't be respected
+        if let Some(write_params) = &write_params {
+            if write_params.max_rows_per_file != rows_per_fragment.0 as usize {
+                panic!(
+                    "Max rows per file in write params does not match rows per fragment: {} != {}",
+                    write_params.max_rows_per_file, rows_per_fragment.0 as usize
+                );
+            }
+        } else {
+            panic!("Write params are not set, will not write correct # of fragments");
+        }
         let reader = self.into_reader_rows(
             RowCount::from(rows_per_fragment.0 as u64),
             BatchCount::from(frag_count.0),
         );
-        Dataset::write(
-            reader,
-            path,
-            Some(WriteParams {
-                max_rows_per_file: rows_per_fragment.0 as usize,
-                ..Default::default()
-            }),
-        )
-        .await
+        Dataset::write(reader, path, write_params).await
     }
 }
 
 pub struct NoContextTestFixture {
-    _tmp_dir: TempDir,
+    _tmp_dir: TempStrDir,
     pub dataset: Dataset,
+}
+
+impl Default for NoContextTestFixture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NoContextTestFixture {
@@ -621,14 +387,17 @@ impl NoContextTestFixture {
             .unwrap();
 
         runtime.block_on(async move {
-            let tempdir = tempdir().unwrap();
-            let tmppath = tempdir.path().to_str().unwrap();
-            let dataset = lance_datagen::gen()
+            let tempdir = TempStrDir::default();
+            let dataset = lance_datagen::gen_batch()
                 .col(
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
                 )
-                .into_dataset(tmppath, FragmentCount::from(4), FragmentRowCount::from(100))
+                .into_dataset(
+                    tempdir.as_str(),
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(100),
+                )
                 .await
                 .unwrap();
             Self {
@@ -669,25 +438,42 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     src.push("../../test_data");
     src.push(table_path);
 
-    let test_dir = tempdir().unwrap();
+    let test_dir = TempDir::default();
 
-    copy_dir_all(src.as_path(), test_dir.path())?;
+    copy_dir_all(src.as_path(), test_dir.std_path())?;
 
     Ok(test_dir)
 }
 
-pub async fn assert_plan_node_equals(
-    plan_node: Arc<dyn ExecutionPlan>,
-    expected: &str,
-) -> lance_core::Result<()> {
-    let plan_desc = format!(
-        "{}",
-        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
-    );
+/// Trims whitespace from the start and end of each line in the string.
+fn trim_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    if !result.is_empty() {
+        // Remove the last newline
+        result.pop();
+    }
+    result
+}
+
+/// Asserts that the actual string matches the expected pattern.
+/// The pattern can contain "..." to match any content between specified pieces.
+/// The first piece must match from the start, middle pieces can appear anywhere,
+/// and the last piece must match at the end.
+pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core::Result<()> {
+    let actual_cleaned = trim_whitespace(actual);
+    let expected = trim_whitespace(expected_pattern);
 
     let to_match = expected.split("...").collect::<Vec<_>>();
     let num_pieces = to_match.len();
-    let mut remainder = plan_desc.as_str().trim_end_matches('\n');
+    let mut remainder = actual_cleaned.as_str().trim_end_matches('\n');
+
     for (i, piece) in to_match.into_iter().enumerate() {
         let res = match i {
             0 => remainder.starts_with(piece),
@@ -695,27 +481,56 @@ pub async fn assert_plan_node_equals(
             _ => remainder.contains(piece),
         };
         if !res {
-            break;
+            return Err(lance_core::Error::InvalidInput {
+                source: format!(
+                    "Expected string to match:\nExpected: {}\nActual: {}",
+                    expected_pattern, actual
+                )
+                .into(),
+                location: location!(),
+            });
         }
         let idx = remainder.find(piece).unwrap();
         remainder = &remainder[idx + piece.len()..];
     }
+
     if !remainder.is_empty() {
-        panic!(
-            "Expected plan to match:\nExpected: {}\nActual: {}",
-            expected, plan_desc
-        )
+        return Err(lance_core::Error::InvalidInput {
+            source: format!(
+                "Expected string to match:\nExpected: {}\nActual: {}",
+                expected_pattern, actual
+            )
+            .into(),
+            location: location!(),
+        });
     }
+
     Ok(())
+}
+
+pub async fn assert_plan_node_equals(
+    plan_node: Arc<dyn ExecutionPlan>,
+    raw_expected: &str,
+) -> lance_core::Result<()> {
+    let raw_plan_desc = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
+    );
+
+    // Use the extracted string matching logic
+    assert_string_matches(&raw_plan_desc, raw_expected)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use crate::dataset::WriteDestination;
+
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+    use lance_core::utils::tempfile::TempStrDir;
     use rstest::rstest;
 
     #[rstest]
@@ -742,7 +557,7 @@ mod tests {
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
         let generator = TestDatasetGenerator::new(data, data_storage_version);
-        let schema = generator.make_schema(&mut rand::thread_rng());
+        let schema = generator.make_schema(&mut rand::rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
         assert_eq!(&roundtripped_schema, arrow_schema.as_ref());
@@ -769,7 +584,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let struct_fields: ArrowFields = vec![
             ArrowField::new("f1", DataType::Utf8, true),
@@ -799,17 +614,11 @@ mod tests {
         .unwrap();
 
         let generator = TestDatasetGenerator::new(vec![data.clone()], data_storage_version);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
             let fragment = generator
-                .make_fragment(
-                    tmp_dir.path().to_str().unwrap(),
-                    &data,
-                    &schema,
-                    &mut rng,
-                    2,
-                )
+                .make_fragment(tmp_dir.as_str(), &data, &schema, &mut rng, 2)
                 .await;
 
             assert!(fragment.files.len() > 1, "Expected multiple files");
@@ -820,8 +629,17 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
-            assert_ne!(field_ids_frags, field_ids);
+            let mut field_ids = schema
+                .fields_pre_order()
+                .filter_map(|f| {
+                    if data_storage_version < LanceFileVersion::V2_1 || f.children.is_empty() {
+                        Some(f.id)
+                    } else {
+                        // In 2.1+, struct / list fields don't have their own column
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);
@@ -834,7 +652,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
@@ -865,11 +683,11 @@ mod tests {
         let seed = 42;
         let generator = TestDatasetGenerator::new(data.clone(), data_storage_version).seed(seed);
 
-        let path = tmp_dir.path().join("ds1");
-        let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+        let path = format!("{}/ds1", tmp_dir.as_str());
+        let dataset = generator.make_hostile(&path).await;
 
-        let path2 = tmp_dir.path().join("ds2");
-        let dataset2 = generator.make_hostile(path2.to_str().unwrap()).await;
+        let path2 = format!("{}/ds2", tmp_dir.as_str());
+        let dataset2 = generator.make_hostile(&path2).await;
 
         // Given the same seed, should produce the same layout.
         assert_eq!(dataset.schema(), dataset2.schema());
@@ -888,8 +706,8 @@ mod tests {
             let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
-                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
-                let dataset = generator.make_hostile(path.to_str().unwrap()).await;
+                let path = format!("{}/test_ds_{}_{}", tmp_dir.as_str(), num_cols, i);
+                let dataset = generator.make_hostile(&path).await;
 
                 let field_structure = get_field_structure(&dataset);
 
@@ -899,6 +717,12 @@ mod tests {
                     assert_ne!(field_structure[0], field_structure[1]);
                 }
             }
+        }
+    }
+
+    impl<'a> From<&'a TempStrDir> for WriteDestination<'a> {
+        fn from(value: &'a TempStrDir) -> Self {
+            WriteDestination::Uri(value.as_str())
         }
     }
 }

@@ -3,110 +3,150 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::{any::Any, ops::Bound, sync::Arc};
-
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_array::array_has;
+use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::{any::Any, ops::Bound, sync::Arc};
 
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
+use serde::Serialize;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
+use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
+pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
 pub mod flat;
 pub mod inverted;
+pub mod json;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
+pub mod registry;
+pub mod zoned;
+pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
+use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ScalarIndexType {
+/// Builtin index types supported by the Lance library
+///
+/// This is primarily for convenience to avoid a bunch of string
+/// constants and provide some auto-complete.  This type should not
+/// be used in the manifest as plugins cannot add new entries.
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+pub enum BuiltinIndexType {
     BTree,
     Bitmap,
     LabelList,
     NGram,
+    ZoneMap,
+    BloomFilter,
     Inverted,
 }
 
-impl TryFrom<IndexType> for ScalarIndexType {
+impl BuiltinIndexType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::BTree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "labellist",
+            Self::NGram => "ngram",
+            Self::ZoneMap => "zonemap",
+            Self::Inverted => "inverted",
+            Self::BloomFilter => "bloomfilter",
+        }
+    }
+}
+
+impl TryFrom<IndexType> for BuiltinIndexType {
     type Error = Error;
 
     fn try_from(value: IndexType) -> Result<Self> {
         match value {
-            IndexType::BTree | IndexType::Scalar => Ok(Self::BTree),
+            IndexType::BTree => Ok(Self::BTree),
             IndexType::Bitmap => Ok(Self::Bitmap),
             IndexType::LabelList => Ok(Self::LabelList),
             IndexType::NGram => Ok(Self::NGram),
+            IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
-            _ => Err(Error::InvalidInput {
-                source: format!("Index type {:?} is not a scalar index", value).into(),
+            IndexType::BloomFilter => Ok(Self::BloomFilter),
+            _ => Err(Error::Index {
+                message: "Invalid index type".to_string(),
                 location: location!(),
             }),
         }
     }
 }
 
-impl From<ScalarIndexType> for IndexType {
-    fn from(val: ScalarIndexType) -> Self {
-        match val {
-            ScalarIndexType::BTree => Self::BTree,
-            ScalarIndexType::Bitmap => Self::Bitmap,
-            ScalarIndexType::LabelList => Self::LabelList,
-            ScalarIndexType::NGram => Self::NGram,
-            ScalarIndexType::Inverted => Self::Inverted,
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarIndexParams {
+    /// The type of index to create
+    ///
+    /// Plugins may add additional index types.  Index type lookup is case-insensitive.
+    pub index_type: String,
+    /// The parameters to train the index
+    ///
+    /// This should be a JSON string.  The contents of the JSON string will be specific to the
+    /// index type.  If not set, then default parameters will be used for the index type.
+    pub params: Option<String>,
+}
+
+impl Default for ScalarIndexParams {
+    fn default() -> Self {
+        Self {
+            index_type: BuiltinIndexType::BTree.as_str().to_string(),
+            params: None,
         }
     }
 }
 
-#[derive(Default)]
-pub struct ScalarIndexParams {
-    /// If set then always use the given index type and skip auto-detection
-    pub force_index_type: Option<ScalarIndexType>,
-}
-
 impl ScalarIndexParams {
-    pub fn new(index_type: ScalarIndexType) -> Self {
+    /// Creates a new ScalarIndexParams from one of the builtin index types
+    pub fn for_builtin(index_type: BuiltinIndexType) -> Self {
         Self {
-            force_index_type: Some(index_type),
+            index_type: index_type.as_str().to_string(),
+            params: None,
         }
+    }
+
+    /// Create a new ScalarIndexParams with the given index type
+    pub fn new(index_type: String) -> Self {
+        Self {
+            index_type,
+            params: None,
+        }
+    }
+
+    /// Set the parameters for the index
+    pub fn with_params<ParamsType: Serialize>(mut self, params: &ParamsType) -> Self {
+        self.params = Some(serde_json::to_string(params).unwrap());
+        self
     }
 }
 
 impl IndexParams for ScalarIndexParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn index_type(&self) -> IndexType {
-        match self.force_index_type {
-            Some(ScalarIndexType::BTree) | None => IndexType::BTree,
-            Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
-            Some(ScalarIndexType::LabelList) => IndexType::LabelList,
-            Some(ScalarIndexType::Inverted) => IndexType::Inverted,
-            Some(ScalarIndexType::NGram) => IndexType::NGram,
-        }
     }
 
     fn index_name(&self) -> &str {
@@ -117,10 +157,6 @@ impl IndexParams for ScalarIndexParams {
 impl IndexParams for InvertedIndexParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn index_type(&self) -> IndexType {
-        IndexType::Inverted
     }
 
     fn index_name(&self) -> &str {
@@ -207,16 +243,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     /// Cast the query as Any to allow for downcasting
     fn as_any(&self) -> &dyn Any;
-    /// Format the query as a string
+    /// Format the query as a string for display purposes
     fn format(&self, col: &str) -> String;
     /// Convert the query to a datafusion expression
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
-    /// If true, the query results are inexact and will need rechecked
-    fn needs_recheck(&self) -> bool {
-        false
-    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -300,13 +332,9 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        let params = FtsSearchParams::new()
+        FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
-            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
-        match self.query {
-            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
-            _ => params,
-        }
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0))
     }
 }
 
@@ -550,9 +578,106 @@ impl AnyQuery for TextQuery {
             None => false,
         }
     }
+}
 
-    fn needs_recheck(&self) -> bool {
-        true
+/// A query that a InvertedIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenQuery {
+    /// Retrieve all row ids where the text contains all tokens parsed from given string. The tokens
+    /// are separated by punctuations and white spaces.
+    TokensContains(String),
+}
+
+/// A query that a BloomFilter index can satisfy
+///
+/// This is a subset of SargableQuery that only includes operations that bloom filters
+/// can efficiently handle: equals, is_null, and is_in queries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BloomFilterQuery {
+    /// Retrieve all row ids where the value is exactly the given value
+    Equals(ScalarValue),
+    /// Retrieve all row ids where the value is null
+    IsNull(),
+    /// Retrieve all row ids where the value is in the given set of values
+    IsIn(Vec<ScalarValue>),
+}
+
+impl AnyQuery for BloomFilterQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::Equals(val) => {
+                format!("{} = {}", col, val)
+            }
+            Self::IsNull() => {
+                format!("{} IS NULL", col)
+            }
+            Self::IsIn(values) => {
+                format!(
+                    "{} IN [{}]",
+                    col,
+                    values
+                        .iter()
+                        .map(|val| val.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        }
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        let col_expr = Expr::Column(Column::new_unqualified(col));
+        match self {
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
+            Self::IsNull() => col_expr.is_null(),
+            Self::IsIn(values) => col_expr.in_list(
+                values
+                    .iter()
+                    .map(|val| Expr::Literal(val.clone(), None))
+                    .collect::<Vec<_>>(),
+                false,
+            ),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+impl AnyQuery for TokenQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            Self::TokensContains(substr) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(CONTAINS_TOKENS_UDF.clone()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
+                ],
+            }),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
     }
 }
 
@@ -560,29 +685,68 @@ impl AnyQuery for TextQuery {
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
-    Exact(RowIdTreeMap),
+    Exact(RowAddrTreeMap),
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
-    AtMost(RowIdTreeMap),
+    AtMost(RowAddrTreeMap),
     /// All of the given row ids satisfy the query but there may be more
     ///
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
-    AtLeast(RowIdTreeMap),
+    AtLeast(RowAddrTreeMap),
 }
 
 impl SearchResult {
-    pub fn row_ids(&self) -> &RowIdTreeMap {
+    pub fn row_addrs(&self) -> &RowAddrTreeMap {
         match self {
-            Self::Exact(row_ids) => row_ids,
-            Self::AtMost(row_ids) => row_ids,
-            Self::AtLeast(row_ids) => row_ids,
+            Self::Exact(row_addrs) => row_addrs,
+            Self::AtMost(row_addrs) => row_addrs,
+            Self::AtLeast(row_addrs) => row_addrs,
         }
     }
 
     pub fn is_exact(&self) -> bool {
         matches!(self, Self::Exact(_))
+    }
+}
+
+/// Brief information about an index that was created
+pub struct CreatedIndex {
+    /// The details of the index that was created
+    ///
+    /// These should be stored somewhere as they will be needed to
+    /// load the index later.
+    pub index_details: prost_types::Any,
+    /// The version of the index that was created
+    ///
+    /// This can be used to determine if a reader is able to load the index.
+    pub index_version: u32,
+}
+
+/// The criteria that specifies how to update an index
+pub struct UpdateCriteria {
+    /// If true, then we need to read the old data to update the index
+    ///
+    /// This should be avoided if possible but is left in for some legacy paths
+    pub requires_old_data: bool,
+    /// The criteria required for data (both old and new)
+    pub data_criteria: TrainingCriteria,
+}
+
+impl UpdateCriteria {
+    pub fn requires_old_data(data_criteria: TrainingCriteria) -> Self {
+        Self {
+            requires_old_data: true,
+            data_criteria,
+        }
+    }
+
+    pub fn only_new_data(data_criteria: TrainingCriteria) -> Self {
+        Self {
+            requires_old_data: false,
+            data_criteria,
+        }
     }
 }
 
@@ -598,31 +762,29 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
-    /// Returns true if the query can be answered exactly
-    ///
-    /// If false is returned then the query still may be answered exactly but if true is returned
-    /// then the query must be answered exactly
-    fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
-
-    /// Load the scalar index from storage
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized;
+    /// Returns true if the remap operation is supported
+    fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()>;
+    ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()>;
+    ) -> Result<CreatedIndex>;
+
+    /// Returns the criteria that will be used to update the index
+    fn update_criteria(&self) -> UpdateCriteria;
+
+    /// Derive the index parameters from the current index
+    ///
+    /// This returns a ScalarIndexParams that can be used to recreate an index
+    /// with the same configuration on another dataset.
+    fn derive_index_params(&self) -> Result<ScalarIndexParams>;
 }

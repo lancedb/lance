@@ -6,10 +6,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::Float32Array;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::Field;
 use lance_table::utils::LanceIteratorExtension;
 use snafu::location;
 use tracing::instrument;
@@ -17,10 +17,11 @@ use tracing::instrument;
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
 use lance_linalg::distance::DistanceType;
-use lance_linalg::kmeans::compute_partitions_arrow_array;
 
+use crate::vector::kmeans::compute_partitions_arrow_array;
 use crate::vector::transform::Transformer;
-use crate::vector::LOSS_METADATA_KEY;
+use crate::vector::utils::SimpleIndex;
+use crate::vector::{CENTROID_DIST_COLUMN, CENTROID_DIST_FIELD, LOSS_METADATA_KEY, PART_ID_FIELD};
 
 use super::PART_ID_COLUMN;
 
@@ -39,6 +40,8 @@ pub struct PartitionTransformer {
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
+    with_distance: bool,
+    index: Option<SimpleIndex>,
 }
 
 impl PartitionTransformer {
@@ -47,21 +50,42 @@ impl PartitionTransformer {
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
+        let index = SimpleIndex::may_train_index(
+            centroids.values().clone(),
+            centroids.value_length() as usize,
+            distance_type,
+        )
+        .unwrap();
+
         Self {
             centroids,
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
+            with_distance: false,
+            index,
         }
+    }
+
+    pub fn with_distance(mut self, with_distance: bool) -> Self {
+        self.with_distance = with_distance;
+        self
     }
 }
 impl Transformer for PartitionTransformer {
     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.column_by_name(&self.output_column).is_some() {
-            // If the partition ID column is already present, we don't need to compute it again.
+        if !(batch.column_by_name(&self.output_column).is_none()
+            || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
+        {
+            // If the output columns are already present, we don't need to compute it again.
             return Ok(batch.clone());
         }
+
+        // clear the columns if any of them is present
+        let batch = batch
+            .drop_column(PART_ID_COLUMN)?
+            .drop_column(CENTROID_DIST_COLUMN)?;
 
         let arr =
             batch
@@ -85,13 +109,30 @@ impl Transformer for PartitionTransformer {
                 location: location!(),
             })?;
 
-        let (part_ids, loss) =
-            compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?;
+        let (part_ids, dists) = match &self.index {
+            Some(index) => fsl
+                .iter()
+                .map(|vec| match vec {
+                    Some(v) => {
+                        let (id, dist) = index.search(v).unwrap();
+                        (Some(id), Some(dist))
+                    }
+                    None => (None, None),
+                })
+                .unzip(),
+            None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
+        };
+        let loss = dists
+            .iter()
+            .map(|d| d.unwrap_or_default() as f64)
+            .sum::<f64>();
         let part_ids = UInt32Array::from(part_ids);
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
-        Ok(batch
-            .try_with_column(field, Arc::new(part_ids))?
-            .add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
+        let mut batch = batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?;
+        if self.with_distance {
+            let dists = Float32Array::from(dists);
+            batch = batch.try_with_column(CENTROID_DIST_FIELD.clone(), Arc::new(dists))?;
+        }
+        Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
     }
 }
 

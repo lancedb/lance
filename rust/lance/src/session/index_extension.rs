@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::{vector::VectorIndex, IndexParams, IndexType};
 
 use crate::Dataset;
@@ -45,7 +45,7 @@ pub trait VectorIndexExtension: IndexExtension {
         dataset: Arc<Dataset>,
         column: &str,
         uuid: &str,
-        reader: FileReader,
+        reader: PreviousFileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
 
@@ -65,12 +65,14 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
+    use lance_file::previous::writer::{
+        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+    };
     use lance_file::version::LanceFileVersion;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         metrics::MetricsCollector,
@@ -94,7 +96,7 @@ mod test {
 
     impl DeepSizeOf for MockIndex {
         fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-            todo!()
+            0
         }
     }
 
@@ -140,7 +142,7 @@ mod test {
             unimplemented!()
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!()
         }
 
@@ -194,7 +196,12 @@ mod test {
         fn ivf_model(&self) -> &IvfModel {
             unimplemented!()
         }
+
         fn quantizer(&self) -> Quantizer {
+            unimplemented!()
+        }
+
+        fn partition_size(&self, _: usize) -> usize {
             unimplemented!()
         }
 
@@ -265,9 +272,13 @@ mod test {
 
             let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
             let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
-            let mut writer: FileWriter<ManifestDescribing> =
-                FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())
-                    .unwrap();
+            let mut writer: PreviousFileWriter<ManifestDescribing> =
+                PreviousFileWriter::with_object_writer(
+                    writer,
+                    schema,
+                    &PreviousFileWriterOptions::default(),
+                )
+                .unwrap();
             writer.add_metadata(
                 INDEX_METADATA_SCHEMA_KEY,
                 json!(IndexMetadata {
@@ -295,7 +306,7 @@ mod test {
             _dataset: Arc<Dataset>,
             _column: &str,
             _uuid: &str,
-            _reader: FileReader,
+            _reader: PreviousFileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -309,10 +320,6 @@ mod test {
     impl IndexParams for MockIndexParams {
         fn as_any(&self) -> &dyn Any {
             self
-        }
-
-        fn index_type(&self) -> IndexType {
-            IndexType::Vector
         }
 
         fn index_name(&self) -> &str {
@@ -348,12 +355,11 @@ mod test {
             .load_index_called
             .load(std::sync::atomic::Ordering::Acquire));
 
-        let mut ds_with_extension =
-            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
-                .with_session(Arc::new(session))
-                .load()
-                .await
-                .unwrap();
+        let mut ds_with_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
 
         // create index
         ds_with_extension
@@ -370,11 +376,10 @@ mod test {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // check that the index was created
-        let ds_without_extension =
-            DatasetBuilder::from_uri(test_ds.tmp_dir.path().to_str().unwrap())
-                .load()
-                .await
-                .unwrap();
+        let ds_without_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .load()
+            .await
+            .unwrap();
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid

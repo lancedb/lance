@@ -6,7 +6,8 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
-use lance_table::format::Index;
+use lance_index::is_system_index;
+use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
@@ -33,9 +34,9 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         &dataset.manifest,
     )
     .await?;
-    let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-        None => return Ok(()),
-        Some(idx) => idx,
+    let Some(frag_reuse_index_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(());
     };
 
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
@@ -88,7 +89,6 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
             removed_indices: vec![frag_reuse_index_meta.clone()],
         },
         None,
-        None,
     );
 
     dataset
@@ -100,9 +100,9 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
 
 fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
-    index_meta: &Index,
+    index_meta: &IndexMetadata,
 ) -> lance_core::Result<bool> {
-    if index_meta.name == FRAG_REUSE_INDEX_NAME {
+    if is_system_index(index_meta) {
         return Ok(true);
     }
 
@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),

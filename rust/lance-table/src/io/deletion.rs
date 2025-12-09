@@ -60,12 +60,13 @@ pub async fn write_deletion_file(
     let deletion_file = match removed_rows {
         DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -96,12 +97,13 @@ pub async fn write_deletion_file(
             Some(deletion_file)
         }
         DeletionVector::Bitmap(bitmap) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 

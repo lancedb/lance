@@ -4,6 +4,7 @@
 use core::panic;
 use std::cmp::{max, min};
 
+use lance_core::assume_eq;
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
@@ -129,7 +130,8 @@ pub(super) fn compute_pq_distance(
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
         let dist_table =
             &distance_table[sub_vec_idx * NUM_CENTROIDS..(sub_vec_idx + 1) * NUM_CENTROIDS];
-        debug_assert_eq!(vec_indices.len(), distances.len());
+        assume_eq!(dist_table.len(), NUM_CENTROIDS);
+        assume_eq!(vec_indices.len(), distances.len());
         vec_indices
             .iter()
             .zip(distances.iter_mut())

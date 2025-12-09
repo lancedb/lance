@@ -16,12 +16,11 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
-use rayon::prelude::*;
 use snafu::location;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::vector::kmeans::train_kmeans;
+use crate::vector::kmeans::{train_kmeans, KMeansParams};
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -108,10 +107,10 @@ impl PQBuildParams {
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
         let d = sub_vectors
-            .into_par_iter()
+            .into_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
-                train_kmeans::<T>(
+                let params = KMeansParams::new(
                     self.codebook.as_ref().map(|cb| {
                         let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
                             cb.as_fixed_size_list().values().as_primitive::<T>().slice(
@@ -123,12 +122,15 @@ impl PQBuildParams {
                         .unwrap();
                         Arc::new(sub_vec_centroids)
                     }),
-                    &sub_vec,
-                    sub_vector_dimension,
-                    num_centroids,
                     self.max_iters as u32,
                     self.kmeans_redos,
                     distance_type,
+                );
+                train_kmeans::<T>(
+                    &sub_vec,
+                    params,
+                    sub_vector_dimension,
+                    num_centroids,
                     self.sample_rate,
                 )
                 .map(|kmeans| kmeans.centroids)
@@ -156,7 +158,7 @@ impl PQBuildParams {
 
     /// Build a [ProductQuantizer] from the given data.
     ///
-    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
+    /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
@@ -169,10 +171,9 @@ impl PQBuildParams {
 
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         if data.len() < num_centroids {
-            return Err(Error::Index {
+            return Err(Error::Unprocessable {
                 message: format!(
-                    "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
-                    num_centroids,
+                    "Not enough rows to train PQ. Requires {num_centroids} rows but only {} available",
                     data.len()
                 ),
                 location: location!(),

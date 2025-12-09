@@ -2,25 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::{
-    datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
-};
-use datafusion_common::{
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, TableReference,
-};
+use datafusion::{execution::SessionState, logical_expr::Expr};
 use datafusion_substrait::substrait::proto::{
-    expression::field_reference::{ReferenceType, RootType},
-    expression::reference_segment,
-    expression::RexType,
+    expression::{
+        field_reference::{ReferenceType, RootType},
+        reference_segment, RexType,
+    },
     expression_reference::ExprType,
-    extensions::{simple_extension_declaration::MappingType, SimpleExtensionDeclaration},
     function_argument::ArgType,
-    plan_rel::RelType,
     r#type::{Kind, Struct},
-    read_rel::{NamedTable, ReadType},
-    rel, Expression, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel,
-    RelRoot, Type,
+    Expression, ExpressionReference, ExtendedExpression, NamedStruct, Type,
 };
 use lance_core::{Error, Result};
 use prost::Message;
@@ -37,12 +28,14 @@ use std::sync::Arc;
 ///
 /// As a result, it may be a good idea for now to remove those types from the schema before
 /// calling this function.
-pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>> {
+pub fn encode_substrait(
+    expr: Expr,
+    schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Vec<u8>> {
     use arrow_schema::Field;
     use datafusion::logical_expr::ExprSchemable;
     use datafusion_common::DFSchema;
-
-    let ctx = SessionContext::new();
 
     let df_schema = Arc::new(DFSchema::try_from(schema)?);
     let output_type = expr.get_type(&df_schema)?;
@@ -51,7 +44,7 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
     let extended_expr = datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
         &[(&expr, &output_field)],
         &df_schema,
-        &ctx.state(),
+        state,
     )?;
 
     Ok(extended_expr.encode_to_vec())
@@ -60,6 +53,11 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
 fn count_fields(dtype: &Type) -> usize {
     match dtype.kind.as_ref().unwrap() {
         Kind::Struct(struct_type) => struct_type.types.iter().map(count_fields).sum::<usize>() + 1,
+        Kind::List(list_type) => {
+            // Recursively count fields in the list's child type
+            // This is critical for schemas with List<Struct> patterns
+            count_fields(list_type.r#type.as_ref().unwrap())
+        }
         _ => 1,
     }
 }
@@ -115,16 +113,6 @@ fn remove_extension_types(
         }),
     };
     Ok((new_substrait_schema, new_arrow_schema, index_mapping))
-}
-
-fn remove_type_extensions(
-    declarations: &[SimpleExtensionDeclaration],
-) -> Vec<SimpleExtensionDeclaration> {
-    declarations
-        .iter()
-        .filter(|d| matches!(d.mapping_type, Some(MappingType::ExtensionFunction(_))))
-        .cloned()
-        .collect()
 }
 
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
@@ -237,7 +225,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
-pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Result<Expr> {
+pub async fn parse_substrait(
+    expr: &[u8],
+    input_schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
         return Err(Error::InvalidInput {
@@ -267,119 +259,63 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         }),
     }?;
 
-    let (substrait_schema, input_schema) =
-        if envelope.base_schema.as_ref().unwrap().r#struct.is_some() {
-            let (substrait_schema, input_schema, index_mapping) = remove_extension_types(
-                envelope.base_schema.as_ref().unwrap(),
-                input_schema.clone(),
-            )?;
+    // The Substrait may have come from a producer that uses extension types that DF doesn't support (e.g.
+    // from pyarrow) so we need to remove them and remap expr references (since they are indexes into the
+    // schema and we may have removed some fields)
+    let substrait_schema = if envelope.base_schema.as_ref().unwrap().r#struct.is_some() {
+        let (substrait_schema, _, index_mapping) =
+            remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
 
-            if substrait_schema.r#struct.as_ref().unwrap().types.len()
-                != envelope
-                    .base_schema
-                    .as_ref()
-                    .unwrap()
-                    .r#struct
-                    .as_ref()
-                    .unwrap()
-                    .types
-                    .len()
-            {
-                remap_expr_references(&mut expr, &index_mapping)?;
-            }
+        if substrait_schema.r#struct.as_ref().unwrap().types.len()
+            != envelope
+                .base_schema
+                .as_ref()
+                .unwrap()
+                .r#struct
+                .as_ref()
+                .unwrap()
+                .types
+                .len()
+        {
+            remap_expr_references(&mut expr, &index_mapping)?;
+        }
 
-            (substrait_schema, input_schema)
-        } else {
-            (envelope.base_schema.as_ref().unwrap().clone(), input_schema)
-        };
-
-    // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
-    // we need to create a dummy plan with a single project node
-    let plan = Plan {
-        version: None,
-        extensions: remove_type_extensions(&envelope.extensions),
-        advanced_extensions: envelope.advanced_extensions.clone(),
-        parameter_bindings: vec![],
-        expected_type_urls: vec![],
-        extension_uris: vec![],
-        relations: vec![PlanRel {
-            rel_type: Some(RelType::Root(RelRoot {
-                input: Some(Rel {
-                    rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-                        common: None,
-                        input: Some(Box::new(Rel {
-                            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
-                                common: None,
-                                base_schema: Some(substrait_schema),
-                                filter: None,
-                                best_effort_filter: None,
-                                projection: None,
-                                advanced_extension: None,
-                                read_type: Some(ReadType::NamedTable(NamedTable {
-                                    names: vec!["dummy".to_string()],
-                                    advanced_extension: None,
-                                })),
-                            }))),
-                        })),
-                        expressions: vec![expr],
-                        advanced_extension: None,
-                    }))),
-                }),
-                // Not technically accurate but pretty sure DF ignores this
-                names: vec![],
-            })),
-        }],
+        substrait_schema
+    } else {
+        envelope.base_schema.as_ref().unwrap().clone()
     };
 
-    let session_context = SessionContext::new();
-    let dummy_table = Arc::new(EmptyTable::new(input_schema));
-    session_context.register_table(
-        TableReference::Bare {
-            table: "dummy".into(),
-        },
-        dummy_table,
-    )?;
-    let df_plan = datafusion_substrait::logical_plan::consumer::from_substrait_plan(
-        &session_context.state(),
-        &plan,
-    )
-    .await?;
+    let extended_expr = ExtendedExpression {
+        base_schema: Some(substrait_schema),
+        referred_expr: vec![ExpressionReference {
+            output_names: envelope.referred_expr[0].output_names.clone(),
+            expr_type: Some(ExprType::Expression(expr)),
+        }],
+        ..envelope
+    };
 
-    let expr = df_plan.expressions().pop().unwrap();
+    let mut expr_container =
+        datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
+            state,
+            &extended_expr,
+        )
+        .await?;
 
-    // When DF parses the above plan it turns column references into qualified references
-    // into `dummy` (e.g. we get `WHERE dummy.x < 0` instead of `WHERE x < 0`)  We want
-    // these to be unqualified references instead and so we need a quick transformation pass
+    if expr_container.exprs.is_empty() {
+        return Err(Error::invalid_input(
+            "Substrait expression did not contain any expressions",
+            location!(),
+        ));
+    }
 
-    let expr = expr.transform(&|node| match node {
-        Expr::Column(column) => {
-            if let Some(relation) = column.relation {
-                match relation {
-                    TableReference::Bare { table } => {
-                        if table.as_ref() == "dummy" {
-                            Ok(Transformed::yes(Expr::Column(Column {
-                                relation: None,
-                                name: column.name,
-                                spans: column.spans.clone(), // Preserve spans if available
-                            })))
-                        } else {
-                            // This should not be possible
-                            Err(DataFusionError::Substrait(format!(
-                                "Unexpected reference to table {} found when parsing filter",
-                                table
-                            )))
-                        }
-                    }
-                            // This should not be possible
-                            _ => Err(DataFusionError::Substrait("Unexpected partially or fully qualified table reference encountered when parsing filter".into()))
-                }
-            } else {
-                Ok(Transformed::no(Expr::Column(column)))
-            }
-        }
-        _ => Ok(Transformed::no(node)),
-    })?;
-    Ok(expr.data)
+    if expr_container.exprs.len() > 1 {
+        return Err(Error::invalid_input(
+            "Substrait expression contained multiple expressions",
+            location!(),
+        ));
+    }
+
+    Ok(expr_container.exprs.pop().unwrap().0)
 }
 
 #[cfg(test)]
@@ -388,44 +324,121 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
+        execution::SessionState,
         logical_expr::{BinaryExpr, Operator},
-        prelude::Expr,
+        prelude::{Expr, SessionContext},
     };
     use datafusion_common::{Column, ScalarValue};
-    use prost::Message;
-    use substrait_expr::functions::functions_comparison::FunctionsComparisonExt;
-    use substrait_expr::{
-        builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
-        helpers::{literals::literal, schema::SchemaInfo},
+    use datafusion_substrait::substrait::proto::{
+        expression::{
+            field_reference::{ReferenceType, RootReference, RootType},
+            literal::LiteralType,
+            reference_segment::{self, StructField},
+            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
+        },
+        expression_reference::ExprType,
+        extensions::{
+            simple_extension_declaration::{ExtensionFunction, MappingType},
+            SimpleExtensionDeclaration, SimpleExtensionUri,
+        },
+        function_argument::ArgType,
+        r#type::{Boolean, Kind, Nullability, Struct, I32},
+        Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
+        Version,
     };
+    use prost::Message;
 
     use crate::substrait::{encode_substrait, parse_substrait};
 
+    fn session_state() -> SessionState {
+        let ctx = SessionContext::new();
+        ctx.state()
+    }
+
     #[tokio::test]
     async fn test_substrait_conversion() {
-        let schema = SchemaInfo::new_full()
-            .field("x", substrait_expr::helpers::types::i32(true))
-            .build();
-        let expr_builder = ExpressionsBuilder::new(schema, BuilderParams::default());
-        expr_builder
-            .add_expression(
-                "filter_mask",
-                expr_builder
-                    .functions()
-                    .lt(
-                        expr_builder.fields().resolve_by_name("x").unwrap(),
-                        literal(0_i32),
-                    )
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap();
-        let expr = expr_builder.build();
+        let expr = ExtendedExpression {
+            version: Some(Version {
+                major_number: 0,
+                minor_number: 63,
+                patch_number: 1,
+                git_hash: "".to_string(),
+                producer: "unit-test".to_string(),
+            }),
+            extension_uris: vec![
+                SimpleExtensionUri {
+                    extension_uri_anchor: 1,
+                    uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml".to_string(),
+                }
+            ],
+            extensions: vec![
+                SimpleExtensionDeclaration {
+                    mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                        extension_uri_reference: 1,
+                        function_anchor: 1,
+                        name: "lt".to_string(),
+                    })),
+                }
+            ],
+            referred_expr: vec![ExpressionReference {
+                output_names: vec!["filter_mask".to_string()],
+                expr_type: Some(ExprType::Expression(Expression {
+                    rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                        function_reference: 1,
+                        arguments: vec![
+                            FunctionArgument {
+                                arg_type: Some(ArgType::Value(Expression {
+                                    rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                                        reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                                            reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(StructField { field: 0, child: None })))
+                                        })),
+                                        root_type: Some(RootType::RootReference(RootReference {}))
+                                    })))
+                                }))
+                            },
+                            FunctionArgument {
+                                arg_type: Some(ArgType::Value(Expression {
+                                    rex_type: Some(RexType::Literal(Literal {
+                                        nullable: false,
+                                        type_variation_reference: 0,
+                                        literal_type: Some(LiteralType::I32(0))
+                                    }))
+                                }))
+                            }
+                        ],
+                        options: vec![],
+                        output_type: Some(Type {
+                            kind: Some(Kind::Bool(Boolean {
+                                type_variation_reference: 0,
+                                nullability: Nullability::Required as i32,
+                            })),
+                        }),
+                        #[allow(deprecated)]
+                        args: vec![],
+                    }))
+                })),
+            }],
+            base_schema: Some(NamedStruct {
+                names: vec!["x".to_string()],
+                r#struct: Some(Struct {
+                    types: vec![Type {
+                        kind: Some(Kind::I32(I32 {
+                            type_variation_reference: 0,
+                            nullability: Nullability::Nullable as i32,
+                        })),
+                    }],
+                    type_variation_reference: 0,
+                    nullability: Nullability::Required as i32,
+                }),
+            }),
+            advanced_extensions: None,
+            expected_type_urls: vec![],
+        };
         let expr_bytes = expr.encode_to_vec();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
 
-        let df_expr = parse_substrait(expr_bytes.as_slice(), schema)
+        let df_expr = parse_substrait(expr_bytes.as_slice(), schema, &session_state())
             .await
             .unwrap();
 
@@ -446,11 +459,137 @@ mod tests {
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         });
 
-        let bytes = encode_substrait(expr.clone(), Arc::new(schema.clone())).unwrap();
+        let bytes =
+            encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
 
-        let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()))
+        let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state())
             .await
             .unwrap();
         assert_eq!(decoded, expr);
+    }
+
+    /// Helper to create a simple equality filter on the "id" field
+    fn id_filter(value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("id"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to test substrait roundtrip encode/decode
+    async fn assert_substrait_roundtrip(schema: Schema, expr: Expr) {
+        let schema = Arc::new(schema);
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    /// Helper to create List<Struct> field
+    fn list_of_struct(name: &str, fields: Vec<Field>) -> Field {
+        Field::new(
+            name,
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(fields.into()),
+                true,
+            ))),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_of_struct() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_of_struct(
+                "top_previous_companies",
+                vec![
+                    Field::new("company_id", DataType::Int64, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_list_struct_struct() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            list_of_struct(
+                "employees_count_breakdown_by_month",
+                vec![
+                    Field::new("date", DataType::Utf8, true),
+                    Field::new(
+                        "breakdown",
+                        DataType::Struct(
+                            vec![
+                                Field::new("employees_count_owner", DataType::Int64, true),
+                                Field::new("employees_count_founder", DataType::Int64, true),
+                                Field::new("employees_count_clevel", DataType::Int64, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_with_many_nested_columns() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "location",
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("country", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            list_of_struct(
+                "top_previous_companies",
+                vec![
+                    Field::new("company_id", DataType::Int64, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                ],
+            ),
+            list_of_struct(
+                "employees_by_month",
+                vec![
+                    Field::new("date", DataType::Utf8, true),
+                    Field::new(
+                        "breakdown",
+                        DataType::Struct(
+                            vec![
+                                Field::new("count_owner", DataType::Int64, true),
+                                Field::new("count_founder", DataType::Int64, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                ],
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_substrait_roundtrip(schema, id_filter("test-id")).await;
     }
 }

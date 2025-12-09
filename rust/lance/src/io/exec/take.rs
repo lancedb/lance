@@ -27,10 +27,10 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use tracing::error;
 
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
@@ -102,11 +102,32 @@ impl TakeStream {
 
     async fn do_open_reader(&self, fragment_id: u32) -> DataFusionResult<Arc<FragmentReader>> {
         let fragment = self
-        .dataset
-        .get_fragment(fragment_id as usize)
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!("The input to a take operation specified fragment id {} but this fragment does not exist in the dataset", fragment_id))
-        })?;
+            .dataset
+            .get_fragment(fragment_id as usize)
+            .ok_or_else(|| {
+                let branch = self
+                    .dataset
+                    .manifest()
+                    .branch
+                    .as_deref()
+                    .unwrap_or("main");
+                error!(
+                    fragment_id,
+                    dataset_uri = %self.dataset.uri(),
+                    manifest_version = self.dataset.manifest().version,
+                    manifest_path = %self.dataset.manifest_location().path,
+                    branch = ?self.dataset.manifest().branch,
+                    "Missing fragment id during take operation",
+                );
+                DataFusionError::Execution(format!(
+                    "The input to a take operation specified fragment id {} but this fragment does not exist in the dataset (uri={}, version={}, manifest={}, branch={})",
+                    fragment_id,
+                    self.dataset.uri(),
+                    self.dataset.manifest().version,
+                    self.dataset.manifest_location().path,
+                    branch
+                ))
+            })?;
 
         let reader = Arc::new(
             fragment
@@ -276,10 +297,8 @@ impl TakeStream {
             })
             .boxed();
         batches
+            .inspect_ok(move |_| metrics.io_metrics.record(&scan_scheduler))
             .try_buffered(get_num_compute_intensive_cpus())
-            .finally(move || {
-                metrics.io_metrics.record_final(scan_scheduler.as_ref());
-            })
     }
 }
 
@@ -318,7 +337,7 @@ impl DisplayAs for TakeExec {
                 if extra_fields.contains(name) {
                     format!("({})", name)
                 } else {
-                    name.to_string()
+                    name.clone()
                 }
             })
             .collect::<Vec<_>>()
@@ -553,6 +572,10 @@ impl ExecutionPlan for TakeExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -565,11 +588,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::OnMissing, ROW_ID};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
     use rstest::rstest;
-    use tempfile::{tempdir, TempDir};
 
     use crate::{
         dataset::WriteParams,
@@ -579,7 +602,7 @@ mod tests {
 
     struct TestFixture {
         dataset: Arc<Dataset>,
-        _tmp_dir_guard: TempDir,
+        _tmp_dir_guard: TempStrDir,
     }
 
     async fn test_fixture() -> TestFixture {
@@ -620,8 +643,8 @@ mod tests {
             })
             .collect();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
         let params = WriteParams {
             max_rows_per_file: 10,
             ..Default::default()
@@ -928,7 +951,7 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let arc_dasaset = Arc::new(fixture.dataset);
 
-        let input = lance_datagen::gen()
+        let input = lance_datagen::gen_batch()
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(50), BatchCount::from(2));
 

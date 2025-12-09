@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-
-use object_store::{local::LocalFileSystem, path::Path};
-use url::Url;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
     DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::Result;
+use lance_core::Error;
+use object_store::{local::LocalFileSystem, path::Path};
+use snafu::location;
+use url::Url;
 
 #[derive(Default, Debug)]
 pub struct FileStoreProvider;
@@ -30,14 +31,31 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
-    fn extract_path(&self, url: &Url) -> object_store::path::Path {
-        url.to_file_path()
-            .ok()
-            .and_then(|p| Path::from_absolute_path(p).ok())
-            .unwrap_or_else(|| Path::from(url.path()))
+    fn extract_path(&self, url: &Url) -> Result<Path> {
+        if let Ok(file_path) = url.to_file_path() {
+            if let Ok(path) = Path::from_absolute_path(&file_path) {
+                return Ok(path);
+            }
+        }
+
+        Path::parse(url.path()).map_err(|e| {
+            Error::invalid_input(
+                format!("Failed to parse path '{}': {}", url.path(), e),
+                location!(),
+            )
+        })
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &Url,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok(url.scheme().to_string())
     }
 }
 
@@ -60,9 +78,34 @@ mod tests {
 
         for (uri, expected_path) in cases {
             let url = uri_to_url(uri).unwrap();
-            let path = provider.extract_path(&url);
+            let path = provider.extract_path(&url).unwrap();
             assert_eq!(path.as_ref(), expected_path, "uri: '{}'", uri);
         }
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file",
+            provider
+                .calculate_object_store_prefix(&Url::parse("file:///etc").unwrap(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_for_file_object_store() {
+        let provider = FileStoreProvider;
+        assert_eq!(
+            "file-object-store",
+            provider
+                .calculate_object_store_prefix(
+                    &Url::parse("file-object-store:///etc").unwrap(),
+                    None
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -83,7 +126,7 @@ mod tests {
 
         for (uri, expected_path) in cases {
             let url = uri_to_url(uri).unwrap();
-            let path = provider.extract_path(&url);
+            let path = provider.extract_path(&url).unwrap();
             assert_eq!(path.as_ref(), expected_path);
         }
     }

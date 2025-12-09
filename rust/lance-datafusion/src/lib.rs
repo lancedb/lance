@@ -13,4 +13,5 @@ pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]
 pub mod substrait;
+pub mod udf;
 pub mod utils;

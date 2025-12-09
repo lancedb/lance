@@ -12,7 +12,7 @@
 //!
 //! Any form of compression can be used since we are compressing and decompressing
 //! entire chunks.
-use crate::{buffer::LanceBuffer, data::DataBlock, format::pb};
+use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncoding};
 
 use lance_core::Result;
 
@@ -84,5 +84,5 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)>;
+    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
 }

@@ -26,3 +26,11 @@ lindera build --dictionary-kind=ipadic mecab-ipadic-2.7.0-20070801 main
 ```bash
 lindera build --build-user-dictionary --dictionary-kind=ipadic user_dict/userdict.csv user_dict2
 ```
+
+## Version Compatibility
+
+**Important**: The binary user dictionary format (`userdic.bin`) is version-specific and needs to be regenerated when upgrading lindera versions.
+
+- Current version: lindera 0.44.0
+- Last regenerated: 2025-09-09
+- Binary format changes between versions will cause deserialization errors

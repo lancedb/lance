@@ -22,6 +22,7 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 bytes = { workspace = true }
 half = { workspace = true }
+jsonb ={ workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true
 

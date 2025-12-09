@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - main
+      - release/**
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - Cargo.*
       - python/**
@@ -23,9 +27,6 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=line-tables-only"
   RUST_BACKTRACE: "1"
   CI: "true"
   # Color output for pytest is off by default.
@@ -33,12 +34,12 @@ env:
   FORCE_COLOR: "1"
   # Change this to bust all caches (may be needed periodically if the caches accumulate
   # a lot of cruft).
-  CACHE_PREFIX: "1"
+  CACHE_PREFIX: "2"
 
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: "ubuntu-24.04"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -66,29 +67,25 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
-          ruff format --check python
+          ruff format --check --diff python
           ruff check python
           pyright
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - name: Install rustfmt
-        run: rustup component add rustfmt
-      - name: Install clippy
-        run: rustup component add clippy
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
+          cargo clippy  --profile ci --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
           pip install maturin
-          maturin develop --locked --extras tests,ray
+          maturin develop --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate
@@ -97,9 +94,9 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["9", "12"]
+        python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: "ubuntu-24.04"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -118,27 +115,21 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
-      - name: Generate forward compatibility files
-        run: python python/tests/forward_compat/datagen.py
-      - name: Run forward compatibility tests (pylance 0.16.0)
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pytest pylance==0.16.0
-          pytest python/tests/forward_compat --run-forward
-      - name: Run forward compatibility tests (pylance 0.29.1.beta2)
-        run: |
-          source venv/bin/activate
-          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
-          pytest python/tests/forward_compat --run-forward
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels
-  linux-arm:
-    timeout-minutes: 45
-    runs-on: ubuntu-2404-4x-arm64
-    name: Python Linux 3.12 ARM
+      - name: Upload wheels as artifacts
+        if: ${{ matrix.python-minor-version == '13' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/target/wheels/pylance-*.whl
+
+  compat:
+    needs: linux
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    name: Compatibility Tests
     defaults:
       run:
         shell: bash
@@ -151,7 +142,38 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.12
+          python-version: 3.13
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/wheels
+      - name: Install dependencies
+        run: |
+          pip install $(ls wheels/pylance-*.whl)[tests,ray]
+      - name: Run compatibility tests
+        run: |
+          make compattest
+        env:
+          COMPAT_TEMP_VENV: 1
+
+  linux-arm:
+    timeout-minutes: 45
+    runs-on: warp-ubuntu-latest-arm64-4x
+    name: Python Linux 3.13 ARM
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -160,18 +182,16 @@ jobs:
         with:
           arm-build: "true"
           manylinux: "2_28"
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
-    name: Python macOS 3.12 ARM
-    runs-on: "macos-14"
+    name: Python macOS 3.13 ARM
+    runs-on: "warp-macos-14-arm64-6x"
     defaults:
       run:
         shell: bash
@@ -184,18 +204,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_mac_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
         with:
           skip-torch: "true"
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: rm -rf target/wheels
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -213,10 +233,12 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_windows_wheel
+        with:
+          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
-    runs-on: "ubuntu-latest"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -235,11 +257,10 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
+        with:
+          args: "--profile ci"
       - name: Install dependencies
         run: |
           pip install ray[data]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels

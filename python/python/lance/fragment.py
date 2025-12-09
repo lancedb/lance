@@ -28,6 +28,9 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    RowDatasetVersionMeta as RowDatasetVersionMeta,
+)
+from .lance import (
     RowIdMeta as RowIdMeta,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
@@ -36,7 +39,14 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner, ReaderLike, Transaction
+    from .dataset import (
+        ColumnOrdering,
+        DatasetBasePath,
+        LanceDataset,
+        LanceScanner,
+        ReaderLike,
+        Transaction,
+    )
     from .lance import LanceSchema
 
 
@@ -61,6 +71,10 @@ class FragmentMetadata:
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
         The row id metadata, if any.
+    created_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row created at version metadata, if any.
+    last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row last updated at version metadata, if any.
     """
 
     id: int
@@ -68,6 +82,8 @@ class FragmentMetadata:
     physical_rows: int
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
+    created_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -104,6 +120,16 @@ class FragmentMetadata:
             row_id_meta=(
                 self.row_id_meta.asdict() if self.row_id_meta is not None else None
             ),
+            created_at_version_meta=(
+                json.loads(self.created_at_version_meta.json())
+                if self.created_at_version_meta is not None
+                else None
+            ),
+            last_updated_at_version_meta=(
+                json.loads(self.last_updated_at_version_meta.json())
+                if self.last_updated_at_version_meta is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -118,12 +144,26 @@ class FragmentMetadata:
         if row_id_meta is not None:
             row_id_meta = RowIdMeta(**row_id_meta)
 
+        created_at_version_meta = json_data.get("created_at_version_meta")
+        if created_at_version_meta is not None:
+            created_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(created_at_version_meta)
+            )
+
+        last_updated_at_version_meta = json_data.get("last_updated_at_version_meta")
+        if last_updated_at_version_meta is not None:
+            last_updated_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(last_updated_at_version_meta)
+            )
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
             physical_rows=json_data["physical_rows"],
             deletion_file=deletion_file,
             row_id_meta=row_id_meta,
+            created_at_version_meta=created_at_version_meta,
+            last_updated_at_version_meta=last_updated_at_version_meta,
         )
 
 
@@ -155,6 +195,7 @@ class DataFile:
     file_major_version: int = 0
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
+    base_id: Optional[int] = None
 
     def __init__(
         self,
@@ -164,6 +205,7 @@ class DataFile:
         file_major_version: int = 0,
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
+        base_id: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -172,6 +214,7 @@ class DataFile:
         self.file_major_version = file_major_version
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
+        self.base_id = base_id
 
     def __repr__(self):
         # pretend we have a 'path' attribute
@@ -405,6 +448,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -424,11 +468,34 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
             **columns_arg,
         )
         from .dataset import LanceScanner
 
         return LanceScanner(s, self._ds)
+
+    def open_session(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        with_row_address: Optional[bool] = None,
+    ) -> "FragmentSession":
+        """Open a FragmentSession, which manages a short-lived session of LanceFragment.
+         This API works well for users making repeated requests over the same columns.
+
+        Parameters
+        ----------
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+        with_row_address: enable returns with row addresses.
+
+        Returns
+        -------
+        session : FragmentSession
+        """
+        return FragmentSession(self._fragment.open_session(columns, with_row_address))
 
     def take(
         self,
@@ -448,6 +515,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -458,6 +526,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
         ).to_batches()
 
     def to_table(
@@ -468,6 +537,7 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -476,6 +546,7 @@ class LanceFragment(pa.dataset.Fragment):
             offset=offset,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
+            order_by=order_by,
         ).to_table()
 
     def merge(
@@ -549,6 +620,106 @@ class LanceFragment(pa.dataset.Fragment):
         max_field_id = self._ds.max_field_id
         metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
         return metadata, schema
+
+    def update_columns(
+        self,
+        data_obj: ReaderLike,
+        left_on: str = "_rowid",
+        right_on: Optional[str] = None,
+        schema=None,
+    ) -> Tuple[FragmentMetadata, List[int]]:
+        """
+        Update existing columns in this fragment.
+
+        This operation performs a left-outer-hash-join with the right table (new data)
+        on the column specified by left_on and right_on. For every row in the current
+        fragment, the updated column value is:
+
+        1. If no matched row on the right side, the column value of the left side row.
+        2. If there is exactly one corresponding row on the right side, the column value
+           of the matching row.
+        3. If there are multiple corresponding rows, the column value of a random row.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be used for updating. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+            The data must include the join column (right_on) and the columns to update.
+        left_on: str, default "_rowid"
+            The name of the column in the fragment to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to left_on.
+        schema: pa.Schema, optional
+            The schema of the data. If not specified, the schema will be inferred.
+
+        Returns
+        -------
+        Tuple[FragmentMetadata, List[int]]
+            A tuple of:
+            - FragmentMetadata: The updated fragment metadata
+            - List[int]: The list of field IDs that were modified
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> # Create initial dataset
+        >>> df = pa.table({
+        ...     'id': [1, 2],
+        ...     'name': ['a', 'b'],
+        ...     'value': [10, 20]
+        ... })
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> # Prepare update data with _rowid (must be UInt64)
+        >>> update_data = pa.table({
+        ...     'id': [1],
+        ...     'name': ['x'],
+        ...     'value': [100]
+        ... })
+        >>> # Update the fragment
+        >>> fragment = dataset.get_fragment(0)
+        >>> updated_fragment, fields_modified = fragment.update_columns(
+        ...     update_data,
+        ...     left_on="id",
+        ...     right_on="id"
+        ... )
+        >>> # Commit the changes
+        >>> from lance import LanceOperation
+        >>> op = LanceOperation.Update(
+        ...     updated_fragments=[updated_fragment],
+        ...     fields_modified=fields_modified,
+        ... )
+        >>> dataset = lance.LanceDataset.commit(
+        ...     "dataset",
+        ...     op,
+        ...     read_version=dataset.version
+        ... )
+
+        See Also
+        --------
+        LanceFragment.merge :
+            Merge new columns into this fragment (adds columns).
+        LanceDataset.update :
+            Update rows in the entire dataset.
+
+        Notes
+        -----
+        - The columns to update must already exist in the fragment
+        - The join column (left_on/right_on) will not be updated
+        - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - This is a low-level API; for most use cases, use Dataset.update() instead
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+        metadata, fields_modified = self._fragment.update_columns(
+            reader, left_on, right_on
+        )
+        return metadata, fields_modified
 
     def merge_columns(
         self,
@@ -694,7 +865,10 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        storage_options_provider=None,
+        enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -712,7 +886,10 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        storage_options_provider=None,
+        enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -730,7 +907,10 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    enable_move_stable_row_ids: bool = False,
+    storage_options_provider=None,
+    enable_stable_row_ids: bool = False,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List["DatasetBasePath"]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -779,11 +959,38 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    enable_move_stable_row_ids: bool
-        Experimental: if set to true, the writer will use move-stable row ids.
+    storage_options_provider : Optional[StorageOptionsProvider]
+        A storage options provider that can fetch and refresh storage options
+        dynamically. This is useful for credentials that expire and need to be
+        refreshed automatically.
+    enable_stable_row_ids: bool
+        Experimental: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    target_bases : list of str, optional
+        References to base paths where data should be written. Can be
+        specified in all modes.
+
+        Each string is resolved by trying to match:
+        1. Base name (e.g., "primary", "archive") from registered bases
+        2. Base path URI (e.g., "s3://bucket1/data")
+
+        **CREATE mode**: References must match bases in `initial_bases`
+        **APPEND/OVERWRITE modes**: References must match bases in the
+        existing manifest
+    initial_bases : list of DatasetBasePath, optional
+        Base paths to register when creating a new dataset (CREATE mode only).
+
+        This allows `target_bases` references to be resolved during fragment
+        writing. Example:
+
+        >>> from lance import DatasetBasePath
+        >>> initial_bases = [DatasetBasePath(path="s3://bucket1/data", name="base1")]
+
+        **Only valid in CREATE mode**. Will raise an error if used with
+        APPEND/OVERWRITE modes.
+
     Returns
     -------
     List[FragmentMetadata] | Transaction
@@ -831,5 +1038,28 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        enable_move_stable_row_ids=enable_move_stable_row_ids,
+        storage_options_provider=storage_options_provider,
+        enable_stable_row_ids=enable_stable_row_ids,
+        target_bases=target_bases,
+        initial_bases=initial_bases,
     )
+
+
+class FragmentSession:
+    def __init__(self, session):
+        self._session = session
+
+    def take(self, indices):
+        """
+        Take rows from this fragment based on the offset in the fragment.
+
+        Parameters
+        ----------
+        indices : Array or array-like
+            indices of rows to select in the fragment.
+
+        Returns
+        -------
+        table : pyarrow.Table
+        """
+        return pa.Table.from_batches([self._session.take(indices)])

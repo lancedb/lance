@@ -8,9 +8,9 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2::writer::FileWriterOptions;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
@@ -18,10 +18,51 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
+
+/// Generates a filename optimized for S3 throughput using a UUID-based approach.
+///
+/// This approach follows Apache Iceberg's ObjectStoreLocationProvider pattern:
+/// - Takes a UUID (16 bytes total)
+/// - Uses first 3 bytes (24 bits) as binary string prefix for S3 distribution
+/// - Uses remaining 13 bytes as hex string for uniqueness
+///
+/// Format: `<24-bit-binary><remaining-hex>`
+/// Example: "101100101101010011010110a1b2c3d4e5f6g7h8i9j0"
+///
+/// We use binary instead of hex for the prefix because it helps S3 scale up on the
+/// prefix faster with fewer throttling and retries. Binary provides maximum entropy per character
+/// (1 bit) compared to hex (4 bits), allowing S3's internal partitioning to more
+/// quickly recognize the access pattern and scale appropriately.
+///
+/// The binary prefix ensures files are distributed evenly across S3 prefixes,
+/// minimizing throttling and maximizing throughput, while maintaining uniqueness.
+pub(crate) fn generate_random_filename() -> String {
+    let uuid = Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+
+    let mut out = String::with_capacity(50);
+
+    // Convert first 3 bytes to binary string (24 bits)
+    for &b in &bytes[..3] {
+        for i in (0..8).rev() {
+            out.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
+        }
+    }
+
+    // Convert remaining 13 bytes to hex string (26 chars)
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in &bytes[3..] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+
+    out
+}
 
 /// Builder for writing a new fragment.
 ///
@@ -94,11 +135,13 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
+        let data_file_key = generate_random_filename();
+        let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let has_blob_v2 = schema_has_blob_v2(&schema);
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::v2::writer::FileWriter::try_new(
+        let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
             schema,
             FileWriterOptions {
@@ -106,6 +149,16 @@ impl<'a> FragmentCreateBuilder<'a> {
                 ..Default::default()
             },
         )?;
+
+        let mut preprocessor = if has_blob_v2 {
+            Some(BlobPreprocessor::new(
+                object_store.as_ref().clone(),
+                base_path.child(DATA_DIR),
+                data_file_key.clone(),
+            ))
+        } else {
+            None
+        };
 
         let (major, minor) = writer.version().to_numbers();
 
@@ -120,7 +173,10 @@ impl<'a> FragmentCreateBuilder<'a> {
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
+            let mut batch_chunk = batched_chunk?;
+            if let Some(pre) = preprocessor.as_mut() {
+                batch_chunk = preprocess_blob_batches(&batch_chunk, pre).await?;
+            }
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
@@ -157,6 +213,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
+        let version = params.data_storage_version.unwrap_or_default();
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -169,7 +226,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             &schema,
             stream,
             params.into_owned(),
-            LanceFileVersion::Stable,
+            version,
+            None, // Fragment creation doesn't use target_bases
         )
         .await
     }
@@ -199,10 +257,10 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
+        let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema,
@@ -290,6 +348,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
+    use lance_core::utils::tempfile::{TempDir, TempStrDir};
     use rstest::rstest;
 
     use super::*;
@@ -314,8 +373,8 @@ mod tests {
         // Writing with empty schema produces an error
         let empty_schema = Arc::new(ArrowSchema::empty());
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], empty_schema));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempDir::default();
+        let result = FragmentCreateBuilder::new(&tmp_dir.path_str())
             .write(empty_reader, None)
             .await;
         assert!(result.is_err());
@@ -329,7 +388,7 @@ mod tests {
         // Writing empty reader produces an error
         let arrow_schema = test_data().schema();
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], arrow_schema.clone()));
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .write(empty_reader, None)
             .await;
         assert!(result.is_err());
@@ -346,7 +405,7 @@ mod tests {
             .try_with_column(ArrowField::new("c", DataType::Utf8, false))
             .unwrap();
         let wrong_schema = Schema::try_from(&wrong_schema).unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .schema(&wrong_schema)
             .write(test_data(), None)
             .await;
@@ -363,8 +422,8 @@ mod tests {
     async fn test_fragment_write_default_schema() {
         // Infers schema and uses 0 as default field id
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .write(data, None)
             .await
             .unwrap();
@@ -386,8 +445,8 @@ mod tests {
         custom_schema.mut_field_by_id(0).unwrap().id = 3;
         custom_schema.mut_field_by_id(1).unwrap().id = 1;
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .schema(&custom_schema)
             .write(data, Some(42))
             .await
@@ -405,8 +464,8 @@ mod tests {
         // Writing with empty schema produces an error
         let empty_schema = Arc::new(ArrowSchema::empty());
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], empty_schema));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempDir::default();
+        let result = FragmentCreateBuilder::new(&tmp_dir.path_str())
             .write_fragments(empty_reader)
             .await;
         assert!(result.is_err());
@@ -420,7 +479,7 @@ mod tests {
         // Writing empty reader produces an error
         let arrow_schema = test_data().schema();
         let empty_reader = Box::new(RecordBatchIterator::new(vec![], arrow_schema.clone()));
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .write_fragments(empty_reader)
             .await;
         assert!(result.is_ok());
@@ -432,7 +491,7 @@ mod tests {
             .try_with_column(ArrowField::new("c", DataType::Utf8, false))
             .unwrap();
         let wrong_schema = Schema::try_from(&wrong_schema).unwrap();
-        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let result = FragmentCreateBuilder::new(tmp_dir.std_path().to_str().unwrap())
             .schema(&wrong_schema)
             .write_fragments(test_data())
             .await;
@@ -449,8 +508,8 @@ mod tests {
     async fn test_write_fragments_default_schema() {
         // Infers schema and uses 0 as default field id
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let tmp_dir = TempStrDir::default();
+        let fragments = FragmentCreateBuilder::new(&tmp_dir)
             .write_fragments(data)
             .await
             .unwrap();
@@ -466,12 +525,12 @@ mod tests {
     async fn test_write_fragments_with_options() {
         // Uses provided schema. Field ids are correct in fragment metadata.
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
         let writer_params = WriteParams {
             max_rows_per_file: 1,
             ..Default::default()
         };
-        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let fragments = FragmentCreateBuilder::new(&tmp_dir)
             .write_params(&writer_params)
             .write_fragments(data)
             .await
@@ -491,7 +550,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_write_fragments_with_format_version(
+    async fn test_write_with_format_version(
         #[values(
             LanceFileVersion::V2_0,
             LanceFileVersion::V2_1,
@@ -501,12 +560,12 @@ mod tests {
         file_version: LanceFileVersion,
     ) {
         let data = test_data();
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = TempStrDir::default();
         let writer_params = WriteParams {
             data_storage_version: Some(file_version),
             ..Default::default()
         };
-        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
             .write_params(&writer_params)
             .write(data, None)
             .await
@@ -518,5 +577,70 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_fragments_with_format_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable
+        )]
+        file_version: LanceFileVersion,
+    ) {
+        let data = test_data();
+        let tmp_dir = TempStrDir::default();
+        let writer_params = WriteParams {
+            data_storage_version: Some(file_version),
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write_params(&writer_params)
+            .write_fragments(data)
+            .await
+            .unwrap();
+
+        assert!(!fragment.is_empty());
+        fragment[0].files.iter().for_each(|f| {
+            let (major_version, minor_version) = file_version.to_numbers();
+            assert_eq!(f.file_major_version, major_version);
+            assert_eq!(f.file_minor_version, minor_version);
+        })
+    }
+
+    #[test]
+    fn test_binary_filename_generation() {
+        use std::collections::HashSet;
+
+        // Test format and uniqueness
+        let mut filenames = HashSet::new();
+        for _ in 0..100 {
+            let filename = generate_random_filename();
+
+            // Should be 50 characters: 24 binary + 26 hex
+            assert_eq!(filename.len(), 50, "Filename should be 50 characters");
+
+            // First 24 should be binary
+            let binary_part = &filename[0..24];
+            assert!(
+                binary_part.chars().all(|c| c == '0' || c == '1'),
+                "First 24 chars should be binary: {}",
+                binary_part
+            );
+
+            // Last 26 should be hex
+            let hex_part = &filename[24..];
+            assert_eq!(hex_part.len(), 26, "Hex part should be 26 characters");
+            assert!(
+                hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+                "Last 26 chars should be hex: {}",
+                hex_part
+            );
+
+            // Should be unique
+            assert!(filenames.insert(filename.clone()));
+        }
     }
 }

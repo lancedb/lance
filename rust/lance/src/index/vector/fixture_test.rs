@@ -20,6 +20,7 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
@@ -38,7 +39,6 @@ mod test {
             prefilter::{DatasetPreFilter, PreFilter},
             vector::ivf::IVFIndex,
         },
-        session::Session,
         Result,
     };
 
@@ -53,8 +53,8 @@ mod test {
     }
 
     impl DeepSizeOf for ResidualCheckMockIndex {
-        fn deep_size_of_children(&self, _: &mut Context) -> usize {
-            todo!()
+        fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+            self.assert_query_value.deep_size_of_children(cx) + self.ret_val.get_array_memory_size()
         }
     }
 
@@ -109,7 +109,7 @@ mod test {
             Ok(self.ret_val.clone())
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!("only for IVF")
         }
 
@@ -163,7 +163,12 @@ mod test {
         fn ivf_model(&self) -> &IvfModel {
             unimplemented!("only for IVF")
         }
+
         fn quantizer(&self) -> Quantizer {
+            unimplemented!("only for IVF")
+        }
+
+        fn partition_size(&self, _: usize) -> usize {
             unimplemented!("only for IVF")
         }
 
@@ -187,13 +192,11 @@ mod test {
         for _ in 0..4 {
             ivf.add_partition(0);
         }
-        // hold on to this pointer, because the index only holds a weak reference
-        let session = Arc::new(Session::default());
 
         let make_idx = move |assert_query: Vec<f32>, metric: MetricType| async move {
-            let f = tempfile::NamedTempFile::new().unwrap();
+            let f = TempStdFile::default();
 
-            let reader = LocalObjectReader::open_local_path(f.path(), 64, None)
+            let reader = LocalObjectReader::open_local_path(f, 64, None)
                 .await
                 .unwrap();
 
@@ -208,12 +211,12 @@ mod test {
                 ]))),
             });
             IVFIndex::try_new(
-                session.clone(),
                 &Uuid::new_v4().to_string(),
                 ivf,
                 reader.into(),
                 mock_sub_index,
                 metric,
+                LanceCache::no_cache(),
             )
             .unwrap()
         };
@@ -249,7 +252,7 @@ mod test {
         ] {
             let mut key = Arc::new(Float32Array::from(query)) as Arc<dyn Array>;
             if metric == MetricType::Cosine {
-                key = normalize_arrow(&key).unwrap();
+                key = normalize_arrow(&key).unwrap().0;
             };
             let q = Query {
                 column: "test".to_string(),
@@ -263,9 +266,10 @@ mod test {
                 refine_factor: None,
                 metric_type: metric,
                 use_index: true,
+                dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
-            let partition_ids = idx.find_partitions(&q).unwrap();
+            let (partition_ids, _) = idx.find_partitions(&q).unwrap();
             assert_eq!(partition_ids.len(), 4);
             let nearest_partition_id = partition_ids.value(0);
             idx.search_in_partition(

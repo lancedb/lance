@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+import threading
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
-from lance.file import LanceFileReader, LanceFileWriter
+from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
 
 
 def test_file_read_projection(tmp_path):
@@ -59,10 +61,15 @@ def test_schema_only(tmp_path):
 def test_write_with_max_page_bytes(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
-    with LanceFileWriter(str(path), schema, max_page_bytes=1) as writer:
-        writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    reader = LanceFileReader(str(path))
-    assert len(reader.metadata().columns[0].pages) == 3
+    for version in ["2.0", "2.1"]:
+        with LanceFileWriter(
+            str(path), schema, max_page_bytes=1, version=version
+        ) as writer:
+            writer.write_batch(pa.table({"a": [1, 2, 3]}))
+        reader = LanceFileReader(str(path))
+        # Only 2.0 splits large pages on write.   In 2.1+ we split on read.
+        expected_pages = 3 if version == "2.0" else 1
+        assert len(reader.metadata().columns[0].pages) == expected_pages
 
 
 def test_aborted_write(tmp_path):
@@ -87,7 +94,7 @@ def test_version(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
 
-    with LanceFileWriter(str(path), schema) as writer:
+    with LanceFileWriter(str(path), schema, version="2.0") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     reader = LanceFileReader(str(path))
     metadata = reader.metadata()
@@ -229,8 +236,7 @@ def test_metadata(tmp_path):
     assert metadata.num_rows == 3
     assert metadata.num_global_buffer_bytes > 0
     assert metadata.num_column_metadata_bytes > 0
-    # 64 and not 24 because we align/pad to 64 bytes
-    assert metadata.num_data_bytes == 64
+    assert metadata.num_data_bytes > 0
     assert len(metadata.columns) == 1
 
     column = metadata.columns[0]
@@ -267,10 +273,12 @@ def test_file_stat(tmp_path):
     assert len(file_stat.columns) == 2
 
     assert file_stat.columns[0].num_pages == 1
-    assert file_stat.columns[0].size_bytes == 8_000_000
+    assert file_stat.columns[0].size_bytes <= 8_000_000
 
-    assert file_stat.columns[1].num_pages == 2
-    assert file_stat.columns[1].size_bytes == 64_000_000
+    # 2 pages on 2.0, 1 page in 2.1+
+    assert file_stat.columns[1].num_pages <= 2
+    # Slightly larger than 64MiB because of padding, chunk overhead, etc.
+    assert file_stat.columns[1].size_bytes <= 64_200_000
 
 
 def test_round_trip_parquet(tmp_path):
@@ -286,6 +294,21 @@ def test_round_trip_parquet(tmp_path):
     reader = LanceFileReader(str(lance_path))
     round_tripped = reader.read_all().to_table()
     assert round_tripped == table
+
+
+def test_write_read_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    with session.open_writer("bar.lance") as writer:
+        writer.write_batch(pa.table({"a": [4, 5, 6]}))
+
+    reader = session.open_reader("foo.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+
+    reader = session.open_reader("bar.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [4, 5, 6]})
 
 
 def test_list_field_name(tmp_path):
@@ -484,7 +507,9 @@ def test_blob(tmp_path):
     # 100 1MiB values.  If we store as regular large_binary we end up
     # with several pages of values.  If we store as a blob we get a
     # single page
-    vals = pa.array([b"0" * (1024 * 1024) for _ in range(100)], pa.large_binary())
+    expected = pa.table(
+        {"val": pa.array([b"0" * (1024 * 1024)] * 100, pa.large_binary())}
+    )
     schema_no_blob = pa.schema([pa.field("val", pa.large_binary())])
     schema_blob = pa.schema(
         [pa.field("val", pa.large_binary(), metadata={"lance-encoding:blob": "true"})]
@@ -492,21 +517,24 @@ def test_blob(tmp_path):
 
     path = tmp_path / "no_blob.lance"
     with LanceFileWriter(str(path), schema_no_blob) as writer:
-        writer.write_batch(pa.table({"val": vals}))
+        for _ in range(100):
+            vals = pa.array([b"0" * (1024 * 1024)], pa.large_binary())
+            writer.write_batch(pa.table({"val": vals}))
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) > 1
-    assert reader.read_all().to_table() == pa.table({"val": vals})
+    assert reader.read_all().to_table() == expected
 
     path = tmp_path / "blob.lance"
     with LanceFileWriter(str(path), schema_blob) as writer:
-        writer.write_batch(pa.table({"val": vals}))
+        for _ in range(100):
+            vals = pa.array([b"0" * (1024 * 1024)], pa.large_binary())
+            writer.write_batch(pa.table({"val": vals}))
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
 
     actual = reader.read_all().to_table()
-    expected = pa.table({"val": vals})
 
     assert actual.num_rows == expected.num_rows
     for row_num in range(expected.num_rows):
@@ -514,3 +542,218 @@ def test_blob(tmp_path):
         expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
         assert len(actual_bytes) == len(expected_bytes)
         assert actual_bytes == expected_bytes
+
+
+def test_multithreaded_writer(tmp_path):
+    """Test concurrent multi-threaded writing to the same LanceFileWriter"""
+    path = tmp_path / "multithreaded.lance"
+    schema = pa.schema(
+        [
+            pa.field("thread_id", pa.int64()),
+            pa.field("value", pa.int64()),
+            pa.field("data", pa.string()),
+        ]
+    )
+
+    # Used to store all written data for subsequent validation
+    all_data = []
+    data_lock = threading.Lock()
+
+    def write_thread_data(thread_id, writer, num_records):
+        """Function for individual thread to write data"""
+        thread_data = []
+        for i in range(num_records):
+            record = {
+                "thread_id": thread_id,
+                "value": thread_id * 1000 + i,
+                "data": f"thread_{thread_id}_record_{i}",
+            }
+            thread_data.append(record)
+
+        # Create pyarrow table
+        table = pa.table(
+            {
+                "thread_id": [r["thread_id"] for r in thread_data],
+                "value": [r["value"] for r in thread_data],
+                "data": [r["data"] for r in thread_data],
+            }
+        )
+
+        # Write data
+        writer.write_batch(table)
+
+        # Record written data for validation
+        with data_lock:
+            all_data.extend(thread_data)
+
+    # Test parameters
+    num_threads = 5
+    records_per_thread = 100
+
+    # Create writer and start multi-threaded writing
+    with LanceFileWriter(str(path), schema) as writer:
+        threads = []
+
+        # Start multiple threads
+        for thread_id in range(num_threads):
+            thread = threading.Thread(
+                target=write_thread_data, args=(thread_id, writer, records_per_thread)
+            )
+            threads.append(thread)
+            thread.start()
+
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+
+    # Validate written data
+    reader = LanceFileReader(str(path))
+    result_table = reader.read_all().to_table()
+
+    # Check if total row count is correct
+    expected_total_rows = num_threads * records_per_thread
+    assert result_table.num_rows == expected_total_rows, (
+        f"Expected {expected_total_rows} rows, got {result_table.num_rows}"
+    )
+
+    # Check data content correctness (order may differ, but data should be complete)
+    # Convert results to dictionary list for comparison
+    result_data = [
+        {
+            "thread_id": result_table.column("thread_id").chunk(0)[i].as_py(),
+            "value": result_table.column("value").chunk(0)[i].as_py(),
+            "data": result_table.column("data").chunk(0)[i].as_py(),
+        }
+        for i in range(result_table.num_rows)
+    ]
+
+    # Verify all data exists (order not considered)
+    all_data_sorted = sorted(all_data, key=lambda x: (x["thread_id"], x["value"]))
+    result_data_sorted = sorted(result_data, key=lambda x: (x["thread_id"], x["value"]))
+
+    assert len(all_data_sorted) == len(result_data_sorted)
+
+    # Compare data item by item
+    for expected, actual in zip(all_data_sorted, result_data_sorted):
+        assert expected == actual, f"Data mismatch: expected {expected}, got {actual}"
+
+    # Verify data from each thread exists
+    thread_ids_in_result = set(result_table.column("thread_id").chunk(0).to_pylist())
+    expected_thread_ids = set(range(num_threads))
+    assert thread_ids_in_result == expected_thread_ids
+
+    # Verify record count for each thread
+    for thread_id in range(num_threads):
+        thread_rows = result_table.filter(
+            pc.equal(result_table.column("thread_id"), thread_id)
+        )
+        assert thread_rows.num_rows == records_per_thread
+
+
+def test_session_list_all_files(tmp_path):
+    """Test that LanceFileSession.list() returns all files with relative paths"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Write files at different levels
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    with session.open_writer("file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+
+    with session.open_writer("subdir/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+
+    with session.open_writer("other/file5.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [5]}))
+
+    # List all files
+    files = sorted(session.list())
+
+    # Verify relative paths (no absolute paths)
+    assert files == [
+        "file1.lance",
+        "file2.lance",
+        "other/file5.lance",
+        "subdir/file3.lance",
+        "subdir/file4.lance",
+    ]
+
+    # Verify no absolute paths
+    for f in files:
+        assert not f.startswith("/")
+        assert str(tmp_path) not in f
+
+
+def test_session_list_with_prefix(tmp_path):
+    """Test that LanceFileSession.list() filters by prefix correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Write files in different directories
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    with session.open_writer("subdir/file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+
+    with session.open_writer("other/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+
+    # List with prefix "subdir"
+    subdir_files = sorted(session.list("subdir"))
+    assert subdir_files == ["subdir/file2.lance", "subdir/file3.lance"]
+
+    # List with prefix "other"
+    other_files = sorted(session.list("other"))
+    assert other_files == ["other/file4.lance"]
+
+    # List with non-existent prefix
+    empty = session.list("nonexistent")
+    assert empty == []
+
+
+def test_session_list_with_trailing_slash(tmp_path):
+    """Test that LanceFileSession.list() handles trailing slashes correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    with session.open_writer("dir/file.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    # Both with and without trailing slash should work
+    files_no_slash = session.list("dir")
+    files_with_slash = session.list("dir/")
+
+    assert files_no_slash == files_with_slash
+    assert files_no_slash == ["dir/file.lance"]
+
+
+def test_session_contains(tmp_path):
+    """Test that LanceFileSession.contains() works correctly"""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # File doesn't exist yet
+    assert not session.contains("test.lance")
+
+    # Write a file
+    with session.open_writer("test.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+
+    # File exists now
+    assert session.contains("test.lance")
+
+    # Nested file
+    with session.open_writer("subdir/nested.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    assert session.contains("subdir/nested.lance")
+    assert not session.contains("subdir/nonexistent.lance")

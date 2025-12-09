@@ -143,10 +143,10 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                         return Ok(Transformed::no(plan));
                     }
 
-                    if proj.expr().iter().enumerate().all(|(index, (expr, name))| {
-                        if let Some(expr) = expr.as_any().downcast_ref::<Column>() {
+                    if proj.expr().iter().enumerate().all(|(index, proj_expr)| {
+                        if let Some(expr) = proj_expr.expr.as_any().downcast_ref::<Column>() {
                             // no renaming, no reordering
-                            expr.index() == index && expr.name() == name
+                            expr.index() == index && expr.name() == proj_expr.alias
                         } else {
                             false
                         }
@@ -172,5 +172,7 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+        // Push down limit into FilteredReadExec and other Execs via with_fetch()
+        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
     ])
 }

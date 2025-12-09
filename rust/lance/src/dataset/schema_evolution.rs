@@ -4,6 +4,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{io::exec::Planner, Error, Result};
+use arrow::compute::can_cast_types;
 use arrow::compute::CastOptions;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -307,13 +308,7 @@ pub(super) async fn add_columns(
     .await?;
 
     let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        operation,
-        // TODO: Make it possible to add new blob columns
-        /*blob_op= */ None,
-        None,
-    );
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
@@ -477,17 +472,6 @@ pub(super) async fn alter_columns(
             )
         })?;
 
-        if !field_src.is_default_storage() {
-            return Err(Error::NotSupported {
-                source: format!(
-                    "Column \"{}\" is not a default storage column and cannot yet be altered",
-                    alteration.path
-                )
-                .into(),
-                location: location!(),
-            });
-        }
-
         if let Some(nullable) = alteration.nullable {
             // TODO: in the future, we could check the values of the column to see if
             //       they are all non-null and thus the column could be made non-nullable.
@@ -511,7 +495,7 @@ pub(super) async fn alter_columns(
         }
 
         if let Some(data_type) = &alteration.data_type {
-            if !(lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type)
+            if !(can_cast_types(&field_src.data_type(), data_type)
                 && is_upcast_downcast(&field_src.data_type(), data_type))
             {
                 return Err(Error::invalid_input(
@@ -546,7 +530,6 @@ pub(super) async fn alter_columns(
             Operation::Project { schema: new_schema },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
-            None,
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
@@ -620,7 +603,6 @@ pub(super) async fn alter_columns(
                 fragments,
             },
             /*blob_op= */ None,
-            None,
         )
     };
 
@@ -642,18 +624,7 @@ pub(super) async fn alter_columns(
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
-        if let Some(field) = dataset.schema().field(col) {
-            if !field.is_default_storage() {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Column \"{}\" is not a default storage column and cannot yet be dropped",
-                        col
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-        } else {
+        if dataset.schema().field(col).is_none() {
             return Err(Error::invalid_input(
                 format!("Column {} does not exist in the dataset", col),
                 location!(),
@@ -675,7 +646,6 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         dataset.manifest.version,
         Operation::Project { schema: new_schema },
         /*blob_op= */ None,
-        None,
     );
 
     dataset
@@ -694,6 +664,7 @@ mod test {
     use super::*;
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Fields as ArrowFields;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use rstest::rstest;
 
@@ -716,8 +687,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -806,8 +777,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -910,8 +881,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -965,6 +936,8 @@ mod test {
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
                     }))
                 } else {
                     Ok(None)
@@ -1076,8 +1049,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1153,8 +1126,8 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1225,8 +1198,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1353,8 +1326,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
@@ -1555,8 +1528,8 @@ mod test {
             ],
         )?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1620,8 +1593,8 @@ mod test {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
 
-        let test_dir = tempfile::tempdir()?;
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let mut dataset = Dataset::write(
@@ -1731,8 +1704,8 @@ mod test {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -1788,8 +1761,8 @@ mod test {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
         let mut dataset = Dataset::write(
             reader,
             test_uri,

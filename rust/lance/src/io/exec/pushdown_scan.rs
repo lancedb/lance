@@ -31,6 +31,7 @@ use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
 use snafu::location;
@@ -70,6 +71,8 @@ pub struct ScanConfig {
     /// If true (default), the scan will emit batches in the same order as the
     /// fragments. If false, the scan may emit batches in an arbitrary order.
     pub ordered_output: bool,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl Default for ScanConfig {
@@ -81,6 +84,7 @@ impl Default for ScanConfig {
             with_row_address: false,
             make_deletions_null: false,
             ordered_output: true,
+            file_reader_options: None,
         }
     }
 }
@@ -301,9 +305,11 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await?;
+        let mut frag_config = FragReadConfig::default();
+        if let Some(file_reader_options) = config.file_reader_options.clone() {
+            frag_config = frag_config.with_file_reader_options(file_reader_options);
+        }
+        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -711,9 +717,9 @@ mod test {
     use arrow_select::concat::concat_batches;
     use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
-    use tempfile::tempdir;
 
     use crate::dataset::WriteParams;
     use lance_datafusion::logical_expr::ExprExt;
@@ -726,8 +732,8 @@ mod test {
     #[tokio::test]
     async fn test_empty_result() {
         // Test we can get no results
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "i",
@@ -779,8 +785,8 @@ mod test {
     async fn test_null_batch() {
         // If every row in a batch is null then a predicate can evaluate to Scalar(NULL)
         // Ensure we handle that.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "s",
@@ -835,8 +841,8 @@ mod test {
     async fn test_nested_filter() {
         // Validate we can filter and project nested columns and they will be
         // merged correctly.
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let field_a = Arc::new(Field::new("a", DataType::Int32, false));
         let field_b = Arc::new(Field::new("b", DataType::Int32, false));
@@ -947,8 +953,8 @@ mod test {
         // Expected simplification: false, s.x > 150, true
         // Expected result: [150..300]
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let field = Arc::new(Field::new("int", DataType::Int32, false));
 
@@ -1343,10 +1349,9 @@ mod test {
         }
 
         async fn run_test(&self) {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
+            let test_uri = TempStrDir::default();
 
-            let dataset = Arc::new(Self::dataset(test_uri, self.data.clone()).await);
+            let dataset = Arc::new(Self::dataset(&test_uri, self.data.clone()).await);
             let expected = self.expected_result().await;
 
             let ctx = SessionContext::new();
@@ -1416,8 +1421,8 @@ mod test {
 
     #[tokio::test]
     async fn test_retrieve_just_row_id() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "int",
@@ -1477,8 +1482,8 @@ mod test {
 
     #[tokio::test]
     async fn test_with_deletions() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("int", DataType::Int32, false),

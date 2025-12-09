@@ -20,7 +20,7 @@ use datafusion::common::DFSchema;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -30,7 +30,9 @@ use datafusion::logical_expr::{
     Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
-use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
+use datafusion::sql::planner::{
+    ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
+};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
     Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -50,9 +52,10 @@ use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 use snafu::location;
 
+use chrono::Utc;
 use lance_core::{Error, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CastListF16Udf {
     signature: Signature,
 }
@@ -162,20 +165,24 @@ impl Default for LanceContextProvider {
     fn default() -> Self {
         let config = SessionConfig::new();
         let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+
+        let ctx = SessionContext::new_with_config_rt(config.clone(), runtime.clone());
+        crate::udf::register_functions(&ctx);
+
+        let state = ctx.state();
+
+        // SessionState does not expose expr_planners, so we need to get them separately
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
             .with_default_features();
-
-        // SessionState does not expose expr_planners, so we need to get the default ones from
-        // the builder and store them to return from get_expr_planners
 
         // unwrap safe because with_default_features sets expr_planners
         let expr_planners = state_builder.expr_planners().as_ref().unwrap().clone();
 
         Self {
             options: ConfigOptions::default(),
-            state: state_builder.build(),
+            state,
             expr_planners,
         }
     }
@@ -238,6 +245,7 @@ impl ContextProvider for LanceContextProvider {
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
+    enable_relations: bool,
 }
 
 impl Planner {
@@ -245,21 +253,47 @@ impl Planner {
         Self {
             schema,
             context_provider: LanceContextProvider::default(),
+            enable_relations: false,
         }
     }
 
-    fn column(idents: &[Ident]) -> Expr {
-        let mut column = col(&idents[0].value);
-        for ident in &idents[1..] {
-            column = Expr::ScalarFunction(ScalarFunction {
-                args: vec![
-                    column,
-                    Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
-                ],
-                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-            });
+    /// If passed with `true`, then the first identifier in column reference
+    /// is parsed as the relation. For example, `table.field.inner` will be
+    /// read as the nested field `field.inner` (`inner` on struct field `field`)
+    /// on the `table` relation. If `false` (the default), then no relations
+    /// are used and all identifiers are assumed to be a nested column path.
+    pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
+        self.enable_relations = enable_relations;
+        self
+    }
+
+    fn column(&self, idents: &[Ident]) -> Expr {
+        fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
+            for ident in idents {
+                *expr = Expr::ScalarFunction(ScalarFunction {
+                    args: vec![
+                        std::mem::take(expr),
+                        Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
+                    ],
+                    func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                });
+            }
         }
-        column
+
+        if self.enable_relations && idents.len() > 1 {
+            // Create qualified column reference (relation.column)
+            let relation = &idents[0].value;
+            let column_name = &idents[1].value;
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let mut result = column;
+            handle_remaining_idents(&mut result, &idents[2..]);
+            result
+        } else {
+            // Default behavior - treat as struct field access
+            let mut column = col(&idents[0].value);
+            handle_remaining_idents(&mut column, &idents[1..]);
+            column
+        }
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -416,7 +450,8 @@ impl Planner {
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
                 collect_spans: false,
-                map_varchar_to_utf8view: false,
+                map_string_types_to_utf8view: false,
+                default_null_ordering: NullOrdering::NullsMax,
             },
         );
 
@@ -555,10 +590,10 @@ impl Planner {
                 } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
-                    Ok(Self::column(vec![id.clone()].as_slice()))
+                    Ok(self.column(vec![id.clone()].as_slice()))
                 }
             }
-            SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
+            SQLExpr::CompoundIdentifier(ids) => Ok(self.column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(&value.value),
@@ -677,7 +712,14 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                match escape_char {
+                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
+                    Some(value) => return Err(Error::invalid_input(
+                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
+                        location!()
+                    )),
+                    None => None,
+                },
                 true,
             ))),
             SQLExpr::Like {
@@ -690,15 +732,34 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                match escape_char {
+                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
+                    Some(value) => return Err(Error::invalid_input(
+                        format!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}", value),
+                        location!()
+                    )),
+                    None => None,
+                },
                 false,
             ))),
             SQLExpr::Cast {
-                expr, data_type, ..
-            } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                expr: Box::new(self.parse_sql_expr(expr)?),
-                data_type: self.parse_type(data_type)?,
-            })),
+                expr,
+                data_type,
+                kind,
+                ..
+            } => match kind {
+                datafusion::sql::sqlparser::ast::CastKind::TryCast
+                | datafusion::sql::sqlparser::ast::CastKind::SafeCast => {
+                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast {
+                        expr: Box::new(self.parse_sql_expr(expr)?),
+                        data_type: self.parse_type(data_type)?,
+                    }))
+                }
+                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                    expr: Box::new(self.parse_sql_expr(expr)?),
+                    data_type: self.parse_type(data_type)?,
+                })),
+            },
             SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
                 "JSON access is not supported",
                 location!(),
@@ -774,8 +835,8 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL filter clause.
     ///
-    /// Note: the returned expression must be passed through [optimize_expr()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_expr()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let ast_expr = parse_sql_filter(filter)?;
@@ -787,14 +848,19 @@ impl Planner {
                 location!(),
             )
         })?;
+
         Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.
     ///
-    /// Note: the returned expression must be passed through [optimize_filter()]
-    /// before being passed to [create_physical_expr()].
+    /// Note: the returned expression must be passed through `optimize_filter()`
+    /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        if self.schema.field_with_name(expr).is_ok() {
+            return Ok(col(expr));
+        }
+
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
@@ -844,7 +910,7 @@ impl Planner {
 
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::default();
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
         let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
@@ -858,7 +924,6 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
-
         Ok(datafusion::physical_expr::create_physical_expr(
             expr,
             df_schema.as_ref(),
@@ -869,6 +934,9 @@ impl Planner {
     /// Collect the columns in the expression.
     ///
     /// The columns are returned in sorted order.
+    ///
+    /// If the expr refers to nested columns these will be returned
+    /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         let mut visitor = ColumnCapturingVisitor {
             current_path: VecDeque::new(),
@@ -891,10 +959,22 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
     fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
         match node {
             Expr::Column(Column { name, .. }) => {
+                // Build the field path from the column name and any nested fields
+                // The nested field names from get_field already come as literal strings,
+                // so we just need to concatenate them properly
                 let mut path = name.clone();
                 for part in self.current_path.drain(..) {
                     path.push('.');
-                    path.push_str(&part);
+                    // Check if the part needs quoting (contains dots)
+                    if part.contains('.') || part.contains('`') {
+                        // Quote the field name with backticks and escape any existing backticks
+                        let escaped = part.replace('`', "``");
+                        path.push('`');
+                        path.push_str(&escaped);
+                        path.push('`');
+                    } else {
+                        path.push_str(&part);
+                    }
                 }
                 self.columns.insert(path);
                 self.current_path.clear();
@@ -1659,5 +1739,89 @@ mod tests {
     fn test_lance_context_provider_expr_planners() {
         let ctx_provider = LanceContextProvider::default();
         assert!(!ctx_provider.get_expr_planners().is_empty());
+    }
+
+    #[test]
+    fn test_regexp_match_and_non_empty_captions() {
+        // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
+        // causing planning/evaluation failures. This should evaluate successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("Liberty for all"),
+                    Some("peace"),
+                    Some("revolution now"),
+                    Some("Liberty"),
+                    Some("revolutionary"),
+                    Some("none"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some(""),
+                    Some("c"),
+                    Some("d"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some(""),
+                    Some("y"),
+                    Some("z"),
+                    None,
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let result = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            result.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_regexp_match_infer_error_without_boolean_coercion() {
+        // With the fix applied, using parse_filter should coerce regexp_match to boolean
+        // even when nested in a larger AND expression, so this should plan successfully.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keywords", DataType::Utf8, true),
+            Field::new("natural_caption", DataType::Utf8, true),
+            Field::new("poetic_caption", DataType::Utf8, true),
+        ]));
+
+        let planner = Planner::new(schema);
+
+        let expr = planner
+            .parse_filter(
+                "regexp_match(keywords, 'Liberty|revolution') AND \
+                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
+            )
+            .unwrap();
+
+        // Should not panic
+        let _physical = planner.create_physical_expr(&expr).unwrap();
     }
 }

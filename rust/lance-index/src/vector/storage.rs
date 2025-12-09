@@ -12,7 +12,7 @@ use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::FilterExpression;
-use lance_file::v2::reader::FileReader;
+use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
@@ -95,7 +95,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
+    fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
@@ -110,9 +110,7 @@ pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
     quantizer: Q,
 
-    // this is for testing purpose
-    assert_num_columns: bool,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -120,21 +118,14 @@ impl<Q: Quantization> StorageBuilder<Q> {
         vector_column: String,
         distance_type: DistanceType,
         quantizer: Q,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         Ok(Self {
             vector_column,
             distance_type,
             quantizer,
-            assert_num_columns: true,
-            fri,
+            frag_reuse_index,
         })
-    }
-
-    // this is for testing purpose
-    pub fn assert_num_columns(mut self, assert_num_columns: bool) -> Self {
-        self.assert_num_columns = assert_num_columns;
-        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -154,9 +145,6 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        if self.assert_num_columns {
-            debug_assert_eq!(batch.num_columns(), 2, "{}", batch.schema());
-        }
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
@@ -164,7 +152,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             batch,
             &self.quantizer.metadata(None),
             self.distance_type,
-            self.fri.clone(),
+            self.frag_reuse_index.clone(),
         )
     }
 }
@@ -178,7 +166,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -191,7 +179,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
-    pub async fn try_new(reader: FileReader, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
+    pub async fn try_new(
+        reader: FileReader,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -249,12 +240,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             distance_type,
             metadata,
             ivf,
-            fri,
+            frag_reuse_index,
         })
     }
 
     pub fn num_rows(&self) -> u64 {
         self.reader.num_rows()
+    }
+
+    pub fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {
@@ -299,6 +294,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        Q::Storage::try_from_batch(batch, self.metadata(), self.distance_type, self.fri.clone())
+        Q::Storage::try_from_batch(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )
     }
 }

@@ -3,6 +3,10 @@
 
 import logging
 import os
+import re
+import subprocess
+import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -72,3 +76,141 @@ def test_logger_output(tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         LOGGER.info("Test log message")
     assert "Test log message" in caplog.text
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
+def test_lance_log_file(tmp_path):
+    log_file = tmp_path / "lance_rust.log"
+
+    # Run a simple Lance operation with file logging enabled
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import lance; import pyarrow as pa; "
+            "lance.write_dataset(pa.table({'x': range(10)}), 'memory://test')",
+        ],
+        capture_output=True,
+        env={
+            "LANCE_LOG": "debug",
+            "LANCE_LOG_FILE": str(log_file),
+        },
+    )
+
+    assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
+
+    assert log_file.exists(), "Log file was not created"
+
+    log_content = log_file.read_text()
+    assert len(log_content.strip()) > 0, "Log file is empty"
+
+    # Check that stderr is empty or minimal (logs should go to file, not stderr)
+    stderr_content = result.stderr.decode().strip()
+    # Allow for some minimal output but no actual log messages
+    assert "DEBUG" not in stderr_content, (
+        "Debug logs should not appear in stderr when file logging is enabled"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
+def test_lance_log_file_with_directory_creation(tmp_path):
+    log_dir = tmp_path / "logs" / "nested"
+    log_file = log_dir / "lance_rust.log"
+
+    # Run a simple Lance operation with file logging to a nested path
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import lance; import pyarrow as pa; "
+            "lance.write_dataset(pa.table({'x': range(10)}), 'memory://test')",
+        ],
+        capture_output=True,
+        env={
+            "LANCE_LOG": "info",
+            "LANCE_LOG_FILE": str(log_file),
+        },
+    )
+
+    assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
+
+    # Check that the directory and log file were created
+    assert log_dir.exists(), "Log directory was not created"
+    assert log_file.exists(), "Log file was not created"
+
+    log_content = log_file.read_text()
+    assert len(log_content.strip()) > 0, "Log file is empty"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
+def test_lance_log_file_invalid_path():
+    invalid_path = "/invalid/path/that/cannot/be/created/lance.log"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import lance; import pyarrow as pa; "
+            "lance.write_dataset(pa.table({'x': range(10)}), 'memory://test')",
+        ],
+        capture_output=True,
+        env={
+            "LANCE_LOG": "info",
+            "LANCE_LOG_FILE": invalid_path,
+        },
+    )
+
+    # The command should still succeed (fallback to stderr)
+    assert result.returncode == 0, (
+        f"Command should succeed even with invalid log path: {result.stderr.decode()}"
+    )
+    assert not Path(invalid_path).exists(), "Log file should not be created"
+
+    # Should contain an error message about the invalid path
+    stderr_content = result.stderr.decode()
+    assert len(stderr_content) > 0
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
+def test_timestamp_precision():
+    def get_sample_log_line(precision: str):
+        output = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import lance; import pyarrow as pa;\
+                     lance.write_dataset(pa.table({'x': range(100)}), 'memory://test')",
+            ],
+            capture_output=True,
+            check=True,
+            env={
+                "LANCE_LOG": "debug",
+                "LANCE_LOG_TS_PRECISION": precision,
+            },
+        )
+        return output.stderr.decode("utf-8").splitlines()[0]
+
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z.*", get_sample_log_line("ns")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z.*", get_sample_log_line("us")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z.*", get_sample_log_line("ms")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z.*", get_sample_log_line("s")
+    )

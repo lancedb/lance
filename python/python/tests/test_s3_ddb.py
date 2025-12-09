@@ -17,8 +17,7 @@ from threading import Barrier
 import lance
 import pyarrow as pa
 import pytest
-from lance.dependencies import _RAY_AVAILABLE, ray
-from lance.file import LanceFileReader, LanceFileWriter
+from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
 from lance.fragment import write_fragments
 
 # These are all keys that are accepted by storage_options
@@ -244,30 +243,6 @@ def test_s3_ddb_distributed_commit(s3_bucket: str, ddb_table: str):
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_ray_committer(s3_bucket: str, ddb_table: str):
-    from lance.ray.sink import write_lance
-
-    table_name = uuid.uuid4().hex
-    table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
-
-    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
-
-    ds = ray.data.range(10).map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
-    write_lance(ds, table_dir, schema=schema, storage_options=CONFIG)
-
-    ds = lance.dataset(table_dir, storage_options=CONFIG)
-    assert ds.count_rows() == 10
-    assert ds.schema == schema
-
-    tbl = ds.to_table()
-    assert sorted(tbl["id"].to_pylist()) == list(range(10))
-    assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
-    assert len(ds.get_fragments()) == 1
-
-
-@pytest.mark.integration
 def test_file_writer_reader(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
     del storage_options["dynamodb_endpoint"]
@@ -289,16 +264,52 @@ def test_file_writer_reader(s3_bucket: str):
     )
 
 
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 @pytest.mark.integration
-@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
-def test_ray_read_lance(s3_bucket: str):
+def test_file_session_upload_download(s3_bucket: str, tmp_path):
     storage_options = copy.deepcopy(CONFIG)
-    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
-    path = f"s3://{s3_bucket}/test_ray_read.lance"
-    lance.write_dataset(table, path, storage_options=storage_options)
-    ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
-    ds.take(1)
+    del storage_options["dynamodb_endpoint"]
+
+    session_uri = f"s3://{s3_bucket}/test_session"
+    session = LanceFileSession(session_uri, storage_options=storage_options)
+
+    # Create a local file to upload
+    local_file = tmp_path / "test_upload.txt"
+    test_content = "Hello from LanceFileSession!"
+    local_file.write_text(test_content)
+
+    # Test upload_file
+    session.upload_file(str(local_file), "uploaded.txt")
+
+    # Test contains - file should exist after upload
+    assert session.contains("uploaded.txt"), "File should exist after upload"
+    assert not session.contains("nonexistent.txt"), "Nonexistent file should not exist"
+
+    # Upload another file to test list
+    local_file2 = tmp_path / "test_upload2.txt"
+    local_file2.write_text("Second file")
+    session.upload_file(str(local_file2), "subdir/nested.txt")
+
+    # Test list - should see both files
+    files = session.list()
+    assert "uploaded.txt" in files, f"uploaded.txt should be in list: {files}"
+    assert "subdir/nested.txt" in files, f"subdir/nested.txt should be in list: {files}"
+
+    # Test list with prefix
+    subdir_files = session.list("subdir")
+    assert len(subdir_files) == 1, f"Should have 1 file in subdir: {subdir_files}"
+    assert "subdir/nested.txt" in subdir_files
+
+    # Test download_file
+    download_path = tmp_path / "downloaded.txt"
+    session.download_file("uploaded.txt", str(download_path))
+
+    # Verify downloaded content matches
+    assert download_path.read_text() == test_content, "Downloaded content should match"
+
+    # Test downloading nested file
+    download_nested = tmp_path / "downloaded_nested.txt"
+    session.download_file("subdir/nested.txt", str(download_nested))
+    assert download_nested.read_text() == "Second file"
 
 
 @pytest.mark.integration

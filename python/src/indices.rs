@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
+
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
+use chrono::{DateTime, Utc};
+use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
 use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
@@ -13,6 +17,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
 use pyo3::Bound;
 use pyo3::{
@@ -21,13 +26,97 @@ use pyo3::{
     wrap_pyfunction, PyObject, PyResult, Python,
 };
 
+use lance::index::DatasetIndexInternalExt;
+
 use crate::fragment::FileFragment;
+use crate::utils::PyJson;
 use crate::{
-    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT,
+    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexDescription};
 use uuid::Uuid;
+
+#[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
+#[derive(Debug, Clone)]
+pub struct PyIndexConfig {
+    pub index_type: String,
+    pub config: String,
+}
+
+#[pymethods]
+impl PyIndexConfig {
+    #[new]
+    fn new(index_type: &str, config: &str) -> PyResult<Self> {
+        Ok(Self {
+            index_type: index_type.to_string(),
+            config: config.to_string(),
+        })
+    }
+}
+
+#[pyclass(name = "IvfModel", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIvfModel {
+    pub(crate) inner: IvfModel,
+}
+
+#[pymethods]
+impl PyIvfModel {
+    #[getter]
+    fn centroids(&self, py: Python) -> PyResult<Option<PyObject>> {
+        if let Some(centroids) = &self.inner.centroids {
+            let data = centroids.clone().into_data();
+            Ok(Some(data.to_pyarrow(py)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Internal helper to fetch an IVF model for the given index name.
+async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfModel> {
+    use lance_index::metrics::NoOpMetricsCollector;
+
+    // Load index metadata list
+    let idx_metas = dataset.ds.load_indices().await.infer_error()?; // Convert Lance error to PyErr
+
+    // Find the index by name
+    let idx_meta = idx_metas
+        .iter()
+        .find(|idx| idx.name == index_name)
+        .ok_or_else(|| PyValueError::new_err(format!("Index \"{}\" not found", index_name)))?;
+
+    if idx_meta.fields.is_empty() {
+        return Err(PyValueError::new_err("Index has no fields"));
+    }
+
+    let schema = dataset.ds.schema();
+    let field = schema
+        .field_by_id(idx_meta.fields[0])
+        .ok_or_else(|| PyValueError::new_err("Failed to resolve index field"))?;
+    let column_name = &field.name;
+
+    // Open the vector index
+    let vindex = dataset
+        .ds
+        .open_vector_index(
+            column_name,
+            &idx_meta.uuid.to_string(),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .infer_error()?;
+
+    // Clone the IVF model
+    Ok(vindex.ivf_model().clone())
+}
+
+#[pyfunction]
+fn get_ivf_model(py: Python<'_>, dataset: &Dataset, index_name: &str) -> PyResult<Py<PyIvfModel>> {
+    let ivf_model = rt().block_on(Some(py), do_get_ivf_model(dataset, index_name))??;
+    Py::new(py, PyIvfModel { inner: ivf_model })
+}
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -43,7 +132,7 @@ async fn do_train_ivf_model(
     let params = IvfBuildParams {
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
-        num_partitions: num_partitions as usize,
+        num_partitions: Some(num_partitions as usize),
         ..Default::default()
     };
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
@@ -71,7 +160,7 @@ fn train_ivf_model(
     sample_rate: u32,
     max_iters: u32,
 ) -> PyResult<PyObject> {
-    let centroids = RT.block_on(
+    let centroids = rt().block_on(
         Some(py),
         do_train_ivf_model(
             dataset,
@@ -140,7 +229,7 @@ fn train_pq_model(
         lengths: vec![],
         loss: None,
     };
-    let codebook = RT.block_on(
+    let codebook = rt().block_on(
         Some(py),
         do_train_pq_model(
             dataset,
@@ -227,7 +316,7 @@ pub fn transform_vectors(
         codebook,
         distance_type,
     );
-    RT.block_on(
+    rt().block_on(
         Some(py),
         do_transform_vectors(
             dataset,
@@ -278,7 +367,7 @@ pub fn shuffle_transformed_vectors(
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
-    let result = RT.block_on(
+    let result = rt().block_on(
         None,
         do_shuffle_transformed_vectors(
             unsorted_filenames,
@@ -371,12 +460,108 @@ pub fn load_shuffled_vectors(
         distance_type,
     );
 
-    RT.block_on(
+    rt().block_on(
         None,
         do_load_shuffled_vectors(
             filenames, dir_path, dataset, column, idx_name, ivf_model, pq_model,
         ),
     )?
+}
+
+#[pyclass(name = "IndexSegmentDescription", module = "lance.indices", get_all)]
+#[derive(Clone)]
+pub struct PyIndexSegmentDescription {
+    /// The UUID of the index segment
+    pub uuid: String,
+    /// The dataset version at which the index segment was last updated
+    pub dataset_version_at_last_update: u64,
+    /// The fragment ids that are covered by the index segment
+    pub fragment_ids: HashSet<u32>,
+    /// The version of the index
+    pub index_version: i32,
+    /// The timestamp when the index segment was created
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl PyIndexSegmentDescription {
+    pub fn __repr__(&self) -> String {
+        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at)
+    }
+}
+
+#[pyclass(name = "IndexDescription", module = "lance.indices", get_all)]
+pub struct PyIndexDescription {
+    /// The name of the index
+    pub name: String,
+    /// The full type URL of the index
+    pub type_url: String,
+    /// The short type of the index (may not be unique)
+    pub index_type: String,
+    /// The ids of the fields that the index is built on
+    pub fields: Vec<u32>,
+    /// The names of the fields that the index is built on
+    pub field_names: Vec<String>,
+    /// The number of rows indexed by the index
+    pub num_rows_indexed: u64,
+    /// The details of the index
+    pub details: PyJson,
+    /// The segments of the index
+    pub segments: Vec<PyIndexSegmentDescription>,
+}
+
+impl PyIndexDescription {
+    pub fn new(index: &dyn IndexDescription, dataset: &LanceDataset) -> Self {
+        let field_names = index
+            .field_ids()
+            .iter()
+            .map(|field| {
+                dataset
+                    .schema()
+                    .field_by_id(*field as i32)
+                    .map(|f| f.name.clone())
+                    .unwrap_or("<unknown>".to_string())
+            })
+            .collect();
+
+        let segments = index
+            .metadata()
+            .iter()
+            .map(|segment| {
+                let fragment_ids = segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
+                    .unwrap_or_default();
+                PyIndexSegmentDescription {
+                    uuid: segment.uuid.to_string(),
+                    dataset_version_at_last_update: segment.dataset_version,
+                    fragment_ids,
+                    index_version: segment.index_version,
+                    created_at: segment.created_at,
+                }
+            })
+            .collect();
+
+        let details = index.details().unwrap_or_else(|_| "{}".to_string());
+
+        Self {
+            name: index.name().to_string(),
+            fields: index.field_ids().to_vec(),
+            field_names,
+            index_type: index.index_type().to_string(),
+            segments,
+            type_url: index.type_url().to_string(),
+            num_rows_indexed: index.rows_indexed(),
+            details: PyJson(details),
+        }
+    }
+}
+
+#[pymethods]
+impl PyIndexDescription {
+    pub fn __repr__(&self) -> String {
+        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len())
+    }
 }
 
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -386,6 +571,11 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
+    indices.add_class::<PyIvfModel>()?;
+    indices.add_class::<PyIndexConfig>()?;
+    indices.add_class::<PyIndexDescription>()?;
+    indices.add_class::<PyIndexSegmentDescription>()?;
+    indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())
 }

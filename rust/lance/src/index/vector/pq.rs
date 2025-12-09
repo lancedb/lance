@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -46,7 +47,7 @@ use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::io::exec::knn::KNN_INDEX_SCHEMA;
-use crate::{arrow::*, Dataset};
+use crate::Dataset;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -67,7 +68,7 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for PQIndex {
@@ -103,14 +104,14 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
         Self {
             code: None,
             row_ids: None,
             pq,
             metric_type,
-            fri,
+            frag_reuse_index,
         }
     }
 
@@ -290,7 +291,7 @@ impl VectorIndex for PQIndex {
         .await
     }
 
-    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 
@@ -349,40 +350,41 @@ impl VectorIndex for PQIndex {
             self.pq.num_sub_vectors,
         );
 
-        let (primitive_row_ids, transposed_pq_codes) = if let Some(fri_ref) = self.fri.as_ref() {
-            let num_vectors = row_ids.len();
-            let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
-            let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
-                .enumerate()
-                .filter_map(|(vec_idx, old_row_id)| {
-                    let new_row_id = fri_ref.remap_row_id(*old_row_id);
-                    new_row_id.map(|new_row_id| {
-                        (
-                            new_row_id,
-                            Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
-                        )
+        let (primitive_row_ids, transposed_pq_codes) =
+            if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                let num_vectors = row_ids.len();
+                let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
+                let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
+                    .enumerate()
+                    .filter_map(|(vec_idx, old_row_id)| {
+                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
+                        new_row_id.map(|new_row_id| {
+                            (
+                                new_row_id,
+                                Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
+                            )
+                        })
                     })
-                })
-                .unzip();
-            let transposed_codes = transpose(
-                &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
-                remapped_row_ids.len(),
-                self.pq.num_sub_vectors,
-            );
-            (
-                Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
-                Arc::new(transposed_codes),
-            )
-        } else {
-            (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
-        };
+                    .unzip();
+                let transposed_codes = transpose(
+                    &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
+                    remapped_row_ids.len(),
+                    self.pq.num_sub_vectors,
+                );
+                (
+                    Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
+                    Arc::new(transposed_codes),
+                )
+            } else {
+                (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
+            };
 
         Ok(Box::new(Self {
             code: Some(transposed_pq_codes),
             row_ids: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
-            fri: self.fri.clone(),
+            frag_reuse_index: self.frag_reuse_index.clone(),
         }))
     }
 
@@ -470,7 +472,12 @@ impl VectorIndex for PQIndex {
     fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
+
     fn quantizer(&self) -> Quantizer {
+        unimplemented!("only for IVF")
+    }
+
+    fn partition_size(&self, _: usize) -> usize {
         unimplemented!("only for IVF")
     }
 
@@ -501,6 +508,8 @@ pub async fn build_pq_model(
     params: &PQBuildParams,
     ivf: Option<&IvfModel>,
 ) -> Result<ProductQuantizer> {
+    let num_codes = 2_usize.pow(params.num_bits as u32);
+
     if let Some(codebook) = &params.codebook {
         let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
@@ -570,13 +579,16 @@ pub async fn build_pq_model(
         training_data
     };
 
-    let num_codes = 2_usize.pow(params.num_bits as u32);
     if training_data.len() < num_codes {
-        return Err(Error::Index {
+        warn!(
+            "Skip PQ training: only {} rows available, needs >= {}",
+            training_data.len(),
+            num_codes
+        );
+        return Err(Error::Unprocessable {
             message: format!(
-                "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
-                num_codes,
-                training_data.len()
+                "Not enough rows to train PQ. Requires {num_codes} rows but only {available} available",
+                available = training_data.len()
             ),
             location: location!(),
         });
@@ -610,7 +622,7 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
-        // TODO: support auto-remap with FRI for HNSW
+        // TODO: support auto-remap with frag_reuse_index for HNSW
         None,
     )?;
 
@@ -625,12 +637,14 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
-    use tempfile::tempdir;
+    use lance_core::utils::tempfile::TempStrDir;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowIdMask;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_testing::datagen::generate_random_array_with_range;
+    use lance_testing::datagen::{
+        generate_random_array_with_range, generate_random_array_with_seed,
+    };
 
     const DIM: usize = 128;
     async fn generate_dataset(
@@ -662,8 +676,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_l2() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
 
@@ -693,8 +707,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_pq_model_cosine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 
@@ -752,6 +766,35 @@ mod tests {
             "distances: {:?}",
             distances
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_model_insufficient_rows_returns_prereq() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = 16;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        )]));
+
+        let vectors = generate_random_array_with_seed::<Float32Type>(dim * 10, [11u8; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let params = PQBuildParams::new(16, 8);
+        let err = build_pq_model(&dataset, "vector", dim, MetricType::L2, &params, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Unprocessable { .. }));
     }
 
     struct TestPreFilter {

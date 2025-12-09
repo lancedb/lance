@@ -9,7 +9,6 @@ use arrow::array::{ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
-use tracing::instrument;
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -148,6 +147,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
         compress_remainder(&positions[length - remainder..], &mut builder)?;
         builder.append_value("");
     }
+
     Ok(builder.finish())
 }
 
@@ -190,8 +190,8 @@ pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Vec<
 
     let remainder = num_positions as usize % BLOCK_SIZE;
     if remainder > 0 {
-        let compressed = compressed.value(num_blocks + 1);
-        decompress_remainder(compressed, remainder, &mut positions);
+        let compressed_block = compressed.value(num_blocks + 1);
+        decompress_remainder(compressed_block, remainder, &mut positions);
     }
 
     positions
@@ -212,11 +212,10 @@ pub fn decompress_positions_list(compressed: &ListArray) -> Result<ListArray> {
     Ok(builder.finish())
 }
 
-pub fn read_num_positions(posting_list: &arrow::array::LargeBinaryArray) -> u32 {
-    u32::from_le_bytes(posting_list.values().as_ref()[..4].try_into().unwrap())
+pub fn read_num_positions(compressed: &arrow::array::LargeBinaryArray) -> u32 {
+    u32::from_le_bytes(compressed.value(0).try_into().unwrap())
 }
 
-#[instrument(level = "info", name = "decompress_posting_block", skip_all)]
 pub fn decompress_posting_block(
     block: &[u8],
     buffer: &mut [u32; BLOCK_SIZE],
@@ -229,7 +228,6 @@ pub fn decompress_posting_block(
     decompress_block(&block[num_bytes..], buffer, frequencies);
 }
 
-#[instrument(level = "info", name = "decompress_posting_remainder", skip_all)]
 pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,
@@ -278,10 +276,16 @@ mod tests {
     #[test]
     fn test_compress_posting_list() -> Result<()> {
         let num_rows: usize = BLOCK_SIZE * 1024 - 7;
-        let mut rng = rand::thread_rng();
-        let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
-        let frequencies: Vec<u32> = (0..num_rows).map(|_| rng.gen_range(1..=u32::MAX)).collect();
-        let block_max_scores = (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.gen_range(0.0..1.0));
+        let mut rng = rand::rng();
+        let doc_ids: Vec<u32> = (0..num_rows)
+            .map(|_| rng.random())
+            .sorted_unstable()
+            .collect();
+        let frequencies: Vec<u32> = (0..num_rows)
+            .map(|_| rng.random_range(1..=u32::MAX))
+            .collect();
+        let block_max_scores =
+            (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.random_range(0.0..1.0));
         let posting_list = compress_posting_list(
             doc_ids.len(),
             doc_ids.iter(),
@@ -309,9 +313,9 @@ mod tests {
     #[test]
     fn test_compress_positions() -> Result<()> {
         let num_positions: usize = BLOCK_SIZE * 2 - 7;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let positions: Vec<u32> = (0..num_positions)
-            .map(|_| rng.gen())
+            .map(|_| rng.random())
             .sorted_unstable()
             .collect();
         let compressed = compress_positions(&positions)?;

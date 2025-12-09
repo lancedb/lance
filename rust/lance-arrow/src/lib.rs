@@ -10,15 +10,15 @@ use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
-    UInt8Array,
+    GenericListArray, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    StructArray, UInt32Array, UInt8Array,
 };
 use arrow_array::{
     new_null_array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -27,10 +27,26 @@ pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
 pub mod floats;
+use crate::list::ListArrayExt;
 pub use floats::*;
+
 pub mod cast;
+pub mod json;
 pub mod list;
 pub mod memory;
+pub mod r#struct;
+
+/// Arrow extension metadata key for extension name
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Arrow extension metadata key for extension metadata
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+
+/// Key used by lance to mark a field as a blob
+/// TODO: Use Arrow extension mechanism instead?
+pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+/// Arrow extension type name for Lance blob v2 columns
+pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -140,7 +156,10 @@ impl DataTypeExt for DataType {
                 IntervalUnit::MonthDayNano => Some(16),
             },
             Self::FixedSizeBinary(s) => Some(*s as usize),
-            Self::FixedSizeList(dt, s) => Some(*s as usize * dt.data_type().byte_width()),
+            Self::FixedSizeList(dt, s) => dt
+                .data_type()
+                .byte_width_opt()
+                .map(|width| width * *s as usize),
             _ => None,
         }
     }
@@ -257,7 +276,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         if n >= self.len() {
             return Ok(self.clone());
         }
-        let mut rng = SmallRng::from_entropy();
+        let mut rng = SmallRng::from_os_rng();
         let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
     }
@@ -497,7 +516,7 @@ pub trait RecordBatchExt {
     /// Afterwards we add all non-matching right columns to the output.
     ///
     /// Note: This method likely does not handle nested fields correctly and you may want to consider
-    /// using [`merge_with_schema`] instead.
+    /// using [`Self::merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -558,6 +577,9 @@ pub trait RecordBatchExt {
         column: Arc<dyn Array>,
     ) -> Result<RecordBatch>;
 
+    /// Rename a column at a given index.
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -579,6 +601,9 @@ pub trait RecordBatchExt {
 
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
+
+    /// Create a new RecordBatch with compacted memory after slicing.
+    fn shrink_to_fit(&self) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -650,6 +675,28 @@ impl RecordBatchExt for RecordBatch {
                 self.schema().metadata().clone(),
             )),
             columns,
+        )
+    }
+
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch> {
+        let mut fields = self.schema().fields().to_vec();
+        if index >= fields.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Index out of bounds: {}",
+                index
+            )));
+        }
+        fields[index] = Arc::new(Field::new(
+            new_name,
+            fields[index].data_type().clone(),
+            fields[index].is_nullable(),
+        ));
+        Self::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                self.schema().metadata().clone(),
+            )),
+            self.columns().to_vec(),
         )
     }
 
@@ -726,6 +773,11 @@ impl RecordBatchExt for RecordBatch {
         let taken = take(&struct_array, indices, None)?;
         self.try_new_from_struct_array(taken.as_struct().clone())
     }
+
+    fn shrink_to_fit(&self) -> Result<Self> {
+        // Deep copy the sliced record batch, instead of whole batch
+        crate::deepcopy::deep_copy_batch_sliced(self)
+    }
 }
 
 fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
@@ -755,7 +807,8 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
             )));
         }
     }
-    StructArray::try_new(fields.clone(), columns, None)
+    // Preserve the struct's validity when projecting
+    StructArray::try_new(fields.clone(), columns, struct_array.nulls().cloned())
 }
 
 fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
@@ -902,11 +955,196 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
+/// Helper function to normalize validity buffers
+/// Returns None for all-null validity (placeholder structs)
+fn normalize_validity(
+    validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<&arrow_buffer::NullBuffer> {
+    validity.and_then(|v| {
+        if v.null_count() == v.len() {
+            None
+        } else {
+            Some(v)
+        }
+    })
+}
+
+/// Helper function to merge validity buffers from two struct arrays
+/// Returns None only if both arrays are null at the same position
+///
+/// Special handling for placeholder structs (all-null validity)
+fn merge_struct_validity(
+    left_validity: Option<&arrow_buffer::NullBuffer>,
+    right_validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<arrow_buffer::NullBuffer> {
+    // Normalize both validity buffers (convert all-null to None)
+    let left_normalized = normalize_validity(left_validity);
+    let right_normalized = normalize_validity(right_validity);
+
+    match (left_normalized, right_normalized) {
+        // Fast paths: no computation needed
+        (None, None) => None,
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        (Some(left), Some(right)) => {
+            // Fast path: if both have no nulls, can return either one
+            if left.null_count() == 0 && right.null_count() == 0 {
+                return Some(left.clone());
+            }
+
+            let left_buffer = left.inner();
+            let right_buffer = right.inner();
+
+            // Perform bitwise OR directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = left_buffer | right_buffer;
+
+            Some(arrow_buffer::NullBuffer::from(merged_buffer))
+        }
+    }
+}
+
+fn merge_list_child_values(
+    child_field: &Field,
+    left_values: ArrayRef,
+    right_values: ArrayRef,
+) -> ArrayRef {
+    match child_field.data_type() {
+        DataType::Struct(child_fields) => Arc::new(merge_with_schema(
+            left_values.as_struct(),
+            right_values.as_struct(),
+            child_fields,
+        )) as ArrayRef,
+        DataType::List(grandchild) => {
+            let left_list = left_values
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("left list values should be ListArray");
+            let right_list = right_values
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("right list values should be ListArray");
+            let merged_values = merge_list_child_values(
+                grandchild.as_ref(),
+                left_list.values().clone(),
+                right_list.values().clone(),
+            );
+            let merged_validity = merge_struct_validity(left_list.nulls(), right_list.nulls());
+            Arc::new(ListArray::new(
+                grandchild.clone(),
+                left_list.offsets().clone(),
+                merged_values,
+                merged_validity,
+            )) as ArrayRef
+        }
+        DataType::LargeList(grandchild) => {
+            let left_list = left_values
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("left list values should be LargeListArray");
+            let right_list = right_values
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("right list values should be LargeListArray");
+            let merged_values = merge_list_child_values(
+                grandchild.as_ref(),
+                left_list.values().clone(),
+                right_list.values().clone(),
+            );
+            let merged_validity = merge_struct_validity(left_list.nulls(), right_list.nulls());
+            Arc::new(LargeListArray::new(
+                grandchild.clone(),
+                left_list.offsets().clone(),
+                merged_values,
+                merged_validity,
+            )) as ArrayRef
+        }
+        DataType::FixedSizeList(grandchild, list_size) => {
+            let left_list = left_values
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("left list values should be FixedSizeListArray");
+            let right_list = right_values
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("right list values should be FixedSizeListArray");
+            let merged_values = merge_list_child_values(
+                grandchild.as_ref(),
+                left_list.values().clone(),
+                right_list.values().clone(),
+            );
+            let merged_validity = merge_struct_validity(left_list.nulls(), right_list.nulls());
+            Arc::new(FixedSizeListArray::new(
+                grandchild.clone(),
+                *list_size,
+                merged_values,
+                merged_validity,
+            )) as ArrayRef
+        }
+        _ => left_values.clone(),
+    }
+}
+
+// Helper function to adjust child array validity based on parent struct validity
+// When parent struct is null, propagates null to child array
+// Optimized with fast paths and SIMD operations
+fn adjust_child_validity(
+    child: &ArrayRef,
+    parent_validity: Option<&arrow_buffer::NullBuffer>,
+) -> ArrayRef {
+    // Fast path: no parent validity means no adjustment needed
+    let parent_validity = match parent_validity {
+        None => return child.clone(),
+        Some(p) if p.null_count() == 0 => return child.clone(), // No nulls to propagate
+        Some(p) => p,
+    };
+
+    let child_validity = child.nulls();
+
+    // Compute the new validity: child_validity AND parent_validity
+    let new_validity = match child_validity {
+        None => {
+            // Fast path: child has no existing validity, just use parent's
+            parent_validity.clone()
+        }
+        Some(child_nulls) => {
+            let child_buffer = child_nulls.inner();
+            let parent_buffer = parent_validity.inner();
+
+            // Perform bitwise AND directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = child_buffer & parent_buffer;
+
+            arrow_buffer::NullBuffer::from(merged_buffer)
+        }
+    };
+
+    // Create new array with adjusted validity
+    arrow_array::make_array(
+        arrow_data::ArrayData::try_new(
+            child.data_type().clone(),
+            child.len(),
+            Some(new_validity.into_inner().into_inner()),
+            child.offset(),
+            child.to_data().buffers().to_vec(),
+            child.to_data().child_data().to_vec(),
+        )
+        .unwrap(),
+    )
+}
+
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
     let right_fields = right_struct_array.fields();
     let right_columns = right_struct_array.columns();
+
+    // Get the validity buffers from both structs
+    let left_validity = left_struct_array.nulls();
+    let right_validity = right_struct_array.nulls();
+
+    // Compute merged validity
+    let merged_validity = merge_struct_validity(left_validity, right_validity);
 
     // iterate through the fields on the left hand side
     for (left_field, left_column) in left_struct_array
@@ -960,13 +1198,17 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                     _ => {
                         // TODO handle list-of-struct and other types
                         fields.push(left_field.as_ref().clone());
-                        columns.push(left_column.clone());
+                        // Adjust the column validity: if left struct was null, propagate to child
+                        let adjusted_column = adjust_child_validity(left_column, left_validity);
+                        columns.push(adjusted_column);
                     }
                 }
             }
             None => {
                 fields.push(left_field.as_ref().clone());
-                columns.push(left_column.clone());
+                // Adjust the column validity: if left struct was null, propagate to child
+                let adjusted_column = adjust_child_validity(left_column, left_validity);
+                columns.push(adjusted_column);
             }
         }
     }
@@ -983,17 +1225,14 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                 .any(|f| f.name() == field.name())
             {
                 fields.push(field.as_ref().clone());
-                columns.push(column.clone() as ArrayRef);
+                // This field doesn't exist on the left
+                // We use the right's column but need to adjust for struct validity
+                let adjusted_column = adjust_child_validity(column, right_validity);
+                columns.push(adjusted_column);
             }
         });
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = fields
-        .iter()
-        .cloned()
-        .map(Arc::new)
-        .zip(columns.iter().cloned())
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    StructArray::try_new(Fields::from(fields), columns, merged_validity).unwrap()
 }
 
 fn merge_with_schema(
@@ -1019,6 +1258,13 @@ fn merge_with_schema(
     let right_fields = right_struct_array.fields();
     let right_columns = right_struct_array.columns();
 
+    // Get the validity buffers from both structs
+    let left_validity = left_struct_array.nulls();
+    let right_validity = right_struct_array.nulls();
+
+    // Compute merged validity
+    let merged_validity = merge_struct_validity(left_validity, right_validity);
+
     for field in fields {
         let left_match_idx = left_fields.iter().position(|f| {
             f.name() == field.name() && same_type_kind(f.data_type(), field.data_type())
@@ -1030,27 +1276,113 @@ fn merge_with_schema(
         match (left_match_idx, right_match_idx) {
             (None, Some(right_idx)) => {
                 output_fields.push(right_fields[right_idx].as_ref().clone());
-                columns.push(right_columns[right_idx].clone());
+                // Adjust validity if the right struct was null
+                let adjusted_column =
+                    adjust_child_validity(&right_columns[right_idx], right_validity);
+                columns.push(adjusted_column);
             }
             (Some(left_idx), None) => {
                 output_fields.push(left_fields[left_idx].as_ref().clone());
-                columns.push(left_columns[left_idx].clone());
+                // Adjust validity if the left struct was null
+                let adjusted_column = adjust_child_validity(&left_columns[left_idx], left_validity);
+                columns.push(adjusted_column);
             }
             (Some(left_idx), Some(right_idx)) => {
-                if let DataType::Struct(child_fields) = field.data_type() {
-                    let left_sub_array = left_columns[left_idx].as_struct();
-                    let right_sub_array = right_columns[right_idx].as_struct();
-                    let merged_sub_array =
-                        merge_with_schema(left_sub_array, right_sub_array, child_fields);
-                    output_fields.push(Field::new(
-                        field.name(),
-                        merged_sub_array.data_type().clone(),
-                        field.is_nullable(),
-                    ));
-                    columns.push(Arc::new(merged_sub_array) as ArrayRef);
-                } else {
-                    output_fields.push(left_fields[left_idx].as_ref().clone());
-                    columns.push(left_columns[left_idx].clone());
+                match field.data_type() {
+                    DataType::Struct(child_fields) => {
+                        let left_sub_array = left_columns[left_idx].as_struct();
+                        let right_sub_array = right_columns[right_idx].as_struct();
+                        let merged_sub_array =
+                            merge_with_schema(left_sub_array, right_sub_array, child_fields);
+                        output_fields.push(Field::new(
+                            field.name(),
+                            merged_sub_array.data_type().clone(),
+                            field.is_nullable(),
+                        ));
+                        columns.push(Arc::new(merged_sub_array) as ArrayRef);
+                    }
+                    DataType::List(child_field) => {
+                        let left_list = left_columns[left_idx]
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap();
+                        let right_list = right_columns[right_idx]
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap();
+                        let merged_values = merge_list_child_values(
+                            child_field.as_ref(),
+                            left_list.trimmed_values(),
+                            right_list.trimmed_values(),
+                        );
+                        let merged_validity =
+                            merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        let merged_list = ListArray::new(
+                            child_field.clone(),
+                            left_list.offsets().clone(),
+                            merged_values,
+                            merged_validity,
+                        );
+                        output_fields.push(field.as_ref().clone());
+                        columns.push(Arc::new(merged_list) as ArrayRef);
+                    }
+                    DataType::LargeList(child_field) => {
+                        let left_list = left_columns[left_idx]
+                            .as_any()
+                            .downcast_ref::<LargeListArray>()
+                            .unwrap();
+                        let right_list = right_columns[right_idx]
+                            .as_any()
+                            .downcast_ref::<LargeListArray>()
+                            .unwrap();
+                        let merged_values = merge_list_child_values(
+                            child_field.as_ref(),
+                            left_list.trimmed_values(),
+                            right_list.trimmed_values(),
+                        );
+                        let merged_validity =
+                            merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        let merged_list = LargeListArray::new(
+                            child_field.clone(),
+                            left_list.offsets().clone(),
+                            merged_values,
+                            merged_validity,
+                        );
+                        output_fields.push(field.as_ref().clone());
+                        columns.push(Arc::new(merged_list) as ArrayRef);
+                    }
+                    DataType::FixedSizeList(child_field, list_size) => {
+                        let left_list = left_columns[left_idx]
+                            .as_any()
+                            .downcast_ref::<FixedSizeListArray>()
+                            .unwrap();
+                        let right_list = right_columns[right_idx]
+                            .as_any()
+                            .downcast_ref::<FixedSizeListArray>()
+                            .unwrap();
+                        let merged_values = merge_list_child_values(
+                            child_field.as_ref(),
+                            left_list.values().clone(),
+                            right_list.values().clone(),
+                        );
+                        let merged_validity =
+                            merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        let merged_list = FixedSizeListArray::new(
+                            child_field.clone(),
+                            *list_size,
+                            merged_values,
+                            merged_validity,
+                        );
+                        output_fields.push(field.as_ref().clone());
+                        columns.push(Arc::new(merged_list) as ArrayRef);
+                    }
+                    _ => {
+                        output_fields.push(left_fields[left_idx].as_ref().clone());
+                        // For fields that exist in both, use left but adjust validity
+                        let adjusted_column =
+                            adjust_child_validity(&left_columns[left_idx], left_validity);
+                        columns.push(adjusted_column);
+                    }
                 }
             }
             (None, None) => {
@@ -1059,12 +1391,7 @@ fn merge_with_schema(
         }
     }
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = output_fields
-        .into_iter()
-        .map(Arc::new)
-        .zip(columns)
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    StructArray::try_new(Fields::from(output_fields), columns, merged_validity).unwrap()
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
@@ -1082,7 +1409,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 
 /// Interleave multiple RecordBatches into a single RecordBatch.
 ///
-/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+/// Behaves like [`arrow_select::interleave::interleave`], but for RecordBatches.
 pub fn interleave_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],
@@ -1165,6 +1492,11 @@ impl BufferExt for arrow_buffer::Buffer {
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
         buf.extend(std::iter::repeat_n(0_u8, to_fill));
+
+        // FIX for issue #4512: Shrink buffer to actual size before converting to immutable
+        // This reduces memory overhead from capacity over-allocation
+        buf.shrink_to_fit();
+
         Self::from(buf)
     }
 }
@@ -1172,7 +1504,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, Int32Array, ListArray, StringArray};
+    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
+    use arrow_array::{Float32Array, Int32Array, StructArray};
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1393,6 +1726,35 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_width_opt() {
+        assert_eq!(DataType::Int32.byte_width_opt(), Some(4));
+        assert_eq!(DataType::Int64.byte_width_opt(), Some(8));
+        assert_eq!(DataType::Float32.byte_width_opt(), Some(4));
+        assert_eq!(DataType::Float64.byte_width_opt(), Some(8));
+        assert_eq!(DataType::Utf8.byte_width_opt(), None);
+        assert_eq!(DataType::Binary.byte_width_opt(), None);
+        assert_eq!(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))).byte_width_opt(),
+            None
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3)
+                .byte_width_opt(),
+            Some(12)
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4)
+                .byte_width_opt(),
+            Some(16)
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 5)
+                .byte_width_opt(),
+            None
+        );
+    }
+
+    #[test]
     fn test_take_record_batch() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, true),
@@ -1487,5 +1849,384 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn test_project_preserves_struct_validity() {
+        // Test that projecting a struct array preserves its validity (fix for issue #4385)
+        let fields = Fields::from(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float32, true),
+        ]);
+
+        // Create a struct array with validity
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let value_array = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let struct_array = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(id_array) as ArrayRef,
+                Arc::new(value_array) as ArrayRef,
+            ],
+            Some(vec![true, false, true].into()), // Second struct is null
+        );
+
+        // Project the struct array
+        let projected = project(&struct_array, &fields).unwrap();
+
+        // Verify the validity is preserved
+        assert_eq!(projected.null_count(), 1);
+        assert!(!projected.is_null(0));
+        assert!(projected.is_null(1));
+        assert!(!projected.is_null(2));
+    }
+
+    #[test]
+    fn test_merge_struct_with_different_validity() {
+        // Test case from Weston's review comment
+        // File 1 has height field with some nulls
+        let height_array = Int32Array::from(vec![Some(500), None, Some(600), None]);
+        let left_fields = Fields::from(vec![Field::new("height", DataType::Int32, true)]);
+        let left_struct = StructArray::new(
+            left_fields,
+            vec![Arc::new(height_array) as ArrayRef],
+            Some(vec![true, false, true, false].into()), // Rows 2 and 4 are null structs
+        );
+
+        // File 2 has width field with some nulls
+        let width_array = Int32Array::from(vec![Some(300), Some(200), None, None]);
+        let right_fields = Fields::from(vec![Field::new("width", DataType::Int32, true)]);
+        let right_struct = StructArray::new(
+            right_fields,
+            vec![Arc::new(width_array) as ArrayRef],
+            Some(vec![true, true, false, false].into()), // Rows 3 and 4 are null structs
+        );
+
+        // Merge the two structs
+        let merged = merge(&left_struct, &right_struct);
+
+        // Expected:
+        // Row 1: both non-null -> {width: 300, height: 500}
+        // Row 2: left null, right non-null -> {width: 200, height: null}
+        // Row 3: left non-null, right null -> {width: null, height: 600}
+        // Row 4: both null -> null struct
+
+        assert_eq!(merged.null_count(), 1); // Only row 4 is null
+        assert!(!merged.is_null(0));
+        assert!(!merged.is_null(1));
+        assert!(!merged.is_null(2));
+        assert!(merged.is_null(3));
+
+        // Check field values
+        let height_col = merged.column_by_name("height").unwrap();
+        let height_values = height_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(height_values.value(0), 500);
+        assert!(height_values.is_null(1)); // height is null when left struct was null
+        assert_eq!(height_values.value(2), 600);
+
+        let width_col = merged.column_by_name("width").unwrap();
+        let width_values = width_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(width_values.value(0), 300);
+        assert_eq!(width_values.value(1), 200);
+        assert!(width_values.is_null(2)); // width is null when right struct was null
+    }
+
+    #[test]
+    fn test_merge_with_schema_with_nullable_struct_list_schema_mismatch() {
+        // left_list setup
+        let left_company_id = Arc::new(Int32Array::from(vec![None, None]));
+        let left_count = Arc::new(Int32Array::from(vec![None, None]));
+        let left_struct = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("company_id", DataType::Int32, true),
+                Field::new("count", DataType::Int32, true),
+            ]),
+            vec![left_company_id, left_count],
+            None,
+        ));
+        let left_list = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(left_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([2]),
+            left_struct,
+            None,
+        ));
+
+        // Right List Setup
+        let right_company_name = Arc::new(StringArray::from(vec!["Google", "Microsoft"]));
+        let right_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("company_name", DataType::Utf8, true)]),
+            vec![right_company_name],
+            None,
+        ));
+        let right_list = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(right_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([2]),
+            right_struct,
+            None,
+        ));
+
+        let target_fields = Fields::from(vec![Field::new(
+            "companies",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("company_id", DataType::Int32, true),
+                    Field::new("company_name", DataType::Utf8, true),
+                    Field::new("count", DataType::Int32, true),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+
+        let left_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "companies",
+                left_list.data_type().clone(),
+                true,
+            )])),
+            vec![left_list as ArrayRef],
+        )
+        .unwrap();
+
+        let right_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "companies",
+                right_list.data_type().clone(),
+                true,
+            )])),
+            vec![right_list as ArrayRef],
+        )
+        .unwrap();
+
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &Schema::new(target_fields.to_vec()))
+            .unwrap();
+
+        // Verify the merged structure
+        let merged_list = merged
+            .column_by_name("companies")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let merged_struct = merged_list.values().as_struct();
+
+        // Should have all 3 fields
+        assert_eq!(merged_struct.num_columns(), 3);
+        assert!(merged_struct.column_by_name("company_id").is_some());
+        assert!(merged_struct.column_by_name("company_name").is_some());
+        assert!(merged_struct.column_by_name("count").is_some());
+
+        // Verify values
+        let company_id = merged_struct
+            .column_by_name("company_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(company_id.is_null(0));
+        assert!(company_id.is_null(1));
+
+        let company_name = merged_struct
+            .column_by_name("company_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(company_name.value(0), "Google");
+        assert_eq!(company_name.value(1), "Microsoft");
+
+        let count = merged_struct
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(count.is_null(0));
+        assert!(count.is_null(1));
+    }
+
+    #[test]
+    fn test_merge_struct_lists() {
+        test_merge_struct_lists_generic::<i32>();
+    }
+
+    #[test]
+    fn test_merge_struct_large_lists() {
+        test_merge_struct_lists_generic::<i64>();
+    }
+
+    fn test_merge_struct_lists_generic<O: OffsetSizeTrait>() {
+        // left_list setup
+        let left_company_id = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(9),
+            Some(10),
+            Some(11),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(17),
+            Some(18),
+            Some(19),
+            Some(20),
+        ]));
+        let left_count = Arc::new(Int32Array::from(vec![
+            Some(10),
+            Some(20),
+            Some(30),
+            Some(40),
+            Some(50),
+            Some(60),
+            Some(70),
+            Some(80),
+            Some(90),
+            Some(100),
+            Some(110),
+            Some(120),
+            Some(130),
+            Some(140),
+            Some(150),
+            Some(160),
+            Some(170),
+            Some(180),
+            Some(190),
+            Some(200),
+        ]));
+        let left_struct = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("company_id", DataType::Int32, true),
+                Field::new("count", DataType::Int32, true),
+            ]),
+            vec![left_company_id, left_count],
+            None,
+        ));
+
+        let left_list = Arc::new(GenericListArray::<O>::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(left_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([3, 1]),
+            left_struct.clone(),
+            None,
+        ));
+
+        let left_list_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new(
+                "companies",
+                if O::IS_LARGE {
+                    DataType::LargeList(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(left_struct.fields().clone()),
+                        true,
+                    )))
+                } else {
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(left_struct.fields().clone()),
+                        true,
+                    )))
+                },
+                true,
+            )]),
+            vec![left_list as ArrayRef],
+            None,
+        ));
+
+        // right_list setup
+        let right_company_name = Arc::new(StringArray::from(vec![
+            "Google",
+            "Microsoft",
+            "Apple",
+            "Facebook",
+        ]));
+        let right_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("company_name", DataType::Utf8, true)]),
+            vec![right_company_name],
+            None,
+        ));
+        let right_list = Arc::new(GenericListArray::<O>::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(right_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([3, 1]),
+            right_struct.clone(),
+            None,
+        ));
+
+        let right_list_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new(
+                "companies",
+                if O::IS_LARGE {
+                    DataType::LargeList(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(right_struct.fields().clone()),
+                        true,
+                    )))
+                } else {
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(right_struct.fields().clone()),
+                        true,
+                    )))
+                },
+                true,
+            )]),
+            vec![right_list as ArrayRef],
+            None,
+        ));
+
+        // prepare schema
+        let target_fields = Fields::from(vec![Field::new(
+            "companies",
+            if O::IS_LARGE {
+                DataType::LargeList(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("company_id", DataType::Int32, true),
+                        Field::new("company_name", DataType::Utf8, true),
+                        Field::new("count", DataType::Int32, true),
+                    ])),
+                    true,
+                )))
+            } else {
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("company_id", DataType::Int32, true),
+                        Field::new("company_name", DataType::Utf8, true),
+                        Field::new("count", DataType::Int32, true),
+                    ])),
+                    true,
+                )))
+            },
+            true,
+        )]);
+
+        // merge left_list and right_list
+        let merged_array = merge_with_schema(&left_list_struct, &right_list_struct, &target_fields);
+        assert_eq!(merged_array.len(), 2);
     }
 }

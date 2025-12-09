@@ -25,6 +25,72 @@ fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, true)
 }
 
+/// Get a column from a RecordBatch, supporting nested field paths.
+///
+/// This function handles:
+/// - Simple column names: "column"
+/// - Nested paths: "parent.child" or "parent.child.grandchild"
+/// - Backtick-escaped field names: "parent.`field.with.dots`"
+fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+    // Try to get the column directly first (fast path for simple columns)
+    if let Some(col) = batch.column_by_name(column) {
+        return Ok(col.clone());
+    }
+
+    // Parse the field path using Lance's field path parsing logic
+    // This properly handles backtick-escaped field names
+    let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| Error::Schema {
+        message: format!("Failed to parse field path '{}': {}", column, e),
+        location: location!(),
+    })?;
+
+    if parts.is_empty() {
+        return Err(Error::Schema {
+            message: format!("Invalid empty field path: {}", column),
+            location: location!(),
+        });
+    }
+
+    // Get the root column
+    let mut current_array: ArrayRef = batch
+        .column_by_name(&parts[0])
+        .ok_or_else(|| Error::Schema {
+            message: format!(
+                "Column '{}' does not exist in batch (looking for root field '{}')",
+                column, parts[0]
+            ),
+            location: location!(),
+        })?
+        .clone();
+
+    // Navigate through nested struct fields
+    for part in &parts[1..] {
+        let struct_array = current_array
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .ok_or_else(|| Error::Schema {
+                message: format!(
+                    "Cannot access nested field '{}' in column '{}': parent is not a struct",
+                    part, column
+                ),
+                location: location!(),
+            })?;
+
+        current_array = struct_array
+            .column_by_name(part)
+            .ok_or_else(|| Error::Schema {
+                message: format!(
+                    "Nested field '{}' does not exist in column '{}'",
+                    part, column
+                ),
+                location: location!(),
+            })?
+            .clone();
+    }
+
+    Ok(current_array)
+}
+
 #[instrument(level = "debug", skip_all)]
 pub async fn compute_distance(
     key: ArrayRef,
@@ -36,13 +102,8 @@ pub async fn compute_distance(
         // Ignore the distance calculated from inner vector index.
         batch = batch.drop_column(DIST_COL)?;
     }
-    let vectors = batch
-        .column_by_name(column)
-        .ok_or_else(|| Error::Schema {
-            message: format!("column {} does not exist in dataset", column),
-            location: location!(),
-        })?
-        .clone();
+
+    let vectors = get_column_from_batch(&batch, column)?;
 
     let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
         NullBuffer::union(rowids.nulls(), vectors.nulls())

@@ -108,18 +108,30 @@ def test_sql_predicates(dataset):
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
 
 
+def test_sql_current_date(tmp_path: Path):
+    table = pa.table(
+        {"date": pa.array([date(2020, 1, 1), date(2020, 1, 2)], type=pa.date32())}
+    )
+    dataset = lance.write_dataset(table, tmp_path / "current_date")
+
+    filtered = dataset.to_table(filter="date <= current_date()")
+    assert filtered.equals(dataset.to_table())
+
+
 def test_illegal_predicates(dataset):
-    predicates_nrows = [
+    bad_parse = [
         "str BETWEEN 10 AND 20",
         "str > 10",
-        "x AN",
+        "str AN",
         "🥞",
-        "foo = 7",
-        "int",
     ]
-    for expr in predicates_nrows:
+    for expr in bad_parse:
         with pytest.raises(ValueError, match="Invalid user input: *"):
             dataset.to_table(filter=expr)
+    with pytest.raises(ValueError, match="No field named foo"):
+        dataset.to_table(filter="foo = 7")
+    with pytest.raises(ValueError, match="does not return a boolean"):
+        dataset.to_table(filter="int")
 
 
 def test_compound(dataset):
@@ -309,3 +321,19 @@ def test_struct_field_order(tmp_path):
         )
         expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
         assert result == expected
+
+
+@pytest.mark.skip(
+    reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
+    " as it requires release mode"
+)
+def test_filter_depth_limit():
+    column_name = "a_very_long_column_name"
+    ds = lance.write_dataset(pa.table({column_name: [1, 2]}), "memory://")
+    ds.create_scalar_index(column_name, "BTREE")
+
+    filter = " AND ".join([f"{column_name} = {i}" for i in range(500)])
+    ds.to_table(filter=filter)
+    with pytest.raises(ValueError, match="the filter expression is too long"):
+        filter = " AND ".join([f"{column_name} = {i}" for i in range(501)])
+        ds.to_table(filter=filter)

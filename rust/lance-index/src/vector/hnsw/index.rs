@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_file::reader::FileReader;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
@@ -71,7 +71,8 @@ impl<Q: Quantization> HNSWIndex<Q> {
         aux_reader: Arc<dyn Reader>,
         options: HNSWIndexOptions,
     ) -> Result<Self> {
-        let reader = FileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
+        let reader =
+            PreviousFileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
 
         let partition_metadata = match reader.schema().metadata.get(IVF_PARTITION_KEY) {
             Some(json) => {
@@ -186,7 +187,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )
     }
 
-    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 
@@ -223,7 +224,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             VECTOR_ID_FIELD.clone(),
         ]))?;
 
-        let reader = FileReader::try_new_from_reader(
+        let reader = PreviousFileReader::try_new_from_reader(
             reader.path(),
             reader.clone(),
             None,
@@ -255,7 +256,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         length: usize,
         partition_id: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let reader = FileReader::try_new_self_described_from_reader(reader, None).await?;
+        let reader = PreviousFileReader::try_new_self_described_from_reader(reader, None).await?;
 
         let metadata = self.get_partition_metadata(partition_id)?;
         let storage = Arc::new(self.partition_storage.load_partition(partition_id).await?);
@@ -328,6 +329,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
     fn quantizer(&self) -> Quantizer {
         self.partition_storage.quantizer().clone()
+    }
+
+    fn partition_size(&self, _: usize) -> usize {
+        unimplemented!("only for IVF")
     }
 
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {

@@ -25,6 +25,11 @@ runs:
       shell: bash
       run: |
         echo "ARM BUILD: ${{ inputs.arm-build }}"
+    - name: Clean old wheels
+      shell: bash
+      run: |
+        # Ensure no cached pylance wheels linger across cache restores
+        rm -f python/target/wheels/pylance-*.whl || true
     - name: Build x86_64 Manylinux2014 wheel
       if: ${{ inputs.arm-build == 'false' && inputs.manylinux == '2_17' }}
       uses: PyO3/maturin-action@v1

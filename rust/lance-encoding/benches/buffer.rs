@@ -19,15 +19,15 @@ fn bench_zip(c: &mut Criterion) {
                 (0..num_values * 2).map(|_| rand::random::<u8>()).collect();
             let random_ints: Vec<u8> = (0..num_values * 4).map(|_| rand::random::<u8>()).collect();
             let mut buffers = vec![
-                (LanceBuffer::Owned(random_shorts), 16),
-                (LanceBuffer::Owned(random_ints), 32),
+                (LanceBuffer::from(random_shorts), 16),
+                (LanceBuffer::from(random_ints), 32),
             ];
             let buffers = &mut buffers;
 
             b.iter(move || {
                 let buffers = buffers
                     .iter_mut()
-                    .map(|(buf, bits_per_value)| (buf.borrow_and_clone(), *bits_per_value))
+                    .map(|(buf, bits_per_value)| (buf.clone(), *bits_per_value))
                     .collect::<Vec<_>>();
                 black_box(LanceBuffer::zip_into_one(buffers, num_values as u64).unwrap());
             })
@@ -42,16 +42,16 @@ fn bench_zip(c: &mut Criterion) {
             let random_shorts3: Vec<u8> =
                 (0..num_values * 2).map(|_| rand::random::<u8>()).collect();
             let mut buffers = vec![
-                (LanceBuffer::Owned(random_shorts1), 16),
-                (LanceBuffer::Owned(random_shorts2), 16),
-                (LanceBuffer::Owned(random_shorts3), 16),
+                (LanceBuffer::from(random_shorts1), 16),
+                (LanceBuffer::from(random_shorts2), 16),
+                (LanceBuffer::from(random_shorts3), 16),
             ];
             let buffers = &mut buffers;
 
             b.iter(move || {
                 let buffers = buffers
                     .iter_mut()
-                    .map(|(buf, bits_per_value)| (buf.borrow_and_clone(), *bits_per_value))
+                    .map(|(buf, bits_per_value)| (buf.clone(), *bits_per_value))
                     .collect::<Vec<_>>();
                 black_box(LanceBuffer::zip_into_one(buffers, num_values as u64).unwrap());
             })

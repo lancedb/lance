@@ -22,20 +22,22 @@
 //! transparent).
 
 use arrow_buffer::ArrowNativeType;
-use snafu::location;
-use std::{
-    io::{Cursor, Write},
-    str::FromStr,
-};
-
 use lance_core::{Error, Result};
+use snafu::location;
 
+use std::str::FromStr;
+
+use crate::compression::{BlockCompressor, BlockDecompressor};
+use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
+use crate::format::{
+    pb21::{self, CompressiveEncoding},
+    ProtobufUtils21,
+};
 use crate::{
     buffer::LanceBuffer,
     compression::VariablePerValueDecompressor,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
-    format::{pb, ProtobufUtils},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -67,6 +69,36 @@ pub enum CompressionScheme {
     Lz4,
 }
 
+impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
+    type Error = Error;
+
+    fn try_from(scheme: CompressionScheme) -> Result<Self> {
+        match scheme {
+            CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
+            CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
+            _ => Err(Error::invalid_input(
+                format!("Unsupported compression scheme: {:?}", scheme),
+                location!(),
+            )),
+        }
+    }
+}
+
+impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
+    type Error = Error;
+
+    fn try_from(scheme: pb21::CompressionScheme) -> Result<Self> {
+        match scheme {
+            pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
+            pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
+            _ => Err(Error::invalid_input(
+                format!("Unsupported compression scheme: {:?}", scheme),
+                location!(),
+            )),
+        }
+    }
+}
+
 impl std::fmt::Display for CompressionScheme {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let scheme_str = match self {
@@ -85,7 +117,9 @@ impl FromStr for CompressionScheme {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "none" => Ok(Self::None),
+            "fsst" => Ok(Self::Fsst),
             "zstd" => Ok(Self::Zstd),
+            "lz4" => Ok(Self::Lz4),
             _ => Err(Error::invalid_input(
                 format!("Unknown compression scheme: {}", s),
                 location!(),
@@ -97,65 +131,195 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
-    fn name(&self) -> &str;
+    fn config(&self) -> CompressionConfig;
 }
 
-#[derive(Debug, Default)]
-pub struct ZstdBufferCompressor {
-    compression_level: i32,
-}
+#[cfg(feature = "zstd")]
+mod zstd {
+    use std::io::{Cursor, Write};
 
-impl ZstdBufferCompressor {
-    pub fn new(compression_level: i32) -> Self {
-        Self { compression_level }
+    use super::*;
+
+    use ::zstd::bulk::decompress_to_buffer;
+    use ::zstd::stream::copy_decode;
+
+    #[derive(Debug, Default)]
+    pub struct ZstdBufferCompressor {
+        compression_level: i32,
     }
-}
 
-impl BufferCompressor for ZstdBufferCompressor {
-    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        let mut encoder = zstd::Encoder::new(output_buf, self.compression_level)?;
-        encoder.write_all(input_buf)?;
-        match encoder.finish() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
+    impl ZstdBufferCompressor {
+        pub fn new(compression_level: i32) -> Self {
+            Self { compression_level }
+        }
+
+        // https://datatracker.ietf.org/doc/html/rfc8878
+        fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
+            if input_buf.len() < 8 {
+                return true; // can't be length prefixed format if less than 8 bytes
+            }
+            // read the first 4 bytes as the magic number
+            let mut magic_buf = [0u8; 4];
+            magic_buf.copy_from_slice(&input_buf[..4]);
+            let magic = u32::from_le_bytes(magic_buf);
+
+            // see RFC 8878, section 3.1.1. Zstandard Frames, which defines the magic number
+            const ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528;
+            if magic == ZSTD_MAGIC_NUMBER {
+                // the compressed buffer starts like a Zstd frame.
+                // Per RFC 8878, the reserved bit (with Bit Number 3, the 4th bit) in the FHD (frame header descriptor) MUST be 0
+                // see section 3.1.1.1.1. 'Frame_Header_Descriptor' and section 3.1.1.1.1.4. 'Reserved Bit' for details
+                const FHD_BYTE_INDEX: usize = 4;
+                let fhd_byte = input_buf[FHD_BYTE_INDEX];
+                const FHD_RESERVED_BIT_MASK: u8 = 0b0001_0000;
+                let reserved_bit = fhd_byte & FHD_RESERVED_BIT_MASK;
+
+                if reserved_bit != 0 {
+                    // this bit is 1. This is NOT a valid zstd frame.
+                    // therefore, it must be length prefixed format where the length coincidentally
+                    // started with the magic number
+                    false
+                } else {
+                    // the reserved bit is 0. This is consistent with a valid Zstd frame.
+                    // treat it as raw stream format
+                    true
+                }
+            } else {
+                // doesn't start with the magic number, so it can't be the raw stream format
+                false
+            }
+        }
+
+        fn decompress_length_prefixed_zstd(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+        ) -> Result<()> {
+            const LENGTH_PREFIX_SIZE: usize = 8;
+            let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+            len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
+
+            let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+
+            let start = output_buf.len();
+            output_buf.resize(start + uncompressed_len, 0);
+
+            let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
+            decompress_to_buffer(compressed_data, &mut output_buf[start..])?;
+            Ok(())
         }
     }
 
-    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        let source = Cursor::new(input_buf);
-        zstd::stream::copy_decode(source, output_buf)?;
-        Ok(())
-    }
+    impl BufferCompressor for ZstdBufferCompressor {
+        fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+            output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
+            let mut encoder = ::zstd::stream::Encoder::new(output_buf, self.compression_level)?;
 
-    fn name(&self) -> &str {
-        "zstd"
+            encoder.write_all(input_buf)?;
+            match encoder.finish() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+            if input_buf.is_empty() {
+                return Ok(());
+            }
+
+            let is_raw_stream_format = self.is_raw_stream_format(input_buf);
+            if is_raw_stream_format {
+                copy_decode(Cursor::new(input_buf), output_buf)?;
+            } else {
+                self.decompress_length_prefixed_zstd(input_buf, output_buf)?;
+            }
+
+            Ok(())
+        }
+
+        fn config(&self) -> CompressionConfig {
+            CompressionConfig {
+                scheme: CompressionScheme::Zstd,
+                level: Some(self.compression_level),
+            }
+        }
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Lz4BufferCompressor {}
+#[cfg(feature = "lz4")]
+mod lz4 {
+    use super::*;
 
-impl BufferCompressor for Lz4BufferCompressor {
-    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        lz4::block::compress_to_buffer(input_buf, None, true, output_buf)
+    #[derive(Debug, Default)]
+    pub struct Lz4BufferCompressor {}
+
+    impl BufferCompressor for Lz4BufferCompressor {
+        fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+            // Remember the starting position
+            let start_pos = output_buf.len();
+
+            // LZ4 needs space for the compressed data
+            let max_size = ::lz4::block::compress_bound(input_buf.len())?;
+            // Resize to ensure we have enough space (including 4 bytes for size header)
+            output_buf.resize(start_pos + max_size + 4, 0);
+
+            let compressed_size = ::lz4::block::compress_to_buffer(
+                input_buf,
+                None,
+                true,
+                &mut output_buf[start_pos..],
+            )
             .map_err(|err| Error::Internal {
                 message: format!("LZ4 compression error: {}", err),
                 location: location!(),
-            })
-            .map(|_| ())
-    }
+            })?;
 
-    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        lz4::block::decompress_to_buffer(input_buf, None, output_buf)
-            .map_err(|err| Error::Internal {
-                message: format!("LZ4 decompression error: {}", err),
-                location: location!(),
-            })
-            .map(|_| ())
-    }
+            // Truncate to actual size
+            output_buf.truncate(start_pos + compressed_size);
+            Ok(())
+        }
 
-    fn name(&self) -> &str {
-        "zstd"
+        fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+            // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
+            // We can read this to know exactly how much space we need
+            if input_buf.len() < 4 {
+                return Err(Error::Internal {
+                    message: "LZ4 compressed data too short".to_string(),
+                    location: location!(),
+                });
+            }
+
+            // Read the uncompressed size from the first 4 bytes (little-endian)
+            let uncompressed_size =
+                u32::from_le_bytes([input_buf[0], input_buf[1], input_buf[2], input_buf[3]])
+                    as usize;
+
+            // Remember the starting position
+            let start_pos = output_buf.len();
+
+            // Resize to ensure we have the exact space needed
+            output_buf.resize(start_pos + uncompressed_size, 0);
+
+            // Now decompress directly into the buffer slice
+            let decompressed_size =
+                ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start_pos..])
+                    .map_err(|err| Error::Internal {
+                    message: format!("LZ4 decompression error: {}", err),
+                    location: location!(),
+                })?;
+
+            // Truncate to actual decompressed size (should be same as uncompressed_size)
+            output_buf.truncate(start_pos + decompressed_size);
+
+            Ok(())
+        }
+
+        fn config(&self) -> CompressionConfig {
+            CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            }
+        }
     }
 }
 
@@ -173,24 +337,83 @@ impl BufferCompressor for NoopBufferCompressor {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        "none"
+    fn config(&self) -> CompressionConfig {
+        CompressionConfig {
+            scheme: CompressionScheme::None,
+            level: None,
+        }
     }
 }
 
 pub struct GeneralBufferCompressor {}
 
 impl GeneralBufferCompressor {
-    pub fn get_compressor(compression_config: CompressionConfig) -> Box<dyn BufferCompressor> {
+    pub fn get_compressor(
+        compression_config: CompressionConfig,
+    ) -> Result<Box<dyn BufferCompressor>> {
         match compression_config.scheme {
             // FSST has its own compression path and isn't implemented as a generic buffer compressor
-            CompressionScheme::Fsst => unimplemented!(),
-            CompressionScheme::Zstd => Box::new(ZstdBufferCompressor::new(
-                compression_config.level.unwrap_or(0),
-            )),
-            CompressionScheme::Lz4 => Box::new(Lz4BufferCompressor::default()),
-            CompressionScheme::None => Box::new(NoopBufferCompressor {}),
+            CompressionScheme::Fsst => Err(Error::InvalidInput {
+                source: "fsst is not usable as a general buffer compressor".into(),
+                location: location!(),
+            }),
+            CompressionScheme::Zstd => {
+                #[cfg(feature = "zstd")]
+                {
+                    Ok(Box::new(zstd::ZstdBufferCompressor::new(
+                        compression_config.level.unwrap_or(0),
+                    )))
+                }
+                #[cfg(not(feature = "zstd"))]
+                {
+                    Err(Error::InvalidInput {
+                        source: "package was not built with zstd support".into(),
+                        location: location!(),
+                    })
+                }
+            }
+            CompressionScheme::Lz4 => {
+                #[cfg(feature = "lz4")]
+                {
+                    Ok(Box::new(lz4::Lz4BufferCompressor::default()))
+                }
+                #[cfg(not(feature = "lz4"))]
+                {
+                    Err(Error::InvalidInput {
+                        source: "package was not built with lz4 support".into(),
+                        location: location!(),
+                    })
+                }
+            }
+            CompressionScheme::None => Ok(Box::new(NoopBufferCompressor {})),
         }
+    }
+}
+
+/// A block decompressor that first applies general-purpose compression (LZ4/Zstd)
+/// before delegating to an inner block decompressor.
+#[derive(Debug)]
+pub struct GeneralBlockDecompressor {
+    inner: Box<dyn BlockDecompressor>,
+    compressor: Box<dyn BufferCompressor>,
+}
+
+impl GeneralBlockDecompressor {
+    pub fn try_new(
+        inner: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+    ) -> Result<Self> {
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        Ok(Self { inner, compressor })
+    }
+}
+
+impl BlockDecompressor for GeneralBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+        self.inner
+            .decompress(LanceBuffer::from(decompressed), num_values)
     }
 }
 
@@ -202,28 +425,33 @@ pub struct CompressedBufferEncoder {
 
 impl Default for CompressedBufferEncoder {
     fn default() -> Self {
-        Self {
-            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
-                scheme: CompressionScheme::Zstd,
-                level: Some(0),
-            }),
-        }
+        // Pick zstd if available, otherwise lz4, otherwise none
+        #[cfg(feature = "zstd")]
+        let (scheme, level) = (CompressionScheme::Zstd, Some(0));
+        #[cfg(all(feature = "lz4", not(feature = "zstd")))]
+        let (scheme, level) = (CompressionScheme::Lz4, None);
+        #[cfg(not(any(feature = "zstd", feature = "lz4")))]
+        let (scheme, level) = (CompressionScheme::None, None);
+
+        let compressor =
+            GeneralBufferCompressor::get_compressor(CompressionConfig { scheme, level }).unwrap();
+        Self { compressor }
     }
 }
 
 impl CompressedBufferEncoder {
-    pub fn new(compression_config: CompressionConfig) -> Self {
-        let compressor = GeneralBufferCompressor::get_compressor(compression_config);
-        Self { compressor }
+    pub fn try_new(compression_config: CompressionConfig) -> Result<Self> {
+        let compressor = GeneralBufferCompressor::get_compressor(compression_config)?;
+        Ok(Self { compressor })
     }
 
-    pub fn from_scheme(scheme: &str) -> Result<Self> {
-        let scheme = CompressionScheme::from_str(scheme)?;
+    pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
+        let scheme = CompressionScheme::try_from(scheme)?;
         Ok(Self {
             compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
                 scheme,
                 level: Some(0),
-            }),
+            })?,
         })
     }
 }
@@ -270,9 +498,9 @@ impl CompressedBufferEncoder {
 }
 
 impl PerValueCompressor for CompressedBufferEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let data_type = data.name();
-        let mut data = data.as_variable_width().ok_or(Error::Internal {
+        let data = data.as_variable_width().ok_or(Error::Internal {
             message: format!(
                 "Attempt to use CompressedBufferEncoder on data of type {}",
                 data_type
@@ -305,14 +533,22 @@ impl PerValueCompressor for CompressedBufferEncoder {
             block_info: BlockInfo::new(),
         });
 
-        let encoding = ProtobufUtils::block(self.compressor.name());
+        // TODO: Support setting the level
+        // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
+        let encoding = ProtobufUtils21::wrapped(
+            self.compressor.config(),
+            ProtobufUtils21::variable(
+                ProtobufUtils21::flat(data.bits_per_offset as u64, None),
+                None,
+            ),
+        )?;
 
         Ok((compressed, encoding))
     }
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, mut data: VariableWidthBlock) -> Result<DataBlock> {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
         let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
 
@@ -324,7 +560,7 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             )?,
             64 => self.per_value_decompress(
                 data_bytes,
-                &data.offsets.borrow_to_typed_slice::<u32>(),
+                &data.offsets.borrow_to_typed_slice::<u64>(),
                 &mut decompressed,
             )?,
             _ => unreachable!(),
@@ -339,10 +575,46 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
     }
 }
 
+impl BlockCompressor for CompressedBufferEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let encoded = match data {
+            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+            DataBlock::VariableWidth(variable_width) => {
+                // Wrap VariableEncoder to handle the encoding
+                let encoder = VariableEncoder::default();
+                BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Unsupported data block type".into(),
+                    location: location!(),
+                })
+            }
+        };
+
+        let mut compressed = Vec::new();
+        self.compressor.compress(&encoded, &mut compressed)?;
+        Ok(LanceBuffer::from(compressed))
+    }
+}
+
+impl BlockDecompressor for CompressedBufferEncoder {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let mut decompressed = Vec::new();
+        self.compressor.decompress(&data, &mut decompressed)?;
+
+        // Delegate to BinaryBlockDecompressor which handles the inline metadata
+        let inner_decoder = BinaryBlockDecompressor::default();
+        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
 
     #[test]
     fn test_compression_scheme_from_str() {
@@ -359,5 +631,176 @@ mod tests {
     #[test]
     fn test_compression_scheme_from_str_invalid() {
         assert!(CompressionScheme::from_str("invalid").is_err());
+    }
+
+    #[cfg(feature = "zstd")]
+    mod zstd {
+        use std::io::Write;
+
+        use super::*;
+
+        #[test]
+        fn test_compress_zstd_with_length_prefixed() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let input_data = b"Hello, world!";
+            let mut compressed_data = Vec::new();
+
+            compressor
+                .compress(input_data, &mut compressed_data)
+                .unwrap();
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(&compressed_data, &mut decompressed_data)
+                .unwrap();
+            assert_eq!(input_data, decompressed_data.as_slice());
+        }
+
+        #[test]
+        fn test_zstd_compress_decompress_multiple_times() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let (input_data_1, input_data_2) = (b"Hello ", b"World");
+            let mut compressed_data = Vec::new();
+
+            compressor
+                .compress(input_data_1, &mut compressed_data)
+                .unwrap();
+            let compressed_length_1 = compressed_data.len();
+
+            compressor
+                .compress(input_data_2, &mut compressed_data)
+                .unwrap();
+
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(
+                    &compressed_data[..compressed_length_1],
+                    &mut decompressed_data,
+                )
+                .unwrap();
+
+            compressor
+                .decompress(
+                    &compressed_data[compressed_length_1..],
+                    &mut decompressed_data,
+                )
+                .unwrap();
+
+            // the output should contain both input_data_1 and input_data_2
+            assert_eq!(
+                decompressed_data.len(),
+                input_data_1.len() + input_data_2.len()
+            );
+            assert_eq!(
+                &decompressed_data[..input_data_1.len()],
+                input_data_1,
+                "First part of decompressed data should match input_1"
+            );
+            assert_eq!(
+                &decompressed_data[input_data_1.len()..],
+                input_data_2,
+                "Second part of decompressed data should match input_2"
+            );
+        }
+
+        #[test]
+        fn test_compress_zstd_raw_stream_format_and_decompress_with_length_prefixed() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let input_data = b"Hello, world!";
+            let mut compressed_data = Vec::new();
+
+            // compress using raw stream format
+            let mut encoder = ::zstd::Encoder::new(&mut compressed_data, 0).unwrap();
+            encoder.write_all(input_data).unwrap();
+            encoder.finish().expect("failed to encode data with zstd");
+
+            // decompress using length prefixed format
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(&compressed_data, &mut decompressed_data)
+                .unwrap();
+            assert_eq!(input_data, decompressed_data.as_slice());
+        }
+    }
+
+    #[cfg(feature = "lz4")]
+    mod lz4 {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow_schema::{DataType, Field};
+        use lance_datagen::array::{binary_prefix_plus_counter, utf8_prefix_plus_counter};
+
+        use super::*;
+
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use crate::{
+            constants::{
+                COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
+                STRUCTURAL_ENCODING_META_KEY,
+            },
+            encodings::physical::block::lz4::Lz4BufferCompressor,
+            testing::{check_round_trip_encoding_generated, FnArrayGeneratorProvider, TestCases},
+            version::LanceFileVersion,
+        };
+
+        #[test]
+        fn test_lz4_compress_decompress() {
+            let compressor = Lz4BufferCompressor::default();
+            let input_data = b"Hello, world!";
+            let mut compressed_data = Vec::new();
+
+            compressor
+                .compress(input_data, &mut compressed_data)
+                .unwrap();
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(&compressed_data, &mut decompressed_data)
+                .unwrap();
+            assert_eq!(input_data, decompressed_data.as_slice());
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_lz4_compress_round_trip() {
+            for data_type in &[
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Binary,
+                DataType::LargeBinary,
+            ] {
+                let field = Field::new("", data_type.clone(), false);
+                let mut field_meta = HashMap::new();
+                field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
+                // Some bad cardinality estimatation causes us to use dictionary encoding currently
+                // which causes the expected encoding check to fail.
+                field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+                // Also disable size-based dictionary encoding
+                field_meta.insert(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    STRUCTURAL_ENCODING_FULLZIP.to_string(),
+                );
+                let field = field.with_metadata(field_meta);
+                let test_cases = TestCases::basic()
+                    // Need to use large pages as small pages might be too small to compress
+                    .with_page_sizes(vec![1024 * 1024])
+                    .with_expected_encoding("zstd")
+                    .with_min_file_version(LanceFileVersion::V2_1);
+
+                // Can't use the default random provider because random data isn't compressible
+                // and we will fallback to uncompressed encoding
+                let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
+                    DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
+                    DataType::Binary => {
+                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
+                    }
+                    DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
+                    DataType::LargeBinary => {
+                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
+                    }
+                    _ => panic!("Unsupported data type: {:?}", data_type),
+                }));
+
+                check_round_trip_encoding_generated(field, datagen, test_cases).await;
+            }
+        }
     }
 }

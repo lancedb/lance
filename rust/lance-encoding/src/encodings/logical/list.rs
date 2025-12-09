@@ -3,7 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, LargeListArray, ListArray};
+use arrow_array::{cast::AsArray, make_array, Array, ArrayRef, LargeListArray, ListArray};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -143,10 +143,7 @@ impl<'a> StructuralListSchedulingJob<'a> {
 }
 
 impl StructuralSchedulingJob for StructuralListSchedulingJob<'_> {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>> {
         self.child.schedule_next(context)
     }
 }
@@ -164,7 +161,7 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
-    fn accept_page(&mut self, child: crate::decoder::LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
 
@@ -202,7 +199,13 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
         match &self.data_type {
             DataType::List(child_field) => {
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                let array = if !child_field.is_nullable() && array.null_count() == array.len() {
+                    make_array(array.into_data().into_builder().nulls(None).build()?)
+                } else {
+                    array
+                };
                 let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
+
                 Ok(DecodedArray {
                     array: Arc::new(list_array),
                     repdef,
@@ -227,21 +230,21 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
+    use crate::constants::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
+        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt64Array, UInt8Array,
     };
+
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use lance_core::datatypes::{
-        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
-    };
     use rstest::rstest;
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
@@ -256,7 +259,6 @@ mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
@@ -267,7 +269,7 @@ mod tests {
         );
         let field =
             Field::new("", make_list_type(DataType::Int32), true).with_metadata(field_metadata);
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
     #[rstest]
@@ -284,26 +286,26 @@ mod tests {
         let field = Field::new("item", DataType::Int32, true).with_metadata(field_metadata);
         for _ in 0..5 {
             let field = Field::new("", make_list_type(field.data_type().clone()), true);
-            check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+            check_basic_random(field).await;
         }
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -315,7 +317,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -342,7 +344,6 @@ mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_simple_list(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
@@ -365,8 +366,7 @@ mod tests {
             .with_range(0..3)
             .with_range(1..3)
             .with_indices(vec![1, 3])
-            .with_indices(vec![2])
-            .with_file_version(version);
+            .with_indices(vec![2]);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -414,7 +414,7 @@ mod tests {
             .with_range(5..7)
             .with_indices(vec![1, 6])
             .with_indices(vec![6])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![Arc::new(outer_list)], &test_cases, field_metadata)
             .await;
     }
@@ -445,7 +445,38 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![1, 3])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_simple_string_list_no_null(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some("a"), Some("bc"), Some("def")]);
+        list_builder.append_value([Some("gh"), Some("zxy")]);
+        list_builder.append_value([Some("gh"), Some("z")]);
+        list_builder.append_value([Some("ijk"), Some("lmnop"), Some("qrs")]);
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3])
+            .with_indices(vec![2])
+            .with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -477,7 +508,7 @@ mod tests {
             .with_range(1..2)
             .with_indices(vec![0])
             .with_indices(vec![1])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -503,6 +534,35 @@ mod tests {
             .with_indices(vec![2]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
+            &test_cases,
+            HashMap::default(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_list_all_null() {
+        let items = UInt64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 5, 8, 10]);
+        let offsets = OffsetBuffer::new(offsets);
+        let list_validity = NullBuffer::new(BooleanBuffer::from(vec![false, false, false]));
+
+        // The list array is nullable but the items are not.  Then, all lists are null.
+        let list_arr = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, false)),
+            offsets,
+            Arc::new(items),
+            Some(list_validity),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(1..2)
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_arr)],
             &test_cases,
             HashMap::default(),
         )
@@ -539,7 +599,7 @@ mod tests {
             .with_range(1..2)
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, field_metadata)
             .await;
     }
@@ -552,6 +612,7 @@ mod tests {
     ) {
         // This is a simple pre-defined list that spans two pages.  This test is useful for
         // debugging the repetition index
+
         let items_builder = Int64Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         for i in 0..512 {
@@ -574,7 +635,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_file_version(LanceFileVersion::V2_1)
+            .with_min_file_version(LanceFileVersion::V2_1)
             .with_page_sizes(vec![100])
             .with_range(800..900);
         check_round_trip_encoding_of_data(
@@ -607,7 +668,6 @@ mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_empty_lists(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
@@ -632,8 +692,7 @@ mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2])
-                .with_indices(vec![0, 1])
-                .with_file_version(version);
+                .with_indices(vec![0, 1]);
             check_round_trip_encoding_of_data(
                 vec![list_array.clone()],
                 &test_cases,
@@ -660,10 +719,7 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_indices(vec![1])
-            .with_file_version(version);
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
         check_round_trip_encoding_of_data(
             vec![list_array.clone()],
             &test_cases,
@@ -685,10 +741,7 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_indices(vec![1])
-            .with_file_version(version);
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
         check_round_trip_encoding_of_data(
             vec![list_array.clone()],
             &test_cases,
@@ -708,10 +761,7 @@ mod tests {
         list_builder.append_null();
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_indices(vec![1])
-            .with_file_version(version);
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
         check_round_trip_encoding_of_data(
             vec![list_array.clone()],
             &test_cases,
@@ -721,10 +771,6 @@ mod tests {
         let test_cases = test_cases.with_batch_size(1);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
             .await;
-
-        if version < LanceFileVersion::V2_1 {
-            return;
-        }
 
         // Scenario 4: All lists are null and inside a struct (only valid for 2.1 since 2.0 doesn't
         // support null structs)
@@ -749,7 +795,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_indices(vec![1])
-            .with_file_version(version);
+            .with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(
             vec![struct_array.clone()],
             &test_cases,
@@ -759,6 +805,20 @@ mod tests {
         let test_cases = test_cases.with_batch_size(1);
         check_round_trip_encoding_of_data(vec![struct_array], &test_cases, field_metadata.clone())
             .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_list_list() {
+        let items_builder = Int32Builder::new();
+        let list_builder = ListBuilder::new(items_builder);
+        let mut outer_list_builder = ListBuilder::new(list_builder);
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        let list_array = Arc::new(outer_list_builder.finish());
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -780,5 +840,53 @@ mod tests {
         // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
+    }
+
+    // Regression test for issue with ListArray encoding when crossing 1024 value boundary
+    // This test reproduces the bug where rows_avail assertion fails in schedule_instructions
+    // when encoding a ListArray with specific size patterns that cross the 1024 value boundary
+    #[tokio::test]
+    async fn test_fuzz_issue_4466() {
+        // This specific pattern of list sizes triggers the bug when total values cross 1024
+        // 94 lists total 1009 values (passes), 95 lists total 1025 values (fails)
+        let list_sizes = vec![
+            13, 18, 12, 7, 14, 12, 6, 13, 18, 8, // 0-9: 119 values
+            6, 11, 17, 12, 8, 19, 5, 6, 10, 13, // 10-19: 107 values
+            8, 6, 10, 4, 8, 16, 14, 12, 18, 9, // 20-29: 105 values
+            17, 8, 14, 18, 15, 3, 2, 4, 5, 1, // 30-39: 82 values
+            3, 13, 1, 2, 10, 4, 10, 18, 7, 14, // 40-49: 75 values
+            18, 13, 9, 17, 3, 13, 10, 14, 8, 19, // 50-59: 125 values
+            17, 10, 5, 11, 6, 15, 10, 18, 18, 20, // 60-69: 130 values
+            16, 11, 12, 15, 7, 9, 3, 10, 20, 5, // 70-79: 102 values
+            2, 3, 17, 4, 8, 12, 15, 6, 3, 20, // 80-89: 90 values
+            15, 20, 1, 19, 16, // 90-94: 71 values
+        ];
+
+        // Build the ListArray
+        let mut list_builder = ListBuilder::new(Int32Builder::new());
+        let mut total_values = 0;
+
+        for size in &list_sizes {
+            for i in 0..*size {
+                list_builder.values().append_value(i);
+            }
+            list_builder.append(true);
+            total_values += size;
+        }
+
+        let list_array = Arc::new(list_builder.finish());
+
+        // Verify we have the expected number of values
+        assert_eq!(list_array.len(), 95);
+        assert_eq!(total_values, 1025);
+
+        // This should trigger the assertion failure at primitive.rs:1362
+        // debug_assert!(rows_avail > 0)
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+
+        // The bug manifests when encoding this specific pattern
+        // Expected: successful round-trip encoding
+        // Actual: panic at primitive.rs:1362 - assertion failed: rows_avail > 0
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

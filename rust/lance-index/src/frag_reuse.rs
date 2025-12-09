@@ -6,9 +6,9 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use deepsize::{Context, DeepSizeOf};
 use itertools::Itertools;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
 use lance_table::format::{pb, ExternalFile, Fragment};
@@ -16,6 +16,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::{any::Any, collections::HashMap, sync::Arc};
+use uuid::Uuid;
 
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
@@ -204,18 +205,27 @@ impl FragReuseIndexDetails {
 /// An index that stores row ID maps.
 /// A row ID map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
+    pub uuid: Uuid,
     pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
+impl DeepSizeOf for FragReuseIndex {
+    fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+    }
+}
+
 impl FragReuseIndex {
     pub fn new(
+        uuid: Uuid,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
+            uuid,
             row_id_maps,
             details,
         }
@@ -235,8 +245,8 @@ impl FragReuseIndex {
         mapped_value
     }
 
-    pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
-        RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
+    pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(row_addrs.row_addrs().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
             self.remap_row_id(addr_as_u64)
         }))
@@ -246,7 +256,7 @@ impl FragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Remap a record batch that contains a row_id column at index `row_id_idx`
     /// Currently this assumes there are only 2 columns in the schema,
     /// which is the case for all indexes.
     /// For example, for btree, the schema is (value, row_id).

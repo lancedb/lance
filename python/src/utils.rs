@@ -20,20 +20,18 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::datatypes::Schema;
 use lance::Result;
-use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::writer::FileWriter;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
-use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
-use lance_linalg::{
-    distance::DistanceType,
-    kmeans::{KMeans as LanceKMeans, KMeansParams},
+use lance_index::vector::kmeans::{
+    compute_partitions, KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams,
 };
+use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
 use pyo3::intern;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
@@ -42,7 +40,24 @@ use pyo3::{
     IntoPyObjectExt,
 };
 
-use crate::RT;
+use crate::file::object_store_from_uri_or_path;
+use crate::rt;
+
+/// A wrapper around a JSON string that converts to a Python object
+/// using json.loads when marshalling to Python.
+#[derive(Debug, Clone)]
+pub struct PyJson(pub String);
+
+impl<'py> IntoPyObject<'py> for PyJson {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        let json_module = py.import("json")?;
+        json_module.call_method1("loads", (self.0,))
+    }
+}
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -210,7 +225,7 @@ impl Hnsw {
         let dt = DistanceType::try_from(distance_type)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        let hnsw = RT
+        let hnsw = rt()
             .runtime
             .block_on(params.build(vectors.clone(), dt))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -219,12 +234,12 @@ impl Hnsw {
 
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
-        let object_store = ObjectStore::local();
-        let path = Path::parse(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
-        let mut writer = RT
+        let (object_store, path) =
+            rt().block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
+        let mut writer = rt()
             .block_on(
                 Some(py),
-                FileWriter::<ManifestDescribing>::try_new(
+                PreviousFileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())
@@ -233,7 +248,7 @@ impl Hnsw {
                 ),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        RT.block_on(Some(py), async {
+        rt().block_on(Some(py), async {
             let batch = self.hnsw.to_batch()?;
             let metadata = batch.schema_ref().metadata().clone();
             writer.write_record_batch(batch).await?;
@@ -281,5 +296,15 @@ pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     match full_name.rsplit_once('.') {
         Some((_, name)) => Ok(name.to_string()),
         None => Ok(full_name),
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&i32> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        self.0.into_bound_py_any(py)
     }
 }

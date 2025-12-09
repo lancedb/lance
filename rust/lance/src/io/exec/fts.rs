@@ -15,25 +15,56 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
-use lance_index::scalar::inverted::query::{
-    collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
-};
-use lance_index::scalar::inverted::{
-    flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
-};
-use lance_index::scalar::ScalarIndexType;
-use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
-use tracing::instrument;
-
-use crate::{index::DatasetIndexInternalExt, Dataset};
 
 use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
+use crate::{index::DatasetIndexInternalExt, Dataset};
+use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::inverted::builder::document_input;
+use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
+use lance_index::scalar::inverted::query::{
+    collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+};
+use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
+use lance_index::scalar::inverted::{
+    flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
+};
+use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_index::{DatasetIndexExt, IndexCriteria};
+use tracing::instrument;
+
+pub struct FtsIndexMetrics {
+    index_metrics: IndexMetrics,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl FtsIndexMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            index_metrics: IndexMetrics::new(metrics, partition),
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+        }
+    }
+}
+
+impl MetricsCollector for FtsIndexMetrics {
+    fn record_parts_loaded(&self, num_parts: usize) {
+        self.index_metrics.record_parts_loaded(num_parts);
+    }
+
+    fn record_index_loads(&self, num_indexes: usize) {
+        self.index_metrics.record_index_loads(num_indexes);
+    }
+
+    fn record_comparisons(&self, num_comparisons: usize) {
+        self.index_metrics.record_comparisons(num_comparisons);
+    }
+}
 
 #[derive(Debug)]
 pub struct MatchQueryExec {
@@ -50,10 +81,20 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -173,19 +214,15 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-
         let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",
@@ -193,7 +230,7 @@ impl ExecutionPlan for MatchQueryExec {
                 )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
-                .open_generic_index(&column, &uuid, metrics.as_ref())
+                .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
             let pre_filter = build_prefilter(
@@ -221,26 +258,37 @@ impl ExecutionPlan for MatchQueryExec {
                 .with_prefix_length(query.prefix_length);
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
-                true => tantivy::tokenizer::TextAnalyzer::from(
-                    tantivy::tokenizer::SimpleTokenizer::default(),
-                ),
+                true => {
+                    let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
+                        tantivy::tokenizer::SimpleTokenizer::default(),
+                    );
+                    match inverted_idx.tokenizer().doc_type() {
+                        DocType::Text => {
+                            Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                        DocType::Json => {
+                            Box::new(JsonTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                    }
+                }
             };
-            let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     query.operator,
                     pre_filter,
-                    metrics,
+                    metrics.clone(),
                 )
                 .boxed()
                 .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
+            metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -269,6 +317,10 @@ impl ExecutionPlan for MatchQueryExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 /// Calculates the FTS score for each row in the input
@@ -287,10 +339,20 @@ impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlatMatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlatMatchQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "FlatMatchQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -361,47 +423,47 @@ impl ExecutionPlan for FlatMatchQueryExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let unindexed_input = self.unindexed_input.execute(partition, context)?;
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
+        let unindexed_input =
+            document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
-                )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, metrics.as_ref())
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?;
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let inverted_idx = match index_meta {
+                Some(index_meta) => {
+                    let uuid = index_meta.uuid.to_string();
+                    let index = ds
+                        .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                        .await?;
+                    index.as_any().downcast_ref::<InvertedIndex>().cloned()
+                }
+                None => None,
+            };
+
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
-                inverted_idx,
+                &inverted_idx,
             ))
         })
-        .try_flatten_unordered(None);
+        .try_flatten_unordered(None)
+        .map(move |batch| {
+            if let Ok(batch) = &batch {
+                metrics_clone
+                    .baseline_metrics
+                    .record_output(batch.num_rows());
+            }
+            batch
+        });
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
@@ -421,6 +483,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -437,10 +503,20 @@ impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "PhraseQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "PhraseQuery\nquery={}", self.query.terms)
+                write!(
+                    f,
+                    "PhraseQuery\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
             }
         }
     }
@@ -450,7 +526,7 @@ impl PhraseQueryExec {
     pub fn new(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
-        params: FtsSearchParams,
+        mut params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -459,7 +535,7 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        assert_eq!(params.phrase_slop, Some(query.slop));
+        params = params.with_phrase_slop(Some(query.slop));
 
         Self {
             dataset,
@@ -553,18 +629,15 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let column = query.column.ok_or(DataFusionError::Execution(format!(
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
             let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
-                )
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
                     "No Inverted index found for column {}",
@@ -572,7 +645,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
-                .open_generic_index(&column, &uuid, metrics.as_ref())
+                .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
             let pre_filter = build_prefilter(
@@ -594,19 +667,20 @@ impl ExecutionPlan for PhraseQueryExec {
                 })?;
 
             let mut tokenizer = index.tokenizer();
-            let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
                 .bm25_search(
-                    tokens.into(),
+                    Arc::new(tokens),
                     params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
                     pre_filter,
-                    metrics,
+                    metrics.clone(),
                 )
                 .boxed()
                 .await?;
+            metrics.baseline_metrics.record_output(doc_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
                 vec![
@@ -632,6 +706,10 @@ impl ExecutionPlan for PhraseQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -745,10 +823,12 @@ impl ExecutionPlan for BoostQueryExec {
         let params = self.params.clone();
         let positive = self.positive.execute(partition, context.clone())?;
         let negative = self.negative.execute(partition, context)?;
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let positive = positive.try_collect::<Vec<_>>().await?;
             let negative = negative.try_collect::<Vec<_>>().await?;
 
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let mut res = HashMap::new();
             for batch in positive {
                 let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
@@ -774,6 +854,7 @@ impl ExecutionPlan for BoostQueryExec {
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
+            metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -800,6 +881,10 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -957,12 +1042,16 @@ impl ExecutionPlan for BooleanQueryExec {
             .transpose()?;
         let mut should = self.should.execute(partition, context.clone())?;
         let mut must_not = self.must_not.execute(partition, context)?;
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
+            let elapsed_time = metrics.baseline_metrics.elapsed_compute();
+
             let mut res = HashMap::new();
             let has_must = must.is_some();
             if let Some(mut must) = must {
                 while let Some(batch) = must.try_next().await? {
+                    let _timer = elapsed_time.timer();
                     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
                     res.extend(std::iter::zip(
@@ -974,6 +1063,7 @@ impl ExecutionPlan for BooleanQueryExec {
 
             // add the scores from the should clause
             while let Some(batch) = should.try_next().await? {
+                let _timer = elapsed_time.timer();
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
 
@@ -987,6 +1077,7 @@ impl ExecutionPlan for BooleanQueryExec {
 
             // remove the results from the must_not clause
             while let Some(batch) = must_not.try_next().await? {
+                let _timer = elapsed_time.timer();
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 for row_id in row_ids {
                     res.remove(row_id);
@@ -994,11 +1085,13 @@ impl ExecutionPlan for BooleanQueryExec {
             }
 
             // sort the results and take the top k
+            let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
+            metrics.baseline_metrics.record_output(row_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
                 vec![
@@ -1057,8 +1150,10 @@ pub mod tests {
         match_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
+        let metrics = match_query.metrics().unwrap();
+        assert!(metrics.elapsed_compute().unwrap() > 0);
 
-        let flat_input = lance_datagen::gen()
+        let flat_input = lance_datagen::gen_batch()
             .col(
                 "text",
                 lance_datagen::array::rand_utf8(ByteCount::from(10), false),
@@ -1074,6 +1169,8 @@ pub mod tests {
         flat_match_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
+        let metrics = flat_match_query.metrics().unwrap();
+        assert!(metrics.elapsed_compute().unwrap() > 0);
 
         let phrase_query = PhraseQueryExec::new(
             Arc::new(fixture.dataset.clone()),
@@ -1084,6 +1181,8 @@ pub mod tests {
         phrase_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
+        let metrics = phrase_query.metrics().unwrap();
+        assert!(metrics.elapsed_compute().unwrap() > 0);
 
         let boost_input_one = MatchQueryExec::new(
             Arc::new(fixture.dataset.clone()),
@@ -1116,5 +1215,7 @@ pub mod tests {
         boost_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
+        let metrics = boost_query.metrics().unwrap();
+        assert!(metrics.elapsed_compute().unwrap() > 0);
     }
 }

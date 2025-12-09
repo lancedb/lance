@@ -511,6 +511,7 @@ mod tests {
     use std::ops::Deref;
 
     use arrow_array::*;
+    use lance_core::utils::tempfile::TempStdFile;
     use rand::prelude::*;
 
     use super::*;
@@ -539,8 +540,8 @@ mod tests {
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-        let mut rng = rand::thread_rng();
-        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.random()).collect();
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
@@ -553,8 +554,7 @@ mod tests {
     }
 
     async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test_round_trip");
+        let path = TempStdFile::default();
 
         let expected_as_array = expected
             .iter()
@@ -702,8 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_decode_by_range() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("decode_by_range");
+        let path = TempStdFile::default();
 
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
         {
@@ -749,8 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let path = test_dir.path().join("takes");
+        let path = TempStdFile::default();
 
         let array = Int32Array::from_iter_values(0..100);
 

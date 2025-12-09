@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{env, path::PathBuf};
-
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
+use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 
+pub mod lance_tokenizer;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
@@ -19,9 +19,19 @@ use jieba::JiebaTokenizerBuilder;
 #[cfg(feature = "tokenizer-lindera")]
 use lindera::LinderaTokenizerBuilder;
 
+use crate::pbold;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+    JsonTokenizer, LanceTokenizer, TextTokenizer,
+};
+
 /// Tokenizer configs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
+    /// lance tokenizer takes care of different data types, such as text, json, etc.
+    /// - 'text': parsing input documents into tokens
+    /// - 'json': parsing input json string into tokens
+    /// - none: auto type inference
+    pub(crate) lance_tokenizer: Option<String>,
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
@@ -39,7 +49,7 @@ pub struct InvertedIndexParams {
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
     /// If false, only store the frequency of the term in the document
-    /// Default is true
+    /// Default is false
     #[serde(default)]
     pub(crate) with_position: bool,
 
@@ -60,6 +70,11 @@ pub struct InvertedIndexParams {
     #[serde(default = "bool_true")]
     pub(crate) remove_stop_words: bool,
 
+    /// use customized stop words.
+    /// - `None`: use built-in stop words based on language
+    /// - `Some(words)`: use customized stop words
+    pub(crate) custom_stop_words: Option<Vec<String>>,
+
     /// ascii folding
     #[serde(default = "bool_true")]
     pub(crate) ascii_folding: bool,
@@ -75,6 +90,53 @@ pub struct InvertedIndexParams {
     /// whether prefix only
     #[serde(default)]
     pub(crate) prefix_only: bool,
+}
+
+impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
+    type Error = Error;
+
+    fn try_from(params: &InvertedIndexParams) -> Result<Self> {
+        Ok(Self {
+            base_tokenizer: Some(params.base_tokenizer.clone()),
+            language: serde_json::to_string(&params.language)?,
+            with_position: params.with_position,
+            max_token_length: params.max_token_length.map(|l| l as u32),
+            lower_case: params.lower_case,
+            stem: params.stem,
+            remove_stop_words: params.remove_stop_words,
+            ascii_folding: params.ascii_folding,
+            min_ngram_length: params.min_ngram_length,
+            max_ngram_length: params.max_ngram_length,
+            prefix_only: params.prefix_only,
+        })
+    }
+}
+
+impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
+    type Error = Error;
+
+    fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            lance_tokenizer: defaults.lance_tokenizer,
+            base_tokenizer: details
+                .base_tokenizer
+                .as_ref()
+                .cloned()
+                .unwrap_or(defaults.base_tokenizer),
+            language: serde_json::from_str(details.language.as_str())?,
+            with_position: details.with_position,
+            max_token_length: details.max_token_length.map(|l| l as usize),
+            lower_case: details.lower_case,
+            stem: details.stem,
+            remove_stop_words: details.remove_stop_words,
+            custom_stop_words: defaults.custom_stop_words,
+            ascii_folding: details.ascii_folding,
+            min_ngram_length: details.min_ngram_length,
+            max_ngram_length: details.max_ngram_length,
+            prefix_only: details.prefix_only,
+        })
+    }
 }
 
 fn bool_true() -> bool {
@@ -111,6 +173,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
+            lance_tokenizer: None,
             base_tokenizer,
             language,
             with_position: false,
@@ -118,11 +181,17 @@ impl InvertedIndexParams {
             lower_case: true,
             stem: true,
             remove_stop_words: true,
+            custom_stop_words: None,
             ascii_folding: true,
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
         }
+    }
+
+    pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
+        self.lance_tokenizer = Some(lance_tokenizer);
+        self
     }
 
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
@@ -167,6 +236,11 @@ impl InvertedIndexParams {
         self
     }
 
+    pub fn custom_stop_words(mut self, custom_stop_words: Option<Vec<String>>) -> Self {
+        self.custom_stop_words = custom_stop_words;
+        self
+    }
+
     pub fn ascii_folding(mut self, ascii_folding: bool) -> Self {
         self.ascii_folding = ascii_folding;
         self
@@ -195,7 +269,7 @@ impl InvertedIndexParams {
         self
     }
 
-    pub fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzer> {
+    pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
@@ -209,22 +283,39 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = tantivy::tokenizer::StopWordFilter::new(self.language)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "removing stop words for language {:?} is not supported yet",
-                            self.language
-                        ),
-                        location!(),
-                    )
-                })?;
+            let stop_word_filter = match &self.custom_stop_words {
+                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
+                None => {
+                    tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "removing stop words for language {:?} is not supported yet",
+                                self.language
+                            ),
+                            location!(),
+                        )
+                    })?
+                }
+            };
             builder = builder.filter_dynamic(stop_word_filter);
         }
         if self.ascii_folding {
             builder = builder.filter_dynamic(tantivy::tokenizer::AsciiFoldingFilter);
         }
-        Ok(builder.build())
+        let tokenizer = builder.build();
+
+        match self.lance_tokenizer {
+            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
+            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
+            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+            _ => Err(Error::invalid_input(
+                format!(
+                    "unknown lance tokenizer {}",
+                    self.lance_tokenizer.as_ref().unwrap()
+                ),
+                location!(),
+            )),
+        }
     }
 
     fn build_base_tokenizer(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {

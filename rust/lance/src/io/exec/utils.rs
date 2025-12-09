@@ -1,12 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
-use lance_table::format::Index;
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
+use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
@@ -26,7 +27,7 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
 use lance_core::{Result, ROW_ID};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
@@ -49,7 +50,7 @@ pub(crate) fn build_prefilter(
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
-    index_meta: &[Index],
+    index_meta: &[IndexMetadata],
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -75,12 +76,13 @@ pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowIdTreeMap::new();
+        let mut allow_list = RowAddrTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).expect(
-                "input batch missing row id column even though it is in the schema for the stream",
-            );
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
+                message: "input batch missing row id column even though it is in the schema for the stream".into(),
+                location: location!(),
+            })?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -370,16 +372,19 @@ impl ExecutionPlan for ReplayExec {
 
 #[derive(Debug, Clone)]
 pub struct IoMetrics {
-    iops: Count,
-    requests: Count,
-    bytes_read: Count,
+    // We use gauge and not counter here because the underlying ScanScheduler
+    // reports cumulative stats, not deltas. We use set_max to ensure the gauge
+    // always shows the highest value seen.
+    iops: Gauge,
+    requests: Gauge,
+    bytes_read: Gauge,
 }
 
 impl IoMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
-        let iops = metrics.new_count(IOPS_METRIC, partition);
-        let requests = metrics.new_count(REQUESTS_METRIC, partition);
-        let bytes_read = metrics.new_count(BYTES_READ_METRIC, partition);
+        let iops = metrics.new_gauge(IOPS_METRIC, partition);
+        let requests = metrics.new_gauge(REQUESTS_METRIC, partition);
+        let bytes_read = metrics.new_gauge(BYTES_READ_METRIC, partition);
         Self {
             iops,
             requests,
@@ -387,11 +392,13 @@ impl IoMetrics {
         }
     }
 
-    pub fn record_final(&self, scan_scheduler: &ScanScheduler) {
-        let stats = scan_scheduler.stats();
-        self.iops.add(stats.iops as usize);
-        self.requests.add(stats.requests as usize);
-        self.bytes_read.add(stats.bytes_read as usize);
+    pub fn record(&self, scan_scheduler: &ScanScheduler) {
+        let current_stats = scan_scheduler.stats();
+
+        // Use set_max to ensure gauge always shows the highest value seen
+        self.iops.set_max(current_stats.iops as usize);
+        self.requests.set_max(current_stats.requests as usize);
+        self.bytes_read.set_max(current_stats.bytes_read as usize);
     }
 }
 
@@ -430,6 +437,7 @@ mod tests {
 
     use arrow_array::{types::UInt32Type, RecordBatchReader};
     use arrow_schema::SortOptions;
+    use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -446,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay() {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
         let schema = data.schema();
@@ -466,7 +474,7 @@ mod tests {
                 None,
                 JoinType::Inner,
                 vec![SortOptions::default()],
-                true,
+                NullEquality::NullEqualsNull,
             )
             .unwrap(),
         );

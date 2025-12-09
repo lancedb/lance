@@ -3,10 +3,7 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::cmp::min;
-use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
-
+use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -14,19 +11,20 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
-use lance_file::{
-    reader::FileReader,
-    writer::{FileWriter, ManifestProvider},
+use lance_file::previous::{
+    reader::FileReader as PreviousFileReader,
+    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
+use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-
-use super::{IndexReader, IndexStore, IndexWriter};
+use std::cmp::min;
+use std::collections::HashMap;
+use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -70,7 +68,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
+impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
@@ -89,7 +87,7 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
 }
 
 #[async_trait]
-impl IndexWriter for v2::writer::FileWriter {
+impl IndexWriter for current_writer::FileWriter {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write_batch(&batch).await?;
@@ -109,7 +107,7 @@ impl IndexWriter for v2::writer::FileWriter {
 }
 
 #[async_trait]
-impl IndexReader for FileReader {
+impl IndexReader for PreviousFileReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
@@ -141,7 +139,7 @@ impl IndexReader for FileReader {
 }
 
 #[async_trait]
-impl IndexReader for v2::reader::FileReader {
+impl IndexReader for current_reader::FileReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;
@@ -160,16 +158,13 @@ impl IndexReader for v2::reader::FileReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            v2::reader::ReaderProjection::from_column_names(
+            ReaderProjection::from_column_names(
                 self.metadata().version(),
                 self.schema(),
                 projection,
             )?
         } else {
-            v2::reader::ReaderProjection::from_whole_schema(
-                self.schema(),
-                self.metadata().version(),
-            )
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
         };
         let batches = self
             .read_stream_projected(
@@ -218,10 +213,10 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
-        let writer = v2::writer::FileWriter::try_new(
+        let writer = current_writer::FileWriter::try_new(
             writer,
             schema,
-            v2::writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions::default(),
         )?;
         Ok(Box::new(writer))
     }
@@ -232,7 +227,7 @@ impl IndexStore for LanceIndexStore {
             .scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await?;
-        match v2::reader::FileReader::try_open(
+        match current_reader::FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -246,7 +241,7 @@ impl IndexStore for LanceIndexStore {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
                     let path = self.index_dir.child(name);
-                    let file_reader = FileReader::try_new_self_described(
+                    let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
                         &path,
                         Some(&self.metadata_cache),
@@ -306,14 +301,18 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 pub mod tests {
 
-    use std::{collections::HashMap, ops::Bound, path::Path};
+    use std::{collections::HashMap, ops::Bound};
 
     use crate::metrics::NoOpMetricsCollector;
+    use crate::pbold;
+    use crate::scalar::bitmap::BitmapIndexPlugin;
+    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
+    use crate::scalar::label_list::LabelListIndexPlugin;
+    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
-        bitmap::{train_bitmap_index, BitmapIndex},
-        btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
+        bitmap::BitmapIndex,
+        btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
         flat::FlatIndexMetadata,
-        label_list::{train_label_list_index, LabelListIndex},
         LabelListQuery, SargableQuery, ScalarIndex,
     };
 
@@ -327,89 +326,72 @@ pub mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::utils::mask::RowIdTreeMap;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
-    use tempfile::{tempdir, TempDir};
+    use lance_core::utils::mask::RowAddrTreeMap;
+    use lance_core::utils::tempfile::TempDir;
+    use lance_core::ROW_ID;
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
-        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+        let test_path = tempdir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
-    }
-
-    pub struct MockTrainingSource {
-        data: SendableRecordBatchStream,
-    }
-
-    impl MockTrainingSource {
-        pub async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
-            Self {
-                data: lance_datafusion::utils::reader_to_stream(Box::new(data)),
-            }
-        }
-    }
-
-    impl From<SendableRecordBatchStream> for MockTrainingSource {
-        fn from(data: SendableRecordBatchStream) -> Self {
-            Self { data }
-        }
-    }
-
-    #[async_trait]
-    impl TrainingSource for MockTrainingSource {
-        async fn scan_ordered_chunks(
-            self: Box<Self>,
-            _chunk_size: u32,
-        ) -> Result<SendableRecordBatchStream> {
-            Ok(self.data)
-        }
-
-        async fn scan_unordered_chunks(
-            self: Box<Self>,
-            _chunk_size: u32,
-        ) -> Result<SendableRecordBatchStream> {
-            Ok(self.data)
-        }
     }
 
     async fn train_index(
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
-        value_type: DataType,
         custom_batch_size: Option<u64>,
     ) {
-        let sub_index_trainer = FlatIndexMetadata::new(value_type);
-
-        let data = Box::new(MockTrainingSource::new(data).await);
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
-        train_btree_index(
-            data,
-            &sub_index_trainer,
-            index_store.as_ref(),
-            batch_size as u32,
-        )
-        .await
-        .unwrap();
+        let params = BTreeParameters {
+            zone_size: Some(batch_size),
+        };
+        let params = serde_json::to_string(&params).unwrap();
+        let btree_plugin = BTreeIndexPlugin;
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = btree_plugin
+            .new_training_request(
+                &params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            )
+            .unwrap();
+        btree_plugin
+            .train_index(data, index_store.as_ref(), request, None)
+            .await
+            .unwrap();
+    }
+
+    fn default_details<T: prost::Message + prost::Name + std::default::Default>() -> prost_types::Any
+    {
+        prost_types::Any::from_msg(&T::default()).unwrap()
     }
 
     #[tokio::test]
     async fn test_basic_btree() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store, None).await.unwrap();
+        train_index(&index_store, data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
         let result = index
             .search(
@@ -420,9 +402,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = index
             .search(
@@ -436,9 +418,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(0), row_ids.len());
+        assert_eq!(Some(0), row_addrs.len());
 
         let result = index
             .search(
@@ -452,28 +434,39 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(100), row_ids.len());
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     #[tokio::test]
     async fn test_btree_update() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
-        let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store, None).await.unwrap();
+        train_index(&index_store, data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
-        let data = gen()
-            .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
-            .col("row_ids", array::step_custom::<UInt64Type>(4096 * 100, 1))
+        let data = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::step_custom::<Int32Type>(4096 * 100, 1),
+            )
+            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
-        let updated_index_dir = tempdir().unwrap();
+        let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
@@ -482,7 +475,15 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BTreeIndex::load(updated_index_store, None).await.unwrap();
+        let updated_index = BTreeIndexPlugin
+            .load_index(
+                updated_index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
         let result = updated_index
             .search(
@@ -493,10 +494,10 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = updated_index
             .search(
@@ -507,53 +508,70 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(500_000));
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(500_000));
     }
 
-    async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
+    async fn check(index: &Arc<dyn ScalarIndex>, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(results.row_addrs(), &expected_arr);
     }
 
     #[tokio::test]
     async fn test_btree_with_gaps() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
-            .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
-            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
-            .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
-            .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
-            .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
-            .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
-            .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
+        let batch_one = gen_batch()
             .col(
-                "row_ids",
-                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
-            .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
+        let batch_two = gen_batch()
             .col(
-                "row_ids",
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_three = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_four = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                ROW_ID,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        train_index(&index_store, data, DataType::Int32, Some(4)).await;
-        let index = BTreeIndex::load(index_store, None).await.unwrap();
+        train_index(&index_store, data, Some(4)).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
         // The above should create four pages
         //
@@ -748,11 +766,11 @@ pub mod tests {
             // Min/max accumulator not implemented for Duration(Nanosecond)
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
-            let tempdir = tempdir().unwrap();
+            let tempdir = TempDir::default();
             let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen()
-                .col("values", array::rand_type(data_type))
-                .col("row_ids", array::step::<UInt64Type>())
+            let data: RecordBatch = gen_batch()
+                .col(VALUE_COLUMN_NAME, array::rand_type(data_type))
+                .col(ROW_ID, array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
                 .unwrap();
 
@@ -788,8 +806,16 @@ pub mod tests {
                 data.schema().clone(),
             );
 
-            train_index(&index_store, training_data, data_type.clone(), None).await;
-            let index = BTreeIndex::load(index_store, None).await.unwrap();
+            train_index(&index_store, training_data, None).await;
+            let index = BTreeIndexPlugin
+                .load_index(
+                    index_store,
+                    &default_details::<pbold::BTreeIndexDetails>(),
+                    None,
+                    &LanceCache::no_cache(),
+                )
+                .await
+                .unwrap();
 
             let result = index
                 .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
@@ -797,47 +823,59 @@ pub mod tests {
                 .unwrap();
 
             assert!(result.is_exact());
-            let row_ids = result.row_ids();
+            let row_addrs = result.row_addrs();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
-            assert!(!row_ids.is_empty());
-            assert!(row_ids.len().unwrap() < data.num_rows() as u64);
-            assert!(row_ids.contains(sample_row_id));
+            assert!(!row_addrs.is_empty());
+            assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
+            assert!(row_addrs.contains(sample_row_id));
         }
     }
 
     #[tokio::test]
     async fn btree_entire_null_page() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let batch = gen()
+        let batch = gen_batch()
             .col(
-                "values",
+                VALUE_COLUMN_NAME,
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col("row_ids", array::step::<UInt64Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
-        assert_eq!(batch.as_ref().unwrap()["values"].null_count(), 4096);
+        assert_eq!(
+            batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
+            4096
+        );
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, true),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
-        let data = Box::new(MockTrainingSource::new(data).await);
         train_btree_index(
             data,
             &sub_index_trainer,
             index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await
         .unwrap();
 
-        let index = BTreeIndex::load(index_store, None).await.unwrap();
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
         let result = index
             .search(
@@ -848,37 +886,41 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
+        let row_addrs = result.row_addrs();
 
-        assert!(row_ids.is_empty());
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
             .await
             .unwrap();
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(4096));
+        let row_addrs = result.row_addrs();
+        assert_eq!(row_addrs.len(), Some(4096));
     }
 
     async fn train_bitmap(
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = Box::new(MockTrainingSource::new(data).await);
-        train_bitmap_index(data, index_store.as_ref())
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = BitmapIndexPlugin
+            .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
+            .unwrap();
+        BitmapIndexPlugin
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_bitmap_working() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("values", DataType::Utf8, true),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
 
         let batch1 = RecordBatch::try_new(
@@ -907,7 +949,9 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None).await.unwrap();
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         let result = index
             .search(
@@ -918,9 +962,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(2));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(2));
 
         let result = index
             .search(
@@ -931,23 +975,25 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(3), row_ids.len());
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(3));
-        assert!(row_ids.contains(6));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(3), row_addrs.len());
+        assert!(row_addrs.contains(1));
+        assert!(row_addrs.contains(3));
+        assert!(row_addrs.contains(6));
     }
 
     #[tokio::test]
     async fn test_basic_bitmap() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None).await.unwrap();
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         let result = index
             .search(
@@ -958,9 +1004,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(10000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(10000));
 
         let result = index
             .search(
@@ -974,8 +1020,8 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert!(row_ids.is_empty());
+        let row_addrs = result.row_addrs();
+        assert!(row_addrs.is_empty());
 
         let result = index
             .search(
@@ -989,51 +1035,62 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(100), row_ids.len());
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(100), row_addrs.len());
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results.row_ids(), &expected_arr);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
+        assert_eq!(results.row_addrs(), &expected_arr);
     }
 
     #[tokio::test]
     async fn test_bitmap_with_gaps() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
-            .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
-            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
-            .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
-            .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
-            .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
-            .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
-            .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
+        let batch_one = gen_batch()
             .col(
-                "row_ids",
-                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
-            .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
+        let batch_two = gen_batch()
             .col(
-                "row_ids",
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_three = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_four = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                ROW_ID,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None).await.unwrap();
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         // The above should create four pages
         //
@@ -1212,21 +1269,23 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bitmap_update() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
-        let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None).await.unwrap();
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
-        let data = gen()
-            .col("values", array::step_custom::<Int32Type>(4096, 1))
-            .col("row_ids", array::step_custom::<UInt64Type>(4096, 1))
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096, 1))
+            .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
 
-        let updated_index_dir = tempdir().unwrap();
+        let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
@@ -1235,7 +1294,9 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None).await.unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         let result = updated_index
             .search(
@@ -1246,21 +1307,23 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(Some(1), row_ids.len());
-        assert!(row_ids.contains(5000));
+        let row_addrs = result.row_addrs();
+        assert_eq!(Some(1), row_addrs.len());
+        assert!(row_addrs.contains(5000));
     }
 
     #[tokio::test]
     async fn test_bitmap_remap() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
-        let data = gen()
-            .col("values", array::step::<Int32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None).await.unwrap();
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         let mapping = (0..50)
             .map(|i| {
@@ -1275,13 +1338,15 @@ pub mod tests {
             })
             .collect::<HashMap<_, _>>();
 
-        let remapped_dir = tempdir().unwrap();
+        let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
             .remap(&mapping, remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None).await.unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         // Remapped to new value
         assert!(remapped_index
@@ -1291,7 +1356,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .contains(65));
         // Deleted
         assert!(remapped_index
@@ -1301,7 +1366,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .is_empty());
         // Not remapped
         assert!(remapped_index
@@ -1311,7 +1376,7 @@ pub mod tests {
             )
             .await
             .unwrap()
-            .row_ids()
+            .row_addrs()
             .contains(3));
     }
 
@@ -1319,26 +1384,37 @@ pub mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = Box::new(MockTrainingSource::new(data).await);
-        train_label_list_index(data, index_store.as_ref())
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = LabelListIndexPlugin
+            .new_training_request(
+                "{}",
+                &Field::new(
+                    VALUE_COLUMN_NAME,
+                    DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+                    false,
+                ),
+            )
+            .unwrap();
+        LabelListIndexPlugin
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_label_list_index() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col(
-                "values",
+                VALUE_COLUMN_NAME,
                 array::rand_type(&DataType::List(Arc::new(Field::new(
                     "item",
                     DataType::UInt8,
                     false,
                 )))),
             )
-            .col("row_ids", array::step::<UInt64Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
@@ -1355,13 +1431,21 @@ pub mod tests {
             let index_store = index_store.clone();
             let data = data.clone();
             async move {
-                let index = LabelListIndex::load(index_store, None).await.unwrap();
+                let index = LabelListIndexPlugin
+                    .load_index(
+                        index_store,
+                        &default_details::<pbold::LabelListIndexDetails>(),
+                        None,
+                        &LanceCache::no_cache(),
+                    )
+                    .await
+                    .unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
-                let row_ids = result.row_ids();
+                let row_addrs = result.row_addrs();
 
-                let row_ids_set = row_ids
-                    .row_ids()
+                let row_addrs_set = row_addrs
+                    .row_addrs()
                     .unwrap()
                     .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
@@ -1375,7 +1459,7 @@ pub mod tests {
                     let list = list.unwrap();
                     let row_id = row_id.unwrap();
                     let vals = list.as_primitive::<UInt8Type>().values();
-                    if row_ids_set.contains(&row_id) {
+                    if row_addrs_set.contains(&row_id) {
                         assert!(match_fn(vals));
                     } else {
                         assert!(no_match_fn(vals));
@@ -1387,14 +1471,14 @@ pub mod tests {
         // Simple check for 1 value (doesn't matter intersection vs union)
         check(
             LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         check(
             LabelListQuery::HasAllLabels(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         // Set intersection
@@ -1404,9 +1488,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match must have 1 and 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) && vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) && vals.contains(&2)),
             // No-match must either not have 1 or not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) || vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) || !vals.contains(&2)),
         )
         .await;
         // Set union
@@ -1416,9 +1500,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match either have 1 or have 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) || vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) || vals.contains(&2)),
             // No-match must not have 1 and not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) && vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
         )
         .await;
     }

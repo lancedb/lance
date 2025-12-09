@@ -56,9 +56,9 @@ impl MetricsCollector for NoOpMetricsCollector {
 
 #[derive(Default)]
 pub struct LocalMetricsCollector {
-    parts_loaded: AtomicUsize,
-    index_loads: AtomicUsize,
-    comparisons: AtomicUsize,
+    pub parts_loaded: AtomicUsize,
+    pub index_loads: AtomicUsize,
+    pub comparisons: AtomicUsize,
 }
 
 impl LocalMetricsCollector {

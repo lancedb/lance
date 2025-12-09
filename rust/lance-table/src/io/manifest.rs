@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
-
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
+use lance_file::{
+    previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileVersion,
+};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
+use std::collections::HashMap;
+use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};
@@ -22,7 +24,7 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, Transaction, MAGIC};
 
 use super::commit::ManifestLocation;
 
@@ -115,7 +117,7 @@ pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
     location: &ManifestLocation,
     manifest: &Manifest,
-) -> Result<Vec<Index>> {
+) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
         let reader = if let Some(size) = location.size {
             object_store
@@ -129,7 +131,7 @@ pub async fn read_manifest_indexes(
         let indices = section
             .indices
             .into_iter()
-            .map(Index::try_from)
+            .map(IndexMetadata::try_from)
             .collect::<Result<Vec<_>>>()?;
         Ok(indices)
     } else {
@@ -140,7 +142,8 @@ pub async fn read_manifest_indexes(
 async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
+    mut transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
@@ -151,6 +154,14 @@ async fn do_write_manifest(
         manifest.index_section = Some(pos);
     }
 
+    // Write inline transaction if presented.
+    if let Some(tx) = transaction.take() {
+        // Convert to protobuf at the write boundary to persist inline
+        let pb_tx: pb::Transaction = tx.into();
+        let pos = writer.write_protobuf(&pb_tx).await?;
+        manifest.transaction_section = Some(pos);
+    }
+
     writer.write_struct(manifest).await
 }
 
@@ -158,7 +169,8 @@ async fn do_write_manifest(
 pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
+    transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
@@ -209,7 +221,7 @@ pub async fn write_manifest(
         }
     }
 
-    do_write_manifest(writer, manifest, indices).await
+    do_write_manifest(writer, manifest, indices, transaction).await
 }
 
 /// Implementation of ManifestProvider that describes a Lance file by writing
@@ -217,7 +229,7 @@ pub async fn write_manifest(
 pub struct ManifestDescribing {}
 
 #[async_trait]
-impl ManifestProvider for ManifestDescribing {
+impl PreviousManifestProvider for ManifestDescribing {
     async fn store_schema(
         object_writer: &mut ObjectWriter,
         schema: &Schema,
@@ -226,9 +238,9 @@ impl ManifestProvider for ManifestDescribing {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
-            /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
-        let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
+        let pos = do_write_manifest(object_writer, &mut manifest, None, None).await?;
         Ok(Some(pos))
     }
 }
@@ -241,8 +253,10 @@ mod test {
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-    use lance_file::{reader::FileReader, writer::FileWriter};
-    use rand::{distributions::Alphanumeric, Rng};
+    use lance_file::previous::{
+        reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+    };
+    use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -254,13 +268,13 @@ mod test {
         let mut writer = store.create(&path).await.unwrap();
 
         // Write prefix we should ignore
-        let prefix: Vec<u8> = rand::thread_rng()
+        let prefix: Vec<u8> = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(prefix_size)
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::thread_rng()
+        let long_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(manifest_min_size)
             .map(char::from)
@@ -277,9 +291,9 @@ mod test {
             schema,
             Arc::new(vec![]),
             DataStorageFormat::default(),
-            /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
-        let pos = write_manifest(&mut writer, &mut manifest, None)
+        let pos = write_manifest(&mut writer, &mut manifest, None, None)
             .await
             .unwrap();
         writer
@@ -313,7 +327,7 @@ mod test {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -323,15 +337,17 @@ mod test {
         .unwrap();
 
         let array = Int32Array::from_iter_values(0..10);
-        let batch =
-            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         let mut metadata = HashMap::new();
         metadata.insert(String::from("lance:extra"), String::from("for_test"));
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
+        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

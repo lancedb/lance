@@ -26,7 +26,9 @@ use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
+use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
+use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
@@ -44,7 +46,7 @@ pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
 ///
 /// Maps to a top-level array
 ///
-/// For example, FixedSizeList<Int32> will have two EncodedArray instances and one EncodedPage
+/// For example, `FixedSizeList<Int32>` will have two EncodedArray instances and one EncodedPage
 #[derive(Debug)]
 pub struct EncodedPage {
     // The encoded page buffers
@@ -273,10 +275,31 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
 pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEncodingStrategy> {
     match version.resolve() {
         LanceFileVersion::Legacy => panic!(),
-        LanceFileVersion::V2_0 => {
-            Box::new(crate::v2::encoder::CoreFieldEncodingStrategy::default())
+        LanceFileVersion::V2_0 => Box::new(
+            crate::previous::encoder::CoreFieldEncodingStrategy::new(version),
+        ),
+        _ => Box::new(StructuralEncodingStrategy::with_version(version)),
+    }
+}
+
+/// Create an encoding strategy with user-configured compression parameters
+pub fn default_encoding_strategy_with_params(
+    version: LanceFileVersion,
+    params: CompressionParams,
+) -> Result<Box<dyn FieldEncodingStrategy>> {
+    match version.resolve() {
+        LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
+            "Compression parameters are only supported in Lance file version 2.1 and later",
+            location!(),
+        )),
+        _ => {
+            let compression_strategy =
+                Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
+            Ok(Box::new(StructuralEncodingStrategy {
+                compression_strategy,
+                version,
+            }))
         }
-        _ => Box::new(StructuralEncodingStrategy::default()),
     }
 }
 
@@ -293,13 +316,20 @@ pub struct StructuralEncodingStrategy {
 impl Default for StructuralEncodingStrategy {
     fn default() -> Self {
         Self {
-            compression_strategy: Arc::<DefaultCompressionStrategy>::default(),
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
             version: LanceFileVersion::default(),
         }
     }
 }
 
 impl StructuralEncodingStrategy {
+    pub fn with_version(version: LanceFileVersion) -> Self {
+        Self {
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
+            version,
+        }
+    }
+
     fn is_primitive_type(data_type: &DataType) -> bool {
         matches!(
             data_type,
@@ -343,6 +373,45 @@ impl StructuralEncodingStrategy {
         root_field_metadata: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
+
+        // Check if field is marked as blob
+        if field.is_blob() {
+            match data_type {
+                DataType::Binary | DataType::LargeBinary => {
+                    return Ok(Box::new(BlobStructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
+                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
+                    return Ok(Box::new(BlobV2StructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
+                DataType::Struct(_) => {
+                    return Err(Error::InvalidInput {
+                        source: "Blob v2 struct input requires file version >= 2.2".into(),
+                        location: location!(),
+                    });
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
+                            data_type
+                        )
+                        .into(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
         if Self::is_primitive_type(&data_type) {
             Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                 options,
@@ -367,8 +436,9 @@ impl StructuralEncodingStrategy {
                         child_encoder,
                     )))
                 }
-                DataType::Struct(_) => {
-                    if field.is_packed_struct() {
+                DataType::Struct(fields) => {
+                    if field.is_packed_struct() || fields.is_empty() {
+                        // Both packed structs and empty structs are encoded as primitive
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),
@@ -610,4 +680,48 @@ pub async fn encode_batch(
         schema,
         num_rows: batch.num_rows() as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compression_config::{CompressionFieldParams, CompressionParams};
+
+    #[test]
+    fn test_configured_encoding_strategy() {
+        // Create test parameters
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "*_id".to_string(),
+            CompressionFieldParams {
+                rle_threshold: Some(0.5),
+                compression: Some("lz4".to_string()),
+                compression_level: None,
+                bss: None,
+            },
+        );
+
+        // Test with V2.1 - should succeed
+        let strategy =
+            default_encoding_strategy_with_params(LanceFileVersion::V2_1, params.clone())
+                .expect("Should succeed for V2.1");
+
+        // Verify it's a StructuralEncodingStrategy
+        assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
+        assert!(format!("{:?}", strategy).contains("DefaultCompressionStrategy"));
+
+        // Test with V2.0 - should fail
+        let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
+            .expect_err("Should fail for V2.0");
+        assert!(err
+            .to_string()
+            .contains("only supported in Lance file version 2.1"));
+
+        // Test with Legacy - should fail
+        let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
+            .expect_err("Should fail for Legacy");
+        assert!(err
+            .to_string()
+            .contains("only supported in Lance file version 2.1"));
+    }
 }

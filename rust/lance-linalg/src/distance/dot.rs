@@ -13,15 +13,12 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{real::Real, AsPrimitive, Num};
 
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
 use crate::Result;
 
 /// Default implementation of dot product.
@@ -108,7 +105,7 @@ mod kernel {
 impl Dot for f16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        match *FP16_SIMD_SUPPORT {
+        match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
@@ -118,7 +115,7 @@ impl Dot for f16 {
                 kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512 => unsafe {
+            SimdSupport::Avx512FP16 => unsafe {
                 kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
@@ -141,56 +138,7 @@ impl Dot for f16 {
 impl Dot for f32 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        // Manually unrolled 8 times to get enough registers.
-        // TODO: avx512 can unroll more
-        let x_unrolled_chunks = x.chunks_exact(64);
-        let y_unrolled_chunks = y.chunks_exact(64);
-
-        // 8 float32 SIMD
-        let x_aligned_chunks = x_unrolled_chunks.remainder().chunks_exact(8);
-        let y_aligned_chunks = y_unrolled_chunks.remainder().chunks_exact(8);
-
-        let sum = if x_aligned_chunks.remainder().is_empty() {
-            0.0
-        } else {
-            debug_assert_eq!(
-                x_aligned_chunks.remainder().len(),
-                y_aligned_chunks.remainder().len()
-            );
-            x_aligned_chunks
-                .remainder()
-                .iter()
-                .zip(y_aligned_chunks.remainder().iter())
-                .map(|(&x, &y)| x * y)
-                .sum()
-        };
-
-        let mut sum8 = f32x8::zeros();
-        x_aligned_chunks
-            .zip(y_aligned_chunks)
-            .for_each(|(x_chunk, y_chunk)| unsafe {
-                let x1 = f32x8::load_unaligned(x_chunk.as_ptr());
-                let y1 = f32x8::load_unaligned(y_chunk.as_ptr());
-                sum8 += x1 * y1;
-            });
-
-        let mut sum16 = f32x16::zeros();
-        x_unrolled_chunks
-            .zip(y_unrolled_chunks)
-            .for_each(|(x, y)| unsafe {
-                let x1 = f32x16::load_unaligned(x.as_ptr());
-                let x2 = f32x16::load_unaligned(x.as_ptr().add(16));
-                let x3 = f32x16::load_unaligned(x.as_ptr().add(32));
-                let x4 = f32x16::load_unaligned(x.as_ptr().add(48));
-
-                let y1 = f32x16::load_unaligned(y.as_ptr());
-                let y2 = f32x16::load_unaligned(y.as_ptr().add(16));
-                let y3 = f32x16::load_unaligned(y.as_ptr().add(32));
-                let y4 = f32x16::load_unaligned(y.as_ptr().add(48));
-
-                sum16 += (x1 * y1 + x2 * y2) + (x3 * y3 + x4 * y4);
-            });
-        sum16.reduce_sum() + sum8.reduce_sum() + sum
+        dot_scalar::<Self, Self, 16>(x, y)
     }
 }
 
@@ -218,8 +166,8 @@ pub fn dot_distance_batch<'a, T: Dot>(
     to: &'a [T],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
@@ -295,7 +243,6 @@ pub fn dot_distance_arrow_batch(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
@@ -329,15 +276,24 @@ mod tests {
         x.iter().zip(y.iter()).map(|(&x, &y)| x * y).sum::<f64>() as f32
     }
 
-    // Accuracy of dot product depends on the size of the components
-    // of the vector.
-    // Imagine that each `x_i` can vary by `є * |x_i|`. Similarly for `y_i`.
-    // (Basically, it's accurate to ±(1 + є) * |x_i|).
-    // Error for `sum(x, y)` is `є_x + є_y`. Error for multiple is `є_x * x + є_y * y`.
-    // See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
-    // The multiplication of `x_i` and `y_i` can vary by `(є * |x_i|) * |y_i| + (є * |y_i|) * |x_i|`.
-    // This simplifies to `2 * є * (|x_i| + |y_i|)`.
-    // So the error for the sum of all the multiplications is `є * sum(|x_i| + |y_i|)`.
+    /// Error bound for vector dot product
+    /// http://ftp.demec.ufpr.br/CFD/bibliografia/Higham_2002_Accuracy%20and%20Stability%20of%20Numerical%20Algorithms.pdf
+    /// Chapter 3 (page 61) equation 3.5
+    /// A float point calculation error is bounded by:
+    /// (kє/(1-kє)) Sum_i(|x_i||y_i|) if kє < 1
+    /// We are currently using a SIMD version of naive product and summation.
+    /// Therefore, k = 2n-1 (n multiplications, n-1 additions).
+    /// For f16 and bf16, kє can be >=1.
+    /// When that happens, we will use a simpler estimation method:
+    /// Imagine that each `x_i` can vary by `є * |x_i|`, similarly for `y_i`.
+    /// (Basically, it's accurate to ±(1 + є) * |x_i|).
+    /// Error for `sum(x, y)` is `є_x + є_y`.
+    /// Error for multiple is `є_x * x + є_y * y + є_x * є_y`,
+    /// which simplifies to `є_x * x + є_y * y`
+    /// See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
+    /// The multiplication of `x_i` and `y_i` can vary by `є|x_i||y_i| + є|y_i||x_i|`.
+    /// This simplifies to `2є|x_i||y_i|`.
+    /// So the error for the sum of all the multiplications is `2є Sum_i(|x_i||y_i|)`.
     fn max_error<T: Float + AsPrimitive<f64>>(x: &[f64], y: &[f64]) -> f32 {
         let dot = x
             .iter()
@@ -345,7 +301,14 @@ mod tests {
             .zip(y.iter().cloned())
             .map(|(x, y)| x.abs() * y.abs())
             .sum::<f64>();
-        (2.0 * T::epsilon().as_() * dot) as f32
+        let k = ((2 * x.len()) - 1) as f64;
+        let k_epsilon = k * T::epsilon().as_();
+
+        if k_epsilon < 1.0 {
+            (k_epsilon * dot) as f32
+        } else {
+            (2.0 * T::epsilon().as_() * dot) as f32
+        }
     }
 
     fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(

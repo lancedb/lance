@@ -19,11 +19,10 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::mask::RowIdMask;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
@@ -32,9 +31,9 @@ use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
-use crate::error::Result;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
+use crate::Result;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
@@ -57,7 +56,7 @@ pub struct DatasetPreFilter {
 impl DatasetPreFilter {
     pub fn new(
         dataset: Arc<Dataset>,
-        indices: &[Index],
+        indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
@@ -107,7 +106,7 @@ impl DatasetPreFilter {
         let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
             .buffer_unordered(dataset.object_store.io_parallelism());
 
-        let mut deleted_ids = RowIdTreeMap::new();
+        let mut deleted_ids = RowAddrTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
             deleted_ids.insert_bitmap(id, deletion_vector);
         }
@@ -137,29 +136,31 @@ impl DatasetPreFilter {
                 .await
         }
 
-        let cache_key = format!("row_id_mask/{}", dataset.manifest().version);
-
+        let dataset_clone = dataset.clone();
+        let key = crate::session::caches::RowIdMaskKey {
+            version: dataset.manifest().version,
+        };
         dataset
             .metadata_cache
-            .clone()
-            .get_or_insert(cache_key, move |_| {
+            .as_ref()
+            .get_or_insert_with_key(key, move || {
                 async move {
-                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
+                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
                         Ok(row_ids_and_deletions.into_iter().fold(
-                            RowIdTreeMap::new(),
+                            RowAddrTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {
                                     let mut row_ids = row_ids.as_ref().clone();
                                     row_ids.mask(deletion_vector.iter()).unwrap();
-                                    Cow::Owned(row_ids)
+                                    Cow::<RowIdSequence>::Owned(row_ids)
                                 } else {
-                                    Cow::Borrowed(row_ids.as_ref())
+                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
                                 };
-                                let treemap = RowIdTreeMap::from(seq.as_ref());
+                                let treemap = RowAddrTreeMap::from(seq.as_ref());
                                 allow_list |= treemap;
                                 allow_list
                             },
@@ -207,7 +208,7 @@ impl DatasetPreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             None
-        } else if dataset.manifest.uses_move_stable_row_ids() {
+        } else if dataset.manifest.uses_stable_row_ids() {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
         } else {
             Some(
@@ -299,7 +300,7 @@ mod test {
             "memory://test",
             Some(WriteParams {
                 max_rows_per_file: 3,
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -358,7 +359,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowIdTreeMap::from_iter(vec![(2 << 32) + 2]);
+        let mut expected = RowAddrTreeMap::from_iter(vec![(2 << 32) + 2]);
         expected.insert_fragment(1);
         assert_eq!(&mask.block_list, &Some(expected));
 
@@ -378,7 +379,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_fragment(1);
         expected.insert_fragment(2);
         assert_eq!(&mask.block_list, &Some(expected));
@@ -403,7 +404,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let expected = RowIdTreeMap::from_iter(0..8);
+        let expected = RowAddrTreeMap::from_iter(0..8);
         assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list

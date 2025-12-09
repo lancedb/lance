@@ -44,7 +44,7 @@ impl Iterator for TokenIterator<'_> {
 
 pub enum PostingListIterator<'a> {
     Plain(PlainPostingListIterator<'a>),
-    Compressed(CompressedPostingListIterator),
+    Compressed(Box<CompressedPostingListIterator>),
 }
 
 impl<'a> PostingListIterator<'a> {
@@ -52,11 +52,11 @@ impl<'a> PostingListIterator<'a> {
         match posting {
             PostingList::Plain(posting) => Self::Plain(posting.iter()),
             PostingList::Compressed(posting) => {
-                Self::Compressed(CompressedPostingListIterator::new(
+                Self::Compressed(Box::new(CompressedPostingListIterator::new(
                     posting.length as usize,
                     posting.blocks.clone(),
                     posting.positions.clone(),
-                ))
+                )))
             }
         }
     }
@@ -94,8 +94,14 @@ type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<
 
 impl CompressedPostingListIterator {
     pub fn new(length: usize, blocks: LargeBinaryArray, positions: Option<ListArray>) -> Self {
-        debug_assert!(length > 0);
-        debug_assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
+        debug_assert!(length > 0, "length: {}", length);
+        debug_assert_eq!(
+            length.div_ceil(BLOCK_SIZE),
+            blocks.len(),
+            "length: {}, num_blocks: {}",
+            length,
+            blocks.len(),
+        );
 
         Self {
             remainder: length % BLOCK_SIZE,

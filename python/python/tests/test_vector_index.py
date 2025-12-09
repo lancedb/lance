@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import logging
 import platform
 import random
 import string
@@ -12,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance import LanceFragment
+from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
@@ -175,6 +176,38 @@ def test_flat(dataset):
 
 def test_ann(indexed_dataset):
     run(indexed_dataset)
+
+
+def test_rowid_order(indexed_dataset):
+    rs = indexed_dataset.to_table(
+        columns=["meta"],
+        with_row_id=True,
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "use_index": False,
+        },
+        limit=10,
+    )
+
+    print(
+        indexed_dataset.scanner(
+            columns=["meta"],
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "use_index": False,
+            },
+            with_row_id=True,
+            limit=10,
+        ).explain_plan()
+    )
+
+    assert rs.schema[0].name == "meta"
+    assert rs.schema[1].name == "_distance"
+    assert rs.schema[2].name == "_rowid"
 
 
 def test_ann_append(tmp_path):
@@ -356,6 +389,25 @@ def test_create_index_using_cuda(tmp_path, nullify):
     )["id"].to_numpy()
     assert len(expected) == 10
 
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuda",
+    )
+    q = np.random.randn(128)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,  # Use non-default k
+        },
+    )["id"].to_numpy()
+    assert len(expected) == 10
+
 
 def test_create_index_unsupported_accelerator(tmp_path):
     # Even attempting to use an accelerator will trigger torch import
@@ -408,6 +460,27 @@ def test_create_index_unsupported_accelerator(tmp_path):
             num_sub_vectors=16,
             accelerator="cuda:abc",
         )
+
+
+def test_create_index_accelerator_fallback(tmp_path, caplog):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            num_partitions=4,
+            accelerator="cuda",
+        )
+
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "IVF_HNSW_SQ"
+    assert any(
+        "does not support GPU acceleration; falling back to CPU" in record.message
+        for record in caplog.records
+    )
 
 
 def test_use_index(dataset, tmp_path):
@@ -527,6 +600,61 @@ def test_create_4bit_ivf_pq_index(dataset, tmp_path):
     assert index["indices"][0]["sub_index"]["nbits"] == 4
 
 
+def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        target_partition_size=1000,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 1
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        target_partition_size=500,
+        replace=True,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+
+    # setting both num_partitions and target_partition_size will use num_partitions
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        num_partitions=2,
+        target_partition_size=1000,
+        replace=True,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+
+
+def test_index_size_stats(tmp_path: Path):
+    num_rows = 512
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(num_rows * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    index_name = "vec_idx"
+    dataset.create_index(
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+    )
+
+    # Expect to see non-zero sizes here but all sizes are zero
+    stats = dataset.stats.index_stats(index_name)
+    stats = stats["indices"][0]
+    assert stats["partitions"][0]["size"] + stats["partitions"][1]["size"] == num_rows
+
+
 def test_ivf_flat_over_binary_vector(tmp_path):
     dim = 128
     nvec = 1000
@@ -550,6 +678,133 @@ def test_ivf_flat_over_binary_vector(tmp_path):
     )
 
 
+def test_ivf_flat_respects_index_metric_binary(tmp_path):
+    # Binary vectors indexed with Hamming should ignore a user-specified L2 metric.
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array([[0], [128], [255]], type=pa.list_(pa.uint8(), 1)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="hamming",
+    )
+
+    query = np.array([128], dtype=np.uint8)
+
+    # Search should succeed and use the index's Hamming metric despite the L2 hint.
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "l2",
+        },
+    )
+
+    # Should succeed even though user asked for L2 (index metric is used).
+    assert indexed["id"].to_pylist() == [1, 0, 2]
+
+
+def test_ivf_flat_respects_index_metric_float(tmp_path):
+    # Float vectors indexed with L2 should ignore a user-specified Hamming metric.
+    vectors = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([0.5, 0.0], dtype=np.float32)
+
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "hamming",
+        },
+    )
+
+    expected = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 3},
+    )
+
+    assert indexed["id"].to_pylist() == expected["id"].to_pylist()
+    assert np.allclose(
+        indexed["_distance"].to_numpy(), expected["_distance"].to_numpy()
+    )
+
+
+def test_bruteforce_uses_user_metric(tmp_path):
+    # Even if an index exists, a brute-force scan (use_index=False) should
+    # respect the user-specified metric instead of the index metric.
+    vectors = np.array(
+        [
+            [10.0, 10.0],  # Large magnitude, best under dot product
+            [-1.0, -1.0],
+            [1.0, 1.0],  # Closest under L2
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    # Build an index with L2 metric.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([1.0, 1.0], dtype=np.float32)
+
+    # Brute-force search should honor the requested dot metric (not the index's L2).
+    brute_force = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "dot",
+            "use_index": False,
+        },
+    )
+
+    # Under dot product the largest magnitude vector ranks first; under L2 it is last.
+    assert brute_force["id"].to_pylist() == [0, 2, 1]
+
+
 def test_create_ivf_sq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -559,6 +814,53 @@ def test_create_ivf_sq_index(dataset, tmp_path):
         num_partitions=4,
     )
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_ivf_rq_index():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+    assert ds.list_indices()[0]["fields"] == ["vector"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Creating empty vector indices with train=False is not yet implemented",
+    ):
+        ds.delete("id>=0")
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+            replace=True,
+        )
+
+    zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(zero_vectors, type=pa.list_(pa.float32(), 128))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.zeros(128),
+            "k": 10,
+        }
+    )
+    assert res.num_rows == 10
+    assert res["_distance"].to_numpy().min() == 0.0
+    assert res["_distance"].to_numpy().max() == 0.0
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
@@ -939,7 +1241,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
-                    "minimum_nprobes": 1,
+                    "nprobes": 20,
                 },
             )
 
@@ -947,21 +1249,17 @@ def test_index_cache_size(tmp_path):
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     dataset.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=128,
-        num_sub_vectors=2,
-        index_cache_size=10,
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
     )
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
-    # when there is no hit, the hit rate is hard coded to 1.0
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 1.0)
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    # Zero size index cache means all queries should miss the cache
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
     query_index(indexed_dataset, 1)
     # index cache is size=0, there should be no hit
     assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
+    indexed_dataset = lance.dataset(tmp_path / "test")
     # query using the same vector, we should get a very high hit rate
     # it isn't always exactly 199/200 perhaps because the stats counter
     # is a relaxed atomic counter and may lag behind the true value or perhaps
@@ -975,6 +1273,65 @@ def test_index_cache_size(tmp_path):
     query_index(indexed_dataset, 128)
 
     assert last_hit_rate > indexed_dataset._ds.index_cache_hit_rate()
+
+
+def test_index_cache_size_bytes(tmp_path):
+    """Test the new index_cache_size_bytes parameter."""
+    rng = np.random.default_rng(seed=42)
+
+    def query_index(ds, ntimes, q=None):
+        ndim = ds.schema[0].type.list_size
+        for _ in range(ntimes):
+            ds.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
+                },
+            )
+
+    tbl = create_table(nvec=1024, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
+    )
+
+    # Test with index_cache_size_bytes=0 (no cache)
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+    query_index(indexed_dataset, 1)
+    # No cache, so hit rate should be 0
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+
+    # Test with index_cache_size_bytes=20MB (1 entry equivalent)
+    indexed_dataset = lance.dataset(
+        tmp_path / "test", index_cache_size_bytes=20 * 1024 * 1024
+    )
+    # Query using the same vector, we should get a good hit rate
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.8
+
+
+def test_index_cache_size_deprecation(tmp_path):
+    """Test that index_cache_size shows deprecation warning."""
+    import warnings
+
+    tbl = create_table(nvec=100, ndim=16)
+    lance.write_dataset(tbl, tmp_path / "test")
+
+    # Test deprecation warning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        # This should trigger the deprecation warning
+        lance.dataset(tmp_path / "test", index_cache_size=256)
+
+        # Check that a deprecation warning was issued
+        assert len(w) == 1
+        assert issubclass(w[0].category, DeprecationWarning)
+        assert "index_cache_size" in str(w[0].message)
+        assert "index_cache_size_bytes" in str(w[0].message)
 
 
 def test_f16_index(tmp_path: Path):
@@ -1183,6 +1540,23 @@ def test_load_indices(dataset):
     assert len(indices) == 1
 
 
+def test_describe_vector_index(indexed_dataset: LanceDataset):
+    info = indexed_dataset.describe_indices()[0]
+
+    assert info.name == "vector_idx"
+    assert info.type_url == "/lance.table.VectorIndexDetails"
+    # This is currently Unknown because vector indices are not yet handled by plugins
+    assert info.index_type == "Unknown"
+    assert info.num_rows_indexed == 1000
+    assert info.fields == [0]
+    assert info.field_names == ["vector"]
+    assert len(info.segments) == 1
+    assert info.segments[0].fragment_ids == {0}
+    assert info.segments[0].dataset_version_at_last_update == 1
+    assert info.segments[0].index_version == 1
+    assert info.segments[0].created_at is not None
+
+
 def test_optimize_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
@@ -1193,6 +1567,7 @@ def test_optimize_indices(indexed_dataset):
     assert len(indices) == 2
 
 
+@pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
@@ -1377,3 +1752,138 @@ def test_knn_deleted_rows(tmp_path):
     )
     assert 0 not in results["id"]
     assert results.num_rows == ds.count_rows()
+
+
+def test_nested_field_vector_index(tmp_path):
+    """Test vector index creation and querying on nested fields
+
+    Note: While scalar indices work on nested fields, vector indices currently
+    have a limitation in the DataFusion integration layer that prevents them
+    from working with nested field paths. The Python validation layer now
+    correctly handles nested paths, but the Rust planner needs additional work.
+    """
+    # Create a dataset with nested vector field
+    dimensions = 128
+    num_rows = 256
+
+    # Generate random vectors
+    vectors = np.random.randn(num_rows, dimensions).astype(np.float32)
+    vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors.flatten()), dimensions
+    )
+
+    # Create nested structure with vector field
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "data",
+                pa.struct(
+                    [
+                        pa.field("embedding", pa.list_(pa.float32(), dimensions)),
+                        pa.field("label", pa.string()),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    # Create struct array
+    struct_array = pa.StructArray.from_arrays(
+        [vector_array, pa.array([f"label_{i}" for i in range(num_rows)])],
+        names=["embedding", "label"],
+    )
+
+    data = pa.table({"id": list(range(num_rows)), "data": struct_array}, schema=schema)
+
+    # Create dataset
+    uri = tmp_path / "test_nested_vector"
+    dataset = lance.write_dataset(data, uri)
+
+    # Verify the schema
+    assert "data" in dataset.schema.names
+    field = dataset.schema.field("data")
+    assert pa.types.is_struct(field.type)
+
+    # Create vector index on nested column
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+
+    # Verify index was created
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["data.embedding"]
+
+    # Test querying with the index
+    query_vec = vectors[0]
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    # Verify results
+    assert len(result) == 10
+    assert "data" in result.column_names
+    assert "_distance" in result.column_names
+
+    # The first result should be the query vector itself (or very close)
+    assert result["id"][0].as_py() == 0
+    assert result["_distance"][0].as_py() < 0.01  # Should be nearly zero
+
+    # Write additional data to the dataset
+    new_vectors = np.random.randn(50, dimensions).astype(np.float32)
+    new_vector_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(new_vectors.flatten()), dimensions
+    )
+
+    new_struct_array = pa.StructArray.from_arrays(
+        [new_vector_array, pa.array([f"new_label_{i}" for i in range(50)])],
+        names=["embedding", "label"],
+    )
+
+    new_data = pa.table(
+        {"id": list(range(num_rows, num_rows + 50)), "data": new_struct_array},
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(new_data, uri, mode="append")
+
+    # Verify query still works after appending data
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 15, "nprobes": 2}
+    )
+
+    assert len(result) == 15
+    assert "data" in result.column_names
+
+    # Optimize the index to include new data
+    dataset.optimize.optimize_indices()
+
+    # Verify query works after optimization
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 20, "nprobes": 2}
+    )
+
+    assert len(result) == 20
+
+    # Test with cosine metric
+    dataset = dataset.create_index(
+        column="data.embedding",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="cosine",
+        replace=True,
+    )
+
+    result = dataset.to_table(
+        nearest={"column": "data.embedding", "q": query_vec, "k": 10, "nprobes": 2}
+    )
+
+    assert len(result) == 10
+
+    # Verify total row count
+    assert dataset.count_rows() == num_rows + 50

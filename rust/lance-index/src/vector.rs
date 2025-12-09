@@ -8,17 +8,15 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
-use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
-use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
@@ -41,13 +39,15 @@ pub mod v3;
 use super::pb;
 use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
-pub use residual::RESIDUAL_COLUMN;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const DIST_COL: &str = "_distance";
 pub const DISTANCE_TYPE_KEY: &str = "distance_type";
 pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
+pub const DIST_Q_C_COLUMN: &str = "__dist_q_c";
+// dist from vector to centroid
+pub const CENTROID_DIST_COLUMN: &str = "__centroid_dist";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
@@ -61,6 +61,10 @@ pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::n
 
 pub static PART_ID_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true)
+});
+
+pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
 /// Query parameters for the vector indices
@@ -82,7 +86,10 @@ pub struct Query {
     pub upper_bound: Option<f32>,
 
     /// The minimum number of probes to load and search.  More partitions
-    /// will only be loaded if we have not found k results.
+    /// will only be loaded if we have not found k results, or the the algorithm
+    /// determines more partitions are needed to satisfy recall requirements.
+    ///
+    /// The planner will always search at least this many partitions. Defaults to 1.
     pub minimum_nprobes: usize,
 
     /// The maximum number of probes to load and search.  If not set then
@@ -102,6 +109,10 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
+
+    /// the distance between the query and the centroid
+    /// this is only used for IVF index with Rabit quantization
+    pub dist_q_c: f32,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -165,8 +176,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// that are most likely to contain the nearest neighbors (e.g. the closest
     /// partitions to the query vector).
     ///
-    /// The results should be in sorted order from closest to farthest.
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
+    /// Return the partition ids and the distances between the query and the centroids,
+    /// the results should be in sorted order from closest to farthest.
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;
@@ -240,25 +252,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// left alone.
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
 
-    /// Remap the index according to mapping
-    ///
-    /// write the remapped index to the index_dir
-    /// this is available for only v3 index
-    async fn remap_to(
-        self: Arc<Self>,
-        _store: ObjectStore,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _column: String,
-        _index_dir: Path,
-    ) -> Result<()> {
-        unimplemented!("only for v3 index")
-    }
-
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
 
     fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
+    fn partition_size(&self, part_id: usize) -> usize;
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);

@@ -21,10 +21,10 @@ use pprof::criterion::{Output, PProfProfiler};
 use rand::prelude::*;
 
 fn create_full_batch(range: Range<u64>, dim: usize) -> RecordBatch {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let row_ids = UInt64Array::from_iter_values(range);
     let sq_code =
-        UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * dim));
+        UInt8Array::from_iter_values(repeat_with(|| rng.random::<u8>()).take(row_ids.len() * dim));
     let sq_code_fsl = FixedSizeListArray::try_new_from_values(sq_code, dim as i32).unwrap();
 
     let vector_data = generate_random_array(row_ids.len() * dim);
@@ -67,7 +67,7 @@ fn create_sq_batch(row_id_range: Range<u64>, dim: usize) -> RecordBatch {
 
 #[allow(dead_code)]
 pub fn bench_storage(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     const TOTAL: usize = 8 * 1024 * 1024; // 8M rows
 
@@ -85,8 +85,8 @@ pub fn bench_storage(c: &mut Criterion) {
             |b| {
                 let total = storage.len();
                 b.iter(|| {
-                    let a = rng.gen_range(0..total as u32);
-                    let b = rng.gen_range(0..total as u32);
+                    let a = rng.random_range(0..total as u32);
+                    let b = rng.random_range(0..total as u32);
                     storage.dist_calculator_from_id(a).distance(b);
                 });
             },

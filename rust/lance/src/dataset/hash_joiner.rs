@@ -17,7 +17,7 @@ use snafu::location;
 use tokio::task;
 
 use crate::datatypes::lance_supports_nulls;
-use crate::{Error, Result};
+use crate::{Dataset, Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub struct HashJoiner {
@@ -204,6 +204,95 @@ impl HashJoiner {
             .try_collect::<Vec<_>>()
             .await?;
 
+        Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
+    }
+
+    /// Collecting the data using the index column from left table,
+    /// invalid join column values in left table will be filled with origin values in left table
+    ///
+    /// Will run in parallel over columns using all available cores.
+    pub(super) async fn collect_with_fallback(
+        &self,
+        left_batch: &RecordBatch,
+        index_column: ArrayRef,
+        dataset: &Dataset,
+    ) -> Result<RecordBatch> {
+        if index_column.data_type() != &self.index_type {
+            return Err(Error::invalid_input(
+                format!(
+                    "Index column type mismatch: expected {}, got {}",
+                    self.index_type,
+                    index_column.data_type()
+                ),
+                location!(),
+            ));
+        }
+        // Index to use for fall back to left table values
+        let left_batch_index = self.batches.len();
+        // Indices are a pair of (batch_i, row_i). We'll add values in the left table at the end,
+        // and when no match is found we fall back to left table values.
+        let indices = column_to_rows(index_column)?
+            .into_iter()
+            .enumerate()
+            .map(|(left_rowi, row)| {
+                self.index_map
+                    .get(&row.owned())
+                    .map(|(batch_i, row_i)| (*batch_i, *row_i))
+                    .unwrap_or((left_batch_index, left_rowi))
+            })
+            .collect::<Vec<_>>();
+        let indices = Arc::new(indices);
+        // Do this in parallel over the columns
+        let columns = futures::stream::iter(0..self.batches[0].num_columns())
+            .map(|column_i| {
+                // Use interleave to get the data
+                // https://docs.rs/arrow/40.0.0/arrow/compute/kernels/interleave/fn.interleave.html
+                // To handle nulls, we'll add an extra null array at the end
+                let mut arrays = Vec::with_capacity(self.batches.len() + 1);
+                for batch in &self.batches {
+                    arrays.push(batch.column(column_i).clone());
+                }
+                arrays.push(left_batch.column(column_i).clone());
+                // Clone of indices we can send to a new thread
+                let indices = indices.clone();
+                async move {
+                    let task_result = task::spawn_blocking(move || {
+                        let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
+                        interleave(array_refs.as_ref(), indices.as_ref())
+                            .map_err(|err| Error::io(format!("HashJoiner: {}", err), location!()))
+                    })
+                    .await;
+                    match task_result {
+                        Ok(Ok(array)) => {
+                            if array.null_count() > 0
+                                && !dataset.lance_supports_nulls(array.data_type())
+                            {
+                                return Err(Error::invalid_input(
+                                    format!(
+                                        "Join produced null values for type: {:?}, but storing \
+                                        nulls for this data type is not supported by the \
+                                        dataset's current Lance file format version: {:?}. This \
+                                        can be caused by an explicit null in the new data.",
+                                        array.data_type(),
+                                        dataset
+                                            .manifest()
+                                            .data_storage_format
+                                            .lance_file_version()
+                                            .unwrap()
+                                    ),
+                                    location!(),
+                                ));
+                            }
+                            Ok(array)
+                        }
+                        Ok(Err(err)) => Err(err),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
+                    }
+                }
+            })
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
 }

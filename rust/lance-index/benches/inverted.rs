@@ -16,10 +16,10 @@ use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
+use lance_index::scalar::inverted::lance_tokenizer::DocType;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
 use lance_index::{
     metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
 };
@@ -78,7 +78,9 @@ fn bench_inverted(c: &mut Criterion) {
             });
         })
     });
-    let invert_index = rt.block_on(InvertedIndex::load(store, None)).unwrap();
+    let invert_index = rt
+        .block_on(InvertedIndex::load(store, None, &LanceCache::no_cache()))
+        .unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);
@@ -94,11 +96,14 @@ fn bench_inverted(c: &mut Criterion) {
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             // Pick a random word from our sample
-            let word_idx = rand::random::<usize>() % sample_words.len();
+            let word_idx = rand::random_range(0..sample_words.len());
             black_box(
                 invert_index
                     .bm25_search(
-                        vec![sample_words[word_idx].clone()].into(),
+                        Arc::new(Tokens::new(
+                            vec![sample_words[word_idx].clone()],
+                            DocType::Text,
+                        )),
                         params.clone().into(),
                         Operator::Or,
                         no_filter.clone(),

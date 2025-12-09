@@ -10,7 +10,6 @@
 //! is needed in the encoding description.
 
 use arrow_array::OffsetSizeTrait;
-use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
@@ -25,7 +24,9 @@ use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValue
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::{pb, ProtobufUtils};
+use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::{pb21, ProtobufUtils21};
 
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
@@ -67,6 +68,7 @@ fn chunk_offsets<N: OffsetSizeTrait>(
             (num_values_in_this_chunk + 1) * byte_width + chunk_bytes.to_usize().unwrap();
 
         let padded_chunk_size = this_chunk_size.next_multiple_of(alignment);
+        debug_assert!(padded_chunk_size > 0);
 
         let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * byte_width;
         chunks_info.push(ChunkInfo {
@@ -167,10 +169,9 @@ impl BinaryMiniBlockEncoder {
     // put binary data into chunks, every chunk is less than or equal to `AIM_MINICHUNK_SIZE`.
     // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes.
     // the offsets in the chunk points to the bytes offset in this chunk.
-    fn chunk_data(
-        &self,
-        mut data: VariableWidthBlock,
-    ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
+    fn chunk_data(&self, data: VariableWidthBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
+        // TODO: Support compression of offsets
+        // TODO: Support general compression of data
         match data.bits_per_offset {
             32 => {
                 let offsets = data.offsets.borrow_to_typed_slice::<i32>();
@@ -181,7 +182,7 @@ impl BinaryMiniBlockEncoder {
                         chunks,
                         num_values: data.num_values,
                     },
-                    ProtobufUtils::variable(32),
+                    ProtobufUtils21::variable(ProtobufUtils21::flat(32, None), None),
                 )
             }
             64 => {
@@ -193,16 +194,16 @@ impl BinaryMiniBlockEncoder {
                         chunks,
                         num_values: data.num_values,
                     },
-                    ProtobufUtils::variable(64),
+                    ProtobufUtils21::variable(ProtobufUtils21::flat(64, None), None),
                 )
             }
-            _ => panic!("Unsupported bits_per_offset"),
+            _ => panic!("Unsupported bits_per_offset={}", data.bits_per_offset),
         }
     }
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::InvalidInput {
@@ -228,9 +229,20 @@ impl BinaryMiniBlockDecompressor {
         Self { bits_per_offset }
     }
 
-    pub fn from_variable(variable: &pb::Variable) -> Self {
-        Self {
-            bits_per_offset: variable.bits_per_offset as u8,
+    pub fn from_variable(variable: &pb21::Variable) -> Self {
+        if let Compression::Flat(flat) = variable
+            .offsets
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        {
+            Self {
+                bits_per_offset: flat.bits_per_value as u8,
+            }
+        } else {
+            panic!("Unsupported offsets compression: {:?}", variable.offsets);
         }
     }
 }
@@ -238,7 +250,8 @@ impl BinaryMiniBlockDecompressor {
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
-    // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
+    // it has so assertion can not be done here and the caller of `decompress` must ensure
+    // `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
@@ -247,15 +260,16 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 16);
 
-            let offsets: &[u64] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
                 .map(|offset| offset - offsets[0])
                 .collect::<Vec<u64>>();
+
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -267,8 +281,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 8);
 
-            let offsets: &[u32] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u32>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
@@ -276,7 +290,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .collect::<Vec<u32>>();
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -289,44 +303,75 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 }
 
 /// Most basic encoding for variable-width data which does no compression at all
+/// The DataBlock memory layout looks like below:
+///
+/// | bits_per_offset           | bytes_start_offset        | offsets data | bytes data |
+/// | ------------------------- | ------------------------- | ------------ | ---------- |
+/// | <bits_per_offset>/8 bytes | <bits_per_offset>/8 bytes | offsets_len  | data_len   |
+///
+/// It's used in VariableEncoder and BinaryBlockDecompressor
+///
 #[derive(Debug, Default)]
 pub struct VariableEncoder {}
 
 impl BlockCompressor for VariableEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let num_values: u32 = data
-            .num_values()
-            .try_into()
-            .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
-
+    fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
         match data {
-            DataBlock::VariableWidth(mut variable_width_data) => {
-                if variable_width_data.bits_per_offset != 32 {
-                    panic!("BinaryBlockEncoder only works with 32 bits per offset VariableWidth DataBlock.");
+            DataBlock::VariableWidth(ref mut variable_width_data) => {
+                match variable_width_data.bits_per_offset {
+                    32 => {
+                        let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
+                        let offsets = offsets.as_ref();
+                        // The first 4 bytes store the bits per offset, the next 4 bytes store the start
+                        // offset of the bytes data, then offsets data, then bytes data.
+                        let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
+
+                        let output_total_bytes =
+                            bytes_start_offset as usize + variable_width_data.data.len();
+                        let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+                        // Store bit_per_offset info
+                        output.extend_from_slice(&(32_u32).to_le_bytes());
+
+                        // store `bytes_start_offset` in the next 4 bytes of output buffer
+                        output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
+
+                        // store offsets
+                        output.extend_from_slice(&variable_width_data.offsets);
+
+                        // store bytes
+                        output.extend_from_slice(&variable_width_data.data);
+                        Ok(LanceBuffer::from(output))
+                    }
+                    64 => {
+                        let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
+                        let offsets = offsets.as_ref();
+                        // The first 8 bytes store the bits per offset, the next 8 bytes store the start
+                        // offset of the bytes data, then offsets data, then bytes data.
+                        let bytes_start_offset = 8 + 8 + std::mem::size_of_val(offsets) as u64;
+
+                        let output_total_bytes =
+                            bytes_start_offset as usize + variable_width_data.data.len();
+                        let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+                        // Store bit_per_offset info
+                        output.extend_from_slice(&(64_u64).to_le_bytes());
+
+                        // store `bytes_start_offset` in the next 8 bytes of output buffer
+                        output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
+
+                        // store offsets
+                        output.extend_from_slice(&variable_width_data.offsets);
+
+                        // store bytes
+                        output.extend_from_slice(&variable_width_data.data);
+                        Ok(LanceBuffer::from(output))
+                    }
+                    _ => {
+                        panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
+                variable_width_data.bits_per_offset);
+                    }
                 }
-                let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
-                let offsets = offsets.as_ref();
-                // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset,
-                // then offsets data, then bytes data.
-                let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
-
-                let output_total_bytes =
-                    bytes_start_offset as usize + variable_width_data.data.len();
-                let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
-
-                // store `num_values` in the first 4 bytes of output buffer
-                output.extend_from_slice(&(num_values).to_le_bytes());
-
-                // store `bytes_start_offset` in the next 4 bytes of output buffer
-                output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
-
-                // store offsets
-                output.extend_from_slice(cast_slice(offsets));
-
-                // store bytes
-                output.extend_from_slice(&variable_width_data.data);
-
-                Ok(LanceBuffer::Owned(output))
             }
             _ => {
                 panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");
@@ -336,12 +381,15 @@ impl BlockCompressor for VariableEncoder {
 }
 
 impl PerValueCompressor for VariableEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let DataBlock::VariableWidth(variable) = data else {
             panic!("BinaryPerValueCompressor can only work with Variable Width DataBlock.");
         };
 
-        let encoding = ProtobufUtils::variable(variable.bits_per_offset);
+        let encoding = ProtobufUtils21::variable(
+            ProtobufUtils21::flat(variable.bits_per_offset as u64, None),
+            None,
+        );
         Ok((PerValueDataBlock::Variable(variable), encoding))
     }
 }
@@ -360,14 +408,64 @@ pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        debug_assert_eq!(num_values, LittleEndian::read_u32(&data[..4]) as u64);
+        // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
+        // as four bytes.  However, this led to alignment problems and was wasteful since we already store the num_values
+        // in higher layers.
+        //
+        // In the standard scheme we use 4 bytes for the bits per offset and 4 bytes for the bytes_start_offset and we
+        // rely on the passed in num_values to be correct.
 
-        // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-        let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
+        // This isn't perfect but it's probably good enough and the best I think we can do.  The bits per offset will
+        // never be more than 255 and it's little endian so the last 3 bytes will always be 0.  These will be the least
+        // significant 3 bytes of the number of values in the old scheme.  It's pretty unlikely these are all 0 (that would
+        // mean there are at least 16M values in a single page) so we'll use this to determine if the old scheme is used.
+        let is_old_scheme = data[1] != 0 || data[2] != 0 || data[3] != 0;
 
-        // the next `bytes_start_offset - 8` stores the offsets.
-        let offsets = data.slice_with_length(8, bytes_start_offset as usize - 8);
+        let (bits_per_offset, bytes_start_offset, offset_start) = if is_old_scheme {
+            // Old scheme
+            let bits_per_offset = data[0];
+            match bits_per_offset {
+                32 => {
+                    debug_assert_eq!(LittleEndian::read_u32(&data[1..5]), num_values as u32);
+                    let bytes_start_offset = LittleEndian::read_u32(&data[5..9]);
+                    (bits_per_offset, bytes_start_offset as u64, 9)
+                }
+                64 => {
+                    debug_assert_eq!(LittleEndian::read_u64(&data[1..9]), num_values);
+                    let bytes_start_offset = LittleEndian::read_u64(&data[9..17]);
+                    (bits_per_offset, bytes_start_offset, 17)
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                        location: location!(),
+                    });
+                }
+            }
+        } else {
+            // Standard scheme
+            let bits_per_offset = LittleEndian::read_u32(&data[0..4]) as u8;
+            match bits_per_offset {
+                32 => {
+                    let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
+                    (bits_per_offset, bytes_start_offset as u64, 8)
+                }
+                64 => {
+                    let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
+                    (bits_per_offset, bytes_start_offset, 16)
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Unsupported bits_per_offset={}", bits_per_offset).into(),
+                        location: location!(),
+                    });
+                }
+            }
+        };
+
+        // the next `bytes_start_offset - offset_start` stores the offsets.
+        let offsets =
+            data.slice_with_length(offset_start, bytes_start_offset as usize - offset_start);
 
         // the rest are the binary bytes.
         let data = data.slice_with_length(
@@ -378,7 +476,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data,
             offsets,
-            bits_per_offset: 32,
+            bits_per_offset,
             num_values,
             block_info: BlockInfo::new(),
         }))
@@ -393,37 +491,41 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field};
 
-    use lance_core::datatypes::{
-        COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+    use crate::{
+        constants::{
+            COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+            STRUCTURAL_ENCODING_MINIBLOCK,
+        },
+        testing::check_specific_random,
     };
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{
+            check_basic_random, check_round_trip_encoding_of_data, FnArrayGeneratorProvider,
+            TestCases,
+        },
         version::LanceFileVersion,
     };
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8_binary(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, version).await;
+        check_specific_random(
+            field,
+            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
+        )
+        .await;
     }
 
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_binary(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -431,7 +533,7 @@ pub mod tests {
         );
 
         let field = Field::new("", data_type, false).with_metadata(field_metadata);
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
     #[rstest]
@@ -439,6 +541,7 @@ pub mod tests {
     async fn test_binary_fsst(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(DataType::Binary, DataType::Utf8)] data_type: DataType,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -446,36 +549,75 @@ pub mod tests {
             structural_encoding.into(),
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
-
-        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
+        let field = Field::new("", data_type, true).with_metadata(field_metadata);
+        // TODO (https://github.com/lance-format/lance/issues/4783)
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_specific_random(field, test_cases).await;
     }
 
     #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_binary(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    async fn test_fsst_large_binary(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+        #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
     ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
+        let field = Field::new("", data_type, true).with_metadata(field_metadata);
+        check_specific_random(
+            field,
+            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_small_strings(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        use crate::testing::check_basic_generated;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        check_basic_generated(
+            field,
+            Box::new(FnArrayGeneratorProvider::new(move || {
+                lance_datagen::array::utf8_prefix_plus_counter("user_", /*is_large=*/ false)
+            })),
+        )
+        .await;
     }
 
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_simple_binary(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
         let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
 
@@ -489,8 +631,7 @@ pub mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4])
-            .with_file_version(version);
+            .with_indices(vec![0, 1, 3, 4]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
@@ -499,19 +640,15 @@ pub mod tests {
         .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_sliced_utf8(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_sliced_utf8() {
         let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
         let string_array = string_array.slice(1, 3);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_range(0..2)
-            .with_range(1..2)
-            .with_file_version(version);
+            .with_range(1..2);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
@@ -556,11 +693,8 @@ pub mod tests {
         .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_strings(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_empty_strings() {
         // Scenario 1: Some strings are empty
 
         let values = [Some("abc"), Some(""), None];
@@ -575,8 +709,7 @@ pub mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2])
-                .with_indices(vec![0, 1])
-                .with_file_version(version);
+                .with_indices(vec![0, 1]);
             check_round_trip_encoding_of_data(
                 vec![string_array.clone()],
                 &test_cases,
@@ -627,7 +760,7 @@ pub mod tests {
         #[values(true, false)] with_nulls: bool,
         #[values(100, 500, 35000)] dict_size: u32,
     ) {
-        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
         let strings = (0..dict_size)
             .map(|i| i.to_string())
             .collect::<Vec<String>>();
@@ -641,11 +774,157 @@ pub mod tests {
                 if with_nulls && i % 7 == 0 {
                     None
                 } else {
-                    Some(s.to_string())
+                    Some(s.clone())
                 }
             })
             .collect();
         let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_encoding_verification() {
+        use lance_datagen::{ByteCount, RowCount};
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("variable")
+            .with_min_file_version(LanceFileVersion::V2_1);
+
+        // Test both automatic selection and explicit configuration
+        // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)
+        let arr_small = lance_datagen::gen_batch()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(10), false))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_small], &test_cases, HashMap::new()).await;
+
+        // 2. Test explicit "none" compression to force binary encoding
+        let metadata_explicit =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+        let arr_large = lance_datagen::gen_batch()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(50), false))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_large], &test_cases, metadata_explicit).await;
+    }
+
+    #[test]
+    fn test_binary_miniblock_with_misaligned_buffer() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::buffer::LanceBuffer;
+        use crate::compression::MiniBlockDecompressor;
+        use crate::data::DataBlock;
+
+        // Test case 1: u32 offsets
+        {
+            let decompressor = BinaryMiniBlockDecompressor {
+                bits_per_offset: 32,
+            };
+
+            // Create test data with u32 offsets
+            // BinaryMiniBlock format: all offsets followed by all string data
+            // Need to ensure total size is divisible by 4 for u32
+            let mut test_data = Vec::new();
+
+            // Offsets section (3 offsets for 2 values + 1 end offset)
+            test_data.extend_from_slice(&12u32.to_le_bytes()); // offset to start of strings (after offsets)
+            test_data.extend_from_slice(&15u32.to_le_bytes()); // offset to second string
+            test_data.extend_from_slice(&20u32.to_le_bytes()); // offset to end
+
+            // String data section
+            test_data.extend_from_slice(b"ABCXYZ"); // 6 bytes of string data
+            test_data.extend_from_slice(&[0, 0]); // 2 bytes padding to make total 20 bytes (divisible by 4)
+
+            // Create a misaligned buffer by adding padding and slicing
+            let mut padded = Vec::with_capacity(test_data.len() + 1);
+            padded.push(0xFF); // Padding byte to misalign
+            padded.extend_from_slice(&test_data);
+
+            let bytes = bytes::Bytes::from(padded);
+            let misaligned = bytes.slice(1..); // Skip first byte to create misalignment
+
+            // Create LanceBuffer with bytes_per_value=1 to bypass alignment check
+            let buffer = LanceBuffer::from_bytes(misaligned, 1);
+
+            // Verify the buffer is actually misaligned
+            let ptr = buffer.as_ref().as_ptr();
+            assert_ne!(
+                ptr.align_offset(4),
+                0,
+                "Test setup: buffer should be misaligned for u32"
+            );
+
+            // Decompress with misaligned buffer - should work with borrow_to_typed_slice
+            let result = decompressor.decompress(vec![buffer], 2);
+            assert!(
+                result.is_ok(),
+                "Decompression should succeed with misaligned buffer"
+            );
+
+            // Verify the data is correct
+            if let Ok(DataBlock::VariableWidth(block)) = result {
+                assert_eq!(block.num_values, 2);
+                // Data should be the strings (including padding from the original buffer)
+                assert_eq!(&block.data.as_ref()[..6], b"ABCXYZ");
+            } else {
+                panic!("Expected VariableWidth block");
+            }
+        }
+
+        // Test case 2: u64 offsets
+        {
+            let decompressor = BinaryMiniBlockDecompressor {
+                bits_per_offset: 64,
+            };
+
+            // Create test data with u64 offsets
+            let mut test_data = Vec::new();
+
+            // Offsets section (3 offsets for 2 values + 1 end offset)
+            test_data.extend_from_slice(&24u64.to_le_bytes()); // offset to start of strings (after offsets)
+            test_data.extend_from_slice(&29u64.to_le_bytes()); // offset to second string
+            test_data.extend_from_slice(&40u64.to_le_bytes()); // offset to end (divisible by 8)
+
+            // String data section
+            test_data.extend_from_slice(b"HelloWorld"); // 10 bytes of string data
+            test_data.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // 6 bytes padding to make total 40 bytes (divisible by 8)
+
+            // Create misaligned buffer
+            let mut padded = Vec::with_capacity(test_data.len() + 3);
+            padded.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // 3 bytes padding for misalignment
+            padded.extend_from_slice(&test_data);
+
+            let bytes = bytes::Bytes::from(padded);
+            let misaligned = bytes.slice(3..); // Skip 3 bytes
+
+            let buffer = LanceBuffer::from_bytes(misaligned, 1);
+
+            // Verify misalignment for u64
+            let ptr = buffer.as_ref().as_ptr();
+            assert_ne!(
+                ptr.align_offset(8),
+                0,
+                "Test setup: buffer should be misaligned for u64"
+            );
+
+            // Decompress should succeed
+            let result = decompressor.decompress(vec![buffer], 2);
+            assert!(
+                result.is_ok(),
+                "Decompression should succeed with misaligned u64 buffer"
+            );
+
+            if let Ok(DataBlock::VariableWidth(block)) = result {
+                assert_eq!(block.num_values, 2);
+                // Data should be the strings (including padding from the original buffer)
+                assert_eq!(&block.data.as_ref()[..10], b"HelloWorld");
+            } else {
+                panic!("Expected VariableWidth block");
+            }
+        }
     }
 }

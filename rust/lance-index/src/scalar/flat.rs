@@ -13,15 +13,18 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result};
+use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::location;
 
 use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
 use super::{AnyQuery, MetricsCollector, SargableQuery, SearchResult};
-use crate::frag_reuse::FragReuseIndex;
+use crate::scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN};
+use crate::scalar::registry::VALUE_COLUMN_NAME;
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
 /// A flat index is just a batch of value/row-id pairs
@@ -110,8 +113,8 @@ impl DeepSizeOf for FlatIndexMetadata {
 impl FlatIndexMetadata {
     pub fn new(value_type: DataType) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", value_type, true),
-            Field::new("row_ids", DataType::UInt64, true),
+            Field::new(BTREE_VALUES_COLUMN, value_type, true),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, true),
         ]));
         Self { schema }
     }
@@ -128,7 +131,10 @@ impl BTreeSubIndex for FlatIndexMetadata {
         // the schema
         Ok(RecordBatch::try_new(
             self.schema.clone(),
-            vec![batch.column(0).clone(), batch.column(1).clone()],
+            vec![
+                batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
+                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+            ],
         )?)
     }
 
@@ -298,57 +304,40 @@ impl ScalarIndex for FlatIndex {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
-        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(
+        Ok(SearchResult::Exact(RowAddrTreeMap::from_iter(
             matching_ids.values(),
         )))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
-    }
-
-    // Note that there is no write/train method for flat index at the moment and so it isn't
-    // really possible for this method to be called.  If there was we assume it will write all
-    // data as a single batch named data.lance
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Arc<Self>> {
-        let batches = store.open_index_file("data.lance").await?;
-        let num_rows = batches.num_rows();
-        let mut batch = batches.read_range(0..num_rows, None).await?;
-        if let Some(fri_ref) = fri.as_ref() {
-            batch = fri_ref.remap_row_ids_record_batch(batch, 1)?;
-        }
-        let has_nulls = batch.column(0).null_count() > 0;
-        Ok(Arc::new(Self {
-            data: Arc::new(batch),
-            has_nulls,
-        }))
     }
 
     // Same as above, this is dead code at the moment but should work
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
-        dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        let remapped = remap_batch((*self.data).clone(), mapping)?;
-        let mut writer = dest_store
-            .new_index_file("data.lance", remapped.schema())
-            .await?;
-        writer.write_record_batch(remapped).await?;
-        writer.finish().await?;
-        Ok(())
+        _mapping: &HashMap<u64, Option<u64>>,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        unimplemented!()
     }
 
     async fn update(
         &self,
         _new_data: SendableRecordBatchStream,
         _dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         // If this was desired, then you would need to merge new_data and data and write it back out
-        todo!()
+        unimplemented!()
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        unimplemented!()
+    }
+
+    fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
+        // FlatIndex is used internally and doesn't have user-configurable parameters
+        unimplemented!("FlatIndex is an internal index type and cannot be recreated")
     }
 }
 
@@ -359,10 +348,10 @@ mod tests {
     use super::*;
     use arrow_array::types::Int32Type;
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen, RowCount};
+    use lance_datagen::{array, gen_batch, RowCount};
 
     fn example_index() -> FlatIndex {
-        let batch = gen()
+        let batch = gen_batch()
             .col(
                 "values",
                 array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
@@ -383,7 +372,7 @@ mod tests {
         let SearchResult::Exact(actual_row_ids) = actual else {
             panic! {"Expected exact search result"}
         };
-        let expected = RowIdTreeMap::from_iter(expected);
+        let expected = RowAddrTreeMap::from_iter(expected);
         assert_eq!(actual_row_ids, expected);
     }
 
@@ -447,7 +436,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = gen()
+        let expected = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
             .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
             .into_batch_rows(RowCount::from(3))

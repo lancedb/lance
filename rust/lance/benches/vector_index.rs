@@ -42,10 +42,10 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
             .unwrap()
     });
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let vector_column = first_batch.column_by_name("vector").unwrap();
     let value =
-        as_fixed_size_list_array(&vector_column).value(rng.gen_range(0..vector_column.len()));
+        as_fixed_size_list_array(&vector_column).value(rng.random_range(0..vector_column.len()));
     let q: &Float32Array = as_primitive_array(&value);
 
     c.bench_function(
@@ -92,7 +92,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     // reopen with no index caching to test IO overhead
     let dataset = rt.block_on(async {
         DatasetBuilder::from_uri("./vec_data.lance")
-            .with_index_cache_size(0)
+            .with_index_cache_size_bytes(0)
             .load()
             .await
             .unwrap()
@@ -164,7 +164,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         .await
         .unwrap();
     let ivf_params = IvfBuildParams {
-        num_partitions: 32,
+        num_partitions: Some(32),
         ..Default::default()
     };
     let pq_params = PQBuildParams {
@@ -188,10 +188,10 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
 
 fn create_float32_array(num_elements: i32) -> Float32Array {
     // generate an Arrow Float32Array with 10000*128 elements randomly
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut values = Vec::with_capacity(num_elements as usize);
     for _ in 0..num_elements {
-        values.push(rng.gen_range(0.0..1.0));
+        values.push(rng.random_range(0.0..1.0));
     }
     Float32Array::from(values)
 }

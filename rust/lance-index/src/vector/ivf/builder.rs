@@ -18,8 +18,14 @@ use lance_io::stream::RecordBatchStream;
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
 pub struct IvfBuildParams {
+    /// Deprecated: use `target_partition_size` instead.
     /// Number of partitions to build.
-    pub num_partitions: usize,
+    pub num_partitions: Option<usize>,
+
+    /// Target partition size.
+    /// If set, the number of partitions will be computed based on the target partition size.
+    /// Otherwise, the `target_partition_size` will be set by index type.
+    pub target_partition_size: Option<usize>,
 
     // ---- kmeans parameters
     /// Max number of iterations to train kmeans.
@@ -56,7 +62,8 @@ pub struct IvfBuildParams {
 impl Default for IvfBuildParams {
     fn default() -> Self {
         Self {
-            num_partitions: 32,
+            num_partitions: None,
+            target_partition_size: None,
             max_iters: 50,
             centroids: None,
             retrain: false,
@@ -74,7 +81,14 @@ impl IvfBuildParams {
     /// Create a new instance of `IvfBuildParams`.
     pub fn new(num_partitions: usize) -> Self {
         Self {
-            num_partitions,
+            num_partitions: Some(num_partitions),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_target_partition_size(target_partition_size: usize) -> Self {
+        Self {
+            target_partition_size: Some(target_partition_size),
             ..Default::default()
         }
     }
@@ -95,11 +109,18 @@ impl IvfBuildParams {
             });
         }
         Ok(Self {
-            num_partitions,
+            num_partitions: Some(num_partitions),
             centroids: Some(centroids),
             ..Default::default()
         })
     }
+}
+
+pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize) -> usize {
+    // The maximum number of partitions is 4096 to avoid slow KMeans clustering,
+    // bump it once we have better clustering algorithms.
+    const MAX_PARTITIONS: usize = 4096;
+    (num_rows / target_partition_size).clamp(1, MAX_PARTITIONS)
 }
 
 /// Load precomputed partitions from disk.

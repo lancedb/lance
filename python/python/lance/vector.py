@@ -329,7 +329,7 @@ def compute_pq_codes(
     )
     output_schema = pa.schema(
         [
-            pa.field("_rowid", pa.uint64()),
+            pa.field("row_id", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -658,7 +658,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     output_schema = pa.schema(
         [
-            pa.field("_rowid", pa.uint64()),
+            pa.field("row_id", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -734,6 +734,10 @@ def one_pass_assign_ivf_pq_on_accelerator(
     )
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
+        if re.search(r".:\\", dst_dataset_uri) is not None:
+            # Hack for Windows due to
+            # https://github.com/apache/arrow-rs-object-store/issues/499
+            dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
     ds = write_dataset(
         rbr,
         dst_dataset_uri,

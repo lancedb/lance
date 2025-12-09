@@ -15,8 +15,8 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::location;
 
-use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -25,6 +25,57 @@ pub struct Schema {
     pub fields: Vec<Field>,
     /// Metadata of the schema
     pub metadata: HashMap<String, String>,
+}
+
+/// Reference to a field in a schema, either by ID or by path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FieldRef<'a> {
+    /// Reference by field ID
+    ById(i32),
+    /// Reference by field path (e.g., "struct_field.sub_field")
+    ByPath(&'a str),
+}
+
+impl FieldRef<'_> {
+    /// Convert this field reference to a field ID by looking it up in the schema.
+    pub fn into_id(self, schema: &Schema) -> Result<i32> {
+        match self {
+            FieldRef::ById(id) => {
+                if schema.field_by_id(id).is_none() {
+                    return Err(Error::InvalidInput {
+                        source: format!("Field ID {} not found in schema", id).into(),
+                        location: location!(),
+                    });
+                }
+                Ok(id)
+            }
+            FieldRef::ByPath(path) => {
+                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
+                    source: format!("Field '{}' not found in schema", path).into(),
+                    location: location!(),
+                })?;
+                Ok(field.id)
+            }
+        }
+    }
+}
+
+impl From<i32> for FieldRef<'_> {
+    fn from(id: i32) -> Self {
+        FieldRef::ById(id)
+    }
+}
+
+impl<'a> From<&'a str> for FieldRef<'a> {
+    fn from(path: &'a str) -> Self {
+        FieldRef::ByPath(path)
+    }
+}
+
+impl<'a> From<&'a String> for FieldRef<'a> {
+    fn from(path: &'a String) -> Self {
+        FieldRef::ByPath(path.as_str())
+    }
 }
 
 /// State for a pre-order DFS iterator over the fields of a schema.
@@ -95,47 +146,6 @@ impl Schema {
         }
     }
 
-    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
-        let fields = self
-            .fields
-            .iter()
-            .filter(|f| f.storage_class() == storage_class)
-            .cloned()
-            .collect();
-        Self {
-            fields,
-            metadata: self.metadata.clone(),
-        }
-    }
-
-    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
-    /// If there are no blob storage class fields, the second schema will be `None`.
-    /// The order of fields is preserved.
-    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
-        let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut sibling_fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields.iter() {
-            match field.storage_class() {
-                StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => sibling_fields.push(field.clone()),
-            }
-        }
-        (
-            Self {
-                fields: local_fields,
-                metadata: self.metadata.clone(),
-            },
-            if sibling_fields.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    fields: sibling_fields,
-                    metadata: self.metadata.clone(),
-                })
-            },
-        )
-    }
-
     pub fn has_dictionary_types(&self) -> bool {
         self.fields.iter().any(|f| f.has_dictionary_types())
     }
@@ -163,18 +173,33 @@ impl Schema {
     /// Given a string column reference, resolve the path of fields
     ///
     /// For example, given a.b.c we will return the fields [a, b, c]
+    /// Field names containing dots must be quoted: parent."child.with.dot"
     ///
     /// Returns None if we can't find a segment at any point
     pub fn resolve(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
-        let mut split = column.as_ref().split('.').collect::<VecDeque<_>>();
-        let mut fields = Vec::with_capacity(split.len());
-        let first = split.pop_front().unwrap();
-        if let Some(field) = self.field(first) {
-            if field.resolve(&mut split, &mut fields) {
-                Some(fields)
-            } else {
-                None
+        let split = parse_field_path(column.as_ref()).ok()?;
+        if split.is_empty() {
+            return None;
+        }
+
+        if split.len() == 1 {
+            let field_name = &split[0];
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
             }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
+        let mut fields = Vec::with_capacity(split.len());
+        let first = &split[0];
+
+        // Find the first field
+        let field = self.fields.iter().find(|f| &f.name == first)?;
+
+        let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+        if field.resolve(&mut split_refs, &mut fields) {
+            Some(fields)
         } else {
             None
         }
@@ -183,16 +208,17 @@ impl Schema {
     fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
-            let split = col.as_ref().split('.').collect::<Vec<_>>();
-            let first = split[0];
+            let split = parse_field_path(col.as_ref())?;
+            let first = split[0].as_str();
             if let Some(field) = self.field(first) {
-                let projected_field = field.project(&split[1..])?;
+                let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+                let projected_field = field.project(&split_refs)?;
                 if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
                     candidate_field.merge(&projected_field)?;
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if err_on_missing {
+            } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
@@ -325,6 +351,18 @@ impl Schema {
         }
     }
 
+    fn apply_projection(&self, projection: &Projection) -> Self {
+        let filtered_fields = self
+            .fields
+            .iter()
+            .filter_map(|f| f.apply_projection(projection))
+            .collect();
+        Self {
+            fields: filtered_fields,
+            metadata: self.metadata.clone(),
+        }
+    }
+
     /// Project the schema by another schema, and preserves field metadata, i.e., Field IDs.
     ///
     /// Parameters
@@ -338,6 +376,18 @@ impl Schema {
         let projection = projection.try_into()?;
         let mut new_fields = vec![];
         for field in projection.fields.iter() {
+            // Ensure the field is a top-level field (no dots in the name)
+            if field.name.contains('.') {
+                return Err(Error::Schema {
+                    message: format!(
+                        "Field '{}' contains dots. project_by_schema only accepts top-level fields. \
+                         Use project() method for nested field paths.",
+                        field.name
+                    ),
+                    location: location!(),
+                });
+            }
+
             if let Some(self_field) = self.field(&field.name) {
                 new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
             } else if matches!(on_missing, OnMissing::Error) {
@@ -377,13 +427,10 @@ impl Schema {
         })
     }
 
-    /// Get a field by name. Return `None` if the field does not exist.
+    /// Get a field by its path. Return `None` if the field does not exist.
+    /// Field names containing dots must be quoted: parent."child.with.dot"
     pub fn field(&self, name: &str) -> Option<&Field> {
-        let split = name.split('.').collect::<Vec<_>>();
-        self.fields
-            .iter()
-            .find(|f| f.name == split[0])
-            .and_then(|c| c.sub_field(&split[1..]))
+        self.resolve(name).and_then(|fields| fields.last().copied())
     }
 
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
@@ -466,7 +513,7 @@ impl Schema {
     // TODO: pub(crate)
     /// Get the maximum field id in the schema.
     ///
-    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
+    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id()`
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
@@ -573,6 +620,20 @@ impl Schema {
     pub fn all_fields_nullable(&self) -> bool {
         SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
     }
+
+    /// Returns the properly formatted path from root to the field.
+    /// Field names containing dots are quoted (e.g., struct.`field.with.dot`)
+    pub fn field_path(&self, field_id: i32) -> Result<String> {
+        self.field_ancestry_by_id(field_id)
+            .map(|ancestry| {
+                let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
+                format_field_path(&field_refs)
+            })
+            .ok_or_else(|| Error::Index {
+                message: format!("Could not find field ancestry for id {}", field_id),
+                location: location!(),
+            })
+    }
 }
 
 impl PartialEq for Schema {
@@ -604,6 +665,7 @@ impl TryFrom<&ArrowSchema> for Schema {
             metadata: schema.metadata.clone(),
         };
         schema.set_field_id(None);
+        schema.validate()?;
 
         let pk = schema.unenforced_primary_key();
         for pk_col in pk.into_iter() {
@@ -667,7 +729,7 @@ pub fn compare_fields(
     expected: &[Field],
     options: &SchemaCompareOptions,
 ) -> bool {
-    if options.allow_missing_if_nullable || options.ignore_field_order {
+    if options.allow_missing_if_nullable || options.ignore_field_order || options.allow_subschema {
         let expected_names = expected
             .iter()
             .map(|f| f.name.as_str())
@@ -694,6 +756,9 @@ pub fn compare_fields(
                     return false;
                 }
                 cumulative_position = *pos;
+            } else if options.allow_subschema {
+                // allow_subschema: allow missing any field
+                continue;
             } else if options.allow_missing_if_nullable && expected_field.nullable {
                 continue;
             } else {
@@ -741,7 +806,10 @@ pub fn explain_fields_difference(
         .map(prepend_path)
         .collect::<Vec<_>>();
     let missing_fields = expected_names.difference(&field_names);
-    let missing_fields = if options.allow_missing_if_nullable {
+    let missing_fields = if options.allow_subschema {
+        // allow_subschema: don't report any missing fields
+        Vec::new()
+    } else if options.allow_missing_if_nullable {
         missing_fields
             .filter(|f| {
                 let expected_field = expected.iter().find(|ef| ef.name == **f).unwrap();
@@ -836,6 +904,51 @@ impl Projectable for Schema {
     }
 }
 
+/// Specifies how to handle blob columns when projecting
+#[derive(Debug, Clone, Default)]
+pub enum BlobHandling {
+    /// Read all blobs as binary
+    AllBinary,
+    #[default]
+    /// Read all blobs as descriptions and other binary columns as binary
+    BlobsDescriptions,
+    /// Read all binary columns as descriptions
+    AllDescriptions,
+    /// Read specific blobs as binary and the rest as descriptions
+    ///
+    /// Non-blob binary columns will be read as binary
+    ///
+    /// The set contains the field ids that should be read as binary
+    SomeBlobsBinary(HashSet<u32>),
+    /// Read specific columns as binary and all other binary columns as descriptions
+    ///
+    /// The set contains the field ids that should be read as binary
+    SomeBinary(HashSet<u32>),
+}
+
+impl BlobHandling {
+    fn should_unload(&self, field: &Field) -> bool {
+        if !field.data_type().is_binary_like() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => false,
+            Self::BlobsDescriptions => field.is_blob(),
+            Self::AllDescriptions => true,
+            Self::SomeBlobsBinary(set) => field.is_blob() && !set.contains(&(field.id as u32)),
+            Self::SomeBinary(set) => !set.contains(&(field.id as u32)),
+        }
+    }
+
+    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
+        if self.should_unload(&field) {
+            field.into_unloaded_with_version(version)
+        } else {
+            field
+        }
+    }
+}
+
 /// A projection is a selection of fields in a schema
 ///
 /// In addition we record whether the row_id or row_addr are
@@ -846,14 +959,28 @@ pub struct Projection {
     pub field_ids: HashSet<i32>,
     pub with_row_id: bool,
     pub with_row_addr: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
+    pub blob_handling: BlobHandling,
+    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Projection")
-            .field("schema", &self.to_schema())
+            .field("field_ids", &self.field_ids)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_addr", &self.with_row_addr)
+            .field(
+                "with_row_last_updated_at_version",
+                &self.with_row_last_updated_at_version,
+            )
+            .field(
+                "with_row_created_at_version",
+                &self.with_row_created_at_version,
+            )
+            .field("blob_handling", &self.blob_handling)
+            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -866,6 +993,10 @@ impl Projection {
             field_ids: HashSet::new(),
             with_row_id: false,
             with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            blob_handling: BlobHandling::default(),
+            blob_version: BlobVersion::V1,
         }
     }
 
@@ -884,7 +1015,39 @@ impl Projection {
         self
     }
 
-    /// Add a column (and any of its parents) to the projection from a string reference
+    pub fn with_row_last_updated_at_version(mut self) -> Self {
+        self.with_row_last_updated_at_version = true;
+        self
+    }
+
+    pub fn with_row_created_at_version(mut self) -> Self {
+        self.with_row_created_at_version = true;
+        self
+    }
+
+    pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
+        self.blob_handling = blob_handling;
+        self
+    }
+
+    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
+        self.blob_version = blob_version;
+        self
+    }
+
+    fn add_field_children(field_ids: &mut HashSet<i32>, field: &Field) {
+        for child in &field.children {
+            field_ids.insert(child.id);
+            Self::add_field_children(field_ids, child);
+        }
+    }
+
+    /// Add a column to the projection from a string reference
+    ///
+    /// The string reference can be a dotted field path (x.y.z) to reference inner struct fields
+    ///
+    /// Parent fields will automatically be added.  If the specified field has any children then
+    /// those will be added to.  Siblings, aunts, etc. are not automatically added
     pub fn union_column(mut self, column: impl AsRef<str>, on_missing: OnMissing) -> Result<Self> {
         let column = column.as_ref();
         if column == ROW_ID {
@@ -893,10 +1056,19 @@ impl Projection {
         } else if column == ROW_ADDR {
             self.with_row_addr = true;
             return Ok(self);
+        } else if column == crate::ROW_LAST_UPDATED_AT_VERSION {
+            self.with_row_last_updated_at_version = true;
+            return Ok(self);
+        } else if column == crate::ROW_CREATED_AT_VERSION {
+            self.with_row_created_at_version = true;
+            return Ok(self);
         }
 
         if let Some(fields) = self.base.schema().resolve(column) {
             self.field_ids.extend(fields.iter().map(|f| f.id));
+            if let Some(last_field) = fields.last() {
+                Self::add_field_children(&mut self.field_ids, last_field);
+            }
         } else if matches!(on_missing, OnMissing::Error) {
             return Err(Error::InvalidInput {
                 source: format!("Column {} does not exist", column).into(),
@@ -953,6 +1125,10 @@ impl Projection {
         self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
         self.with_row_id = self.with_row_id && other.with_row_id;
         self.with_row_addr = self.with_row_addr && other.with_row_addr;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && other.with_row_created_at_version;
         self
     }
 
@@ -970,6 +1146,10 @@ impl Projection {
                 self.with_row_id = true;
             } else if field.name == ROW_ADDR {
                 self.with_row_addr = true;
+            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+                self.with_row_last_updated_at_version = true;
+            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+                self.with_row_created_at_version = true;
             } else {
                 // If a field is not in our schema then it should probably have an id of -1.  If it isn't -1
                 // that probably implies some kind of weird schema mixing is going on and we should panic.
@@ -984,6 +1164,10 @@ impl Projection {
         self.field_ids.extend(&other.field_ids);
         self.with_row_id = self.with_row_id || other.with_row_id;
         self.with_row_addr = self.with_row_addr || other.with_row_addr;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version || other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version || other.with_row_created_at_version;
         self
     }
 
@@ -999,6 +1183,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id |= other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr |= other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        self.with_row_last_updated_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version |= other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1018,6 +1210,14 @@ impl Projection {
     ) -> Result<Self> {
         self.with_row_id &= !other.fields().iter().any(|f| f.name() == ROW_ID);
         self.with_row_addr &= !other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        self.with_row_last_updated_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_LAST_UPDATED_AT_VERSION);
+        self.with_row_created_at_version &= !other
+            .fields()
+            .iter()
+            .any(|f| f.name() == crate::ROW_CREATED_AT_VERSION);
         let other =
             self.base
                 .schema()
@@ -1034,6 +1234,10 @@ impl Projection {
             .collect();
         self.with_row_addr = self.with_row_addr && !other.with_row_addr;
         self.with_row_id = self.with_row_id && !other.with_row_id;
+        self.with_row_last_updated_at_version =
+            self.with_row_last_updated_at_version && !other.with_row_last_updated_at_version;
+        self.with_row_created_at_version =
+            self.with_row_created_at_version && !other.with_row_created_at_version;
         self
     }
 
@@ -1051,6 +1255,10 @@ impl Projection {
                 self.with_row_id = false;
             } else if field.name == ROW_ADDR {
                 self.with_row_addr = false;
+            } else if field.name == crate::ROW_LAST_UPDATED_AT_VERSION {
+                self.with_row_last_updated_at_version = false;
+            } else if field.name == crate::ROW_CREATED_AT_VERSION {
+                self.with_row_created_at_version = false;
             } else {
                 debug_assert_eq!(field.id, -1);
             }
@@ -1060,13 +1268,54 @@ impl Projection {
 
     /// True if the projection does not select any fields or take the row id / addr
     pub fn is_empty(&self) -> bool {
-        self.field_ids.is_empty() && !self.with_row_addr && !self.with_row_id
+        self.field_ids.is_empty()
+            && !self.with_row_addr
+            && !self.with_row_id
+            && !self.with_row_last_updated_at_version
+            && !self.with_row_created_at_version
+    }
+
+    /// True if the projection is only the row_id or row_addr columns
+    ///
+    /// Note: this will return false for a completely empty projection
+    pub fn is_metadata_only(&self) -> bool {
+        self.field_ids.is_empty()
+            && (self.with_row_addr
+                || self.with_row_id
+                || self.with_row_last_updated_at_version
+                || self.with_row_created_at_version)
+    }
+
+    /// True if the projection has at least one non-metadata column
+    pub fn has_non_meta_cols(&self) -> bool {
+        !self.field_ids.is_empty()
+    }
+
+    /// Convert the projection to a schema that does not include metadata columns
+    pub fn to_bare_schema(&self) -> Schema {
+        self.base.schema().apply_projection(self)
     }
 
     /// Convert the projection to a schema
+    ///
+    /// Includes the _rowid and _rowaddr columns if requested
     pub fn to_schema(&self) -> Schema {
-        let field_ids = self.field_ids.iter().copied().collect::<Vec<_>>();
-        self.base.schema().project_by_ids(&field_ids, false)
+        let mut schema = self.to_bare_schema();
+        let mut extra_fields = Vec::new();
+        if self.with_row_id {
+            extra_fields.push(ROW_ID_FIELD.clone());
+        }
+        if self.with_row_addr {
+            extra_fields.push(ROW_ADDR_FIELD.clone());
+        }
+        if self.with_row_last_updated_at_version {
+            extra_fields.push(crate::ROW_LAST_UPDATED_AT_VERSION_FIELD.clone());
+        }
+        if self.with_row_created_at_version {
+            extra_fields.push(crate::ROW_CREATED_AT_VERSION_FIELD.clone());
+        }
+        schema.extend(&extra_fields).unwrap();
+        schema
     }
 
     /// Convert the projection to a schema
@@ -1080,28 +1329,386 @@ impl Projection {
     }
 
     /// Convert the projection into an Arrow schema
-    pub fn to_arrow_schema(&self) -> Result<arrow_schema::Schema> {
-        let mut arrow_schema: arrow_schema::Schema = (&self.to_schema()).into();
-        // Should we be adding row_id / row_addr on to_schema?
-        if self.with_row_id {
-            arrow_schema = arrow_schema.try_with_column(ROW_ID_FIELD.clone())?;
-        }
-        if self.with_row_addr {
-            arrow_schema = arrow_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
-        }
-        Ok(arrow_schema)
+    pub fn to_arrow_schema(&self) -> arrow_schema::Schema {
+        (&self.to_schema()).into()
     }
+}
+
+/// Parse a field path that may contain quoted field names.
+///
+/// Field names containing dots must be quoted with backticks.
+/// For example: "parent.`child.with.dot`" parses to ["parent", "child.with.dot"]
+///
+/// Backticks within quoted fields must be escaped by doubling them.
+/// For example: "`field``with``backticks`" represents the field name "field`with`backticks"
+///
+/// Returns an error if:
+/// - The input path is empty
+/// - The path has malformed quotes (unclosed, misplaced, etc.)
+/// - The path has empty segments (e.g., "parent..child" or "parent.")
+///
+/// The result is guaranteed to contain at least one element.
+pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
+    if path.is_empty() {
+        return Err(Error::Schema {
+            message: "Field path cannot be empty".to_string(),
+            location: location!(),
+        });
+    }
+
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = path.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                if in_quotes {
+                    // Check if this is an escaped backtick (double backtick)
+                    if chars.peek() == Some(&'`') {
+                        // Consume the second backtick and add a single backtick to current
+                        chars.next();
+                        current.push('`');
+                    } else {
+                        // End of quoted field
+                        in_quotes = false;
+                        // After closing quote, we should either see a dot or end of string
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch != '.' {
+                                return Err(Error::Schema {
+                                    message: format!("Invalid field path '{}': expected '.' or end of string after closing quote", path),
+                                    location: location!(),
+                                });
+                            }
+                        }
+                    }
+                } else if current.is_empty() {
+                    // Start of quoted field
+                    in_quotes = true;
+                } else {
+                    // Quote in the middle of unquoted field name
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Invalid field path '{}': unexpected quote in the middle of field name",
+                            path
+                        ),
+                        location: location!(),
+                    });
+                }
+            }
+            '.' if !in_quotes => {
+                if current.is_empty() {
+                    return Err(Error::Schema {
+                        message: format!("Invalid field path '{}': empty field name", path),
+                        location: location!(),
+                    });
+                }
+                result.push(current);
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    if in_quotes {
+        return Err(Error::Schema {
+            message: format!("Invalid field path '{}': unclosed quote", path),
+            location: location!(),
+        });
+    }
+
+    if !current.is_empty() {
+        result.push(current);
+    } else if !result.is_empty() {
+        return Err(Error::Schema {
+            message: format!("Invalid field path '{}': trailing dot", path),
+            location: location!(),
+        });
+    }
+
+    // This check is now redundant since we check for empty input at the beginning,
+    // but keeping it for extra safety
+    if result.is_empty() {
+        return Err(Error::Schema {
+            message: format!("Invalid field path '{}'", path),
+            location: location!(),
+        });
+    }
+
+    Ok(result)
+}
+
+/// Format a field path, quoting field names that contain dots or backticks.
+///
+/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Backticks in field names are escaped by doubling them.
+/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
+pub fn format_field_path(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            if field.contains('.') || field.contains('`') {
+                // Quote this field
+                // Escape backticks by doubling them (PostgreSQL style)
+                let escaped = field.replace('`', "``");
+                format!("`{}`", escaped)
+            } else {
+                field.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Escape a field path for project
+///
+/// Parses the field path and formats it for SQL usage.
+/// Always quotes all segments with backticks to prevent special characters.
+///
+/// For example:
+/// - "parent.child" -> “`parent`.`child`”
+/// - "parent.`child.with.dot`" -> “`parent`.`child.with.dot`”
+pub fn escape_field_path_for_project(name: &str) -> String {
+    if name == WILDCARD {
+        return name.to_string();
+    }
+    let segments = parse_field_path(name).unwrap_or_else(|_| vec![name.to_string()]);
+    segments
+        .iter()
+        .map(|s| {
+            let escaped = s.replace('`', "``");
+            format!("`{}`", escaped)
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
 
-    use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
-    };
+    #[test]
+    fn projection_from_schema_defaults_to_v1() {
+        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
+        let schema = Schema {
+            fields: vec![field],
+            metadata: HashMap::new(),
+        };
+
+        let projection = Projection::empty(Arc::new(schema));
+
+        assert_eq!(projection.blob_version, BlobVersion::V1);
+    }
+
+    #[test]
+    fn test_resolve_with_quoted_fields() {
+        // Create a schema with fields containing dots
+        let field_with_dots = Field::try_from(&ArrowField::new(
+            "simple.name.with.dot",
+            ArrowDataType::Int32,
+            false,
+        ))
+        .unwrap();
+        let normal_field =
+            Field::try_from(&ArrowField::new("normal", ArrowDataType::Int32, false)).unwrap();
+        let nested_field = Field::try_from(&ArrowField::new(
+            "parent",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("child.with.dot", ArrowDataType::Int32, false),
+                ArrowField::new("normal_child", ArrowDataType::Int32, false),
+            ])),
+            false,
+        ))
+        .unwrap();
+
+        let schema = Schema {
+            fields: vec![field_with_dots, normal_field, nested_field],
+            metadata: HashMap::new(),
+        };
+
+        // Test 1: Resolving a field with dots using quotes
+        let resolved = schema.resolve("`simple.name.with.dot`");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "simple.name.with.dot");
+
+        // Test 2: Resolving a normal field
+        let resolved = schema.resolve("normal");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "normal");
+
+        // Test 3: Resolving a nested field with dots
+        let resolved = schema.resolve("parent.`child.with.dot`");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "child.with.dot");
+
+        // Test 4: Resolving a normal nested field
+        let resolved = schema.resolve("parent.normal_child");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "normal_child");
+
+        // Test 5: Non-existent field should return None
+        let resolved = schema.resolve("\"non.existent\"");
+        assert!(resolved.is_none());
+
+        // Test 6: Schema::field should work the same way
+        let field = schema.field("`simple.name.with.dot`");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "simple.name.with.dot");
+
+        let field = schema.field("parent.`child.with.dot`");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "child.with.dot");
+
+        let field = schema.field("parent.normal_child");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "normal_child");
+    }
+
+    #[test]
+    fn test_field_path_parsing() {
+        // Simple paths without quotes
+        assert_eq!(
+            parse_field_path("a.b.c").unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        // Single quoted field with dots
+        assert_eq!(
+            parse_field_path("`simple.name.with.dot`").unwrap(),
+            vec!["simple.name.with.dot".to_string()]
+        );
+
+        // Path with quoted field containing dots
+        assert_eq!(
+            parse_field_path("parent.`child.with.dot`.normal").unwrap(),
+            vec![
+                "parent".to_string(),
+                "child.with.dot".to_string(),
+                "normal".to_string()
+            ]
+        );
+
+        // Quoted field at the beginning
+        assert_eq!(
+            parse_field_path("`field.with.dot`.child").unwrap(),
+            vec!["field.with.dot".to_string(), "child".to_string()]
+        );
+
+        // Simple field
+        assert_eq!(
+            parse_field_path("simple").unwrap(),
+            vec!["simple".to_string()]
+        );
+
+        // Quoted field at the end
+        assert_eq!(
+            parse_field_path("parent.`field.with.dot`").unwrap(),
+            vec!["parent".to_string(), "field.with.dot".to_string()]
+        );
+
+        // Field with escaped backticks (PostgreSQL style - double backticks)
+        assert_eq!(
+            parse_field_path("parent.`field``with``backticks`").unwrap(),
+            vec!["parent".to_string(), "field`with`backticks".to_string()]
+        );
+
+        // Invalid: unclosed quote
+        assert!(parse_field_path("parent.`unclosed").is_err());
+
+        // Invalid: quote in middle of unquoted field
+        assert!(parse_field_path("par`ent.child").is_err());
+
+        // Invalid: empty field name
+        assert!(parse_field_path("parent..child").is_err());
+
+        // Invalid: trailing dot
+        assert!(parse_field_path("parent.").is_err());
+
+        // Test formatting
+        assert_eq!(
+            format_field_path(&["parent", "child.with.dot", "normal"]),
+            "parent.`child.with.dot`.normal"
+        );
+
+        assert_eq!(
+            format_field_path(&["field`with`backticks"]),
+            "`field``with``backticks`"
+        );
+    }
+
+    #[test]
+    fn test_resolve_quoted_fields() {
+        // Test that top-level fields with dots are rejected during validation
+        let arrow_schema_with_dots = ArrowSchema::new(vec![ArrowField::new(
+            "field.with.dots",
+            DataType::Int32,
+            false,
+        )]);
+
+        // Schema creation should fail due to validation
+        let schema_result = Schema::try_from(&arrow_schema_with_dots);
+        assert!(schema_result.is_err());
+        let err = schema_result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Top level field field.with.dots cannot contain `.`"));
+
+        // Test that nested fields with dots are allowed
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("regular_field", DataType::Int32, false),
+            ArrowField::new(
+                "parent",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("child.with.dot", DataType::Utf8, true),
+                    ArrowField::new("normal_child", DataType::Int32, false),
+                ])),
+                false,
+            ),
+        ]);
+
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // Test resolving regular field
+        let resolved = schema.resolve("regular_field");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "regular_field");
+
+        // Test resolving nested field with dots using quotes
+        let resolved = schema.resolve("parent.`child.with.dot`");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "child.with.dot");
+
+        // Test resolving normal nested field
+        let resolved = schema.resolve("parent.normal_child");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "normal_child");
+    }
+
+    use arrow_schema::DataType;
 
     #[test]
     fn test_schema_projection() {

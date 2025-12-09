@@ -9,13 +9,14 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use futures::StreamExt;
+use lance::dataset::ProjectionRequest;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::{arrow::FixedSizeListArrayExt, dataset::ProjectionRequest};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::{FileReader, FileReaderOptions};
-use lance_file::v2::LanceEncodingsIo;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_file::LanceEncodingsIo;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
@@ -29,11 +30,11 @@ use std::time::Duration;
 
 const BATCH_SIZE: u64 = 1024;
 
-fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
-    let mut rng = rand::thread_rng();
+fn random_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
+    let mut rng = rand::rng();
     let mut ranges = Vec::with_capacity(n);
     for i in 0..n {
-        ranges.push(rng.gen_range(1..num_rows));
+        ranges.push(rng.random_range(1..num_rows));
         ranges[i] = ((ranges[i] / file_size) << 32) | (ranges[i] % file_size);
     }
 
@@ -87,7 +88,7 @@ fn dataset_take(
             ), |b| {
                 b.to_async(rt).iter(|| async {
                     let rows =
-                        gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
+                        random_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
@@ -105,7 +106,7 @@ fn bench_random_single_take_with_file_reader(c: &mut Criterion) {
     let num_batches: u64 = 1024;
     let file_size: u64 = num_batches * BATCH_SIZE + 1;
     let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+        let rows = random_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
         let mut rows_list: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         for row in rows {
             rows_list.push(vec![row as u32]);
@@ -139,7 +140,7 @@ fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
     let num_batches: u64 = 1024;
     let file_size: u64 = num_batches * BATCH_SIZE + 1;
     let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+        let rows = random_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
         let mut rows: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
         rows.sort();
         vec![rows]
@@ -238,7 +239,7 @@ async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     let file_metadata = FileReader::read_all_metadata(&file).await.unwrap();
 
     FileReader::try_open_with_file_metadata(
-        Arc::new(LanceEncodingsIo(file.clone())),
+        Arc::new(LanceEncodingsIo::new(file.clone())),
         file_path.clone(),
         None,
         Arc::<DecoderPlugins>::default(),
@@ -257,7 +258,7 @@ fn bench_random_single_take_with_file_fragment(c: &mut Criterion) {
     // Make sure there is only one fragment.
     let file_size: u64 = num_batches * BATCH_SIZE + 1;
     let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+        let rows = random_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
         let mut rows_list: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         for row in rows {
             rows_list.push(vec![row as u32]);
@@ -292,7 +293,7 @@ fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
     // Make sure there is only one fragment.
     let file_size: u64 = num_batches * BATCH_SIZE + 1;
     let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+        let rows = random_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
         let mut rows: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
         rows.sort();
         vec![rows]

@@ -18,14 +18,16 @@ use std::sync::Arc;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
-use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance_table::format::{
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
@@ -36,9 +38,9 @@ use snafu::location;
 
 use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
-use crate::schema::LanceSchema;
+use crate::schema::{logical_schema_from_lance, LanceSchema};
 use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{Dataset, Scanner, RT};
+use crate::{rt, Dataset, Scanner};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -86,7 +88,7 @@ impl FileFragment {
         dataset: &Dataset,
         fragment_id: usize,
     ) -> PyResult<PyLance<Fragment>> {
-        let metadata = RT.block_on(None, async {
+        let metadata = rt().block_on(None, async {
             LanceFragment::create_from_file(filename, dataset.ds.as_ref(), fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
@@ -111,7 +113,7 @@ impl FileFragment {
         let batches = convert_reader(reader)?;
 
         reader.py().allow_threads(|| {
-            RT.runtime.block_on(async move {
+            rt().runtime.block_on(async move {
                 let metadata =
                     LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
                         .await
@@ -132,11 +134,39 @@ impl FileFragment {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        RT.runtime.block_on(async {
+        rt().runtime.block_on(async {
             self.fragment
                 .count_rows(filter)
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature=(columns=None, with_row_address=None))]
+    fn open_session(
+        self_: PyRef<'_, Self>,
+        columns: Option<Vec<String>>,
+        with_row_address: Option<bool>,
+    ) -> PyResult<FragmentSession> {
+        let dataset_schema = self_.fragment.dataset().schema();
+        let projection = if let Some(columns) = columns {
+            dataset_schema
+                .project(&columns)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+        } else {
+            dataset_schema.clone()
+        };
+
+        let fragment = self_.fragment.clone();
+        let session = rt()
+            .spawn(Some(self_.py()), async move {
+                fragment
+                    .open_session(&projection, with_row_address.unwrap_or(false))
+                    .await
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(FragmentSession {
+            session: Arc::new(session),
         })
     }
 
@@ -157,7 +187,7 @@ impl FileFragment {
 
         let indices = row_indices.iter().map(|v| *v as u32).collect::<Vec<_>>();
         let fragment = self_.fragment.clone();
-        let batch = RT
+        let batch = rt()
             .spawn(Some(self_.py()), async move {
                 fragment.take(&indices, &projection).await
             })?
@@ -166,7 +196,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -178,6 +208,7 @@ impl FileFragment {
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
+        order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -222,7 +253,12 @@ impl FileFragment {
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
-
+        if let Some(orderings) = order_by {
+            let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
+            scanner
+                .order_by(col_orderings)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
     }
@@ -238,7 +274,7 @@ impl FileFragment {
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
         let fragment = self.fragment.clone();
-        let (fragment, schema) = RT
+        let (fragment, schema) = rt()
             .spawn(None, async move {
                 fragment.add_columns(transforms, None, batch_size).await
             })?
@@ -257,7 +293,7 @@ impl FileFragment {
         let transforms = transforms_from_python(transforms)?;
 
         let fragment = self.fragment.clone();
-        let (fragment, schema) = RT
+        let (fragment, schema) = rt()
             .spawn(None, async move {
                 fragment
                     .add_columns(transforms, read_columns, batch_size)
@@ -276,7 +312,7 @@ impl FileFragment {
         max_field_id: i32,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let mut fragment = self.fragment.clone();
-        let (fragment, schema) = RT
+        let (fragment, schema) = rt()
             .spawn(None, async move {
                 fragment
                     .merge_columns(reader.0, &left_on, &right_on, max_field_id)
@@ -287,9 +323,25 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    fn update_columns(
+        &mut self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: String,
+        right_on: String,
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        let mut fragment = self.fragment.clone();
+        let (updated_fragment, fields_modified) = rt()
+            .spawn(None, async move {
+                fragment.update_columns(reader.0, &left_on, &right_on).await
+            })?
+            .infer_error()?;
+
+        Ok((PyLance(updated_fragment), fields_modified))
+    }
+
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
-        let updated_fragment = RT
+        let updated_fragment = rt()
             .block_on(None, async { old_fragment.delete(predicate).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -301,8 +353,8 @@ impl FileFragment {
 
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let schema = self_.fragment.dataset().schema();
-        let arrow_schema: ArrowSchema = schema.into();
-        arrow_schema.to_pyarrow(self_.py())
+        let logical_schema = logical_schema_from_lance(schema);
+        logical_schema.to_pyarrow(self_.py())
     }
 
     /// Returns the data file objects associated with this fragment.
@@ -325,13 +377,13 @@ impl FileFragment {
 
     #[getter]
     fn num_deletions(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.count_deletions())?
+        rt().block_on(None, self.fragment.count_deletions())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     #[getter]
     fn physical_rows(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.physical_rows())?
+        rt().block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
@@ -354,7 +406,7 @@ fn do_write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    RT.block_on(
+    rt().block_on(
         Some(reader.py()),
         InsertBuilder::new(dest.as_dest())
             .with_params(&params)
@@ -371,11 +423,6 @@ pub fn write_fragments(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyObject>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
-
-    assert!(
-        written.blobs_op.is_none(),
-        "Blob writing is not yet supported by the python _write_fragments API"
-    );
 
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
@@ -406,7 +453,7 @@ pub fn write_fragments_transaction<'py>(
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
-        let reader = RT.block_on(
+        let reader = rt().block_on(
             Some(reader.py()),
             scanner
                 .to_reader()
@@ -426,7 +473,13 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    fn new(read_version: u64, id: u64, file_type: &str, num_deleted_rows: usize) -> PyResult<Self> {
+    fn new(
+        read_version: u64,
+        id: u64,
+        file_type: &str,
+        num_deleted_rows: usize,
+        base_id: Option<u32>,
+    ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -442,6 +495,7 @@ impl PyDeletionFile {
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
+            base_id,
         }))
     }
 
@@ -455,6 +509,7 @@ impl PyDeletionFile {
             intern!(slf.py(), "num_deleted_rows"),
             slf.0.num_deleted_rows,
         )?;
+        dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
 
         Ok(dict)
     }
@@ -490,6 +545,11 @@ impl PyDeletionFile {
             DeletionFileType::Array => "array",
             DeletionFileType::Bitmap => "bitmap",
         }
+    }
+
+    #[getter]
+    fn base_id(&self) -> &Option<u32> {
+        &self.0.base_id
     }
 
     #[pyo3(signature = (fragment_id, base_uri=None))]
@@ -545,6 +605,9 @@ impl PyDeletionFile {
 #[pyclass(name = "RowIdMeta", module = "lance.fragment")]
 pub struct PyRowIdMeta(pub RowIdMeta);
 
+#[pyclass(name = "RowDatasetVersionMeta", module = "lance.fragment")]
+pub struct PyRowDatasetVersionMeta(pub RowDatasetVersionMeta);
+
 #[pymethods]
 impl PyRowIdMeta {
     fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
@@ -591,6 +654,76 @@ impl PyRowIdMeta {
     }
 }
 
+#[pymethods]
+impl PyRowDatasetVersionMeta {
+    fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
+        Err(PyNotImplementedError::new_err(
+            "PyRowDatasetVersionMeta.asdict is not yet supported.",
+        ))
+    }
+
+    pub fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.0).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not serialize RowDatasetVersionMeta due to error: {}",
+                err
+            ))
+        })
+    }
+
+    #[staticmethod]
+    pub fn from_json(json: String) -> PyResult<Self> {
+        let dataset_version_meta = serde_json::from_str(&json).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not load RowDatasetVersionMeta due to error: {}",
+                err
+            ))
+        })?;
+        Ok(Self(dataset_version_meta))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+        let state = self.json()?;
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
+            .getattr("RowDatasetVersionMeta")?
+            .getattr("from_json")?
+            .extract()?;
+        Ok((from_json, state))
+    }
+
+    pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for RowDatasetVersionMeta",
+            )),
+        }
+    }
+}
+
+#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct FragmentSession {
+    session: Arc<lance::dataset::fragment::session::FragmentSession>,
+}
+
+#[pymethods]
+impl FragmentSession {
+    #[pyo3(signature=(indices))]
+    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
+        let session = self_.session.clone();
+        let batch = rt()
+            .spawn(
+                Some(self_.py()),
+                async move { session.take(&indices).await },
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        batch.to_pyarrow(self_.py())
+    }
+}
+
 impl FromPyObject<'_> for PyLance<Fragment> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
@@ -601,6 +734,12 @@ impl FromPyObject<'_> for PyLance<Fragment> {
 
         let row_id_meta: Option<PyRef<PyRowIdMeta>> = ob.getattr("row_id_meta")?.extract()?;
         let row_id_meta = row_id_meta.map(|r| r.0.clone());
+        let last_updated_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
+            ob.getattr("last_updated_at_version_meta")?.extract()?;
+        let last_updated_at_version_meta = last_updated_at_version_meta.map(|r| r.0.clone());
+        let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
+            ob.getattr("created_at_version_meta")?.extract()?;
+        let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -608,6 +747,8 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             deletion_file,
             physical_rows: ob.getattr("physical_rows")?.extract()?,
             row_id_meta,
+            last_updated_at_version_meta,
+            created_at_version_meta,
         }))
     }
 }
@@ -630,6 +771,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .as_ref()
             .map(|f| PyDeletionFile(f.clone()));
         let row_id_meta = self.0.row_id_meta.as_ref().map(|r| PyRowIdMeta(r.clone()));
+        let last_updated_at_version_meta = self
+            .0
+            .last_updated_at_version_meta
+            .as_ref()
+            .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let created_at_version_meta = self
+            .0
+            .created_at_version_meta
+            .as_ref()
+            .map(|r| PyRowDatasetVersionMeta(r.clone()));
 
         cls.call1((
             self.0.id,
@@ -637,6 +788,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             self.0.physical_rows,
             deletion_file,
             row_id_meta,
+            created_at_version_meta,
+            last_updated_at_version_meta,
         ))
     }
 }
@@ -662,6 +815,7 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
 }
@@ -685,6 +839,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,
+            self.0.base_id,
         ))
     }
 }

@@ -174,9 +174,7 @@ def test_null_blobs(tmp_path):
             py_blob = blob.as_py()
             # When we write blobs to a file we store the position as 1 and size as 0
             # to avoid needing a validity buffer.
-            #
-            # TODO: We should probably convert these to null on read.
-            assert py_blob == {"position": None, "size": None} or py_blob == {
+            assert py_blob is None or py_blob == {
                 "position": 1,
                 "size": 0,
             }

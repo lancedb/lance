@@ -42,7 +42,6 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
-use futures::ready;
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -84,89 +83,6 @@ impl ScanMetrics {
     }
 }
 
-struct StrictBatchSizeStream<S> {
-    inner: S,
-    batch_size: usize,
-    residual: Option<RecordBatch>,
-}
-
-/// Internal polling method for strict batch size enforcement.
-///
-/// # Use Case
-/// When precise batch sizing is required (e.g., ML batch processing), this method guarantees
-/// output batches exactly match batch_size until final partial batch. Maintains data integrity
-/// across splits using row-aware splitting.
-///
-/// # Example
-/// With batch_size=5 and input sequence:
-/// - Fragment 1: 7 rows → splits into [5,2]
-///   (queues 5, carries 2)
-/// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
-///   splits into [5,1]
-///
-/// - Output batches: [5], [5], [1]
-impl<S> Stream for StrictBatchSizeStream<S>
-where
-    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
-{
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            // Process residual first if present
-            if let Some(residual) = self.residual.take() {
-                if residual.num_rows() >= self.batch_size {
-                    let split_at = self.batch_size;
-                    let chunk = residual.slice(0, split_at);
-                    let new_residual = residual.slice(split_at, residual.num_rows() - split_at);
-                    self.residual = Some(new_residual);
-                    return Poll::Ready(Some(Ok(chunk)));
-                } else {
-                    // Keep residual and proceed to get more data
-                    self.residual = Some(residual);
-                }
-            }
-
-            // Poll the inner stream for next batch
-            match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-                Some(Ok(batch)) => {
-                    // Combine with residual if any
-                    let current_batch = if let Some(residual) = self.residual.take() {
-                        arrow::compute::concat_batches(&residual.schema(), &[residual, batch])
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    } else {
-                        batch
-                    };
-
-                    if current_batch.num_rows() >= self.batch_size {
-                        let split_at = self.batch_size;
-                        let chunk = current_batch.slice(0, split_at);
-                        let new_residual =
-                            current_batch.slice(split_at, current_batch.num_rows() - split_at);
-                        if new_residual.num_rows() > 0 {
-                            self.residual = Some(new_residual);
-                        }
-                        return Poll::Ready(Some(Ok(chunk)));
-                    } else {
-                        // Not enough rows, store as residual
-                        self.residual = Some(current_batch);
-                        continue;
-                    }
-                }
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                None => {
-                    return Poll::Ready(
-                        self.residual
-                            .take()
-                            .filter(|r| r.num_rows() > 0)
-                            .map(Ok::<_, DataFusionError>),
-                    );
-                }
-            }
-        }
-    }
-}
-
 /// Default behavior
 /// polling method for non-strict batch size mode.
 ///
@@ -187,17 +103,20 @@ impl Stream for LanceStream {
         let this = self.get_mut();
         let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
 
-        let poll_result = match this.inner_stream.poll_next_unpin(cx) {
+        let inner_poll = this.inner_stream.poll_next_unpin(cx);
+        timer.done();
+
+        let poll_result = match inner_poll {
             Poll::Ready(None) => {
                 if let Some(scheduler) = &this.scan_scheduler {
-                    this.scan_metrics.io_metrics.record_final(scheduler);
+                    this.scan_metrics.io_metrics.record(scheduler);
                 }
                 Poll::Ready(None)
             }
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
             other => other,
         };
 
-        timer.done();
         this.scan_metrics.baseline_metrics.record_poll(poll_result)
     }
 }
@@ -373,7 +292,11 @@ impl LanceStream {
                             project_schema,
                             FragReadConfig::default()
                                 .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address),
+                                .with_row_address(config.with_row_address)
+                                .with_row_last_updated_at_version(
+                                    config.with_row_last_updated_at_version,
+                                )
+                                .with_row_created_at_version(config.with_row_created_at_version),
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
@@ -406,7 +329,7 @@ impl LanceStream {
             // files we have.  It's not going to have much affect on how much RAM we are using.
             .try_buffered(frag_parallelism)
             .boxed();
-        let batches = batches
+        let inner_stream = batches
             .try_flatten()
             // The second try_buffered controls how many CPU decode tasks we kick off in parallel.
             //
@@ -416,18 +339,6 @@ impl LanceStream {
             .try_buffered(get_num_compute_intensive_cpus())
             .stream_in_current_span()
             .boxed();
-
-        // Apply strict batch size wrapping if needed
-        let inner_stream = if config.strict_batch_size {
-            let strict_stream = StrictBatchSizeStream {
-                inner: batches,
-                batch_size: config.batch_size,
-                residual: None,
-            };
-            strict_stream.boxed()
-        } else {
-            batches
-        };
 
         timer.done();
         Ok(Self {
@@ -472,7 +383,11 @@ impl LanceStream {
                         project_schema.clone(),
                         FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -501,7 +416,11 @@ impl LanceStream {
                         project_schema.clone(),
                         FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -525,17 +444,8 @@ impl LanceStream {
                 .boxed()
         };
 
-        let inner_stream = if config.strict_batch_size {
-            let strict_stream = StrictBatchSizeStream {
-                inner: batches.map_err(|e| DataFusionError::External(Box::new(e))),
-                batch_size: config.batch_size,
-                residual: None,
-            };
-            Box::pin(strict_stream) as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>
-        } else {
-            Box::pin(batches.map_err(|e| DataFusionError::External(Box::new(e))))
-                as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>
-        };
+        let inner_stream = Box::pin(batches.map_err(|e| DataFusionError::External(Box::new(e))))
+            as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>;
 
         timer.done();
         Ok(Self {
@@ -567,6 +477,16 @@ impl RecordBatchStream for LanceStream {
         if self.config.with_row_address {
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
+        if self.config.with_row_last_updated_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if self.config.with_row_created_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
         Arc::new(schema)
     }
 }
@@ -579,9 +499,10 @@ pub struct LanceScanConfig {
     pub io_buffer_size: u64,
     pub with_row_id: bool,
     pub with_row_address: bool,
+    pub with_row_last_updated_at_version: bool,
+    pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
-    pub strict_batch_size: bool,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -595,9 +516,10 @@ impl Default for LanceScanConfig {
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: false,
             with_row_address: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
-            strict_batch_size: false,
         }
     }
 }
@@ -628,23 +550,25 @@ impl DisplayAs for LanceScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}",
+                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}, range={:?}",
                     self.dataset.data_dir(),
                     columns,
                     self.config.with_row_id,
                     self.config.with_row_address,
-                    self.config.ordered_output
+                    self.config.ordered_output,
+                    self.range
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "LanceScan\nuri={}\nprojection=[{}]\nrow_id={}\nrow_addr={}\nordered={}",
+                    "LanceScan\nuri={}\nprojection=[{}]\nrow_id={}\nrow_addr={}\nordered={}\nrange={:?}",
                     self.dataset.data_dir(),
                     columns,
                     self.config.with_row_id,
                     self.config.with_row_address,
-                    self.config.ordered_output
+                    self.config.ordered_output,
+                    self.range
                 )
             }
         }
@@ -668,6 +592,16 @@ impl LanceScanExec {
         if config.with_row_address {
             output_schema = output_schema
                 .try_with_column(ROW_ADDR_FIELD.clone())
+                .unwrap();
+        }
+        if config.with_row_last_updated_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if config.with_row_created_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
@@ -800,6 +734,10 @@ impl ExecutionPlan for LanceScanExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

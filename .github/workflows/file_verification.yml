@@ -1,11 +1,14 @@
 name: Lance File Write Read Round Trip Verification
+permissions:
+  contents: read
 
-on: 
+on:
   workflow_dispatch:
 
 jobs:
   run:
-    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    runs-on: warp-ubuntu-latest-x64-8x
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -13,7 +16,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Build Requirements
         run: |
@@ -56,7 +59,6 @@ jobs:
           source python/venv/bin/activate
           cd .github/workflows/file_verification
           python test_write_read.py
-
 
       - name: Cleanup
         run: |

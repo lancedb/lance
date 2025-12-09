@@ -12,21 +12,22 @@
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
-
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
 mod bitmap;
 mod encoded_array;
 mod index;
-mod segment;
+pub mod segment;
 mod serde;
+pub mod version;
 
 use deepsize::DeepSizeOf;
 // These are the public API.
+pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
 use lance_core::{
-    utils::mask::{RowIdMask, RowIdTreeMap},
+    utils::mask::{RowAddrTreeMap, RowIdMask},
     Error, Result,
 };
 use lance_io::ReadBatchParams;
@@ -34,9 +35,9 @@ pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::location;
 
-use segment::U64Segment;
-
 use crate::utils::LanceIteratorExtension;
+use segment::U64Segment;
+use tracing::instrument;
 
 /// A sequence of row ids.
 ///
@@ -50,7 +51,7 @@ use crate::utils::LanceIteratorExtension;
 /// contiguous or sorted.
 ///
 /// We can make optimizations that assume uniqueness.
-#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq, Default)]
 pub struct RowIdSequence(Vec<U64Segment>);
 
 impl std::fmt::Display for RowIdSequence {
@@ -95,7 +96,17 @@ impl From<Range<u64>> for RowIdSequence {
     }
 }
 
+impl From<&[u64]> for RowIdSequence {
+    fn from(row_ids: &[u64]) -> Self {
+        Self(vec![U64Segment::from_slice(row_ids)])
+    }
+}
+
 impl RowIdSequence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         self.0.iter().flat_map(|segment| segment.iter())
     }
@@ -181,7 +192,7 @@ impl RowIdSequence {
             offset = cutoff;
         }
 
-        self.0.retain(|segment| segment.len() != 0);
+        self.0.retain(|segment| !segment.is_empty());
 
         Ok(())
     }
@@ -299,6 +310,44 @@ impl RowIdSequence {
         None
     }
 
+    /// Get row ids from the sequence based on the provided _sorted_ offsets
+    ///
+    /// Any out of bounds offsets will be ignored
+    ///
+    /// # Panics
+    ///
+    /// If the input selection is not sorted, this function will panic
+    pub fn select<'a>(
+        &'a self,
+        selection: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = u64> + 'a {
+        let mut seg_iter = self.0.iter();
+        let mut cur_seg = seg_iter.next();
+        let mut rows_passed = 0;
+        let mut cur_seg_len = cur_seg.map(|seg| seg.len()).unwrap_or(0);
+        let mut last_index = 0;
+        selection.filter_map(move |index| {
+            if index < last_index {
+                panic!("Selection is not sorted");
+            }
+            last_index = index;
+
+            cur_seg?;
+
+            while (index - rows_passed) >= cur_seg_len {
+                rows_passed += cur_seg_len;
+                cur_seg = seg_iter.next();
+                if let Some(cur_seg) = cur_seg {
+                    cur_seg_len = cur_seg.len();
+                } else {
+                    return None;
+                }
+            }
+
+            Some(cur_seg.unwrap().get(index - rows_passed).unwrap())
+        })
+    }
+
     /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
     /// in the sequence.
     ///
@@ -313,22 +362,23 @@ impl RowIdSequence {
     ///
     /// This function is useful when determining which row offsets to read from a fragment given
     /// a mask.
+    #[instrument(level = "debug", skip_all)]
     pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     ids.mask(mask);
                     ranges.extend(GroupingIterator::new(
-                        unsafe { ids.into_id_iter() }.map(|id| id - range.start + offset),
+                        unsafe { ids.into_addr_iter() }.map(|addr| addr - range.start + offset),
                     ));
                     offset += range.end - range.start;
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
                     let offset_start = offset;
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     offset += range.end - range.start;
                     for hole in holes.iter() {
                         if ids.remove(hole) {
@@ -342,22 +392,22 @@ impl RowIdSequence {
                     sorted_holes.sort_unstable();
                     let mut next_holes_iter = sorted_holes.into_iter().peekable();
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
-                        |id| {
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
+                        |addr| {
                             while let Some(next_hole) = next_holes_iter.peek() {
-                                if *next_hole < id {
+                                if *next_hole < addr {
                                     next_holes_iter.next();
                                     holes_passed += 1;
                                 } else {
                                     break;
                                 }
                             }
-                            id - range.start + offset_start - holes_passed
+                            addr - range.start + offset_start - holes_passed
                         },
                     )));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     let offset_start = offset;
                     offset += range.end - range.start;
                     for (i, val) in range.clone().enumerate() {
@@ -369,9 +419,9 @@ impl RowIdSequence {
                     let mut bitmap_iter = bitmap.iter();
                     let mut bitmap_iter_pos = 0;
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
-                        |id| {
-                            let offset_no_holes = id - range.start + offset_start;
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
+                        |addr| {
+                            let offset_no_holes = addr - range.start + offset_start;
                             while bitmap_iter_pos < offset_no_holes {
                                 if !bitmap_iter.next().unwrap() {
                                     holes_passed += 1;
@@ -440,7 +490,7 @@ impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
     }
 }
 
-impl From<&RowIdSequence> for RowIdTreeMap {
+impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
@@ -513,60 +563,97 @@ impl RowIdSeqSlice<'_> {
 
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
+/// The sequences may less than chunk sizes, because the sequences only
+/// contains the row ids that we want to keep, they come from the updates records.
+/// But the chunk sizes are based on the fragment physical rows(may contain inserted records).
+/// So if the sequences are smaller than the chunk sizes, we need to
+/// assign the incremental row ids in the further step. This behavior is controlled by the
+/// `allow_incomplete` parameter.
+///
 /// # Errors
 ///
-/// Will return an error if the sum of the chunk sizes is not equal to the total
-/// number of row ids in the sequences.
+/// If `allow_incomplete` is false, will return an error if the sum of the chunk sizes
+/// is not equal to the total number of row ids in the sequences.
 pub fn rechunk_sequences(
     sequences: impl IntoIterator<Item = RowIdSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
 ) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
-    let chunk_size_iter = chunk_sizes.into_iter();
-    let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
+    let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
+    let total_chunks = chunk_sizes_vec.len();
+    let mut chunked_sequences = Vec::with_capacity(total_chunks);
     let mut segment_iter = sequences
         .into_iter()
         .flat_map(|sequence| sequence.0.into_iter())
         .peekable();
 
+    let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
+        Error::invalid_input(
+            format!(
+                "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
+                chunk_index, expected_chunk_size, remaining
+            ),
+            location!(),
+        )
+    };
+
+    let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
+        Error::invalid_input(
+            format!(
+                "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
+                processed_chunks, total_chunk_sizes
+            ),
+            location!(),
+        )
+    };
+
     let mut segment_offset = 0_u64;
-    for chunk_size in chunk_size_iter {
+
+    for (chunk_index, chunk_size) in chunk_sizes_vec.iter().enumerate() {
+        let chunk_size = *chunk_size;
         let mut sequence = RowIdSequence(Vec::new());
         let mut remaining = chunk_size;
-
-        let too_many_segments_error = || {
-            Error::invalid_input(
-                "Got too many segments for the provided chunk lengths",
-                location!(),
-            )
-        };
 
         while remaining > 0 {
             let remaining_in_segment = segment_iter
                 .peek()
                 .map_or(0, |segment| segment.len() as u64 - segment_offset);
-            match (remaining_in_segment.cmp(&remaining), remaining_in_segment) {
-                (std::cmp::Ordering::Greater, _) => {
-                    // Can only push part of the segment, we are done with this chunk.
+
+            // Step 1: Handle segment remaining to be empty(also empty seg) - skip and continue
+            if remaining_in_segment == 0 {
+                if segment_iter.next().is_some() {
+                    segment_offset = 0;
+                    continue;
+                } else {
+                    // No more segments available
+                    if allow_incomplete {
+                        break;
+                    } else {
+                        return Err(too_few_segments_error(chunk_index, chunk_size, remaining));
+                    }
+                }
+            }
+
+            // Step 2: Handle still remaining segment based on size comparison
+            match remaining_in_segment.cmp(&remaining) {
+                std::cmp::Ordering::Greater => {
+                    // Segment is larger than remaining space - slice it
                     let segment = segment_iter
                         .peek()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset += remaining;
                     remaining = 0;
                 }
-                (_, 0) => {
-                    // Can push the entire segment.
-                    let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
-                    sequence.extend(RowIdSequence(vec![segment]));
-                    remaining = 0;
-                }
-                (_, _) => {
-                    // Push remaining segment
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                    // UNIFIED HANDLING: Both equal and less cases subtract from remaining
+                    // Equal case: remaining -= remaining_in_segment (remaining becomes 0)
+                    // Less case: remaining -= remaining_in_segment (remaining becomes positive)
                     let segment = segment_iter
                         .next()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining_in_segment as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset = 0;
@@ -579,9 +666,9 @@ pub fn rechunk_sequences(
     }
 
     if segment_iter.peek().is_some() {
-        return Err(Error::invalid_input(
-            "Got too few segments for the provided chunk lengths",
-            location!(),
+        return Err(too_many_segments_error(
+            chunked_sequences.len(),
+            total_chunks,
         ));
     }
 
@@ -772,7 +859,7 @@ mod test {
             chunk_sizes: Vec<u64>,
             expected: Vec<RowIdSequence>,
         ) {
-            let chunked = rechunk_sequences(input, chunk_sizes).unwrap();
+            let chunked = rechunk_sequences(input, chunk_sizes, false).unwrap();
             assert_eq!(chunked, expected);
         }
 
@@ -808,11 +895,11 @@ mod test {
         );
 
         // Too few segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![100]);
+        let result = rechunk_sequences(many_segments.clone(), vec![100], false);
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments, vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5], false);
         assert!(result.is_err());
     }
 
@@ -916,13 +1003,13 @@ mod test {
             U64Segment::Range(40..50),
         ]);
 
-        let tree_map = RowIdTreeMap::from(&sequence);
+        let tree_map = RowAddrTreeMap::from(&sequence);
         let expected = vec![
             0, 1, 2, 3, 4, 7, 9, 10, 12, 14, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
             51, 52, 55, 56, 57, 58, 59,
         ]
         .into_iter()
-        .collect::<RowIdTreeMap>();
+        .collect::<RowAddrTreeMap>();
         assert_eq!(tree_map, expected);
     }
 
@@ -994,20 +1081,44 @@ mod test {
     }
 
     #[test]
+    fn test_selection() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let selection = sequence.select(vec![2, 4, 13, 14, 57].into_iter());
+        assert_eq!(selection.collect::<Vec<_>>(), vec![2, 4, 23, 24]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_selection_unsorted() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let _ = sequence
+            .select(vec![2, 4, 3].into_iter())
+            .collect::<Vec<_>>();
+    }
+
+    #[test]
     fn test_mask_to_offset_ranges() {
         // Tests with a simple range segment
         let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 4..5, 6..7, 8..9]);
 
         let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[54]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[54]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![14..15]);
 
         let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[54]));
+        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[54]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..14, 15..20]);
 
@@ -1017,7 +1128,7 @@ mod test {
             range: 0..10,
             holes: vec![2, 6].into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 3..4, 6..7]);
 
@@ -1025,7 +1136,7 @@ mod test {
             range: 40..60,
             holes: vec![47, 43].into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![3..4]);
 
@@ -1033,7 +1144,7 @@ mod test {
             range: 40..60,
             holes: vec![47, 43].into(),
         }]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..3, 4..18]);
 
@@ -1047,7 +1158,7 @@ mod test {
             .as_slice()
             .into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 4..5]);
 
@@ -1055,7 +1166,7 @@ mod test {
             range: 40..45,
             bitmap: [true, true, false, false, true].as_slice().into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![2..3]);
 
@@ -1063,18 +1174,18 @@ mod test {
             range: 40..45,
             bitmap: [true, true, false, false, true].as_slice().into(),
         }]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..2]);
 
         // Test with a sorted array segment
         let sequence = RowIdSequence(vec![U64Segment::SortedArray(vec![0, 2, 4, 6, 8].into())]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 3..5]);
 
         let sequence = RowIdSequence(vec![U64Segment::Array(vec![8, 2, 6, 0, 4].into())]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..4]);
 
@@ -1090,7 +1201,7 @@ mod test {
             },
             U64Segment::SortedArray(vec![44, 46, 78].into()),
         ]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 46, 100, 104]));
+        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 46, 100, 104]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 5..6, 8..9, 10..11]);
 
@@ -1105,5 +1216,106 @@ mod test {
         let mask = RowIdMask::allow_nothing();
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![]);
+    }
+
+    #[test]
+    fn test_row_id_sequence_rechunk_with_empty_segments() {
+        // equal case (segment exactly fills remaining space)
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(20..23), // [20, 21, 22] - 3 elements
+        ];
+        let chunk_sizes = vec![2, 3]; // First chunk wants 2, second wants 3
+
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[1].len(), 3);
+
+        let first_chunk: Vec<u64> = result[0].iter().collect();
+        let second_chunk: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk, vec![0, 1]);
+        assert_eq!(second_chunk, vec![20, 21, 22]);
+
+        // less case (segment smaller than remaining space)
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements (less than remaining)
+            RowIdSequence::from(20..21), // [20] - 1 element (less than remaining)
+            RowIdSequence::from(30..32), // [30, 31] - 2 elements (exactly fills remaining)
+        ];
+        let chunk_sizes = vec![5]; // Request 5 elements, have exactly 5
+
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 5);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1, 20, 30, 31]);
+
+        // empty segment in the middle
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+            RowIdSequence::from(20..22), // [20, 21] - 2 elements
+        ];
+        let chunk_sizes = vec![3, 1];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[1].len(), 1);
+
+        let first_chunk_elements: Vec<u64> = result[0].iter().collect();
+        let second_chunk_elements: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk_elements, vec![0, 1, 20]);
+        assert_eq!(second_chunk_elements, vec![21]);
+
+        // multiple empty segments
+        let input_sequences = vec![
+            RowIdSequence::from(0..1),   // [0] - 1 element
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+            RowIdSequence::from(20..20), // [] - 0 elements (empty)
+            RowIdSequence::from(30..32), // [30, 31] - 2 elements
+        ];
+        let chunk_sizes = vec![3];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 3);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 30, 31]);
+
+        // empty segment at chunk boundary
+        let input_sequences = vec![
+            RowIdSequence::from(0..3), // [0, 1, 2] - 3 elements (exactly fills first chunk)
+            RowIdSequence::from(10..10), // [] - 0 elements (empty, at boundary)
+            RowIdSequence::from(20..22), // [20, 21] - 2 elements (for second chunk)
+        ];
+        let chunk_sizes = vec![3, 2];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[1].len(), 2);
+
+        let first_chunk_elements: Vec<u64> = result[0].iter().collect();
+        let second_chunk_elements: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk_elements, vec![0, 1, 2]);
+        assert_eq!(second_chunk_elements, vec![20, 21]);
+
+        // empty segments with allow_incomplete = true
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+        ];
+        let chunk_sizes = vec![5]; // Request more than available
+        let result = rechunk_sequences(input_sequences, chunk_sizes, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1]);
     }
 }

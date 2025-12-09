@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-
-use object_store::{memory::InMemory, path::Path};
-use url::Url;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::Result;
+use object_store::{memory::InMemory, path::Path};
+use url::Url;
 
 /// Provides a fresh in-memory object store for each call to `new_store`.
 #[derive(Default, Debug)]
@@ -31,16 +30,25 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            io_tracker: Default::default(),
         })
     }
 
-    fn extract_path(&self, url: &Url) -> Path {
+    fn extract_path(&self, url: &Url) -> Result<Path> {
         let mut output = String::new();
         if let Some(domain) = url.domain() {
             output.push_str(domain);
         }
         output.push_str(url.path());
-        Path::from(output)
+        Ok(Path::from(output))
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        _url: &Url,
+        _storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok("memory".to_string())
     }
 }
 
@@ -53,8 +61,19 @@ mod tests {
         let provider = MemoryStoreProvider;
 
         let url = Url::parse("memory://path/to/file").unwrap();
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url).unwrap();
         let expected_path = Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix() {
+        let provider = MemoryStoreProvider;
+        assert_eq!(
+            "memory",
+            provider
+                .calculate_object_store_prefix(&Url::parse("memory://etc").unwrap(), None)
+                .unwrap()
+        );
     }
 }

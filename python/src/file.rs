@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::PythonErrorExt, RT};
+use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
@@ -20,18 +20,14 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::LanceCache;
+use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::ReaderProjection;
-use lance_file::v2::LanceEncodingsIo;
-use lance_file::{
-    v2::{
-        reader::{
-            BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-        },
-        writer::{FileWriter, FileWriterOptions},
-    },
-    version::LanceFileVersion,
+use lance_file::reader::{
+    BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+    ReaderProjection,
 };
+use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::{version::LanceFileVersion, LanceEncodingsIo};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -40,17 +36,14 @@ use lance_io::{
 };
 use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyIOError, PyRuntimeError, PyValueError},
-    pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
+    exceptions::{PyIOError, PyRuntimeError},
+    pyclass, pyfunction, pymethods, IntoPyObjectExt, PyErr, PyObject, PyResult, Python,
 };
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    sync::{Mutex, MutexGuard},
-};
+use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
-use url::Url;
-
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceBufferDescriptor {
@@ -92,7 +85,7 @@ impl LancePageMetadata {
             .collect();
         Self {
             buffers,
-            encoding: lance_file::v2::reader::describe_encoding(inner),
+            encoding: lance_file::reader::describe_encoding(inner),
         }
     }
 }
@@ -238,17 +231,46 @@ pub struct LanceFileWriter {
 }
 
 impl LanceFileWriter {
+    #[allow(clippy::too_many_arguments)]
     async fn open(
         uri_or_path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        let (object_store, path) =
-            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        let (object_store, path) = object_store_from_uri_or_path_with_provider(
+            uri_or_path,
+            storage_options,
+            storage_options_provider,
+            s3_credentials_refresh_offset_seconds,
+        )
+        .await?;
+        Self::open_with_store(
+            object_store,
+            path,
+            schema,
+            data_cache_bytes,
+            version,
+            keep_original_array,
+            max_page_bytes,
+        )
+        .await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        data_cache_bytes: Option<u64>,
+        version: Option<String>,
+        keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
+    ) -> PyResult<Self> {
         let object_writer = object_store.create(&path).await.infer_error()?;
         let options = FileWriterOptions {
             data_cache_bytes,
@@ -270,72 +292,83 @@ impl LanceFileWriter {
             inner: Arc::new(Mutex::new(Box::new(inner))),
         })
     }
-
-    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
-        self.inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
 }
 
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None, max_page_bytes=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, keep_original_array=None, max_page_bytes=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(
-            path,
-            schema,
-            data_cache_bytes,
-            version,
-            storage_options,
-            keep_original_array,
-            max_page_bytes,
-        ))
+        // Convert Python StorageOptionsProvider to Rust trait object
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
+
+        rt().block_on(
+            None,
+            Self::open(
+                path,
+                schema,
+                data_cache_bytes,
+                version,
+                storage_options,
+                provider,
+                s3_credentials_refresh_offset_seconds,
+                keep_original_array,
+                max_page_bytes,
+            ),
+        )?
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        RT.runtime
-            .block_on(self.inner_lock()?.write_batch(&batch.0))
-            .infer_error()
+        rt().block_on(None, async {
+            self.inner.lock().await.write_batch(&batch.0).await
+        })?
+        .infer_error()
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        RT.runtime
-            .block_on(self.inner_lock()?.finish())
+        rt().block_on(None, async { self.inner.lock().await.finish().await })?
             .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
-        RT.runtime
-            .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
-            .infer_error()
+        rt().block_on(None, async {
+            self.inner
+                .lock()
+                .await
+                .add_global_buffer(Bytes::from(bytes))
+                .await
+        })?
+        .infer_error()
     }
 
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
-        self.inner_lock()?.add_schema_metadata(key, value);
+        rt().block_on(None, async {
+            self.inner.lock().await.add_schema_metadata(key, value)
+        })?;
         Ok(())
     }
 }
 
-fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
-    let mut parts = path.parts().collect::<Vec<_>>();
-    if parts.is_empty() {
-        return Err(PyValueError::new_err(format!(
-            "Path {} is not a valid path to a file",
-            path,
-        )));
+impl Drop for LanceFileWriter {
+    fn drop(&mut self) {
+        rt().runtime.block_on(async {
+            let mut inner = self.inner.lock().await;
+            inner.abort().await;
+        });
     }
-    let filename = parts.pop().unwrap().as_ref().to_owned();
-    Ok((Path::from_iter(parts), filename))
 }
 
 pub async fn object_store_from_uri_or_path_no_options(
@@ -344,47 +377,259 @@ pub async fn object_store_from_uri_or_path_no_options(
     object_store_from_uri_or_path(uri_or_path, None).await
 }
 
-// The ObjectStore::from_uri_or_path expects a path to a directory (and it creates it if it does
-// not exist).  We are given a path to a file and so we need to strip the last component
-// before creating the object store.  We then return the object store and the new relative path
-// to the file.
 pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<(Arc<ObjectStore>, Path)> {
-    if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
-        if url.scheme().len() > 1 {
-            let path = object_store::path::Path::parse(url.path()).map_err(|e| {
-                PyIOError::new_err(format!("Invalid URL path `{}`: {}", url.path(), e))
-            })?;
-            let (parent_path, filename) = path_to_parent(&path)?;
-            url.set_path(parent_path.as_ref());
+    object_store_from_uri_or_path_with_provider(uri_or_path, storage_options, None, None).await
+}
 
-            let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-            let object_store_params =
-                storage_options
-                    .as_ref()
-                    .map(|storage_options| ObjectStoreParams {
-                        storage_options: Some(storage_options.clone()),
-                        ..Default::default()
-                    });
-
-            let (object_store, dir_path) = ObjectStore::from_uri_and_params(
-                object_store_registry,
-                url.as_str(),
-                &object_store_params.unwrap_or_default(),
-            )
-            .await
-            .infer_error()?;
-            let child_path = dir_path.child(filename);
-            return Ok((object_store, child_path));
-        }
+pub async fn object_store_from_uri_or_path_with_provider(
+    uri_or_path: impl AsRef<str>,
+    storage_options: Option<HashMap<String, String>>,
+    storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+    s3_credentials_refresh_offset_seconds: Option<u64>,
+) -> PyResult<(Arc<ObjectStore>, Path)> {
+    let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
+    let mut object_store_params = ObjectStoreParams {
+        storage_options: storage_options.clone(),
+        storage_options_provider,
+        ..Default::default()
+    };
+    if let Some(offset_seconds) = s3_credentials_refresh_offset_seconds {
+        object_store_params.s3_credentials_refresh_offset =
+            std::time::Duration::from_secs(offset_seconds);
     }
-    let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
-        PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
-    })?;
-    let object_store = Arc::new(ObjectStore::local());
+
+    let (object_store, path) = ObjectStore::from_uri_and_params(
+        object_store_registry,
+        uri_or_path.as_ref(),
+        &object_store_params,
+    )
+    .await
+    .infer_error()?;
+
     Ok((object_store, path))
+}
+
+#[pyclass]
+pub struct LanceFileSession {
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+}
+
+impl LanceFileSession {
+    pub async fn try_new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
+    ) -> PyResult<Self> {
+        let (object_store, base_path) = object_store_from_uri_or_path_with_provider(
+            uri_or_path,
+            storage_options,
+            storage_options_provider,
+            s3_credentials_refresh_offset_seconds,
+        )
+        .await?;
+        Ok(Self {
+            object_store,
+            base_path,
+        })
+    }
+}
+
+#[pymethods]
+impl LanceFileSession {
+    #[new]
+    #[pyo3(signature=(uri_or_path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None))]
+    pub fn new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
+    ) -> PyResult<Self> {
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
+        rt().block_on(
+            None,
+            Self::try_new(
+                uri_or_path,
+                storage_options,
+                provider,
+                s3_credentials_refresh_offset_seconds,
+            ),
+        )?
+    }
+
+    #[pyo3(signature=(path, columns=None))]
+    pub fn open_reader(
+        &self,
+        path: String,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<LanceFileReader> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+        )?
+    }
+
+    #[pyo3(signature=(
+        path,
+        schema=None,
+        data_cache_bytes=None,
+        version=None,
+        keep_original_array=None,
+        max_page_bytes=None
+    ))]
+    pub fn open_writer(
+        &self,
+        path: String,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        data_cache_bytes: Option<u64>,
+        version: Option<String>,
+        keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
+    ) -> PyResult<LanceFileWriter> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            LanceFileWriter::open_with_store(
+                self.object_store.clone(),
+                path,
+                schema,
+                data_cache_bytes,
+                version,
+                keep_original_array,
+                max_page_bytes,
+            ),
+        )?
+    }
+
+    pub fn contains(&self, path: String) -> PyResult<bool> {
+        let full_path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(None, async {
+            self.object_store
+                .exists(&full_path)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+        })?
+    }
+
+    pub fn list(&self, path: Option<String>) -> PyResult<Vec<String>> {
+        use futures::stream::StreamExt;
+
+        rt().block_on(None, async {
+            // Construct the full path to list from
+            let list_path = if let Some(prefix) = path {
+                self.base_path.child_path(&Path::from(prefix))
+            } else {
+                self.base_path.clone()
+            };
+
+            // List all files under the specified path
+            let stream = self.object_store.list(Some(list_path));
+            let results: Vec<_> = stream.collect().await;
+
+            let mut paths: Vec<String> = Vec::new();
+            for meta_result in results {
+                let meta = meta_result.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e))
+                })?;
+
+                // Strip the base_path prefix to make it relative
+                // Use prefix_match which handles path separators correctly across platforms
+                let relative_parts =
+                    meta.location.prefix_match(&self.base_path).ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "Path '{}' does not start with base path '{}'",
+                            meta.location.as_ref(),
+                            self.base_path.as_ref()
+                        ))
+                    })?;
+                let relative = Path::from_iter(relative_parts).as_ref().to_string();
+
+                paths.push(relative);
+            }
+
+            Ok(paths)
+        })?
+    }
+
+    /// Upload a file from local filesystem to the object store
+    ///
+    /// Parameters
+    /// ----------
+    /// local_path : str
+    ///     Local file path to upload
+    /// remote_path : str
+    ///     Remote path relative to session's base_path
+    pub fn upload_file(&self, local_path: String, remote_path: String) -> PyResult<()> {
+        rt().block_on(None, async {
+            let local_file = tokio::fs::File::open(&local_path).await.map_err(|e| {
+                PyIOError::new_err(format!("Failed to open local file {}: {}", local_path, e))
+            })?;
+            let mut reader = tokio::io::BufReader::new(local_file);
+            let full_path = self.base_path.child_path(&Path::from(remote_path));
+
+            let mut writer =
+                self.object_store.create(&full_path).await.map_err(|e| {
+                    PyIOError::new_err(format!("Failed to create remote file: {}", e))
+                })?;
+
+            tokio::io::copy(&mut reader, &mut writer)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to upload file: {}", e)))?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to finalize upload: {}", e)))?;
+
+            Ok(())
+        })?
+    }
+
+    /// Download a file from object store to local filesystem
+    ///
+    /// Parameters
+    /// ----------
+    /// remote_path : str
+    ///     Remote path relative to session's base_path
+    /// local_path : str
+    ///     Local file path where the file will be saved
+    pub fn download_file(&self, remote_path: String, local_path: String) -> PyResult<()> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(remote_path));
+            let get_result = self
+                .object_store
+                .inner
+                .get(&full_path)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to get remote file: {}", e)))?;
+
+            let mut stream = get_result.into_stream();
+            let mut writer = tokio::fs::File::create(&local_path).await.map_err(|e| {
+                PyIOError::new_err(format!("Failed to create local file {}: {}", local_path, e))
+            })?;
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.map_err(|e| {
+                    PyIOError::new_err(format!("Failed to read chunk from remote: {}", e))
+                })?;
+                writer.write_all(&chunk).await.map_err(|e| {
+                    PyIOError::new_err(format!("Failed to write chunk to local file: {}", e))
+                })?;
+            }
+
+            writer
+                .flush()
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to flush local file: {}", e)))?;
+
+            Ok(())
+        })?
+    }
 }
 
 #[pyclass]
@@ -396,10 +641,25 @@ impl LanceFileReader {
     async fn open(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let (object_store, path) =
-            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        let (object_store, path) = object_store_from_uri_or_path_with_provider(
+            uri_or_path,
+            storage_options,
+            storage_options_provider,
+            s3_credentials_refresh_offset_seconds,
+        )
+        .await?;
+        Self::open_with_store(object_store, path, columns).await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let scheduler = ScanScheduler::new(
             object_store,
             SchedulerConfig {
@@ -427,7 +687,7 @@ impl LanceFileReader {
         }
 
         let inner = FileReader::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(file.clone())),
+            Arc::new(LanceEncodingsIo::new(file.clone())),
             path,
             base_projection,
             Arc::<DecoderPlugins>::default(),
@@ -449,7 +709,7 @@ impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = RT.runtime.block_on(self.0.next());
+        let batch = rt().block_on(None, self.0.next()).ok()?;
         batch.map(|b| b.map_err(|e| e.into()))
     }
 }
@@ -470,15 +730,16 @@ impl LanceFileReader {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
         let inner = self.inner.clone();
-        let _guard = RT.runtime.enter();
-        let stream = inner
-            .read_stream(
-                params,
-                batch_size,
-                batch_readahead,
-                FilterExpression::no_filter(),
-            )
-            .infer_error()?;
+        let stream = rt().block_on(None, async move {
+            inner
+                .read_stream(
+                    params,
+                    batch_size,
+                    batch_readahead,
+                    FilterExpression::no_filter(),
+                )
+                .infer_error()
+        })??;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }
 }
@@ -486,14 +747,27 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, storage_options_provider=None, s3_credentials_refresh_offset_seconds=None, columns=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
+        storage_options_provider: Option<PyObject>,
+        s3_credentials_refresh_offset_seconds: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        RT.runtime
-            .block_on(Self::open(path, storage_options, columns))
+        let provider = storage_options_provider
+            .map(crate::storage_options::py_object_to_storage_options_provider)
+            .transpose()?;
+        rt().block_on(
+            None,
+            Self::open(
+                path,
+                storage_options,
+                provider,
+                s3_credentials_refresh_offset_seconds,
+                columns,
+            ),
+        )?
     }
 
     pub fn read_all(
@@ -551,7 +825,7 @@ impl LanceFileReader {
     }
 
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
-        let buffer_bytes = RT
+        let buffer_bytes = rt()
             .runtime
             .block_on(self.inner.read_global_buffer(index))
             .infer_error()?;
@@ -561,6 +835,11 @@ impl LanceFileReader {
     pub fn num_rows(&mut self) -> u64 {
         self.inner.num_rows()
     }
+}
+
+#[pyfunction(name = "stable_version")]
+pub fn stable_version() -> PyResult<String> {
+    Ok(LanceFileVersion::Stable.resolve().to_string())
 }
 
 #[cfg(test)]

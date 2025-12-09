@@ -198,17 +198,25 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
 ///
 /// - *expr*: a datafusion logical expression
 pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
-    match &expr {
-        // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
-        // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction(ScalarFunction { func, .. }) => {
-            if func.name() == "regexp_match" {
-                Expr::IsNotNull(Box::new(expr))
-            } else {
-                expr
-            }
+    match expr {
+        // Coerce regexp_match to boolean by checking for non-null
+        Expr::ScalarFunction(sf) if sf.func.name() == "regexp_match" => {
+            log::warn!("regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead");
+            Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
-        _ => expr,
+
+        // Recurse into boolean contexts so nested regexp_match terms are also coerced
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(coerce_filter_type_to_boolean(*left)),
+            op,
+            right: Box::new(coerce_filter_type_to_boolean(*right)),
+        }),
+        Expr::Not(inner) => Expr::Not(Box::new(coerce_filter_type_to_boolean(*inner))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(coerce_filter_type_to_boolean(*inner))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(coerce_filter_type_to_boolean(*inner))),
+
+        // Pass-through for all other nodes
+        other => other,
     }
 }
 
@@ -238,6 +246,57 @@ impl ExprExt for Expr {
             ],
         })
     }
+}
+
+/// Convert a field path string into a DataFusion expression.
+///
+/// This function handles:
+/// - Simple column names: "column"
+/// - Nested paths: "parent.child" or "parent.child.grandchild"
+/// - Backtick-escaped field names: "parent.`field.with.dots`"
+///
+/// # Arguments
+///
+/// * `field_path` - The field path to convert. Supports simple columns, nested paths,
+///   and backtick-escaped field names.
+///
+/// # Returns
+///
+/// Returns `Result<Expr>` - Ok with the DataFusion expression, or Err if the path
+/// could not be parsed.
+///
+/// # Example
+///
+/// ```
+/// use lance_datafusion::logical_expr::field_path_to_expr;
+///
+/// // Simple column
+/// let expr = field_path_to_expr("column_name").unwrap();
+///
+/// // Nested field
+/// let expr = field_path_to_expr("parent.child").unwrap();
+///
+/// // Backtick-escaped field with dots
+/// let expr = field_path_to_expr("parent.`field.with.dots`").unwrap();
+/// ```
+pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
+    // Parse the field path to handle nested fields and backtick-escaped names
+    let parts = lance_core::datatypes::parse_field_path(field_path)?;
+
+    if parts.is_empty() {
+        return Err(Error::invalid_input(
+            format!("Invalid empty field path: {}", field_path),
+            location!(),
+        ));
+    }
+
+    // Build the column expression, handling nested fields
+    let mut expr = col(&parts[0]);
+    for part in &parts[1..] {
+        expr = expr.field_newstyle(part);
+    }
+
+    Ok(expr)
 }
 
 #[cfg(test)]

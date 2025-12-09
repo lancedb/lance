@@ -16,7 +16,7 @@ use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use snafu::location;
 use std::cmp::min;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,7 +25,7 @@ use std::sync::RwLock;
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -165,13 +165,13 @@ impl HNSW {
         &self,
         query: ArrayRef,
         k: usize,
-        ef: usize,
+        params: &HnswQueryParams,
         bitset: Option<Visited>,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let nodes = &self.nodes();
         for level in (0..self.max_level()).rev() {
@@ -189,7 +189,7 @@ impl HNSW {
         Ok(beam_search(
             &bottom_level,
             &ep,
-            ef,
+            params,
             &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
@@ -205,7 +205,7 @@ impl HNSW {
         &self,
         query: ArrayRef,
         k: usize,
-        ef: usize,
+        params: &HnswQueryParams,
         bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
@@ -217,7 +217,7 @@ impl HNSW {
         let result = self.search_inner(
             query,
             k,
-            ef,
+            params,
             bitset,
             &mut visited_generator,
             storage,
@@ -241,34 +241,61 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         prefilter_bitset: Visited,
+        params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
-        let node_ids = storage
-            .row_ids()
-            .enumerate()
-            .filter_map(|(node_id, _)| {
-                prefilter_bitset
-                    .contains(node_id as u32)
-                    .then_some(node_id as u32)
-            })
-            .collect_vec();
+        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
-        for i in 0..node_ids.len() {
-            if let Some(ahead) = self.inner.params.prefetch_distance {
-                if i + ahead < node_ids.len() {
-                    dist_calc.prefetch(node_ids[i + ahead]);
+
+        match self.inner.params.prefetch_distance {
+            Some(ahead) if ahead > 0 => {
+                let mut ids_iter = prefilter_bitset.iter_ones().map(|i| i as u32);
+                let mut buffer = VecDeque::with_capacity(ahead + 1);
+                for _ in 0..=ahead {
+                    if let Some(id) = ids_iter.next() {
+                        buffer.push_back(id);
+                    } else {
+                        break;
+                    }
+                }
+
+                while let Some(node_id) = buffer.pop_front() {
+                    if let Some(&prefetch_id) = buffer.get(ahead - 1) {
+                        dist_calc.prefetch(prefetch_id);
+                    }
+                    if let Some(next) = ids_iter.next() {
+                        buffer.push_back(next);
+                    }
+
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
                 }
             }
-            let node_id = node_ids[i];
-            let dist = dist_calc.distance(node_id).into();
-            if heap.len() < k {
-                heap.push((dist, node_id).into());
-            } else if dist < heap.peek().unwrap().dist {
-                heap.pop();
-                heap.push((dist, node_id).into());
+            _ => {
+                for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
+                }
             }
-        }
+        };
         heap.into_sorted_vec()
     }
 
@@ -377,10 +404,10 @@ impl HnswBuilder {
     ///
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let ml = 1.0 / (self.params.m as f32).ln();
         min(
-            (-rng.gen::<f32>().ln() * ml) as u16,
+            (-rng.random::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
         )
     }
@@ -468,7 +495,12 @@ impl HnswBuilder {
         beam_search(
             &cur_level,
             ep,
-            self.params.ef_construction,
+            &HnswQueryParams {
+                ef: self.params.ef_construction,
+                lower_bound: None,
+                upper_bound: None,
+                dist_q_c: 0.0,
+            },
             dist_calc,
             None,
             self.params.prefetch_distance,
@@ -540,9 +572,12 @@ impl Graph for HnswBottomView<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct HnswQueryParams {
     pub ef: usize,
+    pub lower_bound: Option<f32>,
+    pub upper_bound: Option<f32>,
+    pub dist_q_c: f32,
 }
 
 impl From<&Query> for HnswQueryParams {
@@ -550,6 +585,9 @@ impl From<&Query> for HnswQueryParams {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or(k + k / 2),
+            lower_bound: query.lower_bound,
+            upper_bound: query.upper_bound,
+            dist_q_c: query.dist_q_c,
         }
     }
 }
@@ -701,9 +739,9 @@ impl IvfSubIndex for HNSW {
         let results = if remained < self.len() * 10 / 100 {
             let prefilter_bitset =
                 prefilter_bitset.expect("the prefilter bitset must be set for flat search");
-            self.flat_search(storage, query, k, prefilter_bitset)
+            self.flat_search(storage, query, k, prefilter_bitset, &params)
         } else {
-            self.search_basic(query, k, params.ef, prefilter_bitset, storage)?
+            self.search_basic(query, k, &params, prefilter_bitset, storage)?
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
@@ -730,7 +768,7 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::info!(
+        log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,
@@ -738,6 +776,10 @@ impl IvfSubIndex for HNSW {
             hnsw.inner.params.ef_construction,
             storage.distance_type(),
         );
+
+        if storage.is_empty() {
+            return Ok(hnsw);
+        }
 
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
@@ -752,8 +794,14 @@ impl IvfSubIndex for HNSW {
         Ok(hnsw)
     }
 
-    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        unimplemented!("HNSW remap is not supported yet");
+    fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>, // we don't need the mapping here because we rebuild the graph from remapped storage
+        store: &impl VectorStore,
+    ) -> Result<Self> {
+        // We can't simply remap the row ids in the graph because the vectors are changed,
+        // so the graph needs to be rebuilt.
+        Self::index_vectors(store, self.inner.params.clone())
     }
 
     /// Encode the sub index into a record batch
@@ -812,9 +860,11 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_file::{
-        reader::FileReader,
-        writer::{FileWriter, FileWriterOptions},
+    use lance_file::previous::{
+        reader::FileReader as PreviousFileReader,
+        writer::{
+            FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
+        },
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
@@ -828,7 +878,10 @@ mod tests {
     use crate::vector::{
         flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
-        hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
+        hnsw::{
+            builder::{HnswBuildParams, HnswQueryParams},
+            HNSW, VECTOR_ID_FIELD,
+        },
     };
 
     #[tokio::test]
@@ -856,10 +909,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = FileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &FileWriterOptions::default(),
+            &PreviousFileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -867,7 +920,7 @@ mod tests {
         writer.write_record_batch(batch).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = FileReader::try_new_self_described(&object_store, &path, None)
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader
@@ -878,12 +931,17 @@ mod tests {
 
         let query = fsl.value(0);
         let k = 10;
-        let ef = 50;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
         let builder_results = builder
-            .search_basic(query.clone(), k, ef, None, store.as_ref())
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
         let loaded_results = loaded_hnsw
-            .search_basic(query, k, ef, None, store.as_ref())
+            .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
     }

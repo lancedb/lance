@@ -1,0 +1,4 @@
+nav:
+  - Specification: index.md
+  - Encoding Strategy: encoding.md
+  - Versioning: versioning.md

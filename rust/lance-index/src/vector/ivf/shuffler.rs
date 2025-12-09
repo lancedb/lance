@@ -31,10 +31,10 @@ use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::FileReader;
-use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
-use lance_file::v2::writer::FileWriterOptions;
-use lance_file::writer::FileWriter;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
@@ -45,7 +45,6 @@ use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
 use snafu::location;
-use tempfile::TempDir;
 
 use crate::vector::ivf::IvfTransformer;
 use crate::vector::transform::Transformer;
@@ -55,8 +54,8 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
-    // Note: using into_path here means we will not delete this TempDir automatically
-    let dir = TempDir::new()?.keep();
+    // Note: using keep here means we will not delete this TempDir automatically
+    let dir = tempfile::TempDir::new()?.keep();
     let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
         source: Box::new(e),
         location: location!(),
@@ -236,7 +235,7 @@ impl PartitionListBuilder {
 ///
 /// Returns
 /// -------
-///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
+///   `Result<Vec<impl Stream<Item = Result<RecordBatch>>>>`: a vector of streams
 ///   of shuffled partitioned data. Each stream corresponds to a partition and
 ///   is sorted within the stream. Consumer of these streams is expected to merge
 ///   the streams into a single stream by k-list merge algo.
@@ -472,7 +471,7 @@ impl IvfShuffler {
         info!("Writing unsorted data to disk at {}", path);
         info!("with schema: {:?}", schema);
 
-        let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             Schema::try_from(schema.as_ref())?,
             &Default::default(),
@@ -503,7 +502,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(buffer.as_str());
 
             if self.is_legacy {
-                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
@@ -511,7 +511,7 @@ impl IvfShuffler {
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
-                let cache = LanceCache::with_capacity(128 * 1024 * 1024);
+                let cache = lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024);
 
                 let reader = Lancev2FileReader::try_open(
                     file,
@@ -546,7 +546,8 @@ impl IvfShuffler {
             let path = self.output_dir.child(file_name.as_str());
 
             if self.is_legacy {
-                let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
+                let reader =
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -628,8 +629,9 @@ impl IvfShuffler {
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
-                _reader_handle =
-                    Some(FileReader::try_new_self_described(&object_store, &path, None).await?);
+                _reader_handle = Some(
+                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?,
+                );
 
                 stream::iter(start..end)
                     .map(|i| {
@@ -670,10 +672,14 @@ impl IvfShuffler {
                 }
                 num_processed += 1;
 
-                let batch = batch?;
+                let mut batch = batch?;
 
                 if batch.num_rows() == 0 {
                     continue;
+                }
+
+                if let Some((row_id_idx, _)) = batch.schema().column_with_name("row_id") {
+                    batch = batch.rename_column(row_id_idx, ROW_ID)?;
                 }
 
                 let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
@@ -773,7 +779,7 @@ impl IvfShuffler {
                         true,
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
-                    let mut file_writer = lance_file::v2::writer::FileWriter::try_new(
+                    let mut file_writer = lance_file::writer::FileWriter::try_new(
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),
@@ -817,7 +823,7 @@ impl IvfShuffler {
             let file_scheduler = scan_scheduler
                 .open_file(&path, &CachedFileSize::unknown())
                 .await?;
-            let reader = lance_file::v2::reader::FileReader::try_open(
+            let reader = lance_file::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
@@ -1115,7 +1121,7 @@ mod test {
         let schema2 = schema.clone();
 
         let stream = stream::iter(0..num_batches).map(move |idx| {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let row_ids = Arc::new(UInt64Array::from_iter(
                 (idx * 1024..(idx + 1) * 1024).map(u64::from),
             ));

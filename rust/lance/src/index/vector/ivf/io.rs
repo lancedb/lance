@@ -19,10 +19,11 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
-use lance_file::reader::FileReader;
-use lance_file::writer::FileWriter;
+use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
@@ -43,7 +44,6 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::location;
-use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
 use crate::Result;
@@ -254,8 +254,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     column: &str,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
-    writer: &mut FileWriter<ManifestDescribing>,
-    mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
+    writer: &mut PreviousFileWriter<ManifestDescribing>,
+    mut auxiliary_writer: Option<&mut PreviousFileWriter<ManifestDescribing>>,
     ivf: &mut IvfModel,
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
@@ -298,7 +298,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let object_store = ObjectStore::local();
     let mut part_files = Vec::with_capacity(ivf.num_partitions());
     let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
-    let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
+    let tmp_part_dir = Path::from_filesystem_path(TempStdDir::default())?;
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
@@ -322,10 +322,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
 
         let code_column = match &quantizer {
-            Quantizer::Flat(_) => None,
-            Quantizer::FlatBin(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
-            Quantizer::Scalar(_) => None,
+            _ => None,
         };
         merge_streams(
             &mut streams_heap,
@@ -343,7 +341,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
-        let part_writer = FileWriter::<ManifestDescribing>::try_new(
+        let part_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             part_file,
             Schema::try_from(writer.schema())?,
@@ -353,7 +351,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let aux_part_writer = match auxiliary_writer.as_ref() {
             Some(writer) => Some(
-                FileWriter::<ManifestDescribing>::try_new(
+                PreviousFileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     aux_part_file,
                     Schema::try_from(writer.schema())?,
@@ -405,7 +403,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
-            FileReader::try_new_self_described(&object_store, part_file, None).await?;
+            PreviousFileReader::try_new_self_described(&object_store, part_file, None).await?;
 
         let batches = futures::stream::iter(0..part_reader.num_batches())
             .map(|batch_id| {
@@ -429,7 +427,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
-                FileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
+                PreviousFileReader::try_new_self_described(&object_store, aux_part_file, None)
+                    .await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
@@ -459,8 +458,8 @@ async fn build_hnsw_quantization_partition(
     column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
-    writer: FileWriter<ManifestDescribing>,
-    aux_writer: Option<FileWriter<ManifestDescribing>>,
+    writer: PreviousFileWriter<ManifestDescribing>,
+    aux_writer: Option<PreviousFileWriter<ManifestDescribing>>,
     quantizer: Quantizer,
     row_ids_array: Vec<Arc<dyn Array>>,
     code_array: Vec<Arc<dyn Array>>,
@@ -521,7 +520,7 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     params: HnswBuildParams,
     distance_type: DistanceType,
-    mut writer: FileWriter<ManifestDescribing>,
+    mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<usize> {
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
@@ -534,7 +533,7 @@ async fn build_and_write_pq_storage(
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
     pq: ProductQuantizer,
-    mut writer: FileWriter<ManifestDescribing>,
+    mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
         let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;
@@ -556,6 +555,7 @@ mod tests {
     use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::IndexType;
     use lance_testing::datagen::generate_random_array;
@@ -577,15 +577,11 @@ mod tests {
         let batches =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
 
-        let tmp_uri = tempfile::tempdir().unwrap();
+        let tmp_uri = TempStrDir::default();
 
-        let mut ds = Dataset::write(
-            batches,
-            tmp_uri.path().to_str().unwrap(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let mut ds = Dataset::write(batches, tmp_uri.as_str(), Default::default())
+            .await
+            .unwrap();
 
         let idx_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
         ds.create_index(&["vector"], IndexType::Vector, None, &idx_params, true)

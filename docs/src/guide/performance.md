@@ -2,6 +2,20 @@
 
 This guide provides tips and tricks for optimizing the performance of your Lance applications.
 
+## Logging
+
+Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
+library you are using. For rust, you will need to configure a logging subscriber. For more details
+ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
+logging subscriber that logs to stderr.
+
+The Python/Java logger can be configured with several environment variables:
+
+- `LANCE_LOG`: Controls log filtering based on log level and target. See the [env_logger](https://docs.rs/env_logger/latest/env_logger/) docs for more details. The `LANCE_LOG` environment variable replaces the `RUST_LOG` environment variable.
+- `LANCE_LOG_STYLE`: Controls whether colors are used in the log messages. Valid values are `auto`, `always`, `never`.
+- `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
+- `LANCE_LOG_FILE`: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.
+
 ## Trace Events
 
 Lance uses tracing to log events. If you are running `pylance` then these events will be emitted to
@@ -12,7 +26,7 @@ as log messages. For Rust connections you can use the `tracing` crate to capture
 File audit events are emitted when significant files are created or deleted.
 
 | Event               | Parameter | Description                                                                |
-|---------------------|-----------|----------------------------------------------------------------------------|
+| ------------------- | --------- | -------------------------------------------------------------------------- |
 | `lance::file_audit` | `mode`    | The mode of I/O operation (create, delete, delete_unverified)              |
 | `lance::file_audit` | `type`    | The type of file affected (manifest, data file, index file, deletion file) |
 
@@ -24,7 +38,7 @@ the in-memory cache. Correct cache utilization is important for performance and 
 events are intended to help you debug cache usage.
 
 | Event              | Parameter | Description                                                                                          |
-|--------------------|-----------|------------------------------------------------------------------------------------------------------|
+| ------------------ | --------- | ---------------------------------------------------------------------------------------------------- |
 | `lance::io_events` | `type`    | The type of I/O operation (open_scalar_index, open_vector_index, load_vector_part, load_scalar_part) |
 
 ### Execution Events
@@ -33,7 +47,7 @@ Execution events are emitted when an execution plan is run. These events are use
 debugging query performance.
 
 | Event              | Parameter           | Description                                                    |
-|--------------------|---------------------|----------------------------------------------------------------|
+| ------------------ | ------------------- | -------------------------------------------------------------- |
 | `lance::execution` | `type`              | The type of execution event (plan_run is the only type today)  |
 | `lance::execution` | `output_rows`       | The number of rows in the output of the plan                   |
 | `lance::execution` | `iops`              | The number of I/O operations performed by the plan             |
@@ -47,7 +61,7 @@ debugging query performance.
 Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
 explicitly stated otherwise. Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts. For
-details see [conflict resolution](../format/format.md#conflict-resolution).
+details see [conflict resolution](../format/index.md#conflict-resolution).
 
 Most Lance operations will use multiple threads to perform work in parallel. There are two thread
 pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for
@@ -75,18 +89,47 @@ Lance is designed to be memory efficient. Operations should stream data from dis
 loading the entire dataset into memory. However, there are a few components of Lance that can use
 a lot of memory.
 
+### Metadata Cache
+
+Lance uses a metadata cache to speed up operations. This cache holds various pieces of metadata such
+as file metadata, dataset manifests, etc. This cache is an LRU cache that is sized by bytes. The default
+size is 1 GiB.
+
+The metadata cache is not shared between tables by default. For best performance you should create a
+single table and share it across your application. Alternatively, you can create a single session
+and specify it when you open tables.
+
+Keys are often a composite of multiple fields and all keys are scoped to the dataset URI. The following items are stored in the metadata cache:
+
+| Item              | Key                                              | What is stored                      |
+| ----------------- | ------------------------------------------------ | ----------------------------------- |
+| Dataset Manifests | Dataset URI, version, and etag                   | The manifest for the dataset        |
+| Transactions      | Dataset URI, version                             | The transaction for the dataset     |
+| Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
+| Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
+| Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
+| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
+| Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
+| File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |
+| File Column Meta  | Dataset URI, file path, column index             | The search cache for a column       |
+
+Notes:
+
+1. This is only stored for very old indexes which don't store their details in the manifest.
+
 ### Index Cache
 
 Lance uses an index cache to speed up queries. This caches vector and scalar indices in memory. The
-max size of this cache can be configured when creating a `LanceDataset` using the `index_cache_size`
-parameter. This cache is an LRU cached that is sized by "number of entries". The size of each entry
-and the number of entries needed depends on the index in question. For example, an IVF/PQ vector index
-contains 1 header entry and 1 entry for each partition. The size of each entry is determined by the
-number of vectors and the PQ parameters (e.g. number of subvectors). You can view the size of this cache
-by inspecting the result of `dataset.session().size_bytes()`.
+max size of this cache can be configured when creating a `LanceDataset` using the `index_cache_size_bytes`
+parameter. This cache is an LRU cached that is sized by bytes. The default size is 6 GiB.
+You can view the size of this cache by inspecting the result of `dataset.session().size_bytes()`.
 
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
+
+**Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
+`index_cache_size_bytes` (specified in bytes) for new code.
 
 ### Scanning Data
 
@@ -121,4 +164,75 @@ The above limits refer to limits per-scan. There is an additional limit on the n
 across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
 The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
 with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store. 
+can often lead to issues with excessive retries and timeouts from the object store.
+
+## Indexes
+
+Training and searching indexes can have unique requirements for compute and memory. This section provides some
+guidance on what can be expected for different index types.
+
+### BTree Index
+
+The BTree index is a two-level structure that provides efficient range queries and sorted access.
+It strikes a balance between an expensive memory structure containing all values and an expensive disk
+structure that can't be efficiently searched.
+
+Training a BTree index is done by sorting the column. This is done using an [external sort](https://en.wikipedia.org/wiki/External_sorting) to constrain the total memory usage to a reasonable amount. Updating a BTree index does not
+require re-sorting the entire column. The new values are sorted and the existing values are merged into the new sorted
+values in linear time.
+
+#### Storage Requirements
+
+The BTree index is essentially a sorted copy of a column. The storage requirements are therefore the same as the column
+but an additional 4 bytes per value is required to store the row ID and there is a small lookup structure which
+should be roughly 0.001% of the size of the column.
+
+#### Memory Requirements
+
+Training a BTree index requires some RAM but the current implementation spills to disk rather aggressively and so the
+total memory usage is fairly low.
+
+When searching a BTree index, the index is loaded into the index cache in pages. Each page contains 4096 values.
+
+#### Performance
+
+The sort stage is the most expensive step in training a BTree index. The time complexity is O(n log n) where n is the number of rows in the column. At very large scales this can be a bottleneck and a distributed sort may be necessary. Lance currently does
+not have anything builtin for this but work is underway to add this functionality. Training an index in parts as the data grows
+may be slightly more efficient than training the entire index at once if you have the flexibility to do so.
+
+When the BTree index is fully loaded into the index cache, the search time scales linearly with the number of rows that match the
+query. When the BTree index is not fully loaded into the index cache, the search time will be controlled by the number of pages
+that need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+pages were loaded from disk to satisfy a query.
+
+### Bitmap Index
+
+The Bitmap index is an inverted lookup table that stores a bitmap for each possible value in the column. These bitmaps are compressed and serialized as a [Roaring Bitmap](https://roaringbitmap.org/).
+
+A bitmap index is currently trained by accumulating the column into a hash map from value to a vector of row ids. Each value
+is then serialized into a bitmap and stored in a file.
+
+### Storage Requirements
+
+The size of a bitmap index is difficult to calculate precisely but will generally scale with the number of unique values in the
+column since a unique bitmap is required for each value and a single bitmap with all rows will compress more efficiently than
+many bitmaps with a small number of rows.
+
+#### Memory Requirements
+
+Since training a bitmap index requires collecting the values into a hash map you will need at least 8 bytes of memory per row.
+In addition, if you have many unique values, then you will need additional memory for the keys of the hash map. Training large
+bitmaps with many unique values at scale can be memory intensive.
+
+When a bitmap index is searched, bitmaps are loaded into the session cache individually. The size of the bitmap will depend on
+the number of rows that match the token.
+
+### Performance
+
+When the bitmap index is fully loaded into the index cache, the search time scales linearly with the number of values that the
+query requires. This makes the bitmap very fast for equality queries or very small ranges. Queries against large ranges are
+currently extremely slow and the btree index is much faster for large range queries.
+
+When a bitmap index is not fully loaded into the index cache, the search time will be controlled by the number of bitmaps that
+need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+bitmaps were loaded from disk to satisfy a query.

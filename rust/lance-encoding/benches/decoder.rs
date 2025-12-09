@@ -61,7 +61,7 @@ fn bench_decode(c: &mut Criterion) {
         let func_name = format!("{:?}", data_type).to_lowercase();
         let num_rows = NUM_BYTES / data_type.primitive_width().unwrap() as u64;
         group.bench_function(func_name, |b| {
-            let data = lance_datagen::gen()
+            let data = lance_datagen::gen_batch()
                 .anon_col(lance_datagen::array::rand_type(data_type))
                 .into_batch_rows(lance_datagen::RowCount::from(num_rows))
                 .unwrap();
@@ -124,7 +124,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                         if *nullable {
                             arraygen = arraygen.with_random_nulls(0.5);
                         }
-                        let data = lance_datagen::gen()
+                        let data = lance_datagen::gen_batch()
                             .anon_col(arraygen)
                             .into_batch_rows(lance_datagen::RowCount::from(num_rows))
                             .unwrap();
@@ -168,7 +168,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
 
     let data_type = DataType::Utf8;
     // generate string column with 20 rows
-    let string_data = lance_datagen::gen()
+    let string_data = lance_datagen::gen_batch()
         .anon_col(lance_datagen::array::rand_type(&DataType::Utf8))
         .into_batch_rows(lance_datagen::RowCount::from(20))
         .unwrap();
@@ -182,8 +182,8 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
         let string_array = string_data.column(0);
 
         // generate random int column with 100000 rows
-        let mut rng = rand::thread_rng();
-        let integer_arr: Vec<u32> = (0..100_000).map(|_| rng.gen_range(0..20)).collect();
+        let mut rng = rand::rng();
+        let integer_arr: Vec<u32> = (0..100_000).map(|_| rng.random_range(0..20)).collect();
         let integer_array = UInt32Array::from(integer_arr);
 
         let mapped_strings = take(string_array, &integer_array, None).unwrap();
@@ -246,7 +246,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
         .into();
 
         // generate struct column with 1M rows
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_type(&DataType::Struct(fields)))
             .into_batch_rows(lance_datagen::RowCount::from(NUM_ROWS))
             .unwrap();
@@ -315,7 +315,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
         // generate string column with 10k rows
         // Currently the generator generates fixed size strings by default
         // This function will need to be updated once that changes.
-        let string_data = lance_datagen::gen()
+        let string_data = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_type(&DataType::Utf8))
             .into_batch_rows(lance_datagen::RowCount::from(10000))
             .unwrap();

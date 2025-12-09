@@ -45,24 +45,26 @@ where
 
     c.bench_function(format!("L2({type_name}, scalar)").as_str(), |b| {
         b.iter(|| {
-            Float32Array::from_iter_values(
+            black_box(
                 target
                     .as_slice()
                     .chunks(DIMENSION)
-                    .map(|arr| l2_scalar(key.as_slice(), arr).as_()),
-            );
+                    .map(|arr| l2_scalar(key.as_slice(), arr).as_())
+                    .fold(0.0, |acc: f32, v: f32| acc + v),
+            )
         });
     });
 
     c.bench_function(
         format!("L2({type_name}, auto-vectorization)").as_str(),
         |b| {
-            b.iter(|| unsafe {
-                Float32Array::from_trusted_len_iter(
+            b.iter(|| {
+                black_box(
                     target
                         .as_slice()
                         .chunks(DIMENSION)
-                        .map(|y| Some(black_box(l2(key.as_slice(), y)))),
+                        .map(|y| black_box(l2(key.as_slice(), y)))
+                        .fold(0.0, |acc: f32, v: f32| acc + v),
                 );
             });
         },
@@ -77,7 +79,10 @@ fn bench_distance(c: &mut Criterion) {
         generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
     c.bench_function("L2(f32, simd)", |b| {
         b.iter(|| {
-            black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
+            black_box(
+                l2_distance_batch(key.values(), target.values(), DIMENSION)
+                    .fold(0.0, |acc: f32, v: f32| acc + v),
+            );
         })
     });
 
@@ -90,7 +95,10 @@ fn bench_small_distance(c: &mut Criterion) {
     let target = generate_random_array_with_seed::<Float32Type>(TOTAL * 8, [7; 32]);
     c.bench_function("L2(simd,f32x8)", |b| {
         b.iter(|| {
-            black_box(l2_distance_batch(key.values(), target.values(), 8).count());
+            black_box(
+                l2_distance_batch(key.values(), target.values(), 8)
+                    .fold(0.0, |acc: f32, v: f32| acc + v),
+            );
         })
     });
 }
@@ -120,11 +128,11 @@ fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
 }
 
 fn bench_uint_distance(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
-    let key = repeat_with(|| rng.gen::<u8>())
+    let mut rng = rand::rng();
+    let key = repeat_with(|| rng.random::<u8>())
         .take(DIMENSION)
         .collect::<Vec<_>>();
-    let target = repeat_with(|| rng.gen::<u8>())
+    let target = repeat_with(|| rng.random::<u8>())
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
 
@@ -134,7 +142,7 @@ fn bench_uint_distance(c: &mut Criterion) {
                 target
                     .chunks_exact(DIMENSION)
                     .map(|tgt| l2_distance_uint_scalar(&key, tgt))
-                    .collect::<Vec<_>>(),
+                    .fold(0.0, |acc, v| acc + v),
             );
         });
     });
@@ -145,7 +153,7 @@ fn bench_uint_distance(c: &mut Criterion) {
                 target
                     .chunks_exact(DIMENSION)
                     .map(|tgt| l2_distance_uint_scalar_auto_vectorized(&key, tgt))
-                    .collect::<Vec<_>>(),
+                    .fold(0.0, |acc, v| acc + v),
             );
         });
     });

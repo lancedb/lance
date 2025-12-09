@@ -1,2 +1,5 @@
 *.iml
 .java-version
+.classpath
+.project
+.settings
