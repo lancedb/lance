@@ -155,7 +155,7 @@ impl BlobPreprocessor {
         id
     }
 
-    async fn write_blob(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
+    async fn write_dedicated(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
         let path = dedicated_blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
@@ -236,7 +236,7 @@ impl BlobPreprocessor {
 
                 if has_data && data_len > DEDICATED_THRESHOLD {
                     let blob_id = self.next_blob_id();
-                    self.write_blob(blob_id, data_col.value(i)).await?;
+                    self.write_dedicated(blob_id, data_col.value(i)).await?;
 
                     kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
