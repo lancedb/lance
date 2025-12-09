@@ -17,7 +17,6 @@ use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};
 use lance_index::scalar::{
     btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
-    flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
     registry::ScalarIndexPlugin,
     IndexStore, SargableQuery, ScalarIndex, SearchResult,
@@ -63,11 +62,8 @@ impl BenchmarkFixture {
     }
 
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
-        let sub_index_trainer = FlatIndexMetadata::new(arrow_schema::DataType::UInt32);
-
         train_btree_index(
             test_data_stream(),
-            &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
