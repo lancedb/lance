@@ -585,8 +585,8 @@ enum Matches {
 impl Matches {
     fn page_id(&self) -> u32 {
         match self {
-            Matches::Some(page_id) => *page_id,
-            Matches::All(page_id) => *page_id,
+            Self::Some(page_id) => *page_id,
+            Self::All(page_id) => *page_id,
         }
     }
 }
@@ -624,10 +624,7 @@ impl BTreeLookup {
         }
         let mut all_pages = heap.into_sorted_vec();
         all_pages.dedup();
-        all_pages
-            .into_iter()
-            .map(|page_id| Matches::Some(page_id))
-            .collect()
+        all_pages.into_iter().map(Matches::Some).collect()
     }
 
     // All pages that could have a value in the range
@@ -907,7 +904,7 @@ impl BTreeIndex {
             serialized_page =
                 frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
-        Ok(FlatIndex::try_new(serialized_page)?)
+        FlatIndex::try_new(serialized_page)
     }
 
     async fn search_page(
