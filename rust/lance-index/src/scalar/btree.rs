@@ -707,6 +707,12 @@ impl BTreeLookup {
                 // At this point we know the page record matches at least some values.
                 // We should test to see if ALL values are a match.
 
+                if min.0.is_null() || page_record.max.0.is_null() {
+                    // If there are nulls then we just use Matches::Some
+                    matches.push(Matches::Some(page_record.page_number));
+                    continue;
+                }
+
                 match range.0 {
                     // range.0 < X therefore if the smallest value is not strictly greater than
                     // the lower bound we only have partial match
