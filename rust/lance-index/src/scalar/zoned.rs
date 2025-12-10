@@ -270,7 +270,7 @@ where
         }
     }
 
-    Ok(crate::scalar::SearchResult::AtMost(row_addr_tree_map))
+    Ok(crate::scalar::SearchResult::at_most(row_addr_tree_map))
 }
 
 /// Helper that retrains zones from `stream` and appends them to the existing
@@ -745,14 +745,14 @@ mod tests {
         };
 
         // Fragment 0, offsets 0 and 1
-        assert!(map.contains(0));
-        assert!(map.contains(1));
+        assert!(map.selected(0));
+        assert!(map.selected(1));
         // Fragment 1 should be skipped entirely
-        assert!(!map.contains((1_u64 << 32) + 5));
-        assert!(!map.contains((1_u64 << 32) + 7));
+        assert!(!map.selected((1_u64 << 32) + 5));
+        assert!(!map.selected((1_u64 << 32) + 7));
         // Fragment 2 includes only the single offset 10
-        assert!(map.contains((2_u64 << 32) + 10));
-        assert!(!map.contains((2_u64 << 32) + 11));
+        assert!(map.selected((2_u64 << 32) + 10));
+        assert!(!map.selected((2_u64 << 32) + 11));
     }
 
     #[test]

@@ -9,7 +9,7 @@ import requests
 from lance.log import LOGGER
 
 
-def _is_on_google() -> bool:
+def is_on_google() -> bool:
     LOGGER.info("Testing if running on Google Cloud")
     try:
         rsp = requests.get("http://metadata.google.internal", timeout=5)
@@ -22,7 +22,7 @@ def _is_on_google() -> bool:
 
 @cache
 def _get_base_uri() -> str:
-    if _is_on_google():
+    if is_on_google():
         LOGGER.info("Running on Google Cloud, using gs://lance-benchmarks-ci-datasets/")
         return "gs://lance-benchmarks-ci-datasets/"
     else:
@@ -38,7 +38,7 @@ def get_dataset_uri(name: str) -> str:
     # This is a custom-built dataset, on a unique bucket, that is too big to reproduce
     # locally
     if name == "image_eda":
-        if not _is_on_google():
+        if not is_on_google():
             raise ValueError("The image_eda dataset is only available on Google Cloud")
         return "gs://lance-benchmarks-ci-datasets/image_eda.lance"
     return f"{_get_base_uri()}{name}"

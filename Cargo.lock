@@ -4460,6 +4460,7 @@ dependencies = [
  "mock_instant",
  "moka",
  "object_store",
+ "paste",
  "permutation",
  "pin-project",
  "pprof",

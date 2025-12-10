@@ -44,7 +44,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::RowAddrTreeMap,
+        mask::NullableRowAddrSet,
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -832,7 +832,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<RowAddrTreeMap> {
+    ) -> Result<NullableRowAddrSet> {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
@@ -1172,13 +1172,19 @@ impl ScalarIndex for BTreeIndex {
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
-        let row_ids = stream::iter(page_tasks)
+
+        // Collect both matching row IDs and null row IDs from all pages
+        let results: Vec<NullableRowAddrSet> = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<RowAddrTreeMap>()
+            .try_collect()
             .await?;
-        Ok(SearchResult::Exact(row_ids))
+
+        // Merge matching row IDs
+        let selection = NullableRowAddrSet::union_all(&results);
+
+        Ok(SearchResult::Exact(selection))
     }
 
     fn can_remap(&self) -> bool {
@@ -2003,7 +2009,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{record_batch, FixedSizeListArray};
     use arrow_schema::DataType;
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
@@ -2012,12 +2018,14 @@ mod tests {
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
+    use futures::stream;
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
 
     use crate::metrics::LocalMetricsCollector;
     use crate::{
@@ -2165,7 +2173,7 @@ mod tests {
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             assert_eq!(
                 result,
-                SearchResult::Exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+                SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
     }
@@ -2871,5 +2879,118 @@ mod tests {
         // The cleanup function should handle both valid and invalid file patterns gracefully
         // This test mainly verifies that the function doesn't panic and handles edge cases
         super::cleanup_partition_files(&test_store, &lookup_files, &page_files).await;
+    }
+
+    #[tokio::test]
+    async fn test_btree_null_handling_in_queries() {
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: [null, 0, 5] at row IDs [0, 1, 2]
+        // BTree expects sorted data with nulls first (or filtered out)
+        let batch = record_batch!(
+            ("value", Int32, [None, Some(0), Some(5)]),
+            ("_rowid", UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let stream = stream::once(futures::future::ok(batch.clone()));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(batch.schema(), stream));
+
+        // Train the btree index with FlatIndexMetadata as sub-index
+        let sub_index_trainer = super::FlatIndexMetadata::new(DataType::Int32);
+        super::train_btree_index(stream, &sub_index_trainer, store.as_ref(), 256, None)
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = super::BTreeIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Test 1: Search for value 5 - should return allow=[2], null=[0]
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(5)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![2], "Should find row 2 where value == 5");
+
+                // Check that null_row_ids contains row 0
+                let null_row_ids = row_ids.null_rows();
+                assert!(!null_row_ids.is_empty(), "null_row_ids should be non-empty");
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(null_rows, vec![0], "Should report row 0 as null");
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 2: Range query [0, 3] - should return allow=[1], null=[0]
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int32(Some(0))),
+            std::ops::Bound::Included(ScalarValue::Int32(Some(3))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![1], "Should find row 1 where value == 0");
+
+                // Should report row 0 as null
+                let null_row_ids = row_ids.null_rows();
+                assert!(!null_row_ids.is_empty(), "null_row_ids should be non-empty");
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(null_rows, vec![0], "Should report row 0 as null");
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 3: IsIn query [0, 5] - should return allow=[1, 2], null=[0]
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Int32(Some(0)),
+            ScalarValue::Int32(Some(5)),
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let mut actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                actual_rows.sort();
+                assert_eq!(
+                    actual_rows,
+                    vec![1, 2],
+                    "Should find rows 1 and 2 where value in [0, 5]"
+                );
+
+                // Should report row 0 as null
+                let null_row_ids = row_ids.null_rows();
+                assert!(!null_row_ids.is_empty(), "null_row_ids should be non-empty");
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(null_rows, vec![0], "Should report row 0 as null");
+            }
+            _ => panic!("Expected Exact search result"),
+        }
     }
 }

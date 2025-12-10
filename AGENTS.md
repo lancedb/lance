@@ -58,6 +58,10 @@ The project is organized as a Rust workspace with Python and Java bindings. Rust
 * Run specific test: `cargo test -p <package> <test_name>`
 * Lint: `cargo clippy --all --tests --benches -- -D warnings`
 * Format: `cargo fmt --all`
+* Output code coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch`
+* Create HTML coverage report for a crate: `cargo +nightly llvm-cov -q -p lance-core --branch --html`
+* Print lines in file missing coverage: `cargo +nightly llvm-cov -q -p lance-core --show-missing-lines | grep rust/lance-core/src/datatypes/schema.rs`
+* Show detailed coverage for a file: `python ci/coverage.py -p lance-core -f rust/lance-core/src/datatypes/schema.rs`
 
 ### Python Development
 
@@ -135,6 +139,8 @@ Tests:
   /// # }
   /// ```
   ```
+* Code coverage can be skipped for test utilities and non-critical paths using
+  `#[cfg_attr(coverage, coverage(off))]`.
 
 ## Review Guidelines
 

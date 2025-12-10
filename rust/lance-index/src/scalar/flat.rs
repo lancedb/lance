@@ -15,7 +15,7 @@ use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -299,14 +299,37 @@ impl ScalarIndex for FlatIndex {
             let valid_values = arrow::compute::is_not_null(self.values())?;
             predicate = arrow::compute::and(&valid_values, &predicate)?;
         }
+
+        // Track null row IDs for Kleene logic
+        // When querying FOR nulls (IS NULL or Equals(null)), don't track them as "null results"
+        // because they are the TRUE result of the query
+        let null_row_ids = if self.has_nulls
+            && !matches!(query, SargableQuery::IsNull())
+            && !matches!(query, SargableQuery::Equals(val) if val.is_null())
+        {
+            let null_mask = arrow::compute::is_null(self.values())?;
+            let null_ids = arrow_select::filter::filter(self.ids(), &null_mask)?;
+            let null_ids = null_ids
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("Result of arrow_select::filter::filter did not match input type");
+            if null_ids.is_empty() {
+                None
+            } else {
+                Some(RowAddrTreeMap::from_iter(null_ids.values()))
+            }
+        } else {
+            None
+        };
+
         let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
         let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
-        Ok(SearchResult::Exact(RowAddrTreeMap::from_iter(
-            matching_ids.values(),
-        )))
+        let selected = RowAddrTreeMap::from_iter(matching_ids.values());
+        let selection = NullableRowAddrSet::new(selected, null_row_ids.unwrap_or_default());
+        Ok(SearchResult::Exact(selection))
     }
 
     fn can_remap(&self) -> bool {
@@ -372,7 +395,8 @@ mod tests {
         let SearchResult::Exact(actual_row_ids) = actual else {
             panic! {"Expected exact search result"}
         };
-        let expected = RowAddrTreeMap::from_iter(expected);
+        let expected =
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(expected), Default::default());
         assert_eq!(actual_row_ids, expected);
     }
 

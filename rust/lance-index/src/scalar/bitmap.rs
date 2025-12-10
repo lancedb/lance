@@ -21,7 +21,10 @@ use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
-    utils::{mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        mask::{NullableRowAddrSet, RowAddrTreeMap},
+        tokio::get_num_compute_intensive_cpus,
+    },
     Error, Result, ROW_ID,
 };
 use roaring::RoaringBitmap;
@@ -404,15 +407,21 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
-        let row_ids = match query {
+        let (row_ids, null_row_ids) = match query {
             SargableQuery::Equals(val) => {
                 metrics.record_comparisons(1);
                 if val.is_null() {
-                    (*self.null_map).clone()
+                    // Querying FOR nulls - they are the TRUE result, not NULL result
+                    ((*self.null_map).clone(), None)
                 } else {
                     let key = OrderableScalarValue(val.clone());
                     let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                    (*bitmap).clone()
+                    let null_rows = if !self.null_map.is_empty() {
+                        Some((*self.null_map).clone())
+                    } else {
+                        None
+                    };
+                    ((*bitmap).clone(), null_rows)
                 }
             }
             SargableQuery::Range(start, end) => {
@@ -436,7 +445,7 @@ impl ScalarIndex for BitmapIndex {
 
                 metrics.record_comparisons(keys.len());
 
-                if keys.is_empty() {
+                let result = if keys.is_empty() {
                     RowAddrTreeMap::default()
                 } else {
                     let bitmaps: Vec<_> = stream::iter(
@@ -449,7 +458,14 @@ impl ScalarIndex for BitmapIndex {
 
                     let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
                     RowAddrTreeMap::union_all(&bitmap_refs)
-                }
+                };
+
+                let null_rows = if !self.null_map.is_empty() {
+                    Some((*self.null_map).clone())
+                } else {
+                    None
+                };
+                (result, null_rows)
             }
             SargableQuery::IsIn(values) => {
                 metrics.record_comparisons(values.len());
@@ -473,35 +489,41 @@ impl ScalarIndex for BitmapIndex {
                     })
                     .collect();
 
-                if keys.is_empty() && (!has_null || self.null_map.is_empty()) {
+                // Load bitmaps in parallel
+                let mut bitmaps: Vec<_> = stream::iter(
+                    keys.into_iter()
+                        .map(|key| async move { self.load_bitmap(&key, None).await }),
+                )
+                .buffer_unordered(get_num_compute_intensive_cpus())
+                .try_collect()
+                .await?;
+
+                // Add null bitmap if needed
+                if has_null && !self.null_map.is_empty() {
+                    bitmaps.push(self.null_map.clone());
+                }
+
+                let result = if bitmaps.is_empty() {
                     RowAddrTreeMap::default()
                 } else {
-                    // Load bitmaps in parallel
-                    let mut bitmaps: Vec<_> = stream::iter(
-                        keys.into_iter()
-                            .map(|key| async move { self.load_bitmap(&key, None).await }),
-                    )
-                    .buffer_unordered(get_num_compute_intensive_cpus())
-                    .try_collect()
-                    .await?;
+                    // Convert Arc<RowAddrTreeMap> to &RowAddrTreeMap for union_all
+                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
+                    RowAddrTreeMap::union_all(&bitmap_refs)
+                };
 
-                    // Add null bitmap if needed
-                    if has_null && !self.null_map.is_empty() {
-                        bitmaps.push(self.null_map.clone());
-                    }
-
-                    if bitmaps.is_empty() {
-                        RowAddrTreeMap::default()
-                    } else {
-                        // Convert Arc<RowAddrTreeMap> to &RowAddrTreeMap for union_all
-                        let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                        RowAddrTreeMap::union_all(&bitmap_refs)
-                    }
-                }
+                // If the query explicitly includes null, then nulls are TRUE (not NULL)
+                // Otherwise, nulls remain NULL (unknown)
+                let null_rows = if !has_null && !self.null_map.is_empty() {
+                    Some((*self.null_map).clone())
+                } else {
+                    None
+                };
+                (result, null_rows)
             }
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
-                (*self.null_map).clone()
+                // Querying FOR nulls - they are the TRUE result, not NULL result
+                ((*self.null_map).clone(), None)
             }
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
@@ -511,7 +533,8 @@ impl ScalarIndex for BitmapIndex {
             }
         };
 
-        Ok(SearchResult::Exact(row_ids))
+        let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
+        Ok(SearchResult::Exact(selection))
     }
 
     fn can_remap(&self) -> bool {
@@ -817,7 +840,7 @@ pub mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{record_batch, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
@@ -883,7 +906,12 @@ pub mod tests {
         // Verify results
         let expected_red_rows = vec![0u64, 3, 6, 10, 11];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         } else {
@@ -893,7 +921,12 @@ pub mod tests {
         // Test 2: Search for "red" again - should hit cache
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         }
@@ -907,7 +940,12 @@ pub mod tests {
 
         let expected_range_rows = vec![1u64, 2, 5, 7, 8, 12, 13];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_range_rows);
         }
@@ -921,7 +959,12 @@ pub mod tests {
 
         let expected_in_rows = vec![0u64, 3, 4, 6, 9, 10, 11, 14];
         if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(|id| id.into()).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_in_rows);
         }
@@ -1292,7 +1335,12 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 2).into(),
@@ -1308,7 +1356,12 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 4).into(),
@@ -1324,12 +1377,127 @@ pub mod tests {
             .await
             .unwrap();
         if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_addrs().unwrap().map(u64::from).collect();
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect();
             actual.sort();
             assert_eq!(
                 actual, expected_null_addrs,
                 "Null search results not correct"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_null_handling_in_queries() {
+        // Test that bitmap index correctly returns null_list for queries
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: [0, 5, null]
+        let batch = record_batch!(
+            ("value", Int64, [Some(0), Some(5), None]),
+            ("_rowid", UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        // Train and write the bitmap index
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Test 1: Search for value 5 - should return allow=[1], null=[2]
+        let query = SargableQuery::Equals(ScalarValue::Int64(Some(5)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![1], "Should find row 1 where value == 5");
+
+                let null_row_ids = row_ids.null_rows();
+                // Check that null_row_ids contains row 2
+                assert!(!null_row_ids.is_empty(), "null_row_ids should be Some");
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(null_rows, vec![2], "Should report row 2 as null");
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 2: Search for null values - should return allow=[2], null=None
+        let query = SargableQuery::IsNull();
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_addrs) => {
+                let actual_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    actual_rows,
+                    vec![2],
+                    "IsNull should find row 2 where value is null"
+                );
+
+                let null_row_ids = row_addrs.null_rows();
+                // When querying FOR nulls, null_row_ids should be None (nulls are the TRUE result)
+                assert!(
+                    null_row_ids.is_empty(),
+                    "null_row_ids should be None for IsNull query"
+                );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 3: Range query - should return matching rows and null_list
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int64(Some(0))),
+            std::ops::Bound::Included(ScalarValue::Int64(Some(3))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_addrs) => {
+                let actual_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![0], "Should find row 0 where value == 0");
+
+                // Should report row 2 as null
+                let null_row_ids = row_addrs.null_rows();
+                assert!(!null_row_ids.is_empty(), "null_row_ids should be Some");
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(null_rows, vec![2], "Should report row 2 as null");
+            }
+            _ => panic!("Expected Exact search result"),
         }
     }
 }

@@ -81,7 +81,7 @@ impl EvaluatedIndex {
         if batch.num_rows() != 2 {
             return Err(Error::InvalidInput {
                 source: format!(
-                    "Expected a batch with exactly one row but there are {} rows",
+                    "Expected a batch with exactly 2 rows but there are {} rows",
                     batch.num_rows()
                 )
                 .into(),

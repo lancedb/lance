@@ -213,6 +213,9 @@ debug-assertions = false
 strip = "debuginfo"
 incremental = false
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 style = { level = "deny", priority = -1 }

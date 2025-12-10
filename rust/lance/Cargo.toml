@@ -106,6 +106,7 @@ test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
+paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
@@ -133,6 +134,8 @@ gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 huggingface = ["lance-io/huggingface"]
+# Enable slow integration tests (disabled by default in CI)
+slow_tests = []
 
 [[bin]]
 name = "lq"

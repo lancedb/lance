@@ -313,7 +313,7 @@ pub mod tests {
         bitmap::BitmapIndex,
         btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
         flat::FlatIndexMetadata,
-        LabelListQuery, SargableQuery, ScalarIndex,
+        LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
     };
 
     use super::*;
@@ -321,7 +321,7 @@ pub mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, UInt64Type},
-        RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
+        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -402,9 +402,9 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
-        assert_eq!(Some(1), row_addrs.len());
-        assert!(row_addrs.contains(10000));
+        let row_ids = result.row_addrs().true_rows();
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
 
         let result = index
             .search(
@@ -418,7 +418,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
 
         assert_eq!(Some(0), row_addrs.len());
 
@@ -434,7 +434,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
 
         assert_eq!(Some(100), row_addrs.len());
     }
@@ -494,7 +494,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
 
         assert_eq!(Some(1), row_addrs.len());
         assert!(row_addrs.contains(10000));
@@ -508,7 +508,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
 
         assert_eq!(Some(1), row_addrs.len());
         assert!(row_addrs.contains(500_000));
@@ -518,7 +518,7 @@ pub mod tests {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
         let expected_arr = RowAddrTreeMap::from_iter(expected);
-        assert_eq!(results.row_addrs(), &expected_arr);
+        assert_eq!(&results.row_addrs().true_rows(), &expected_arr);
     }
 
     #[tokio::test]
@@ -823,7 +823,7 @@ pub mod tests {
                 .unwrap();
 
             assert!(result.is_exact());
-            let row_addrs = result.row_addrs();
+            let row_addrs = result.row_addrs().true_rows();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
@@ -886,7 +886,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
 
         assert!(row_addrs.is_empty());
 
@@ -895,7 +895,7 @@ pub mod tests {
             .await
             .unwrap();
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(row_addrs.len(), Some(4096));
     }
 
@@ -962,7 +962,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(Some(1), row_addrs.len());
         assert!(row_addrs.contains(2));
 
@@ -975,7 +975,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(Some(3), row_addrs.len());
         assert!(row_addrs.contains(1));
         assert!(row_addrs.contains(3));
@@ -1004,7 +1004,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(Some(1), row_addrs.len());
         assert!(row_addrs.contains(10000));
 
@@ -1020,7 +1020,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert!(row_addrs.is_empty());
 
         let result = index
@@ -1035,7 +1035,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(Some(100), row_addrs.len());
     }
 
@@ -1043,7 +1043,7 @@ pub mod tests {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
         let expected_arr = RowAddrTreeMap::from_iter(expected);
-        assert_eq!(results.row_addrs(), &expected_arr);
+        assert_eq!(&results.row_addrs().true_rows(), &expected_arr);
     }
 
     #[tokio::test]
@@ -1307,7 +1307,7 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_exact());
-        let row_addrs = result.row_addrs();
+        let row_addrs = result.row_addrs().true_rows();
         assert_eq!(Some(1), row_addrs.len());
         assert!(row_addrs.contains(5000));
     }
@@ -1357,7 +1357,7 @@ pub mod tests {
             .await
             .unwrap()
             .row_addrs()
-            .contains(65));
+            .selected(65));
         // Deleted
         assert!(remapped_index
             .search(
@@ -1377,7 +1377,7 @@ pub mod tests {
             .await
             .unwrap()
             .row_addrs()
-            .contains(3));
+            .selected(3));
     }
 
     async fn train_tag(
@@ -1442,7 +1442,7 @@ pub mod tests {
                     .unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
-                let row_addrs = result.row_addrs();
+                let row_addrs = result.row_addrs().true_rows();
 
                 let row_addrs_set = row_addrs
                     .row_addrs()
@@ -1505,5 +1505,86 @@ pub mod tests {
             Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_label_list_null_handling() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        // Create test data with null items within lists:
+        // Row 0: [1, 2] - no nulls
+        // Row 1: [3, null] - has a null item
+        // Row 2: [4] - no nulls
+        let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3), None]),
+            Some(vec![Some(4)]),
+        ]);
+        let row_ids = UInt64Array::from_iter_values(0..3);
+        // Create schema with nullable list items to match the ListArray
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                VALUE_COLUMN_NAME,
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                true,
+            ),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_array), Arc::new(row_ids)],
+        )
+        .unwrap();
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        train_tag(&index_store, batch_reader).await;
+
+        let index = LabelListIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::LabelListIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        // Test: Search for lists containing value 1
+        // Row 0: [1, 2] - contains 1 → TRUE
+        // Row 1: [3, null] - has null item, unknown if it matches → NULL
+        // Row 2: [4] - doesn't contain 1 → FALSE
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    actual_rows,
+                    vec![0],
+                    "Should find row 0 where list contains 1"
+                );
+
+                let null_row_ids = row_ids.null_rows();
+                assert!(
+                    !null_row_ids.is_empty(),
+                    "null_row_ids should not be empty - row 1 has null item"
+                );
+                let null_rows: Vec<u64> =
+                    null_row_ids.row_addrs().unwrap().map(u64::from).collect();
+                assert_eq!(
+                    null_rows,
+                    vec![1],
+                    "Should report row 1 as null because it contains a null item"
+                );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
     }
 }

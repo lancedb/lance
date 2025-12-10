@@ -1201,7 +1201,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
-    use arrow_array::{RecordBatch, UInt64Array};
+    use arrow_array::{record_batch, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1285,7 +1285,7 @@ mod tests {
         // Equals query: null (should match nothing, as there are no nulls in empty index)
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1342,14 +1342,14 @@ mod tests {
         // Should match the block since value 50 is in the range [0, 100)
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that shouldn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty result since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1436,7 +1436,7 @@ mod tests {
         // Value 150 is only in fragment 1 (values 100-199), not in fragment 0 (values 0-99)
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range((1u64 << 32) + 50..((1u64 << 32) + 100)); // Only the block containing 150
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1502,7 +1502,7 @@ mod tests {
         // Should match all blocks since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every block
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a specific finite value that exists in the data
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(5.0)));
@@ -1511,7 +1511,7 @@ mod tests {
         // Should match only the first block since 5.0 only exists in rows 0-99
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist but is within expected range
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(250.0)));
@@ -1520,14 +1520,14 @@ mod tests {
         // Should match the third block since 250.0 would be in that range if it existed
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(200..300);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value way outside the range
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(10000.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with NaN and finite values
         let query = BloomFilterQuery::IsIn(vec![
@@ -1540,7 +1540,7 @@ mod tests {
         // Should match all blocks since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1601,14 +1601,14 @@ mod tests {
         // Should match zone 2
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(2000..3000);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value way outside the range
         let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(50000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with values from different zones
         let query = BloomFilterQuery::IsIn(vec![
@@ -1624,7 +1624,7 @@ mod tests {
         expected.insert_range(0..1000); // Zone 0
         expected.insert_range(2000..3000); // Zone 2
         expected.insert_range(7000..8000); // Zone 7
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1680,7 +1680,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value in the second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
@@ -1689,7 +1689,7 @@ mod tests {
         // Should match the second zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(100..200);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query =
@@ -1697,7 +1697,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with string values
         let query = BloomFilterQuery::IsIn(vec![
@@ -1710,7 +1710,7 @@ mod tests {
         // Should match both zones
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..200);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1762,7 +1762,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value in the second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
@@ -1771,14 +1771,14 @@ mod tests {
         // Should match the second zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![255, 254, 253])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1831,7 +1831,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some(
@@ -1840,7 +1840,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1887,19 +1887,19 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Date32 value in second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(75)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Date32 value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(500)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1951,7 +1951,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Timestamp value in second zone
         let second_timestamp = timestamp_values[75];
@@ -1962,13 +1962,13 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Timestamp value that doesn't exist
         let query =
             BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(Some(999_999_999i64), None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with multiple timestamp values
         let query = BloomFilterQuery::IsIn(vec![
@@ -1979,7 +1979,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100); // Should match both zones
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -2030,12 +2030,12 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..25);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Time64 value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -2081,12 +2081,12 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(500..750); // Should match the zone containing 500
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsNull query
         let query = BloomFilterQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new())); // No nulls in the data
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new())); // No nulls in the data
 
         // Test IsIn query
         let query = BloomFilterQuery::IsIn(vec![
@@ -2097,6 +2097,86 @@ mod tests {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..250); // Zone containing 100
         expected.insert_range(500..750); // Zone containing 600
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_null_handling_in_queries() {
+        // Test that bloomfilter index correctly returns null_list for queries
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: [0, 5, null]
+        let batch = record_batch!(
+            (VALUE_COLUMN_NAME, Int64, [Some(0), Some(5), None]),
+            (ROW_ADDR, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        // Train and write the bloomfilter index
+        BloomFilterIndexPlugin::train_bloomfilter_index(stream, store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BloomFilterIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Test 1: Search for value 5 - bloomfilter should return at_most with all rows
+        // Like ZoneMap, BloomFilter returns AtMost (superset) and includes nulls
+        let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(5)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_addrs) => {
+                // Bloomfilter returns all rows in the zone including nulls
+                let all_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows (including nulls) since BloomFilter is inexact"
+                );
+
+                // For AtMost results, nulls are included in the superset
+            }
+            _ => panic!("Expected AtMost search result from bloomfilter"),
+        }
+
+        // Test 2: IsIn query - should also return all rows
+        let query = BloomFilterQuery::IsIn(vec![
+            ScalarValue::Int64(Some(0)),
+            ScalarValue::Int64(Some(10)),
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_addrs) => {
+                let all_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows in zone as possible matches"
+                );
+            }
+            _ => panic!("Expected AtMost search result from bloomfilter"),
+        }
     }
 }
