@@ -4,22 +4,27 @@
 use std::collections::HashMap;
 use std::{ops::Bound, sync::Arc};
 
+use arrow_array::Array;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
 };
 
-use datafusion_physical_expr::expressions::{in_list, lit, Column};
+use datafusion_common::DFSchema;
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::create_physical_expr;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use roaring::RoaringBitmap;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
+use crate::scalar::btree::BTREE_VALUES_COLUMN;
 use crate::scalar::{AnyQuery, SargableQuery};
 
+const VALUES_COL_IDX: usize = 0;
+const IDS_COL_IDX: usize = 1;
 /// A flat index is just a batch of value/row-id pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
@@ -31,7 +36,7 @@ pub struct FlatIndex {
     data: Arc<RecordBatch>,
     all_addrs_map: RowAddrTreeMap,
     null_addrs_map: RowAddrTreeMap,
-    has_nulls: bool,
+    df_schema: DFSchema,
 }
 
 impl DeepSizeOf for FlatIndex {
@@ -43,10 +48,11 @@ impl DeepSizeOf for FlatIndex {
 impl FlatIndex {
     pub fn try_new(data: RecordBatch) -> Result<Self> {
         // Sort by row id to make bitmap construction more efficient
-        let data = data.sort_by_column(1, None)?;
-        let has_nulls = data.column(1).null_count() > 0;
+        let data = data.sort_by_column(IDS_COL_IDX, None)?;
+
+        let has_nulls = data.column(VALUES_COL_IDX).null_count() > 0;
         let all_addrs_map = RowAddrTreeMap::from_sorted_iter(
-            data.column(1)
+            data.column(IDS_COL_IDX)
                 .as_primitive::<UInt64Type>()
                 .values()
                 .iter()
@@ -59,20 +65,18 @@ impl FlatIndex {
             RowAddrTreeMap::default()
         };
 
+        let df_schema = DFSchema::try_from(data.schema())?;
+
         Ok(Self {
             data: Arc::new(data),
             all_addrs_map,
             null_addrs_map,
-            has_nulls,
+            df_schema,
         })
     }
 
-    fn values(&self) -> &ArrayRef {
-        self.data.column(0)
-    }
-
     fn ids(&self) -> &ArrayRef {
-        self.data.column(1)
+        self.data.column(IDS_COL_IDX)
     }
 
     pub fn all(&self) -> NullableRowAddrSet {
@@ -80,11 +84,15 @@ impl FlatIndex {
         NullableRowAddrSet::new(self.all_addrs_map.clone(), self.null_addrs_map.clone())
     }
 
+    pub fn all_ignore_nulls(&self) -> NullableRowAddrSet {
+        NullableRowAddrSet::new(self.all_addrs_map.clone(), Default::default())
+    }
+
     pub fn remap_batch(
         batch: RecordBatch,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<RecordBatch> {
-        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
         let val_idx_and_new_id = row_ids
             .values()
             .iter()
@@ -105,7 +113,8 @@ impl FlatIndex {
                 .into_iter()
                 .map(|(val_idx, _)| val_idx as u64),
         );
-        let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
+        let new_vals =
+            arrow_select::take::take(batch.column(VALUES_COL_IDX), &new_val_indices, None)?;
         Ok(RecordBatch::try_new(
             batch.schema(),
             vec![new_vals, new_ids],
@@ -113,8 +122,8 @@ impl FlatIndex {
     }
 
     fn get_null_addrs(sorted_batch: &RecordBatch) -> Result<RowAddrTreeMap> {
-        let null_mask = arrow::compute::is_null(sorted_batch.column(0))?;
-        let null_ids = arrow_select::filter::filter(sorted_batch.column(1), &null_mask)?;
+        let null_mask = arrow::compute::is_null(sorted_batch.column(VALUES_COL_IDX))?;
+        let null_ids = arrow_select::filter::filter(sorted_batch.column(IDS_COL_IDX), &null_mask)?;
         let null_ids = null_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -132,121 +141,80 @@ impl FlatIndex {
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
 
-        let mut null_is_true = false;
-        let mut predicate = match query {
+        // Shortcuts for simple cases where we can re-use computed values
+        match query {
+            // x = NULL means all rows are NULL
             SargableQuery::Equals(value) => {
                 if value.is_null() {
-                    // Query is x = NULL, correct SQL behavior is to return all ids as NULL
-                    // We differ a little and return them all as true right now.
+                    // if we have x = NULL then the correct SQL behavior is to return all NULLs
                     return Ok(NullableRowAddrSet::new(
-                        self.null_addrs_map.clone(),
                         Default::default(),
+                        self.all_addrs_map.clone(),
                     ));
-                } else {
-                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
                 }
             }
+            // x IS NULL we can use pre-computed nulls
             SargableQuery::IsNull() => {
                 return Ok(NullableRowAddrSet::new(
                     self.null_addrs_map.clone(),
                     Default::default(),
                 ));
             }
-            SargableQuery::IsIn(values) => {
-                let mut has_null = false;
-                let choices = values
-                    .iter()
-                    .map(|val| {
-                        has_null |= val.is_null();
-                        lit(val.clone())
-                    })
-                    .collect::<Vec<_>>();
-                let in_list_expr = in_list(
-                    Arc::new(Column::new("values", 0)),
-                    choices,
-                    &false,
-                    &self.data.schema(),
-                )?;
-                let result_col = in_list_expr.evaluate(&self.data)?;
-                let predicate = result_col
-                    .into_array(self.data.num_rows())?
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("InList evaluation should return boolean array")
-                    .clone();
-
-                // If the IN query has nulls, then don't treat the nulls as null.  This is a little different
-                // than SQL behavior.
-                null_is_true = has_null;
-
-                // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
-                if has_null && self.has_nulls {
-                    let nulls = arrow::compute::is_null(self.values())?;
-                    arrow::compute::or(&predicate, &nulls)?
-                } else {
-                    predicate
-                }
-            }
+            // x < NULL or x > NULL means all rows are NULL
             SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
-                    panic!("Scalar range query received with no upper or lower bound")
+                    return Ok(NullableRowAddrSet::new(
+                        self.all_addrs_map.clone(),
+                        Default::default(),
+                    ));
                 }
-                (Bound::Unbounded, Bound::Included(upper)) => {
-                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?
+                (Bound::Unbounded, Bound::Included(upper) | Bound::Excluded(upper)) => {
+                    if upper.is_null() {
+                        return Ok(NullableRowAddrSet::new(
+                            Default::default(),
+                            self.all_addrs_map.clone(),
+                        ));
+                    }
                 }
-                (Bound::Unbounded, Bound::Excluded(upper)) => {
-                    arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?
+                (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded) => {
+                    if lower.is_null() {
+                        return Ok(NullableRowAddrSet::new(
+                            Default::default(),
+                            self.all_addrs_map.clone(),
+                        ));
+                    }
                 }
-                (Bound::Included(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?
-                }
-                (Bound::Included(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Included(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Excluded(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?
-                }
-                (Bound::Excluded(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
-                )?,
-                (Bound::Excluded(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
-                )?,
+                _ => {}
             },
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for flat index, build a inverted index for it",
-                location!(),
-            )),
-        };
-        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
-            // Arrow's comparison kernels do not return false for nulls.  They consider nulls to
-            // be less than any value.  So we need to filter out the nulls manually.
-            let valid_values = arrow::compute::is_not_null(self.values())?;
-            predicate = arrow::compute::and(&valid_values, &predicate)?;
-        }
-
-        // Track null row IDs for Kleene logic
-        // When querying FOR nulls (IS NULL or Equals(null)), don't track them as "null results"
-        // because they are the TRUE result of the query
-        let null_row_ids = if null_is_true {
-            self.null_addrs_map.clone()
-        } else {
-            Default::default()
+            _ => {}
         };
 
-        let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
+        // No shortcut possible, need to actually evaluate the query
+        let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+
+        let predicate = expr.evaluate(&self.data)?;
+        let predicate = predicate.into_array(self.data.num_rows())?;
+        let predicate = predicate
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Predicate should return boolean array");
+        let nulls = arrow::compute::is_null(&predicate)?;
+
+        let matching_ids = arrow_select::filter::filter(self.ids(), predicate)?;
         let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
         let selected = RowAddrTreeMap::from_sorted_iter(matching_ids.values().iter().copied())?;
+
+        let null_row_ids = arrow_select::filter::filter(self.ids(), &nulls)?;
+        let null_row_ids = null_row_ids
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        let null_row_ids = RowAddrTreeMap::from_sorted_iter(null_row_ids.values().iter().copied())?;
+
         Ok(NullableRowAddrSet::new(selected, null_row_ids))
     }
 
@@ -265,10 +233,13 @@ impl FlatIndex {
 
 #[cfg(test)]
 mod tests {
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN},
+    };
 
     use super::*;
-    use arrow_array::types::Int32Type;
+    use arrow_array::{record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
     use lance_datagen::{array, gen_batch, RowCount};
 
@@ -375,5 +346,78 @@ mod tests {
         ]);
         let remapped = FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap();
         assert_eq!(remapped.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_null_handling() {
+        // [null, 0, 5]
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [None, Some(0), Some(5)]),
+            (BTREE_IDS_COLUMN, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        let check = |query: SargableQuery, true_ids: &[u64], null_ids: &[u64]| {
+            let actual = index.search(&query, &NoOpMetricsCollector).unwrap();
+            let expected = NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(true_ids),
+                RowAddrTreeMap::from_iter(null_ids),
+            );
+            assert_eq!(actual, expected, "query: {:?}", query);
+        };
+
+        let null = ScalarValue::Int32(None);
+        let zero = ScalarValue::Int32(Some(0));
+        let three = ScalarValue::Int32(Some(3));
+
+        check(SargableQuery::Equals(zero.clone()), &[1], &[0]);
+        // x = NULL returns all rows as NULL and nothing as TRUE
+        check(SargableQuery::Equals(null.clone()), &[], &[0, 1, 2]);
+
+        check(SargableQuery::IsIn(vec![zero.clone()]), &[1], &[0]);
+        // x IN (0, NULL) promotes all FALSE to NULL
+        check(SargableQuery::IsIn(vec![zero, null.clone()]), &[1], &[0, 2]);
+
+        check(SargableQuery::IsNull(), &[0], &[]);
+
+        check(
+            SargableQuery::Range(Bound::Included(three.clone()), Bound::Unbounded),
+            &[2],
+            &[0],
+        );
+
+        // x < NULL or x > NULL returns everything as NULL
+        check(
+            SargableQuery::Range(Bound::Unbounded, Bound::Included(null.clone())),
+            &[],
+            &[0, 1, 2],
+        );
+
+        check(
+            SargableQuery::Range(Bound::Excluded(null.clone()), Bound::Unbounded),
+            &[],
+            &[0, 1, 2],
+        );
+
+        // x BETWEEN 3 AND NULL returns everything as NULL unless we know it is FALSE
+        check(
+            SargableQuery::Range(
+                Bound::Included(three.clone()),
+                Bound::Included(null.clone()),
+            ),
+            &[],
+            &[0, 2],
+        );
+        check(
+            SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(three)),
+            &[],
+            &[0, 1],
+        );
+        check(
+            SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(null)),
+            &[],
+            &[0, 1, 2],
+        );
     }
 }

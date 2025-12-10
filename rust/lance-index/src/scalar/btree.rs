@@ -943,7 +943,11 @@ impl BTreeIndex {
                 // to search for X IN [5, 3]
                 subindex.search(query, metrics)
             }
-            Matches::All(_) => Ok(subindex.all()),
+            Matches::All(_) => Ok(match query {
+                // This means we hit an all-null page so just grab all row ids as true
+                SargableQuery::IsNull() => subindex.all_ignore_nulls(),
+                _ => subindex.all(),
+            }),
         }
     }
 
