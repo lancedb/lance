@@ -3,7 +3,7 @@
 
 use deepsize::DeepSizeOf;
 
-use super::{RowAddrTreeMap, RowIdMask};
+use super::{RowAddrMask, RowAddrTreeMap};
 
 /// A set of row ids, with optional set of nulls.
 ///
@@ -121,7 +121,7 @@ impl std::ops::BitOrAssign<&Self> for NullableRowAddrSet {
     }
 }
 
-/// A version of [`RowIdMask`] that supports nulls.
+/// A version of [`RowAddrMask`] that supports nulls.
 ///
 /// This mask handles three-valued logic for SQL expressions, where a filter can
 /// evaluate to TRUE, FALSE, or NULL. The `selected` set includes rows that are
@@ -144,13 +144,13 @@ impl NullableRowIdMask {
         }
     }
 
-    pub fn drop_nulls(self) -> RowIdMask {
+    pub fn drop_nulls(self) -> RowAddrMask {
         match self {
             Self::AllowList(NullableRowAddrSet { selected, nulls }) => {
-                RowIdMask::AllowList(selected - nulls)
+                RowAddrMask::AllowList(selected - nulls)
             }
             Self::BlockList(NullableRowAddrSet { selected, nulls }) => {
-                RowIdMask::BlockList(selected | nulls)
+                RowAddrMask::BlockList(selected | nulls)
             }
         }
     }

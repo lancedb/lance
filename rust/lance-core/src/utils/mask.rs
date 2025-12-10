@@ -190,7 +190,7 @@ impl RowAddrMask {
     ///
     /// This is only possible if this is an AllowList and the maps don't contain
     /// any "full fragment" blocks.
-    pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
+    pub fn iter_addrs(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
         match self {
             Self::AllowList(allow_list) => {
                 if let Some(allow_iter) = allow_list.row_addrs() {
@@ -871,7 +871,7 @@ mod tests {
         RowAddrTreeMap::from_iter(ids)
     }
 
-    fn assert_mask_selects(mask: &RowIdMask, selected: &[u64], not_selected: &[u64]) {
+    fn assert_mask_selects(mask: &RowAddrMask, selected: &[u64], not_selected: &[u64]) {
         for &id in selected {
             assert!(mask.selected(id), "Expected row {} to be selected", id);
         }
@@ -880,55 +880,55 @@ mod tests {
         }
     }
 
-    fn selected_in_range(mask: &RowIdMask, range: std::ops::Range<u64>) -> Vec<u64> {
+    fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
     }
 
     #[test]
     fn test_row_id_mask_construction() {
-        let full_mask = RowIdMask::all_rows();
+        let full_mask = RowAddrMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
         assert_mask_selects(&full_mask, &[0, 1, 4 << 32 | 3], &[]);
         assert_eq!(full_mask.allow_list(), None);
         assert_eq!(full_mask.block_list(), Some(&RowAddrTreeMap::default()));
-        assert!(full_mask.iter_ids().is_none());
+        assert!(full_mask.iter_addrs().is_none());
 
-        let empty_mask = RowIdMask::allow_nothing();
+        let empty_mask = RowAddrMask::allow_nothing();
         assert_eq!(empty_mask.max_len(), Some(0));
         assert_mask_selects(&empty_mask, &[], &[0, 1, 4 << 32 | 3]);
         assert_eq!(empty_mask.allow_list(), Some(&RowAddrTreeMap::default()));
         assert_eq!(empty_mask.block_list(), None);
-        let iter = empty_mask.iter_ids();
+        let iter = empty_mask.iter_addrs();
         assert!(iter.is_some());
         assert_eq!(iter.unwrap().count(), 0);
 
-        let allow_list = RowIdMask::from_allowed(rows(&[10, 20, 30]));
+        let allow_list = RowAddrMask::from_allowed(rows(&[10, 20, 30]));
         assert_eq!(allow_list.max_len(), Some(3));
         assert_mask_selects(&allow_list, &[10, 20, 30], &[0, 15, 25, 40]);
         assert_eq!(allow_list.allow_list(), Some(&rows(&[10, 20, 30])));
         assert_eq!(allow_list.block_list(), None);
-        let iter = allow_list.iter_ids();
+        let iter = allow_list.iter_addrs();
         assert!(iter.is_some());
         let ids: Vec<u64> = iter.unwrap().map(|addr| addr.into()).collect();
         assert_eq!(ids, vec![10, 20, 30]);
 
         let mut full_frag = RowAddrTreeMap::default();
         full_frag.insert_fragment(2);
-        let allow_list = RowIdMask::from_allowed(full_frag);
+        let allow_list = RowAddrMask::from_allowed(full_frag);
         assert_eq!(allow_list.max_len(), None);
         assert_mask_selects(&allow_list, &[(2 << 32) + 5], &[(3 << 32) + 5]);
-        assert!(allow_list.iter_ids().is_none());
+        assert!(allow_list.iter_addrs().is_none());
     }
 
     #[test]
     fn test_selected_indices() {
         // Allow list
-        let mask = RowIdMask::from_allowed(rows(&[10, 20, 40]));
+        let mask = RowAddrMask::from_allowed(rows(&[10, 20, 40]));
         assert!(mask.selected_indices(std::iter::empty()).is_empty());
         assert_eq!(mask.selected_indices([25, 20, 14, 10].iter()), &[1, 3]);
 
         // Block list
-        let mask = RowIdMask::from_block(rows(&[10, 20, 40]));
+        let mask = RowAddrMask::from_block(rows(&[10, 20, 40]));
         assert!(mask.selected_indices(std::iter::empty()).is_empty());
         assert_eq!(mask.selected_indices([25, 20, 14, 10].iter()), &[0, 2]);
     }
@@ -936,52 +936,52 @@ mod tests {
     #[test]
     fn test_also_allow() {
         // Allow list
-        let mask = RowIdMask::from_allowed(rows(&[10, 20]));
+        let mask = RowAddrMask::from_allowed(rows(&[10, 20]));
         let new_mask = mask.also_allow(rows(&[20, 30, 40]));
-        assert_eq!(new_mask, RowIdMask::from_allowed(rows(&[10, 20, 30, 40])));
+        assert_eq!(new_mask, RowAddrMask::from_allowed(rows(&[10, 20, 30, 40])));
 
         // Block list
-        let mask = RowIdMask::from_block(rows(&[10, 20, 30]));
+        let mask = RowAddrMask::from_block(rows(&[10, 20, 30]));
         let new_mask = mask.also_allow(rows(&[20, 40]));
-        assert_eq!(new_mask, RowIdMask::from_block(rows(&[10, 30])));
+        assert_eq!(new_mask, RowAddrMask::from_block(rows(&[10, 30])));
     }
 
     #[test]
     fn test_also_block() {
         // Allow list
-        let mask = RowIdMask::from_allowed(rows(&[10, 20, 30]));
+        let mask = RowAddrMask::from_allowed(rows(&[10, 20, 30]));
         let new_mask = mask.also_block(rows(&[20, 40]));
-        assert_eq!(new_mask, RowIdMask::from_allowed(rows(&[10, 30])));
+        assert_eq!(new_mask, RowAddrMask::from_allowed(rows(&[10, 30])));
 
         // Block list
-        let mask = RowIdMask::from_block(rows(&[10, 20]));
+        let mask = RowAddrMask::from_block(rows(&[10, 20]));
         let new_mask = mask.also_block(rows(&[20, 30, 40]));
-        assert_eq!(new_mask, RowIdMask::from_block(rows(&[10, 20, 30, 40])));
+        assert_eq!(new_mask, RowAddrMask::from_block(rows(&[10, 20, 30, 40])));
     }
 
     #[test]
     fn test_iter_ids() {
         // Allow list
-        let mask = RowIdMask::from_allowed(rows(&[10, 20, 30]));
+        let mask = RowAddrMask::from_allowed(rows(&[10, 20, 30]));
         let expected: Vec<_> = [10, 20, 30].into_iter().map(RowAddress::from).collect();
-        assert_eq!(mask.iter_ids().unwrap().collect::<Vec<_>>(), expected);
+        assert_eq!(mask.iter_addrs().unwrap().collect::<Vec<_>>(), expected);
 
         // Allow list with full fragment
         let mut inner = RowAddrTreeMap::default();
         inner.insert_fragment(10);
-        let mask = RowIdMask::from_allowed(inner);
-        assert!(mask.iter_ids().is_none());
+        let mask = RowAddrMask::from_allowed(inner);
+        assert!(mask.iter_addrs().is_none());
 
         // Block list
-        let mask = RowIdMask::from_block(rows(&[10, 20, 30]));
-        assert!(mask.iter_ids().is_none());
+        let mask = RowAddrMask::from_block(rows(&[10, 20, 30]));
+        assert!(mask.iter_addrs().is_none());
     }
 
     #[test]
     fn test_row_id_mask_not() {
-        let allow_list = RowIdMask::from_allowed(rows(&[1, 2, 3]));
+        let allow_list = RowAddrMask::from_allowed(rows(&[1, 2, 3]));
         let block_list = !allow_list.clone();
-        assert_eq!(block_list, RowIdMask::from_block(rows(&[1, 2, 3])));
+        assert_eq!(block_list, RowAddrMask::from_block(rows(&[1, 2, 3])));
         // Can roundtrip by negating again
         assert_eq!(!block_list, allow_list);
     }
@@ -1108,7 +1108,7 @@ mod tests {
             BinaryArray::from_opt_vec(vec![Some(&block_bytes), Some(&allow_bytes)]);
 
         // Deserialize - should handle this by creating AllowList(allow - block)
-        let deserialized = RowIdMask::from_arrow(&old_format_array).unwrap();
+        let deserialized = RowAddrMask::from_arrow(&old_format_array).unwrap();
 
         // The expected result: AllowList([1, 2, 3, 4, 5, 10, 15] - [2, 4, 15]) = [1, 3, 5, 10]
         assert_mask_selects(&deserialized, &[1, 3, 5, 10], &[2, 4, 15]);
@@ -1123,21 +1123,21 @@ mod tests {
         let row_addrs = rows(&[1, 2, 3, 100, 2000]);
 
         // Allow list
-        let original = RowIdMask::from_allowed(row_addrs.clone());
+        let original = RowAddrMask::from_allowed(row_addrs.clone());
         let array = original.into_arrow().unwrap();
-        assert_eq!(RowIdMask::from_arrow(&array).unwrap(), original);
+        assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
 
         // Block list
-        let original = RowIdMask::from_block(row_addrs);
+        let original = RowAddrMask::from_block(row_addrs);
         let array = original.into_arrow().unwrap();
-        assert_eq!(RowIdMask::from_arrow(&array).unwrap(), original);
+        assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
     }
 
     #[test]
     fn test_deserialize_legacy_empty_lists() {
         // Case 1: Both None (should become all_rows)
         let array = BinaryArray::from_opt_vec(vec![None, None]);
-        let mask = RowIdMask::from_arrow(&array).unwrap();
+        let mask = RowAddrMask::from_arrow(&array).unwrap();
         assert_mask_selects(&mask, &[0, 100, u64::MAX], &[]);
 
         // Case 2: Only block list (no allow list)
@@ -1148,7 +1148,7 @@ mod tests {
             buf
         };
         let array = BinaryArray::from_opt_vec(vec![Some(&block_bytes[..]), None]);
-        let mask = RowIdMask::from_arrow(&array).unwrap();
+        let mask = RowAddrMask::from_arrow(&array).unwrap();
         assert_mask_selects(&mask, &[0, 15], &[5, 10]);
 
         // Case 3: Only allow list (no block list)
@@ -1159,7 +1159,7 @@ mod tests {
             buf
         };
         let array = BinaryArray::from_opt_vec(vec![None, Some(&allow_bytes[..])]);
-        let mask = RowIdMask::from_arrow(&array).unwrap();
+        let mask = RowAddrMask::from_arrow(&array).unwrap();
         assert_mask_selects(&mask, &[5, 10], &[0, 15]);
     }
 
@@ -1246,12 +1246,12 @@ mod tests {
         let mask = rows(&[0, 1, 2]);
         let mask2 = rows(&[0, 2, 3]);
 
-        let allow_list = RowIdMask::AllowList(mask2.clone());
+        let allow_list = RowAddrMask::AllowList(mask2.clone());
         let mut actual = mask.clone();
         actual.mask(&allow_list);
         assert_eq!(actual, rows(&[0, 2]));
 
-        let block_list = RowIdMask::BlockList(mask2);
+        let block_list = RowAddrMask::BlockList(mask2);
         let mut actual = mask;
         actual.mask(&block_list);
         assert_eq!(actual, rows(&[1]));

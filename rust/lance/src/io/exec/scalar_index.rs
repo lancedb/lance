@@ -319,7 +319,7 @@ impl MapIndexExec {
         }
 
         let row_id_iter = row_addr_mask
-            .iter_ids()
+            .iter_addrs()
             .ok_or(datafusion::error::DataFusionError::Internal(
                 "IndexedLookupExec: Cannot iterate over row addresses (BlockList or contains full fragments)".to_string(),
             ))?;
@@ -577,7 +577,7 @@ async fn row_ids_for_mask(
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
     match mask {
-        RowIdMask::BlockList(block_list) if block_list.is_empty() => {
+        RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
             // Matches all row ids in the given fragments.
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
@@ -595,7 +595,7 @@ async fn row_ids_for_mask(
                 Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
             }
         }
-        RowIdMask::AllowList(mut allow_list) => {
+        RowAddrMask::AllowList(mut allow_list) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
             if let Some(allow_list_iter) = allow_list.row_addrs() {
@@ -608,7 +608,7 @@ async fn row_ids_for_mask(
                     .collect())
             }
         }
-        RowIdMask::BlockList(block_list) => {
+        RowAddrMask::BlockList(block_list) => {
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
