@@ -1856,13 +1856,14 @@ def test_json_index():
     )
 
 
-def test_null_handling(tmp_path: Path):
+def test_null_handling():
     tbl = pa.table(
         {
             "x": [1, 2, None, 3],
+            "y": ["a", "b", "c", None],
         }
     )
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset = lance.write_dataset(tbl, "memory://test")
 
     def check():
         assert dataset.to_table(filter="x IS NULL").num_rows == 1
@@ -1871,11 +1872,19 @@ def test_null_handling(tmp_path: Path):
         assert dataset.to_table(filter="x < 5").num_rows == 3
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
         assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x > 0 OR (y != 'a')").num_rows == 4
+        assert dataset.to_table(filter="x > 0 AND (y != 'a')").num_rows == 1
+        assert dataset.to_table(filter="y != 'a'").num_rows == 2
+        # NOT should exclude nulls (issue #4756)
+        assert dataset.to_table(filter="NOT (x < 2)").num_rows == 2
+        assert dataset.to_table(filter="NOT (x IN (1, 2))").num_rows == 1
+        # Double NOT
+        assert dataset.to_table(filter="NOT (NOT (x < 2))").num_rows == 1
 
     check()
     dataset.create_scalar_index("x", index_type="BITMAP")
     check()
-    dataset.create_scalar_index("x", index_type="BTREE")
+    dataset.create_scalar_index("y", index_type="BTREE")
     check()
 
 

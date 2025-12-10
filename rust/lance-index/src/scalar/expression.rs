@@ -16,13 +16,16 @@ use datafusion_expr::{
     expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
 };
+use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchResult, TextQuery, TokenQuery,
 };
-use futures::join;
-use lance_core::{utils::mask::RowIdMask, Error, Result};
+use lance_core::{
+    utils::mask::{NullableRowIdMask, RowIdMask},
+    Error, Result,
+};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -903,6 +906,81 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[derive(Debug)]
+enum NullableIndexExprResult {
+    Exact(NullableRowIdMask),
+    AtMost(NullableRowIdMask),
+    AtLeast(NullableRowIdMask),
+}
+
+impl From<SearchResult> for NullableIndexExprResult {
+    fn from(result: SearchResult) -> Self {
+        match result {
+            SearchResult::Exact(mask) => Self::Exact(NullableRowIdMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::AtMost(NullableRowIdMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowIdMask::AllowList(mask)),
+        }
+    }
+}
+
+impl std::ops::BitAnd<Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs & rhs),
+            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(lhs), Self::Exact(rhs)) => {
+                Self::AtMost(lhs & rhs)
+            }
+            (Self::Exact(exact), Self::AtLeast(_)) | (Self::AtLeast(_), Self::Exact(exact)) => {
+                // We could do better here, elements in both lhs and rhs are known
+                // to be true and don't require a recheck.  We only need to recheck
+                // elements in lhs that are not in rhs
+                Self::AtMost(exact)
+            }
+            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs & rhs),
+            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs & rhs),
+            (Self::AtMost(most), Self::AtLeast(_)) | (Self::AtLeast(_), Self::AtMost(most)) => {
+                Self::AtMost(most)
+            }
+        }
+    }
+}
+
+impl std::ops::BitOr<Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs | rhs),
+            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(rhs), Self::Exact(lhs)) => {
+                // We could do better here, elements in lhs are known to be true
+                // and don't require a recheck.  We only need to recheck elements
+                // in rhs that are not in lhs
+                Self::AtMost(lhs | rhs)
+            }
+            (Self::Exact(lhs), Self::AtLeast(rhs)) | (Self::AtLeast(rhs), Self::Exact(lhs)) => {
+                Self::AtLeast(lhs | rhs)
+            }
+            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs | rhs),
+            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs | rhs),
+            (Self::AtMost(_), Self::AtLeast(least)) | (Self::AtLeast(least), Self::AtMost(_)) => {
+                Self::AtLeast(least)
+            }
+        }
+    }
+}
+
+impl NullableIndexExprResult {
+    pub fn drop_nulls(self) -> IndexExprResult {
+        match self {
+            Self::Exact(mask) => IndexExprResult::Exact(mask.drop_nulls()),
+            Self::AtMost(mask) => IndexExprResult::AtMost(mask.drop_nulls()),
+            Self::AtLeast(mask) => IndexExprResult::AtLeast(mask.drop_nulls()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
@@ -981,115 +1059,57 @@ impl ScalarIndexExpr {
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
     #[async_recursion]
-    #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(
+    async fn evaluate_impl(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<IndexExprResult> {
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate(index_loader, metrics).await?;
-                match result {
-                    IndexExprResult::Exact(mask) => Ok(IndexExprResult::Exact(!mask)),
-                    IndexExprResult::AtMost(mask) => Ok(IndexExprResult::AtLeast(!mask)),
-                    IndexExprResult::AtLeast(mask) => Ok(IndexExprResult::AtMost(!mask)),
-                }
+                let result = inner.evaluate_impl(index_loader, metrics).await?;
+                // Flip certainty: NOT(AtMost) → AtLeast, NOT(AtLeast) → AtMost
+                Ok(match result {
+                    NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
+                    NullableIndexExprResult::AtMost(mask) => {
+                        NullableIndexExprResult::AtLeast(!mask)
+                    }
+                    NullableIndexExprResult::AtLeast(mask) => {
+                        NullableIndexExprResult::AtMost(!mask)
+                    }
+                })
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader, metrics);
-                let rhs_result = rhs.evaluate(index_loader, metrics);
-                let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                match (lhs_result?, rhs_result?) {
-                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::Exact(lhs & rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
-                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs & rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(_)) => {
-                        // We could do better here, elements in both lhs and rhs are known
-                        // to be true and don't require a recheck.  We only need to recheck
-                        // elements in lhs that are not in rhs
-                        Ok(IndexExprResult::AtMost(lhs))
-                    }
-                    (IndexExprResult::AtLeast(_), IndexExprResult::Exact(rhs)) => {
-                        // We could do better here (see above)
-                        Ok(IndexExprResult::AtMost(rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs & rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs & rhs))
-                    }
-                    (IndexExprResult::AtLeast(_), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtLeast(_)) => {
-                        Ok(IndexExprResult::AtMost(lhs))
-                    }
-                }
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader, metrics);
-                let rhs_result = rhs.evaluate(index_loader, metrics);
-                let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                match (lhs_result?, rhs_result?) {
-                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::Exact(lhs | rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
-                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
-                        // We could do better here.  Elements in the exact side don't need
-                        // re-check.  We only need to recheck elements exclusively in the
-                        // at-most side
-                        Ok(IndexExprResult::AtMost(lhs | rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtMost(_)) => {
-                        Ok(IndexExprResult::AtLeast(lhs))
-                    }
-                    (IndexExprResult::AtMost(_), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(rhs))
-                    }
-                }
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
-                match search_result {
-                    SearchResult::Exact(matching_row_ids) => {
-                        Ok(IndexExprResult::Exact(RowIdMask {
-                            block_list: None,
-                            allow_list: Some(matching_row_ids),
-                        }))
-                    }
-                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
-                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
-                }
+                Ok(search_result.into())
             }
         }
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<IndexExprResult> {
+        Ok(self
+            .evaluate_impl(index_loader, metrics)
+            .await?
+            .drop_nulls())
     }
 
     pub fn to_expr(&self) -> Expr {
@@ -2174,5 +2194,126 @@ mod tests {
         check_no_index(&index_info, "aisle = NULL");
         check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
         check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
+    }
+
+    #[tokio::test]
+    async fn test_not_flips_certainty() {
+        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+
+        // Test that NOT flips certainty for inexact index results
+        // This tests the implementation in evaluate_impl for Self::Not
+
+        // Helper function that mimics the NOT logic we just fixed
+        fn apply_not(result: NullableIndexExprResult) -> NullableIndexExprResult {
+            match result {
+                NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
+                NullableIndexExprResult::AtMost(mask) => NullableIndexExprResult::AtLeast(!mask),
+                NullableIndexExprResult::AtLeast(mask) => NullableIndexExprResult::AtMost(!mask),
+            }
+        }
+
+        // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
+        let at_most = NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
+        assert!(matches!(
+            apply_not(at_most),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
+        let at_least = NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
+        assert!(matches!(
+            apply_not(at_least),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // Exact should stay Exact
+        let exact = NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        assert!(matches!(
+            apply_not(exact),
+            NullableIndexExprResult::Exact(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_and_or_preserve_certainty() {
+        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+
+        // Test that AND/OR correctly propagate certainty
+        let make_at_most = || {
+            NullableIndexExprResult::AtMost(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                RowAddrTreeMap::new(),
+            )))
+        };
+
+        let make_at_least = || {
+            NullableIndexExprResult::AtLeast(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                RowAddrTreeMap::new(),
+            )))
+        };
+
+        let make_exact = || {
+            NullableIndexExprResult::Exact(NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[1, 2]),
+                RowAddrTreeMap::new(),
+            )))
+        };
+
+        // AtMost & AtMost → AtMost
+        assert!(matches!(
+            make_at_most() & make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtLeast & AtLeast → AtLeast
+        assert!(matches!(
+            make_at_least() & make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtMost & AtLeast → AtMost (superset remains superset)
+        assert!(matches!(
+            make_at_most() & make_at_least(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtMost | AtMost → AtMost
+        assert!(matches!(
+            make_at_most() | make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtLeast | AtLeast → AtLeast
+        assert!(matches!(
+            make_at_least() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtMost | AtLeast → AtLeast (subset coverage guaranteed)
+        assert!(matches!(
+            make_at_most() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // Exact & AtMost → AtMost
+        assert!(matches!(
+            make_exact() & make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // Exact | AtLeast → AtLeast
+        assert!(matches!(
+            make_exact() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
     }
 }

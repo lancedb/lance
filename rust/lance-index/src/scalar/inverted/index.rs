@@ -547,7 +547,7 @@ impl ScalarIndex for InvertedIndex {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowAddrTreeMap::from_iter(row_ids)))
+                Ok(SearchResult::at_most(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
     }
