@@ -578,6 +578,16 @@ pub struct BTreeLookup {
     all_null_pages: Vec<u32>,
 }
 
+impl BTreeLookup {
+    fn empty() -> Self {
+        Self {
+            tree: BTreeMap::new(),
+            null_pages: Vec::new(),
+            all_null_pages: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 enum Matches {
     Some(u32),
@@ -865,16 +875,13 @@ impl DeepSizeOf for BTreeIndex {
 
 impl BTreeIndex {
     fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
-        all_null_pages: Vec<u32>,
+        page_lookup: Arc<BTreeLookup>,
         store: Arc<dyn IndexStore>,
         data_type: DataType,
         index_cache: WeakLanceCache,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
-        let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages, all_null_pages));
         Self {
             page_lookup,
             store,
@@ -955,10 +962,9 @@ impl BTreeIndex {
 
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
+            let page_lookup = Arc::new(BTreeLookup::empty());
             return Ok(Self::new(
-                map,
-                null_pages,
-                all_null_pages,
+                page_lookup,
                 store,
                 data_type,
                 WeakLanceCache::from(index_cache),
@@ -1007,10 +1013,10 @@ impl BTreeIndex {
 
         let data_type = mins.data_type();
 
+        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
+
         Ok(Self::new(
-            map,
-            null_pages,
-            all_null_pages,
+            page_lookup,
             store,
             data_type.clone(),
             WeakLanceCache::from(index_cache),
