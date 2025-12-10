@@ -60,6 +60,7 @@ from .fragment import (
 from .fragment import (
     RowIdMeta as RowIdMeta,
 )
+from .indices import IndexDescription as IndexDescription
 from .optimize import (
     Compaction as Compaction,
 )
@@ -81,13 +82,6 @@ from .trace import capture_trace_events as capture_trace_events
 from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
-def infer_tfrecord_schema(
-    uri: str,
-    tensor_features: Optional[List[str]] = None,
-    string_features: Optional[List[str]] = None,
-) -> pa.Schema: ...
-def read_tfrecord(uri: str, schema: pa.Schema) -> pa.RecordBatchReader: ...
-
 class CleanupStats:
     bytes_removed: int
     old_versions: int
@@ -101,6 +95,7 @@ class LanceFileWriter:
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
         storage_options_provider: Optional[StorageOptionsProvider],
+        s3_credentials_refresh_offset_seconds: Optional[int],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -111,7 +106,11 @@ class LanceFileWriter:
 
 class LanceFileSession:
     def __init__(
-        self, base_path: str, storage_options: Optional[Dict[str, str]] = None
+        self,
+        base_path: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -125,12 +124,18 @@ class LanceFileSession:
         keep_original_array: Optional[bool] = None,
         max_page_bytes: Optional[int] = None,
     ) -> LanceFileWriter: ...
+    def contains(self, path: str) -> bool: ...
+    def list(self, path: Optional[str] = None) -> List[str]: ...
+    def upload_file(self, local_path: str, remote_path: str) -> None: ...
+    def download_file(self, remote_path: str, local_path: str) -> None: ...
 
 class LanceFileReader:
     def __init__(
         self,
         path: str,
         storage_options: Optional[Dict[str, str]],
+        storage_options_provider: Optional[StorageOptionsProvider],
+        s3_credentials_refresh_offset_seconds: Optional[int],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -215,6 +220,7 @@ class _Dataset:
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
     def load_indices(self) -> List[Index]: ...
+    def describe_indices(self) -> List[IndexDescription]: ...
     def scanner(
         self,
         columns: Optional[List[str]] = None,

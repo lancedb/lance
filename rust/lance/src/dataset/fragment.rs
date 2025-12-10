@@ -1115,6 +1115,43 @@ impl FileFragment {
         }
     }
 
+    /// Get the number of physical rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count in the metadata.  This method should
+    /// only be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_physical_rows(&self) -> Result<usize> {
+        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
+            Ok(self.metadata.physical_rows.unwrap())
+        } else {
+            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+        }
+    }
+
+    /// Get the number of deleted rows in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_num_deletions(&self) -> Result<usize> {
+        match &self.metadata().deletion_file {
+            Some(DeletionFile {
+                num_deleted_rows: Some(num_deleted),
+                ..
+            }) => Ok(*num_deleted),
+            None => Ok(0),
+            _ => Err(Error::Internal { message: format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()), location: location!() }),
+        }
+    }
+
+    /// Get the number of logical rows (physical rows - deleted rows) in the fragment synchronously
+    ///
+    /// Fails if the fragment does not have the physical row count or deletion count in the metadata.  This method should only
+    /// be called in new workflows which are not run on old versions of Lance.
+    pub fn fast_logical_rows(&self) -> Result<usize> {
+        let num_physical_rows = self.fast_physical_rows()?;
+        let num_deleted_rows = self.fast_num_deletions()?;
+        Ok(num_physical_rows - num_deleted_rows)
+    }
+
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
@@ -1131,7 +1168,7 @@ impl FileFragment {
         // incorrect `physical_row` values. So if we don't have a writer version,
         // we should not used the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
-        // See: https://github.com/lancedb/lance/issues/1531
+        // See: https://github.com/lance-format/lance/issues/1531
         if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
             return Ok(self.metadata.physical_rows.unwrap());
         }
@@ -1157,8 +1194,6 @@ impl FileFragment {
     /// Verifies:
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
-    /// * All fields in the schema have a corresponding field in one of the data
-    ///   files
     /// * All data files exist and have the same length
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
@@ -2604,11 +2639,7 @@ mod tests {
     use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
-    use lance_io::{
-        assert_io_eq, assert_io_lt,
-        object_store::{ObjectStore, ObjectStoreParams},
-        utils::tracking_store::IOTracker,
-    };
+    use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -3883,12 +3914,7 @@ mod tests {
         )
         .unwrap();
         let session = Arc::new(Session::default());
-        let io_stats = Arc::new(IOTracker::default());
         let write_params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_stats.clone()),
-                ..Default::default()
-            }),
             session: Some(session.clone()),
             ..Default::default()
         };
@@ -3901,9 +3927,9 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = io_stats.incremental_stats();
+            let stats = dataset.object_store().io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
-            assert_io_lt!(stats, write_bytes, 4300);
+            assert_io_lt!(stats, written_bytes, 4300);
         }
 
         // Measure IOPS needed to scan all data first time.
@@ -3926,7 +3952,7 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = io_stats.incremental_stats();
+        let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }

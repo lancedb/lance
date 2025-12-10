@@ -18,6 +18,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
@@ -76,24 +77,94 @@ impl RestAdapter {
             .with_state(self.backend.clone())
     }
 
-    /// Start the REST server (blocking)
-    pub async fn serve(self) -> Result<()> {
+    /// Start the REST server in the background and return a handle for shutdown.
+    ///
+    /// This method binds to the configured address and spawns a background task
+    /// to handle requests. The returned handle can be used to gracefully shut down
+    /// the server.
+    ///
+    /// Returns an error immediately if the server fails to bind to the address.
+    /// If port 0 is specified, the OS will assign an available ephemeral port.
+    /// The actual port can be retrieved from the returned handle via `port()`.
+    pub async fn start(self) -> Result<RestAdapterHandle> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| Error::IO {
+
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
+            Error::IO {
                 source: Box::new(e),
                 location: snafu::location!(),
-            })?;
+            }
+        })?;
 
-        axum::serve(listener, self.router())
-            .await
-            .map_err(|e| Error::IO {
-                source: Box::new(e),
-                location: snafu::location!(),
-            })?;
+        // Get the actual port (important when port 0 was specified)
+        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
-        Ok(())
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let router = self.router();
+
+        tokio::spawn(async move {
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await;
+
+            if let Err(e) = result {
+                log::error!("RestAdapter: server error: {}", e);
+            }
+
+            // Signal that server has shut down
+            let _ = done_tx.send(());
+        });
+
+        Ok(RestAdapterHandle {
+            shutdown_tx,
+            done_rx: std::sync::Mutex::new(Some(done_rx)),
+            port: actual_port,
+        })
+    }
+}
+
+/// Handle for controlling a running REST adapter server.
+///
+/// Use this handle to gracefully shut down the server when it's no longer needed.
+pub struct RestAdapterHandle {
+    shutdown_tx: watch::Sender<bool>,
+    done_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    port: u16,
+}
+
+impl RestAdapterHandle {
+    /// Get the actual port the server is listening on.
+    /// This is useful when port 0 was specified to get an OS-assigned port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Gracefully shut down the server and wait for it to complete.
+    ///
+    /// This signals the server to stop accepting new connections, waits for
+    /// existing connections to complete, and blocks until the server has
+    /// fully shut down.
+    pub fn shutdown(&self) {
+        // Send shutdown signal
+        let _ = self.shutdown_tx.send(true);
+
+        // Wait for server to complete
+        if let Some(done_rx) = self.done_rx.lock().unwrap().take() {
+            // Use a new runtime to block on the oneshot receiver
+            // This is needed because shutdown() is called from sync context
+            let _ = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _ = rt.block_on(done_rx);
+            })
+            .join();
+        }
     }
 }
 
@@ -476,17 +547,16 @@ mod tests {
         use crate::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
         use std::sync::Arc;
         use tempfile::TempDir;
-        use tokio::task::JoinHandle;
 
         /// Test fixture that manages server lifecycle
         struct RestServerFixture {
             _temp_dir: TempDir,
             namespace: crate::RestNamespace,
-            server_handle: JoinHandle<()>,
+            server_handle: RestAdapterHandle,
         }
 
         impl RestServerFixture {
-            async fn new(port: u16) -> Self {
+            async fn new() -> Self {
                 let temp_dir = TempDir::new().unwrap();
                 let temp_path = temp_dir.path().to_str().unwrap().to_string();
 
@@ -498,22 +568,20 @@ mod tests {
                     .unwrap();
                 let backend = Arc::new(backend);
 
-                // Start REST server
+                // Start REST server with port 0 (OS assigns available port)
                 let config = RestAdapterConfig {
-                    host: "127.0.0.1".to_string(),
-                    port,
+                    port: 0,
+                    ..Default::default()
                 };
 
                 let server = RestAdapter::new(backend.clone(), config);
-                let server_handle = tokio::spawn(async move {
-                    server.serve().await.unwrap();
-                });
+                let server_handle = server.start().await.unwrap();
 
-                // Give server time to start
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Get the actual port assigned by OS
+                let actual_port = server_handle.port();
 
                 // Create RestNamespace client
-                let server_url = format!("http://127.0.0.1:{}", port);
+                let server_url = format!("http://127.0.0.1:{}", actual_port);
                 let namespace = RestNamespaceBuilder::new(&server_url)
                     .delimiter("$")
                     .build();
@@ -528,7 +596,7 @@ mod tests {
 
         impl Drop for RestServerFixture {
             fn drop(&mut self) {
-                self.server_handle.abort();
+                self.server_handle.shutdown();
             }
         }
 
@@ -563,9 +631,9 @@ mod tests {
             Bytes::from(buffer)
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_create_and_list_child_namespaces() {
-            let fixture = RestServerFixture::new(4001).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespaces
             for i in 1..=3 {
@@ -593,9 +661,9 @@ mod tests {
             assert!(namespaces.namespaces.contains(&"namespace3".to_string()));
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_nested_namespace_hierarchy() {
-            let fixture = RestServerFixture::new(4002).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create parent namespace
             let create_req = CreateNamespaceRequest {
@@ -646,9 +714,9 @@ mod tests {
             assert!(children.contains(&"child2".to_string()));
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_create_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4003).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace first
@@ -699,9 +767,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_list_tables_in_child_namespace() {
-            let fixture = RestServerFixture::new(4004).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -746,9 +814,9 @@ mod tests {
             assert!(tables.tables.contains(&"table3".to_string()));
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_table_exists_in_child_namespace() {
-            let fixture = RestServerFixture::new(4005).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -783,9 +851,9 @@ mod tests {
             assert!(result.is_ok(), "Table should exist in child namespace");
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_empty_table_exists_in_child_namespace() {
-            let fixture = RestServerFixture::new(4015).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -818,9 +886,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_describe_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4006).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -908,9 +976,9 @@ mod tests {
             }
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_drop_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4007).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -958,9 +1026,9 @@ mod tests {
             // (error message varies depending on implementation details)
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_create_empty_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4008).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1012,9 +1080,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_describe_empty_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4016).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1067,9 +1135,9 @@ mod tests {
             // (schema is None until data is added)
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_drop_empty_table_in_child_namespace() {
-            let fixture = RestServerFixture::new(4017).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1112,9 +1180,9 @@ mod tests {
             // (error message varies depending on implementation details)
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_deeply_nested_namespace_with_empty_table() {
-            let fixture = RestServerFixture::new(4018).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create deeply nested namespace hierarchy
             let create_req = CreateNamespaceRequest {
@@ -1185,9 +1253,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_deeply_nested_namespace_with_table() {
-            let fixture = RestServerFixture::new(4009).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create deeply nested namespace hierarchy
@@ -1266,9 +1334,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_namespace_isolation() {
-            let fixture = RestServerFixture::new(4010).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create two sibling namespaces
@@ -1341,9 +1409,9 @@ mod tests {
             assert!(fixture.namespace.table_exists(exists_req).await.is_ok());
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_drop_namespace_with_tables_fails() {
-            let fixture = RestServerFixture::new(4011).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create namespace
@@ -1387,9 +1455,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_drop_empty_child_namespace() {
-            let fixture = RestServerFixture::new(4012).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1422,9 +1490,9 @@ mod tests {
             // (error message varies depending on implementation details)
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_namespace_with_properties() {
-            let fixture = RestServerFixture::new(4013).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create namespace with properties
             let mut properties = std::collections::HashMap::new();
@@ -1455,9 +1523,9 @@ mod tests {
             assert_eq!(props.get("environment"), Some(&"production".to_string()));
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_root_namespace_operations() {
-            let fixture = RestServerFixture::new(4014).await;
+            let fixture = RestServerFixture::new().await;
 
             // Root namespace should always exist
             let exists_req = NamespaceExistsRequest { id: Some(vec![]) };
@@ -1492,9 +1560,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_register_table() {
-            let fixture = RestServerFixture::new(4019).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -1556,9 +1624,9 @@ mod tests {
             assert!(result.is_ok(), "Registered table should exist");
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_register_table_rejects_absolute_uri() {
-            let fixture = RestServerFixture::new(4020).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1590,9 +1658,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_register_table_rejects_path_traversal() {
-            let fixture = RestServerFixture::new(4021).await;
+            let fixture = RestServerFixture::new().await;
 
             // Create child namespace
             let create_ns_req = CreateNamespaceRequest {
@@ -1624,9 +1692,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_deregister_table() {
-            let fixture = RestServerFixture::new(4022).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -1701,9 +1769,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_register_deregister_round_trip() {
-            let fixture = RestServerFixture::new(4023).await;
+            let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
 
             // Create child namespace
@@ -1814,7 +1882,7 @@ mod tests {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_namespace_write() {
             use arrow::array::Int32Array;
             use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -1822,7 +1890,7 @@ mod tests {
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::LanceNamespace;
 
-            let fixture = RestServerFixture::new(4024).await;
+            let fixture = RestServerFixture::new().await;
             let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
 
             // Use child namespace instead of root

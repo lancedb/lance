@@ -41,6 +41,7 @@ from .udf import BatchUDF, normalize_transform
 if TYPE_CHECKING:
     from .dataset import (
         ColumnOrdering,
+        DatasetBasePath,
         LanceDataset,
         LanceScanner,
         ReaderLike,
@@ -866,6 +867,8 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider=None,
         enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -885,6 +888,8 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider=None,
         enable_stable_row_ids: bool = False,
+        target_bases: Optional[List[str]] = None,
+        initial_bases: Optional[List["DatasetBasePath"]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -904,6 +909,8 @@ def write_fragments(
     storage_options: Optional[Dict[str, str]] = None,
     storage_options_provider=None,
     enable_stable_row_ids: bool = False,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List["DatasetBasePath"]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -961,6 +968,29 @@ def write_fragments(
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    target_bases : list of str, optional
+        References to base paths where data should be written. Can be
+        specified in all modes.
+
+        Each string is resolved by trying to match:
+        1. Base name (e.g., "primary", "archive") from registered bases
+        2. Base path URI (e.g., "s3://bucket1/data")
+
+        **CREATE mode**: References must match bases in `initial_bases`
+        **APPEND/OVERWRITE modes**: References must match bases in the
+        existing manifest
+    initial_bases : list of DatasetBasePath, optional
+        Base paths to register when creating a new dataset (CREATE mode only).
+
+        This allows `target_bases` references to be resolved during fragment
+        writing. Example:
+
+        >>> from lance import DatasetBasePath
+        >>> initial_bases = [DatasetBasePath(path="s3://bucket1/data", name="base1")]
+
+        **Only valid in CREATE mode**. Will raise an error if used with
+        APPEND/OVERWRITE modes.
+
     Returns
     -------
     List[FragmentMetadata] | Transaction
@@ -1010,6 +1040,8 @@ def write_fragments(
         storage_options=storage_options,
         storage_options_provider=storage_options_provider,
         enable_stable_row_ids=enable_stable_row_ids,
+        target_bases=target_bases,
+        initial_bases=initial_bases,
     )
 
 

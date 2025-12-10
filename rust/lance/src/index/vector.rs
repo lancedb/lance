@@ -633,7 +633,7 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
-                    OptimizeOptions::new(),
+                    OptimizeOptions::append(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
@@ -649,7 +649,7 @@ pub(crate) async fn build_vector_index_incremental(
                     shuffler,
                     (),
                     frag_reuse_index,
-                    OptimizeOptions::new(),
+                    OptimizeOptions::append(),
                 )?
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
@@ -673,7 +673,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
-                OptimizeOptions::new(),
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -690,7 +690,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
-                OptimizeOptions::new(),
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -707,7 +707,7 @@ pub(crate) async fn build_vector_index_incremental(
                 shuffler,
                 (),
                 frag_reuse_index,
-                OptimizeOptions::new(),
+                OptimizeOptions::append(),
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
@@ -736,7 +736,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
-                        OptimizeOptions::new(),
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
@@ -752,7 +752,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
-                        OptimizeOptions::new(),
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
@@ -768,7 +768,7 @@ pub(crate) async fn build_vector_index_incremental(
                         shuffler,
                         hnsw_params.clone(),
                         frag_reuse_index,
-                        OptimizeOptions::new(),
+                        OptimizeOptions::append(),
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)

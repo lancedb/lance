@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - main
+      - release/**
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - Cargo.*
       - python/**
@@ -35,7 +39,7 @@ env:
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: "ubuntu-24.04"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -92,7 +96,7 @@ jobs:
       matrix:
         python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: "ubuntu-24.04"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash
@@ -155,7 +159,7 @@ jobs:
 
   linux-arm:
     timeout-minutes: 45
-    runs-on: ubuntu-2404-4x-arm64
+    runs-on: warp-ubuntu-latest-arm64-4x
     name: Python Linux 3.13 ARM
     defaults:
       run:
@@ -187,7 +191,7 @@ jobs:
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
-    runs-on: "macos-14"
+    runs-on: "warp-macos-14-arm64-6x"
     defaults:
       run:
         shell: bash
@@ -234,7 +238,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
-    runs-on: "ubuntu-latest"
+    runs-on: "warp-ubuntu-latest-x64-4x"
     defaults:
       run:
         shell: bash

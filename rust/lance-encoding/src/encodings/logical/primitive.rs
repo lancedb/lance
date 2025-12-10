@@ -1195,8 +1195,8 @@ impl CachedPageData for MiniBlockCacheableState {
 /// need the first chunk (for the trailer which has the 11th row in our range) and the second
 /// chunk.  The final decode task will just need the second chunk.
 ///
-/// The above prose descriptions are what are represented by [`ChunkInstructions`] and
-/// [`ChunkDrainInstructions`].
+/// The above prose descriptions are what are represented by `ChunkInstructions` and
+/// `ChunkDrainInstructions`.
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf

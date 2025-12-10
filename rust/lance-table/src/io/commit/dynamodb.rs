@@ -21,6 +21,7 @@ use object_store::path::Path;
 use snafu::location;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use lance_core::error::box_error;
@@ -82,7 +83,14 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn wrap_err(self) -> Result<T> {
-        self.map_err(|err| Error::from(WrappedSdkError(err)))
+        self.map_err(|err| {
+            warn!(
+                target: "lance::dynamodb",
+                request_id = err.request_id().unwrap_or("unknown"),
+                "DynamoDB SDK error: {err:?}",
+            );
+            Error::from(WrappedSdkError(err))
+        })
     }
 }
 

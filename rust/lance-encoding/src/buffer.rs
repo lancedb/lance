@@ -114,23 +114,23 @@ impl LanceBuffer {
         Self(Buffer::from_vec(self.0.to_vec()))
     }
 
-    /// Reinterprets a Vec<T> as a LanceBuffer
+    /// Reinterprets a `Vec<T>` as a LanceBuffer
     ///
-    /// This is a zero-copy operation. We can safely reinterpret Vec<T> into &[u8] which is what happens here.
-    /// However, we cannot safely reinterpret a Vec<T> into a Vec<u8> in rust due to alignment constraints
+    /// This is a zero-copy operation. We can safely reinterpret `Vec<T>` into `&[u8]` which is what happens here.
+    /// However, we cannot safely reinterpret a `Vec<T>` into a `Vec<u8>` in rust due to alignment constraints
     /// from [`Vec::from_raw_parts`]:
     ///
     /// > `T` needs to have the same alignment as what `ptr` was allocated with.
     /// > (`T` having a less strict alignment is not sufficient, the alignment really
-    /// > needs to be equal to satisfy the [`dealloc`] requirement that memory must be
+    /// > needs to be equal to satisfy the `dealloc` requirement that memory must be
     /// > allocated and deallocated with the same layout.)
     pub fn reinterpret_vec<T: ArrowNativeType>(vec: Vec<T>) -> Self {
         Self(Buffer::from_vec(vec))
     }
 
-    /// Reinterprets Arc<[T]> as a LanceBuffer
+    /// Reinterprets `Arc<[T]>` as a LanceBuffer
     ///
-    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    /// This is similar to [`Self::reinterpret_vec`] but for `Arc<[T]>` instead of `Vec<T>`
     ///
     /// The same alignment constraints apply
     pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
@@ -142,7 +142,7 @@ impl LanceBuffer {
         Self(buffer)
     }
 
-    /// Reinterprets a LanceBuffer into a Vec<T>
+    /// Reinterprets a LanceBuffer into a `Vec<T>`
     ///
     /// If the underlying buffer is not properly aligned, this will involve a copy of the data
     ///
@@ -168,9 +168,9 @@ impl LanceBuffer {
         }
     }
 
-    /// Reinterprets a LanceBuffer into a &[T]
+    /// Reinterprets a LanceBuffer into a `&[T]`
     ///
-    /// Unlike [`borrow_to_typed_slice`], this function returns a `Cow<'_, [T]>` instead of an owned
+    /// Unlike [`Self::borrow_to_typed_slice`], this function returns a `Cow<'_, [T]>` instead of an owned
     /// buffer. It saves the cost of Arc creation and destruction, which can be really helpful when
     /// we borrow data and just drop it without reusing it.
     ///

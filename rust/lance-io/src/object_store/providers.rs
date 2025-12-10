@@ -10,6 +10,9 @@ use object_store::path::Path;
 use snafu::location;
 use url::Url;
 
+use crate::object_store::uri_to_url;
+use crate::object_store::WrappingObjectStore;
+
 use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
@@ -19,6 +22,8 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "huggingface")]
+pub mod huggingface;
 pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
@@ -55,11 +60,10 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Providers should override this if they have special requirements like Azure's.
     fn calculate_object_store_prefix(
         &self,
-        scheme: &str,
-        authority: &str,
+        url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        Ok(format!("{}${}", scheme, authority))
+        Ok(format!("{}${}", url.scheme(), url.authority()))
     }
 }
 
@@ -167,11 +171,8 @@ impl ObjectStoreRegistry {
             return Err(self.scheme_not_found_error(scheme));
         };
 
-        let cache_path = provider.calculate_object_store_prefix(
-            base_path.scheme(),
-            base_path.authority(),
-            params.storage_options.as_ref(),
-        )?;
+        let cache_path =
+            provider.calculate_object_store_prefix(&base_path, params.storage_options.as_ref())?;
         let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params
@@ -210,6 +211,9 @@ impl ObjectStoreRegistry {
             store.inner = wrapper.wrap(&cache_path, store.inner);
         }
 
+        // Always wrap with IO tracking
+        store.inner = store.io_tracker.wrap("", store.inner);
+
         let store = Arc::new(store);
 
         {
@@ -228,35 +232,16 @@ impl ObjectStoreRegistry {
         uri: &str,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        let (scheme, authority) = match uri.find("://") {
+        let url = uri_to_url(uri)?;
+        match self.get_provider(url.scheme()) {
             None => {
-                // If there is no scheme, this is a file:// URI.
-                return Ok("file".to_string());
-            }
-            Some(index) => {
-                let scheme = &uri[..index];
-                let remainder = &uri[index + 3..];
-                let authority = match remainder.find("/") {
-                    None => remainder,
-                    Some(sindex) => &remainder[..sindex],
-                };
-                (scheme, authority)
-            }
-        };
-        match self.get_provider(scheme) {
-            None => {
-                if scheme.len() == 1 {
-                    // On Windows, drive letters such as C:/ can sometimes be confused for schemes.
-                    // So if there is no known object store for this single-letter scheme, treat it
-                    // as the local store.
+                if url.scheme() == "file" || url.scheme().len() == 1 {
                     Ok("file".to_string())
                 } else {
-                    Err(self.scheme_not_found_error(scheme))
+                    Err(self.scheme_not_found_error(url.scheme()))
                 }
             }
-            Some(provider) => {
-                provider.calculate_object_store_prefix(scheme, authority, storage_options)
-            }
+            Some(provider) => provider.calculate_object_store_prefix(&url, storage_options),
         }
     }
 }
@@ -289,6 +274,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "huggingface")]
+        providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
@@ -328,11 +315,10 @@ mod tests {
     #[test]
     fn test_calculate_object_store_prefix() {
         let provider = DummyProvider;
+        let url = Url::parse("dummy://blah/path").unwrap();
         assert_eq!(
             "dummy$blah",
-            provider
-                .calculate_object_store_prefix("dummy", "blah", None)
-                .unwrap()
+            provider.calculate_object_store_prefix(&url, None).unwrap()
         );
     }
 

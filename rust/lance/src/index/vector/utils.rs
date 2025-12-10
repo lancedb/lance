@@ -7,6 +7,7 @@ use arrow_array::{cast::AsArray, ArrayRef, FixedSizeListArray, RecordBatch};
 use futures::StreamExt;
 use lance_arrow::{interleave_batches, DataTypeExt};
 use lance_core::datatypes::Schema;
+use lance_linalg::distance::DistanceType;
 use log::info;
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
@@ -120,6 +121,46 @@ pub fn get_vector_type(
         field.data_type(),
         infer_vector_element_type(&field.data_type())?,
     ))
+}
+
+/// Returns the default distance type for the given vector element type.
+pub fn default_distance_type_for(element_type: &arrow_schema::DataType) -> DistanceType {
+    match element_type {
+        arrow_schema::DataType::UInt8 => DistanceType::Hamming,
+        _ => DistanceType::L2,
+    }
+}
+
+/// Validate that the distance type is supported by the vector element type.
+pub fn validate_distance_type_for(
+    distance_type: DistanceType,
+    element_type: &arrow_schema::DataType,
+) -> Result<()> {
+    let supported = match element_type {
+        arrow_schema::DataType::UInt8 => matches!(distance_type, DistanceType::Hamming),
+        arrow_schema::DataType::Int8
+        | arrow_schema::DataType::Float16
+        | arrow_schema::DataType::Float32
+        | arrow_schema::DataType::Float64 => {
+            matches!(
+                distance_type,
+                DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
+            )
+        }
+        _ => false,
+    };
+
+    if supported {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            format!(
+                "Distance type {} does not support {} vectors",
+                distance_type, element_type
+            ),
+            location!(),
+        ))
+    }
 }
 
 /// If the data type is a fixed size list or list of fixed size list return the inner element type

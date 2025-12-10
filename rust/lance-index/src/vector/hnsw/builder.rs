@@ -16,7 +16,7 @@ use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use snafu::location;
 use std::cmp::min;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -243,39 +243,59 @@ impl HNSW {
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
-        let node_ids = storage
-            .row_ids()
-            .enumerate()
-            .filter_map(|(node_id, _)| {
-                prefilter_bitset
-                    .contains(node_id as u32)
-                    .then_some(node_id as u32)
-            })
-            .collect_vec();
-
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
-        for i in 0..node_ids.len() {
-            if let Some(ahead) = self.inner.params.prefetch_distance {
-                if i + ahead < node_ids.len() {
-                    dist_calc.prefetch(node_ids[i + ahead]);
+
+        match self.inner.params.prefetch_distance {
+            Some(ahead) if ahead > 0 => {
+                let mut ids_iter = prefilter_bitset.iter_ones().map(|i| i as u32);
+                let mut buffer = VecDeque::with_capacity(ahead + 1);
+                for _ in 0..=ahead {
+                    if let Some(id) = ids_iter.next() {
+                        buffer.push_back(id);
+                    } else {
+                        break;
+                    }
+                }
+
+                while let Some(node_id) = buffer.pop_front() {
+                    if let Some(&prefetch_id) = buffer.get(ahead - 1) {
+                        dist_calc.prefetch(prefetch_id);
+                    }
+                    if let Some(next) = ids_iter.next() {
+                        buffer.push_back(next);
+                    }
+
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
                 }
             }
-            let node_id = node_ids[i];
-            let dist: OrderedFloat = dist_calc.distance(node_id).into();
-            if dist <= lower_bound || dist > upper_bound {
-                continue;
+            _ => {
+                for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
+                }
             }
-            if heap.len() < k {
-                heap.push((dist, node_id).into());
-            } else if dist < heap.peek().unwrap().dist {
-                heap.pop();
-                heap.push((dist, node_id).into());
-            }
-        }
+        };
         heap.into_sorted_vec()
     }
 

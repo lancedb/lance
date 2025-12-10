@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import logging
 import platform
 import random
 import string
@@ -12,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance import LanceFragment
+from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
@@ -461,6 +462,27 @@ def test_create_index_unsupported_accelerator(tmp_path):
         )
 
 
+def test_create_index_accelerator_fallback(tmp_path, caplog):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            num_partitions=4,
+            accelerator="cuda",
+        )
+
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "IVF_HNSW_SQ"
+    assert any(
+        "does not support GPU acceleration; falling back to CPU" in record.message
+        for record in caplog.records
+    )
+
+
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
@@ -654,6 +676,133 @@ def test_ivf_flat_over_binary_vector(tmp_path):
             "metric": "hamming",
         }
     )
+
+
+def test_ivf_flat_respects_index_metric_binary(tmp_path):
+    # Binary vectors indexed with Hamming should ignore a user-specified L2 metric.
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array([[0], [128], [255]], type=pa.list_(pa.uint8(), 1)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="hamming",
+    )
+
+    query = np.array([128], dtype=np.uint8)
+
+    # Search should succeed and use the index's Hamming metric despite the L2 hint.
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "l2",
+        },
+    )
+
+    # Should succeed even though user asked for L2 (index metric is used).
+    assert indexed["id"].to_pylist() == [1, 0, 2]
+
+
+def test_ivf_flat_respects_index_metric_float(tmp_path):
+    # Float vectors indexed with L2 should ignore a user-specified Hamming metric.
+    vectors = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([0.5, 0.0], dtype=np.float32)
+
+    indexed = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "hamming",
+        },
+    )
+
+    expected = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 3},
+    )
+
+    assert indexed["id"].to_pylist() == expected["id"].to_pylist()
+    assert np.allclose(
+        indexed["_distance"].to_numpy(), expected["_distance"].to_numpy()
+    )
+
+
+def test_bruteforce_uses_user_metric(tmp_path):
+    # Even if an index exists, a brute-force scan (use_index=False) should
+    # respect the user-specified metric instead of the index metric.
+    vectors = np.array(
+        [
+            [10.0, 10.0],  # Large magnitude, best under dot product
+            [-1.0, -1.0],
+            [1.0, 1.0],  # Closest under L2
+        ],
+        dtype=np.float32,
+    )
+    table = pa.Table.from_pydict(
+        {
+            "vector": pa.array(vectors.tolist(), type=pa.list_(pa.float32(), 2)),
+            "id": pa.array([0, 1, 2], type=pa.int32()),
+        }
+    )
+
+    ds = lance.write_dataset(table, tmp_path)
+    # Build an index with L2 metric.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        metric="l2",
+    )
+
+    query = np.array([1.0, 1.0], dtype=np.float32)
+
+    # Brute-force search should honor the requested dot metric (not the index's L2).
+    brute_force = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 3,
+            "metric": "dot",
+            "use_index": False,
+        },
+    )
+
+    # Under dot product the largest magnitude vector ranks first; under L2 it is last.
+    assert brute_force["id"].to_pylist() == [0, 2, 1]
 
 
 def test_create_ivf_sq_index(dataset, tmp_path):
@@ -1389,6 +1538,23 @@ def test_load_indices(dataset):
     )
     indices = dataset.list_indices()
     assert len(indices) == 1
+
+
+def test_describe_vector_index(indexed_dataset: LanceDataset):
+    info = indexed_dataset.describe_indices()[0]
+
+    assert info.name == "vector_idx"
+    assert info.type_url == "/lance.table.VectorIndexDetails"
+    # This is currently Unknown because vector indices are not yet handled by plugins
+    assert info.index_type == "Unknown"
+    assert info.num_rows_indexed == 1000
+    assert info.fields == [0]
+    assert info.field_names == ["vector"]
+    assert len(info.segments) == 1
+    assert info.segments[0].fragment_ids == {0}
+    assert info.segments[0].dataset_version_at_last_update == 1
+    assert info.segments[0].index_version == 1
+    assert info.segments[0].created_at is not None
 
 
 def test_optimize_indices(indexed_dataset):

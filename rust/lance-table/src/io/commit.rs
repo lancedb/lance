@@ -303,7 +303,7 @@ async fn current_manifest_path(
                 if next_version >= version {
                     warn!(
                         "List operation was expected to be lexically ordered, but was not. This \
-                         could mean a corrupt read. Please make a bug report on the lancedb/lance \
+                         could mean a corrupt read. Please make a bug report on the lance-format/lance \
                          GitHub repository."
                     );
                     break;
@@ -678,7 +678,7 @@ async fn build_dynamodb_external_store(
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{
-        config::{IdentityCache, Region},
+        config::{retry::RetryConfig, IdentityCache, Region},
         Client,
     };
 
@@ -687,7 +687,10 @@ async fn build_dynamodb_external_store(
         .region(Some(Region::new(region.to_string())))
         .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds))
         // caching should be handled by passed AwsCredentialProvider
-        .identity_cache(IdentityCache::no_cache());
+        .identity_cache(IdentityCache::no_cache())
+        // Be more resilient to transient network issues.
+        // 5 attempts = 1 initial + 4 retries with exponential backoff.
+        .retry_config(RetryConfig::standard().with_max_attempts(5));
 
     if let Some(endpoint) = endpoint {
         dynamodb_config = dynamodb_config.endpoint_url(endpoint);
@@ -721,7 +724,7 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "memory" => Ok(Arc::new(ConditionalPutCommitHandler)),
+        "s3" | "gs" | "az" | "memory" | "oss" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),

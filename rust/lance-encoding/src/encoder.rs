@@ -28,7 +28,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::BlobStructuralEncoder;
+use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
@@ -46,7 +46,7 @@ pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
 ///
 /// Maps to a top-level array
 ///
-/// For example, FixedSizeList<Int32> will have two EncodedArray instances and one EncodedPage
+/// For example, `FixedSizeList<Int32>` will have two EncodedArray instances and one EncodedPage
 #[derive(Debug)]
 pub struct EncodedPage {
     // The encoded page buffers
@@ -385,10 +385,24 @@ impl StructuralEncodingStrategy {
                         self.compression_strategy.clone(),
                     )?));
                 }
+                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
+                    return Ok(Box::new(BlobV2StructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
+                DataType::Struct(_) => {
+                    return Err(Error::InvalidInput {
+                        source: "Blob v2 struct input requires file version >= 2.2".into(),
+                        location: location!(),
+                    });
+                }
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!(
-                            "Blob encoding only supports Binary/LargeBinary, got {}",
+                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
                             data_type
                         )
                         .into(),

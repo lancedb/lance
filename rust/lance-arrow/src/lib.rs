@@ -39,12 +39,14 @@ pub mod r#struct;
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 
-/// Arrow extension metadata key for extension metadata  
+/// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Key used by lance to mark a field as a blob
 /// TODO: Use Arrow extension mechanism instead?
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+/// Arrow extension type name for Lance blob v2 columns
+pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -514,7 +516,7 @@ pub trait RecordBatchExt {
     /// Afterwards we add all non-matching right columns to the output.
     ///
     /// Note: This method likely does not handle nested fields correctly and you may want to consider
-    /// using [`merge_with_schema`] instead.
+    /// using [`Self::merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -1407,7 +1409,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 
 /// Interleave multiple RecordBatches into a single RecordBatch.
 ///
-/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+/// Behaves like [`arrow_select::interleave::interleave`], but for RecordBatches.
 pub fn interleave_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],
