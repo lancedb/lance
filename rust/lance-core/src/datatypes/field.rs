@@ -995,6 +995,7 @@ impl TryFrom<&ArrowField> for Field {
                 .map(|f| Self::try_from(f.as_ref()))
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::FixedSizeList(item, _) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
