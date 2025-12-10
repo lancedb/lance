@@ -785,11 +785,11 @@ mod tests {
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatchIterator, UInt32Array};
+    use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::DataTypeExt;
     use lance_io::stream::RecordBatchStream;
-    use arrow_array::{RecordBatchIterator, UInt32Array};
-    use arrow_schema::{Field, Schema, DataType};
 
     use lance_core::{utils::tempfile::TempStrDir, Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
@@ -1082,7 +1082,11 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
         let params = WriteParams::with_storage_version(LanceFileVersion::V2_2);
-        let dataset = Arc::new(Dataset::write(reader, &test_dir, Some(params)).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(reader, &test_dir, Some(params))
+                .await
+                .unwrap(),
+        );
 
         let blobs = dataset
             .take_blobs_by_indices(&[0, 1], "blob")
