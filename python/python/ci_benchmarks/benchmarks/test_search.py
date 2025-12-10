@@ -5,7 +5,7 @@ import re
 
 import lance
 import pytest
-from ci_benchmarks.datasets import get_dataset_uri
+from ci_benchmarks.datasets import get_dataset_uri, is_on_google
 from ci_benchmarks.utils import wipe_os_cache
 
 COLUMN_LABELS = ["bools", "normals"]
@@ -177,11 +177,24 @@ BASIC_BITMAP_FILTER_LABELS = [
 ]
 
 
+# Don't run the no_cache test on Google Cloud as it is way too expensive at the moment
+def use_cache_param():
+    if is_on_google():
+        return [True]
+    return [True, False]
+
+
+def use_cache_ids():
+    if is_on_google():
+        return ["cache"]
+    return ["cache", "no_cache"]
+
+
 # Repeats the same test for the basic dataset which is easier to test with locally
 # This benchmark is not part of the CI job as the EDA dataset is better for that
 @pytest.mark.parametrize("filt", BASIC_BITMAP_FILTERS, ids=BASIC_BITMAP_FILTER_LABELS)
 @pytest.mark.parametrize("payload", [None, "small_strings", "integers"])
-@pytest.mark.parametrize("use_cache", [True, False], ids=["cache", "no_cache"])
+@pytest.mark.parametrize("use_cache", use_cache_param(), ids=use_cache_ids())
 def test_basic_bitmap_search(
     benchmark, filt: str | None, payload: str | None, use_cache: bool
 ):

@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import lance
 import pytest
-from ci_benchmarks.datasets import open_dataset
+from ci_benchmarks.datasets import is_on_google, open_dataset
 
 # POSIX fadvise flag to drop page cache
 POSIX_FADV_DONTNEED = 4
@@ -65,6 +65,7 @@ def test_simple_random_access(benchmark, dataset, rows_per_take):
 
 @pytest.mark.parametrize("dataset", DATASETS)
 @pytest.mark.parametrize("rows_per_take", [1, 10, 100])
+@pytest.mark.skipif(is_on_google(), reason="Requires too many IOPS for cloud storage")
 def test_parallel_random_access(benchmark, dataset, rows_per_take):
     TAKES_PER_ITER = 100
 

@@ -118,7 +118,7 @@ async fn warm_indexed_equality_search(index: &dyn ScalarIndex) {
     let SearchResult::Exact(row_ids) = result else {
         panic!("Expected exact results")
     };
-    assert_eq!(row_ids.len(), Some(1));
+    assert_eq!(row_ids.true_rows().len(), Some(1));
 }
 
 async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
@@ -155,7 +155,7 @@ async fn warm_indexed_inequality_search(index: &dyn ScalarIndex) {
     };
 
     // 100Mi - 50M = 54,857,600
-    assert_eq!(row_ids.len(), Some(54857600));
+    assert_eq!(row_ids.true_rows().len(), Some(54857600));
 }
 
 async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
@@ -176,7 +176,7 @@ async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     };
 
     // Only 3 because 150M is not in dataset
-    assert_eq!(row_ids.len(), Some(3));
+    assert_eq!(row_ids.true_rows().len(), Some(3));
 }
 
 fn bench_baseline(c: &mut Criterion) {

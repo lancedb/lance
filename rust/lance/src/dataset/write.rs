@@ -739,6 +739,9 @@ impl GenericWriter for V2WriterAdapter {
         Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        if let Some(pre) = self.preprocessor.as_mut() {
+            pre.finish().await?;
+        }
         let field_ids = self
             .writer
             .field_id_to_column_indices()

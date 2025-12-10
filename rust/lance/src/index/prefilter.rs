@@ -350,7 +350,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1)); // There was just one row deleted.
+        assert_eq!(mask.block_list().and_then(|x| x.len()), Some(1)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get a mask
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -361,7 +361,7 @@ mod test {
         let mask = mask.unwrap().await.unwrap();
         let mut expected = RowAddrTreeMap::from_iter(vec![(2 << 32) + 2]);
         expected.insert_fragment(1);
-        assert_eq!(&mask.block_list, &Some(expected));
+        assert_eq!(mask.block_list(), Some(&expected));
 
         // If we don't pass the missing fragment id, we should get a smaller mask.
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -370,7 +370,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1));
+        assert_eq!(mask.block_list().and_then(|x| x.len()), Some(1));
 
         // If there are only missing fragments, we should still get a mask
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -382,7 +382,7 @@ mod test {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_fragment(1);
         expected.insert_fragment(2);
-        assert_eq!(&mask.block_list, &Some(expected));
+        assert_eq!(mask.block_list(), Some(&expected));
     }
 
     #[tokio::test]
@@ -405,7 +405,7 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         let expected = RowAddrTreeMap::from_iter(0..8);
-        assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
+        assert_eq!(mask.allow_list(), Some(&expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -414,7 +414,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(5)); // There were five rows left over;
+        assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(5)); // There were five rows left over;
 
         // If there are only missing fragments, we should get an allow list
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -423,6 +423,6 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+        assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
     }
 }
