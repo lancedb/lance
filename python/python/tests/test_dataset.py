@@ -2501,10 +2501,14 @@ def test_add_null_columns_with_conflict_names(tmp_path: Path):
     assert len(fragments) == 1
     assert len(fragments[0].data_files()) == 1
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns(pa.field("id", pa.float32()))
 
-    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+    with pytest.raises(
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+    ):
         ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
 
 
