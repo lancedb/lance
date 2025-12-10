@@ -788,13 +788,20 @@ mod tests {
     use futures::TryStreamExt;
     use lance_arrow::DataTypeExt;
     use lance_io::stream::RecordBatchStream;
+    use arrow_array::{RecordBatchIterator, UInt32Array};
+    use arrow_schema::{Field, Schema, DataType};
 
     use lance_core::{utils::tempfile::TempStrDir, Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
 
     use super::data_file_key_from_path;
-    use crate::{utils::test::TestDatasetGenerator, Dataset};
+    use crate::{
+        blob::{BlobArray, BlobArrayBuilder},
+        dataset::WriteParams,
+        utils::test::TestDatasetGenerator,
+        Dataset,
+    };
 
     struct BlobTestFixture {
         _test_dir: TempStrDir,
@@ -1053,5 +1060,39 @@ mod tests {
         assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("nested/path/xyz"), "xyz");
+    }
+
+    #[tokio::test]
+    async fn test_write_and_take_blobs_with_blob_array_builder() {
+        let test_dir = TempStrDir::default();
+
+        // Build a blob column with the new BlobArrayBuilder
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(b"hello").unwrap();
+        blob_builder.push_bytes(b"world").unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap().into();
+
+        let id_array: arrow_array::ArrayRef = Arc::new(UInt32Array::from(vec![0, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            BlobArray::field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let params = WriteParams::with_storage_version(LanceFileVersion::V2_2);
+        let dataset = Arc::new(Dataset::write(reader, &test_dir, Some(params)).await.unwrap());
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+
+        assert_eq!(blobs.len(), 2);
+        let first = blobs[0].read().await.unwrap();
+        let second = blobs[1].read().await.unwrap();
+        assert_eq!(first.as_ref(), b"hello");
+        assert_eq!(second.as_ref(), b"world");
     }
 }
