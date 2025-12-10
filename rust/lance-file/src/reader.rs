@@ -251,10 +251,11 @@ impl ReaderProjection {
             field_id_to_column_index,
             &mut column_indices,
         )?;
-        Ok(Self {
+        let projection = Self {
             schema: Arc::new(schema.clone()),
             column_indices,
-        })
+        };
+        Ok(projection)
     }
 
     /// Creates a projection that reads the entire file

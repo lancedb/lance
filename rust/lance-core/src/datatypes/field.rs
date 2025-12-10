@@ -520,6 +520,23 @@ impl Field {
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
+    pub fn unloaded_mut(&mut self) -> &mut Self {
+        if self.is_blob_v2() {
+            self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
+        } else if self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+        }
+        self
+    }
+
+    /// If the field is a blob, return a new field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
     pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
         if self.is_blob() {
             match version {
@@ -744,6 +761,13 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_)) | (DataType::List(_), DataType::List(_))
         ) {
+            // Blob v2 uses a struct logical type for descriptors, which differs from the logical
+            // input struct (data/uri). When intersecting schemas for projection we want to keep
+            // the projected blob layout instead of intersecting by child names.
+            if ignore_types && self.is_blob() && other.is_blob() {
+                return Ok(self.clone());
+            }
+
             let children = self
                 .children
                 .iter()
@@ -1015,7 +1039,7 @@ impl TryFrom<&ArrowField> for Field {
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
         } else if is_blob_v2 {
-            LogicalType::from(super::BLOB_LOGICAL_TYPE)
+            LogicalType::from("struct")
         } else {
             LogicalType::try_from(field.data_type())?
         };
