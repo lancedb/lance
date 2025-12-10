@@ -163,6 +163,44 @@ mod tests {
     }
 
     #[test]
+    fn test_backoff_with_base() {
+        let mut backoff = Backoff::default().with_base(3).with_jitter(0);
+        assert_eq!(backoff.next_backoff().as_millis(), 50); // 3^0 * 50
+        assert_eq!(backoff.next_backoff().as_millis(), 150); // 3^1 * 50
+        assert_eq!(backoff.next_backoff().as_millis(), 450); // 3^2 * 50
+    }
+
+    #[test]
+    fn test_backoff_with_unit() {
+        let mut backoff = Backoff::default().with_unit(100).with_jitter(0);
+        assert_eq!(backoff.next_backoff().as_millis(), 100); // 2^0 * 100
+        assert_eq!(backoff.next_backoff().as_millis(), 200); // 2^1 * 100
+    }
+
+    #[test]
+    fn test_backoff_with_min() {
+        let mut backoff = Backoff::default().with_min(100).with_jitter(0);
+        assert_eq!(backoff.next_backoff().as_millis(), 100); // clamped to min
+    }
+
+    #[test]
+    fn test_backoff_with_max() {
+        let mut backoff = Backoff::default().with_max(75).with_jitter(0);
+        assert_eq!(backoff.next_backoff().as_millis(), 50);
+        assert_eq!(backoff.next_backoff().as_millis(), 75); // clamped to max
+    }
+
+    #[test]
+    fn test_backoff_reset() {
+        let mut backoff = Backoff::default().with_jitter(0);
+        assert_eq!(backoff.next_backoff().as_millis(), 50);
+        assert_eq!(backoff.attempt(), 1);
+        backoff.reset();
+        assert_eq!(backoff.attempt(), 0);
+        assert_eq!(backoff.next_backoff().as_millis(), 50);
+    }
+
+    #[test]
     fn test_slot_backoff() {
         #[cfg_attr(coverage, coverage(off))]
         fn assert_in(value: u128, expected: &[u128]) {
