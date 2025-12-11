@@ -470,7 +470,7 @@ impl FileWriter {
         // TODO(xuanwo): this doesn't work on nested struct, need better solution like fields_per_order_mut?
         schema.fields.iter_mut().for_each(|f| {
             if f.is_blob_v2() {
-                let _ = f.unloaded_mut();
+                f.unloaded_mut();
             }
         });
 

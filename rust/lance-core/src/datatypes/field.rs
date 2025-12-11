@@ -516,11 +516,11 @@ impl Field {
             .unwrap_or(false)
     }
 
-    /// If the field is a blob, return a new field with the same name and id
+    /// If the field is a blob, update this field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
     /// If the field is not a blob, return the field itself.
-    pub fn unloaded_mut(&mut self) -> &mut Self {
+    pub fn unloaded_mut(&mut self) {
         if self.is_blob_v2() {
             self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
             self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
@@ -530,7 +530,6 @@ impl Field {
             self.children = BLOB_DESC_LANCE_FIELD.children.clone();
             self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
         }
-        self
     }
 
     /// If the field is a blob, return a new field with the same name and id
@@ -764,7 +763,7 @@ impl Field {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
             // input struct (data/uri). When intersecting schemas for projection we want to keep
             // the projected blob layout instead of intersecting by child names.
-            if ignore_types && self.is_blob() && other.is_blob() {
+            if self.is_blob() && other.is_blob() {
                 return Ok(self.clone());
             }
 
