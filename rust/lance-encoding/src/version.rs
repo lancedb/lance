@@ -81,6 +81,10 @@ impl LanceFileVersion {
 
         Self::iter().filter(|&v| v != Self::Stable && v != Self::Next && v != Self::Legacy)
     }
+
+    pub fn support_add_sub_column(&self) -> bool {
+        self > &Self::V2_1
+    }
 }
 
 impl std::fmt::Display for LanceFileVersion {

@@ -156,6 +156,15 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
+    /// Optional hook allowing a plugin to provide statistics without loading the index.
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
 

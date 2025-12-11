@@ -17,14 +17,9 @@ use crate::scalar::{
 };
 use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::ROW_ADDR;
-use lance_datafusion::chunker::chunk_concat_stream;
 mod as_bytes;
 mod sbbf;
 use arrow_schema::{DataType, Field};
-use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
@@ -45,34 +40,18 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 use snafu::location;
 
+use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
-//
-// Example: Suppose we have two fragments, each with 4 rows.
-// Fragment 0: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 0, 1, 2, 3
-// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 1
-// The row addresses for fragment 1 are: 32>>1, 32>>1 + 1, 32>>1 + 2, 32>>1 + 3
-//
-// Deletion is 0 index based. We delete the 0th and 1st row in fragment 0,
-// and the 1st and 2nd row in fragment 1,
-// Fragment 0: zone_start = 2, zone_length = 2 // covers rows 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 2, 3
-// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 3 in fragment 1
-// The row addresses for fragment 1 are: 32>>1, 32>>1 + 3
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
-    fragment_id: u64,
-    // zone_start is start row of the zone in the fragment, also known
-    // as the local offset. To get the actual first row address,
-    // you can do `fragment_id << 32 + zone_start`
-    zone_start: u64,
-    // zone_length is the `row offset span` between the first and the last row in the current SBBF block
-    // calculated as: (last_row_offset - first_row_offset + 1)
-    zone_length: usize,
+    // Bound of this zone within the fragment. Persisted as three separate columns
+    // (fragment_id, zone_start, zone_length) in the index file.
+    bound: ZoneBound,
     // Whether this zone contains any null values
     has_null: bool,
     // The actual bloom filter (SBBF) for efficient querying
@@ -85,6 +64,12 @@ impl DeepSizeOf for BloomFilterStatistics {
         // We could try to get the actual size from the Sbbf if it has a method for that,
         // but for now we'll estimate based on the number of bytes it serializes to
         self.bloom_filter.to_bytes().len()
+    }
+}
+
+impl AsRef<ZoneBound> for BloomFilterStatistics {
+    fn as_ref(&self) -> &ZoneBound {
+        &self.bound
     }
 }
 
@@ -246,9 +231,11 @@ impl BloomFilterIndex {
             })?;
 
             blocks.push(BloomFilterStatistics {
-                fragment_id: fragment_id_col.value(i),
-                zone_start: zone_start_col.value(i),
-                zone_length: zone_length_col.value(i) as usize,
+                bound: ZoneBound {
+                    fragment_id: fragment_id_col.value(i),
+                    start: zone_start_col.value(i),
+                    length: zone_length_col.value(i) as usize,
+                },
                 has_null: has_null_col.value(i),
                 bloom_filter,
             });
@@ -464,7 +451,7 @@ impl Index for BloomFilterIndex {
 
         // Loop through zones and add unique fragment IDs to the bitmap
         for block in &self.zones {
-            frag_ids.insert(block.fragment_id as u32);
+            frag_ids.insert(block.bound.fragment_id as u32);
         }
 
         Ok(frag_ids)
@@ -478,23 +465,10 @@ impl ScalarIndex for BloomFilterIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-
-        let mut row_addr_tree_map = RowAddrTreeMap::new();
-
-        // For each zone, check if it might contain the queried value
-        for block in self.zones.iter() {
-            if self.evaluate_block_against_query(block, query)? {
-                let zone_start_addr = (block.fragment_id << 32) + block.zone_start;
-                let zone_end_addr = zone_start_addr + block.zone_length as u64;
-
-                // Add all row addresses in this zone to the result
-                row_addr_tree_map.insert_range(zone_start_addr..zone_end_addr);
-            }
-        }
-
-        Ok(SearchResult::AtMost(row_addr_tree_map))
+        search_zones(&self.zones, metrics, |block| {
+            self.evaluate_block_against_query(block, query)
+        })
     }
 
     fn can_remap(&self) -> bool {
@@ -517,33 +491,20 @@ impl ScalarIndex for BloomFilterIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // 1. Prepare the builder for new bloom filters
-        let batches_source = new_data;
-
-        let mut builder = BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
+        // Re-train bloom filters for the appended data using the shared trainer
+        let params = BloomFilterIndexBuilderParams {
             number_of_items: self.number_of_items,
             probability: self.probability,
-        })?;
+        };
 
-        builder.train(batches_source).await?;
+        let processor = BloomFilterProcessor::new(params.clone())?;
+        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
+        let updated_blocks = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        // Get the new blocks from the builder
-        let new_blocks = builder.blocks;
-
-        // Combine existing zones with new zones
-        let mut all_blocks = self.zones.clone();
-        all_blocks.extend(new_blocks);
-
-        // Create a new builder with all blocks to write them out
-        let mut combined_builder =
-            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
-                number_of_items: self.number_of_items,
-                probability: self.probability,
-            })?;
-        combined_builder.blocks = all_blocks;
-
-        // Write the updated index to dest_store
-        combined_builder.write_index(dest_store).await?;
+        // Write the combined zones back to storage
+        let mut builder = BloomFilterIndexBuilder::try_new(params)?;
+        builder.blocks = updated_blocks;
+        builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
@@ -631,38 +592,129 @@ impl BloomFilterIndexBuilderParams {
 pub struct BloomFilterIndexBuilder {
     params: BloomFilterIndexBuilderParams,
     blocks: Vec<BloomFilterStatistics>,
-    // The local offset within the current zones
-    cur_zone_offset: usize,
-    cur_fragment_id: u32,
-    // Track the actual first and last row offsets in the current zone
-    // This handles non-contiguous offsets after deletions
-    cur_zone_first_row_offset: Option<u32>,
-    cur_zone_last_row_offset: Option<u32>,
-    cur_zone_has_null: bool,
-    sbbf: Option<Sbbf>,
 }
 
 impl BloomFilterIndexBuilder {
     pub fn try_new(params: BloomFilterIndexBuilderParams) -> Result<Self> {
-        let sbbf = SbbfBuilder::new()
+        Ok(Self {
+            params,
+            blocks: Vec::new(),
+        })
+    }
+
+    /// Train the builder using the shared ZoneTrainer. The input stream is expected to
+    /// contain the value column followed by `_rowaddr`, matching the order emitted by
+    /// the scalar index training pipeline.
+    pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
+        let processor = BloomFilterProcessor::new(self.params.clone())?;
+        let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
+        self.blocks = trainer.train(batches_source).await?;
+        Ok(())
+    }
+
+    fn bloomfilter_stats_as_batch(&self) -> Result<RecordBatch> {
+        let fragment_ids =
+            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.bound.fragment_id));
+
+        let zone_starts =
+            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.bound.start));
+
+        let zone_lengths = UInt64Array::from_iter_values(
+            self.blocks.iter().map(|block| block.bound.length as u64),
+        );
+
+        let has_nulls = arrow_array::BooleanArray::from(
+            self.blocks
+                .iter()
+                .map(|block| block.has_null)
+                .collect::<Vec<bool>>(),
+        );
+
+        // Convert bloom filters to binary data for serialization
+        let bloom_filter_data = if self.blocks.is_empty() {
+            Arc::new(arrow_array::BinaryArray::new_null(0)) as ArrayRef
+        } else {
+            let binary_data: Vec<Vec<u8>> = self
+                .blocks
+                .iter()
+                .map(|block| block.bloom_filter.to_bytes())
+                .collect();
+            let binary_refs: Vec<Option<&[u8]>> = binary_data
+                .iter()
+                .map(|bytes| Some(bytes.as_slice()))
+                .collect();
+            Arc::new(arrow_array::BinaryArray::from_opt_vec(binary_refs)) as ArrayRef
+        };
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+            Field::new("has_null", DataType::Boolean, false),
+            Field::new("bloom_filter_data", DataType::Binary, false),
+        ]));
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(fragment_ids) as ArrayRef,
+            Arc::new(zone_starts) as ArrayRef,
+            Arc::new(zone_lengths) as ArrayRef,
+            Arc::new(has_nulls) as ArrayRef,
+            bloom_filter_data,
+        ];
+
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+        let record_batch = self.bloomfilter_stats_as_batch()?;
+
+        let mut file_schema = record_batch.schema().as_ref().clone();
+        file_schema.metadata.insert(
+            BLOOMFILTER_ITEM_META_KEY.to_string(),
+            self.params.number_of_items.to_string(),
+        );
+
+        file_schema.metadata.insert(
+            BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
+            self.params.probability.to_string(),
+        );
+
+        let mut index_file = index_store
+            .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
+            .await?;
+        index_file.write_record_batch(record_batch).await?;
+        index_file.finish().await?;
+        Ok(())
+    }
+}
+
+/// Index-specific processor that inserts values into the split block Bloom filter.
+struct BloomFilterProcessor {
+    params: BloomFilterIndexBuilderParams,
+    sbbf: Option<Sbbf>,
+    cur_zone_has_null: bool,
+}
+
+impl BloomFilterProcessor {
+    fn new(params: BloomFilterIndexBuilderParams) -> Result<Self> {
+        let mut processor = Self {
+            params,
+            sbbf: None,
+            cur_zone_has_null: false,
+        };
+        processor.reset()?;
+        Ok(processor)
+    }
+
+    fn build_filter(params: &BloomFilterIndexBuilderParams) -> Result<Sbbf> {
+        SbbfBuilder::new()
             .expected_items(params.number_of_items)
             .false_positive_probability(params.probability)
             .build()
             .map_err(|e| Error::InvalidInput {
                 source: format!("Failed to build SBBF: {:?}", e).into(),
                 location: location!(),
-            })?;
-
-        Ok(Self {
-            params,
-            blocks: Vec::new(),
-            cur_zone_offset: 0,
-            cur_fragment_id: 0,
-            cur_zone_first_row_offset: None,
-            cur_zone_last_row_offset: None,
-            cur_zone_has_null: false,
-            sbbf: Some(sbbf),
-        })
+            })
     }
 
     fn process_primitive_array<T>(sbbf: &mut Sbbf, array: &arrow_array::PrimitiveArray<T>) -> bool
@@ -728,446 +780,245 @@ impl BloomFilterIndexBuilder {
         }
         has_null
     }
+}
 
-    fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
-        if let Some(ref mut sbbf) = self.sbbf {
-            let has_null = match array.data_type() {
-                // Signed integers
-                DataType::Int8 => {
+impl ZoneProcessor for BloomFilterProcessor {
+    type ZoneStatistics = BloomFilterStatistics;
+
+    fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
+        let sbbf = self.sbbf.as_mut().ok_or_else(|| {
+            Error::invalid_input(
+                "BloomFilterProcessor did not initialize bloom filter",
+                location!(),
+            )
+        })?;
+
+        let has_null = match array.data_type() {
+            // Signed integers
+            DataType::Int8 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int8Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::Int16 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int16Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::Int32 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::Int64 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            // Unsigned integers
+            DataType::UInt8 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt8Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::UInt16 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt16Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::UInt32 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::UInt64 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            // Floating point numbers
+            DataType::Float32 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::Float64 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            // Date and time types (stored as i32 internally)
+            DataType::Date32 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date32Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
+            }
+            DataType::Time32(time_unit) => match time_unit {
+                arrow_schema::TimeUnit::Second => {
                     let typed_array = array
                         .as_any()
-                        .downcast_ref::<arrow_array::Int8Array>()
+                        .downcast_ref::<arrow_array::Time32SecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
                 }
-                DataType::Int16 => {
+                arrow_schema::TimeUnit::Millisecond => {
                     let typed_array = array
                         .as_any()
-                        .downcast_ref::<arrow_array::Int16Array>()
+                        .downcast_ref::<arrow_array::Time32MillisecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Int32 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int32Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Int64 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                // Unsigned integers
-                DataType::UInt8 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt8Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::UInt16 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt16Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::UInt32 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt32Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::UInt64 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                // Floating point numbers
-                DataType::Float32 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Float32Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Float64 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Float64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                // Date and time types (stored as i32 internally)
-                DataType::Date32 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Date32Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Time32(time_unit) => match time_unit {
-                    arrow_schema::TimeUnit::Second => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::Time32SecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    arrow_schema::TimeUnit::Millisecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::Time32MillisecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    _ => {
-                        return Err(Error::InvalidInput {
-                            source: format!("Unsupported Time32 unit: {:?}", time_unit).into(),
-                            location: location!(),
-                        });
-                    }
-                },
-                // Date and time types (stored as i64 internally)
-                DataType::Date64 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Date64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Time64(time_unit) => match time_unit {
-                    arrow_schema::TimeUnit::Microsecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::Time64MicrosecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    arrow_schema::TimeUnit::Nanosecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::Time64NanosecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    _ => {
-                        return Err(Error::InvalidInput {
-                            source: format!("Unsupported Time64 unit: {:?}", time_unit).into(),
-                            location: location!(),
-                        });
-                    }
-                },
-                DataType::Timestamp(time_unit, _) => match time_unit {
-                    arrow_schema::TimeUnit::Second => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::TimestampSecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    arrow_schema::TimeUnit::Millisecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    arrow_schema::TimeUnit::Microsecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                    arrow_schema::TimeUnit::Nanosecond => {
-                        let typed_array = array
-                            .as_any()
-                            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-                            .unwrap();
-                        Self::process_primitive_array(sbbf, typed_array)
-                    }
-                },
-                DataType::Utf8 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::StringArray>()
-                        .unwrap();
-                    Self::process_string_array(sbbf, typed_array)
-                }
-                DataType::LargeUtf8 => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::LargeStringArray>()
-                        .unwrap();
-                    Self::process_large_string_array(sbbf, typed_array)
-                }
-                DataType::Binary => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::BinaryArray>()
-                        .unwrap();
-                    Self::process_binary_array(sbbf, typed_array)
-                }
-                DataType::LargeBinary => {
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::LargeBinaryArray>()
-                        .unwrap();
-                    Self::process_large_binary_array(sbbf, typed_array)
                 }
                 _ => {
                     return Err(Error::InvalidInput {
-                        source: format!(
-                            "Bloom filter does not support data type: {:?}",
-                            array.data_type()
-                        )
-                        .into(),
+                        source: format!("Unsupported Time32 unit: {:?}", time_unit).into(),
                         location: location!(),
                     });
                 }
-            };
-
-            // Update the current zone's null tracking
-            self.cur_zone_has_null = self.cur_zone_has_null || has_null;
-        }
-
-        Ok(())
-    }
-
-    fn new_block(&mut self, fragment_id: u32) -> Result<()> {
-        let zone_start = self.cur_zone_first_row_offset.unwrap_or(0) as u64;
-        let zone_length = self
-            .cur_zone_last_row_offset
-            .map(|last_row_offset| {
-                (last_row_offset - self.cur_zone_first_row_offset.unwrap_or(0) + 1) as usize
-            })
-            .unwrap_or(self.cur_zone_offset);
-
-        // Store the current bloom filter directly
-        let bloom_filter = if let Some(ref sbbf) = self.sbbf {
-            sbbf.clone()
-        } else {
-            // Create a default empty bloom filter
-            SbbfBuilder::new()
-                .expected_items(self.params.number_of_items)
-                .false_positive_probability(self.params.probability)
-                .build()
-                .map_err(|e| Error::InvalidInput {
-                    source: format!("Failed to build default SBBF: {:?}", e).into(),
-                    location: location!(),
-                })?
-        };
-
-        let new_block = BloomFilterStatistics {
-            fragment_id: fragment_id as u64,
-            zone_start,
-            zone_length,
-            has_null: self.cur_zone_has_null,
-            bloom_filter,
-        };
-
-        self.blocks.push(new_block);
-        self.cur_zone_offset = 0;
-        self.cur_zone_first_row_offset = None;
-        self.cur_zone_last_row_offset = None;
-        self.cur_zone_has_null = false;
-
-        // Reset sbbf for the next block
-        self.sbbf = Some(
-            SbbfBuilder::new()
-                .expected_items(self.params.number_of_items)
-                .false_positive_probability(self.params.probability)
-                .build()
-                .map_err(|e| Error::InvalidInput {
-                    source: format!("Failed to build SBBF: {:?}", e).into(),
-                    location: location!(),
-                })?,
-        );
-
-        Ok(())
-    }
-
-    pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        assert!(batches_source.schema().field_with_name(ROW_ADDR).is_ok());
-
-        let mut batches_source =
-            chunk_concat_stream(batches_source, self.params.number_of_items as usize);
-
-        while let Some(batch) = batches_source.try_next().await? {
-            if batch.num_rows() == 0 {
-                continue;
+            },
+            // Date and time types (stored as i64 internally)
+            DataType::Date64 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date64Array>()
+                    .unwrap();
+                Self::process_primitive_array(sbbf, typed_array)
             }
-
-            let data_array: &arrow_array::ArrayRef = batch.column(0);
-            let row_addrs_array = batch
-                .column_by_name(ROW_ADDR)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .unwrap();
-
-            let mut remaining = batch.num_rows();
-            let mut array_offset: usize = 0;
-
-            // Initialize cur_fragment_id from the first row address if this is the first batch
-            if self.blocks.is_empty() && self.cur_zone_offset == 0 {
-                let first_row_addr = row_addrs_array.value(0);
-                self.cur_fragment_id = (first_row_addr >> 32) as u32;
-            }
-
-            while remaining > 0 {
-                // Find the next fragment boundary in this batch
-                let next_fragment_index = (array_offset..row_addrs_array.len()).find(|&i| {
-                    let row_addr = row_addrs_array.value(i);
-                    let fragment_id = (row_addr >> 32) as u32;
-                    fragment_id == self.cur_fragment_id + 1
-                });
-                let empty_rows_left_in_cur_zone: usize =
-                    (self.params.number_of_items - self.cur_zone_offset as u64) as usize;
-
-                // Check if there is enough data from the current fragment to fill the current zone
-                let desired = if let Some(idx) = next_fragment_index {
-                    self.cur_fragment_id = (row_addrs_array.value(idx) >> 32) as u32;
-                    // Take the minimum between distance to boundary and space left in zone
-                    // to ensure we don't exceed the zone size limit
-                    std::cmp::min(idx - array_offset, empty_rows_left_in_cur_zone)
-                } else {
-                    empty_rows_left_in_cur_zone
-                };
-
-                if desired > remaining {
-                    // Not enough data to fill a map, just increment counts
-                    self.update_stats(&data_array.slice(array_offset, remaining))?;
-
-                    let first_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
-                    let last_row_offset = RowAddress::new_from_u64(
-                        row_addrs_array.value(array_offset + remaining - 1),
-                    )
-                    .row_offset();
-                    if self.cur_zone_first_row_offset.is_none() {
-                        self.cur_zone_first_row_offset = Some(first_row_offset);
-                    }
-                    self.cur_zone_last_row_offset = Some(last_row_offset);
-
-                    self.cur_zone_offset += remaining;
-                    break;
-                } else if desired > 0 {
-                    // There is enough data, create a new zone
-                    self.update_stats(&data_array.slice(array_offset, desired))?;
-
-                    let first_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
-                    let last_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset + desired - 1))
-                            .row_offset();
-                    if self.cur_zone_first_row_offset.is_none() {
-                        self.cur_zone_first_row_offset = Some(first_row_offset);
-                    }
-                    self.cur_zone_last_row_offset = Some(last_row_offset);
-
-                    self.cur_zone_offset += desired;
-                    self.new_block((row_addrs_array.value(array_offset) >> 32) as u32)?;
-                } else if desired == 0 {
-                    // The new batch starts with a new fragment. Flush the current zone if it's not empty
-                    if self.cur_zone_offset > 0 {
-                        self.new_block(self.cur_fragment_id.wrapping_sub(1))?;
-                    }
-                    // Let the loop run again
-                    // to find the next fragment boundary
-                    continue;
+            DataType::Time64(time_unit) => match time_unit {
+                arrow_schema::TimeUnit::Microsecond => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Time64MicrosecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
                 }
-                array_offset += desired;
-                remaining = remaining.saturating_sub(desired);
+                arrow_schema::TimeUnit::Nanosecond => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Time64NanosecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Unsupported Time64 unit: {:?}", time_unit).into(),
+                        location: location!(),
+                    });
+                }
+            },
+            DataType::Timestamp(time_unit, _) => match time_unit {
+                arrow_schema::TimeUnit::Second => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampSecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                arrow_schema::TimeUnit::Millisecond => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                arrow_schema::TimeUnit::Microsecond => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                arrow_schema::TimeUnit::Nanosecond => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+            },
+            DataType::Utf8 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                Self::process_string_array(sbbf, typed_array)
             }
-        }
-        // Create the final zone
-        if self.cur_zone_offset > 0 {
-            self.new_block(self.cur_fragment_id)?;
-        }
+            DataType::LargeUtf8 => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .unwrap();
+                Self::process_large_string_array(sbbf, typed_array)
+            }
+            DataType::Binary => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .unwrap();
+                Self::process_binary_array(sbbf, typed_array)
+            }
+            DataType::LargeBinary => {
+                let typed_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeBinaryArray>()
+                    .unwrap();
+                Self::process_large_binary_array(sbbf, typed_array)
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "Bloom filter does not support data type: {:?}",
+                        array.data_type()
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        };
 
+        // Update the current zone's null tracking
+        self.cur_zone_has_null = self.cur_zone_has_null || has_null;
         Ok(())
     }
 
-    fn bloomfilter_stats_as_batch(&self) -> Result<RecordBatch> {
-        let fragment_ids =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.fragment_id));
-
-        let zone_starts =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_start));
-
-        let zone_lengths =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_length as u64));
-
-        let has_nulls = arrow_array::BooleanArray::from(
-            self.blocks
-                .iter()
-                .map(|block| block.has_null)
-                .collect::<Vec<bool>>(),
-        );
-
-        // Convert bloom filters to binary data for serialization
-        let bloom_filter_data = if self.blocks.is_empty() {
-            Arc::new(arrow_array::BinaryArray::new_null(0)) as ArrayRef
-        } else {
-            let binary_data: Vec<Vec<u8>> = self
-                .blocks
-                .iter()
-                .map(|block| block.bloom_filter.to_bytes())
-                .collect();
-            let binary_refs: Vec<Option<&[u8]>> = binary_data
-                .iter()
-                .map(|bytes| Some(bytes.as_slice()))
-                .collect();
-            Arc::new(arrow_array::BinaryArray::from_opt_vec(binary_refs)) as ArrayRef
-        };
-
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-            Field::new("has_null", DataType::Boolean, false),
-            Field::new("bloom_filter_data", DataType::Binary, false),
-        ]));
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(fragment_ids) as ArrayRef,
-            Arc::new(zone_starts) as ArrayRef,
-            Arc::new(zone_lengths) as ArrayRef,
-            Arc::new(has_nulls) as ArrayRef,
-            bloom_filter_data,
-        ];
-
-        Ok(RecordBatch::try_new(schema, columns)?)
+    fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
+            Error::invalid_input(
+                "BloomFilterProcessor did not initialize bloom filter",
+                location!(),
+            )
+        })?;
+        Ok(BloomFilterStatistics {
+            bound,
+            has_null: self.cur_zone_has_null,
+            bloom_filter: bloom_filter.clone(),
+        })
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
-        let record_batch = self.bloomfilter_stats_as_batch()?;
-
-        let mut file_schema = record_batch.schema().as_ref().clone();
-        file_schema.metadata.insert(
-            BLOOMFILTER_ITEM_META_KEY.to_string(),
-            self.params.number_of_items.to_string(),
-        );
-
-        file_schema.metadata.insert(
-            BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
-            self.params.probability.to_string(),
-        );
-
-        let mut index_file = index_store
-            .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
-            .await?;
-        index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await?;
+    fn reset(&mut self) -> Result<()> {
+        self.sbbf = Some(Self::build_filter(&self.params)?);
+        self.cur_zone_has_null = false;
         Ok(())
     }
 }
@@ -1309,6 +1160,14 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                 as Arc<dyn ScalarIndex>,
         )
     }
+
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -1342,7 +1201,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
-    use arrow_array::{RecordBatch, UInt64Array};
+    use arrow_array::{record_batch, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1426,7 +1285,7 @@ mod tests {
         // Equals query: null (should match nothing, as there are no nulls in empty index)
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1471,9 +1330,9 @@ mod tests {
         assert_eq!(index.probability, 0.01);
 
         // Check that we have one zone (since 100 items fit exactly in one zone of size 100)
-        assert_eq!(index.zones[0].fragment_id, 0u64);
-        assert_eq!(index.zones[0].zone_start, 0u64);
-        assert_eq!(index.zones[0].zone_length, 100);
+        assert_eq!(index.zones[0].bound.fragment_id, 0u64);
+        assert_eq!(index.zones[0].bound.start, 0u64);
+        assert_eq!(index.zones[0].bound.length, 100);
 
         // Test search functionality
         // The bloom filter should work correctly and find the value
@@ -1483,14 +1342,14 @@ mod tests {
         // Should match the block since value 50 is in the range [0, 100)
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that shouldn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty result since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1552,22 +1411,22 @@ mod tests {
         assert_eq!(index.zones.len(), 4);
 
         // Check fragment 0 zones
-        assert_eq!(index.zones[0].fragment_id, 0u64);
-        assert_eq!(index.zones[0].zone_start, 0u64);
-        assert_eq!(index.zones[0].zone_length, 50);
+        assert_eq!(index.zones[0].bound.fragment_id, 0u64);
+        assert_eq!(index.zones[0].bound.start, 0u64);
+        assert_eq!(index.zones[0].bound.length, 50);
 
-        assert_eq!(index.zones[1].fragment_id, 0u64);
-        assert_eq!(index.zones[1].zone_start, 50u64);
-        assert_eq!(index.zones[1].zone_length, 50);
+        assert_eq!(index.zones[1].bound.fragment_id, 0u64);
+        assert_eq!(index.zones[1].bound.start, 50u64);
+        assert_eq!(index.zones[1].bound.length, 50);
 
         // Check fragment 1 zones
-        assert_eq!(index.zones[2].fragment_id, 1u64);
-        assert_eq!(index.zones[2].zone_start, 0u64);
-        assert_eq!(index.zones[2].zone_length, 50);
+        assert_eq!(index.zones[2].bound.fragment_id, 1u64);
+        assert_eq!(index.zones[2].bound.start, 0u64);
+        assert_eq!(index.zones[2].bound.length, 50);
 
-        assert_eq!(index.zones[3].fragment_id, 1u64);
-        assert_eq!(index.zones[3].zone_start, 50u64);
-        assert_eq!(index.zones[3].zone_length, 50);
+        assert_eq!(index.zones[3].bound.fragment_id, 1u64);
+        assert_eq!(index.zones[3].bound.start, 50u64);
+        assert_eq!(index.zones[3].bound.length, 50);
 
         // Test search functionality
         let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(150)));
@@ -1577,7 +1436,7 @@ mod tests {
         // Value 150 is only in fragment 1 (values 100-199), not in fragment 0 (values 0-99)
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range((1u64 << 32) + 50..((1u64 << 32) + 100)); // Only the block containing 150
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1643,7 +1502,7 @@ mod tests {
         // Should match all blocks since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every block
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a specific finite value that exists in the data
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(5.0)));
@@ -1652,7 +1511,7 @@ mod tests {
         // Should match only the first block since 5.0 only exists in rows 0-99
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist but is within expected range
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(250.0)));
@@ -1661,14 +1520,14 @@ mod tests {
         // Should match the third block since 250.0 would be in that range if it existed
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(200..300);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value way outside the range
         let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(10000.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with NaN and finite values
         let query = BloomFilterQuery::IsIn(vec![
@@ -1681,7 +1540,7 @@ mod tests {
         // Should match all blocks since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1728,9 +1587,9 @@ mod tests {
 
         // Verify zone structure
         for (i, block) in index.zones.iter().enumerate() {
-            assert_eq!(block.fragment_id, 0u64);
-            assert_eq!(block.zone_start, (i * 1000) as u64);
-            assert_eq!(block.zone_length, 1000);
+            assert_eq!(block.bound.fragment_id, 0u64);
+            assert_eq!(block.bound.start, (i * 1000) as u64);
+            assert_eq!(block.bound.length, 1000);
             // Check that the bloom filter has some data (non-zero bytes when serialized)
             assert!(!block.bloom_filter.to_bytes().is_empty());
         }
@@ -1742,14 +1601,14 @@ mod tests {
         // Should match zone 2
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(2000..3000);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value way outside the range
         let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(50000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with values from different zones
         let query = BloomFilterQuery::IsIn(vec![
@@ -1765,7 +1624,7 @@ mod tests {
         expected.insert_range(0..1000); // Zone 0
         expected.insert_range(2000..3000); // Zone 2
         expected.insert_range(7000..8000); // Zone 7
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -1821,7 +1680,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value in the second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
@@ -1830,7 +1689,7 @@ mod tests {
         // Should match the second zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(100..200);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query =
@@ -1838,7 +1697,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with string values
         let query = BloomFilterQuery::IsIn(vec![
@@ -1851,7 +1710,7 @@ mod tests {
         // Should match both zones
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..200);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1903,7 +1762,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value in the second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
@@ -1912,14 +1771,14 @@ mod tests {
         // Should match the second zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![255, 254, 253])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1972,7 +1831,7 @@ mod tests {
         // Should match the first zone
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some(
@@ -1981,7 +1840,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -2028,19 +1887,19 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Date32 value in second zone
         let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(75)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Date32 value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(500)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -2092,7 +1951,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Timestamp value in second zone
         let second_timestamp = timestamp_values[75];
@@ -2103,13 +1962,13 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(50..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Timestamp value that doesn't exist
         let query =
             BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(Some(999_999_999i64), None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with multiple timestamp values
         let query = BloomFilterQuery::IsIn(vec![
@@ -2120,7 +1979,7 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100); // Should match both zones
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -2171,12 +2030,12 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..25);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for Time64 value that doesn't exist
         let query = BloomFilterQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -2222,12 +2081,12 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(500..750); // Should match the zone containing 500
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsNull query
         let query = BloomFilterQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowAddrTreeMap::new())); // No nulls in the data
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new())); // No nulls in the data
 
         // Test IsIn query
         let query = BloomFilterQuery::IsIn(vec![
@@ -2238,6 +2097,86 @@ mod tests {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..250); // Zone containing 100
         expected.insert_range(500..750); // Zone containing 600
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_null_handling_in_queries() {
+        // Test that bloomfilter index correctly returns null_list for queries
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: [0, 5, null]
+        let batch = record_batch!(
+            (VALUE_COLUMN_NAME, Int64, [Some(0), Some(5), None]),
+            (ROW_ADDR, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        // Train and write the bloomfilter index
+        BloomFilterIndexPlugin::train_bloomfilter_index(stream, store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BloomFilterIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Test 1: Search for value 5 - bloomfilter should return at_most with all rows
+        // Like ZoneMap, BloomFilter returns AtMost (superset) and includes nulls
+        let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(5)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_addrs) => {
+                // Bloomfilter returns all rows in the zone including nulls
+                let all_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows (including nulls) since BloomFilter is inexact"
+                );
+
+                // For AtMost results, nulls are included in the superset
+            }
+            _ => panic!("Expected AtMost search result from bloomfilter"),
+        }
+
+        // Test 2: IsIn query - should also return all rows
+        let query = BloomFilterQuery::IsIn(vec![
+            ScalarValue::Int64(Some(0)),
+            ScalarValue::Int64(Some(10)),
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_addrs) => {
+                let all_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows in zone as possible matches"
+                );
+            }
+            _ => panic!("Expected AtMost search result from bloomfilter"),
+        }
     }
 }

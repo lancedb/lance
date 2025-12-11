@@ -6,15 +6,8 @@ contains 1M openai embeddings.
 ## Prepare Dataset
 
 ```sh
-# Python 3.10+
-python3 -m venv venv
-. ./venv/bin/activate
-
-# install dependencies
-pip install -r requirements.txt
-
 # Generate dataset in lance format.
-./datagen.py
+uv run ./datagen.py
 ```
 
 ## Run benchmark
@@ -23,5 +16,5 @@ pip install -r requirements.txt
 as well as `refine_factor`.
 
 ```sh
-./benchmarks.py -k 20
+uv run ./benchmarks.py
 ```

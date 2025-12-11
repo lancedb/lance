@@ -3,6 +3,11 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use super::fragment::FileFragment;
+use super::{
+    transaction::{Operation, Transaction},
+    Dataset,
+};
 use crate::{io::exec::Planner, Error, Result};
 use arrow::compute::can_cast_types;
 use arrow::compute::CastOptions;
@@ -13,14 +18,10 @@ use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
+use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
 use snafu::location;
-
-use super::fragment::FileFragment;
-use super::{
-    transaction::{Operation, Transaction},
-    Dataset,
-};
 
 mod optimize;
 
@@ -132,6 +133,77 @@ fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
     }
 }
 
+trait ArrowFieldExt {
+    fn is_packed(&self) -> bool;
+}
+
+impl ArrowFieldExt for ArrowField {
+    fn is_packed(&self) -> bool {
+        let metadata = self.metadata();
+        metadata
+            .get(PACKED_STRUCT_LEGACY_META_KEY)
+            .map(|v| v == "true")
+            .unwrap_or(metadata.contains_key(PACKED_STRUCT_META_KEY))
+    }
+}
+
+fn check_field_conflict(
+    left: &ArrowField,
+    right: &ArrowField,
+    version: &LanceFileVersion,
+) -> Result<()> {
+    if left.name() != right.name() {
+        return Ok(());
+    }
+
+    match (left.data_type(), right.data_type()) {
+        (DataType::Struct(fl), DataType::Struct(fr)) => {
+            if !version.support_add_sub_column() {
+                return Err(Error::invalid_input(
+                    format!("Column {} is a struct col, add sub column is not supported in Lance file version {}", left.name(), version),
+                    location!(),
+                ));
+            }
+
+            if left.is_packed() || right.is_packed() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} is packed struct and already exists in the dataset",
+                        left.name()
+                    ),
+                    location!(),
+                ));
+            }
+
+            for l_field in fl.iter() {
+                if let Some((_, r_field)) = fr.find(l_field.name()) {
+                    check_field_conflict(l_field, r_field, version)?;
+                }
+            }
+            Ok(())
+        }
+        (DataType::List(fl), DataType::List(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
+            check_field_conflict(fl, fr, version)
+        }
+        (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(
+            format!("Column {} already exists in the dataset", left.name()),
+            location!(),
+        )),
+        (_, _) => Err(Error::invalid_input(
+            format!(
+                "Type conflicts between {}({}) and {}({})",
+                left.name(),
+                left.data_type(),
+                right.name(),
+                right.data_type()
+            ),
+            location!(),
+        )),
+    }
+}
+
 pub(super) async fn add_columns_to_fragments(
     dataset: &Dataset,
     transforms: NewColumnTransform,
@@ -141,17 +213,15 @@ pub(super) async fn add_columns_to_fragments(
 ) -> Result<(Vec<Fragment>, Schema)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
+    let version = dataset.manifest.data_storage_format.lance_file_version()?;
     let check_names = |output_schema: &ArrowSchema| {
-        let new_names = output_schema.field_names();
         for field in &dataset.schema().fields {
-            if new_names.contains(&&field.name) {
-                return Err(Error::invalid_input(
-                    format!("Column {} already exists in the dataset", field.name),
-                    location!(),
-                ));
+            if let Ok(out_field) = output_schema.field_with_name(&field.name) {
+                let ds_field = ArrowField::from(field);
+                check_field_conflict(&ds_field, out_field, &version)?;
             }
         }
-        Ok(())
+        Ok::<(), Error>(())
     };
 
     // Optimize the transforms
@@ -657,6 +727,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use crate::dataset::WriteParams;
@@ -1799,5 +1870,298 @@ mod test {
             ArrowField::new("b", DataType::Int32, true),
         ]);
         assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
+    }
+
+    #[test]
+    fn test_check_field_conflict() {
+        // same struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // same nested struct
+        let inner_struct1 = ArrowField::new(
+            "inner",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        );
+        let inner_struct2 = ArrowField::new(
+            "inner",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        );
+        let field1 = ArrowField::new("test", DataType::Struct(vec![inner_struct1].into()), false);
+        let field2 = ArrowField::new("test", DataType::Struct(vec![inner_struct2].into()), false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // basic type with different name
+        let field1 = ArrowField::new("test1", DataType::Int32, false);
+        let field2 = ArrowField::new("test2", DataType::Int32, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // basic type with same name
+        let field1 = ArrowField::new("test", DataType::Int32, false);
+        let field2 = ArrowField::new("test", DataType::Int32, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // different basic type
+        let field1 = ArrowField::new("test", DataType::Int32, false);
+        let field2 = ArrowField::new("test", DataType::Float64, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // partial conflict
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("a", DataType::Int32, false),
+                    ArrowField::new("b", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("a", DataType::Int32, false),
+                    ArrowField::new("c", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // same list
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // list with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // list with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // list of struct and basic
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // FixedSizeList with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // FixedSizeList with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // LargeList with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // LargeList with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // packed struct
+        let mut packed_meta = HashMap::new();
+        packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+
+        let packed_field = ArrowField::new(
+            "packed",
+            DataType::Struct(vec![ArrowField::new("foo", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta.clone());
+
+        let field1 = ArrowField::new("test", DataType::Struct(vec![packed_field].into()), false);
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        let new_packed_field = ArrowField::new(
+            "new_packed",
+            DataType::Struct(vec![ArrowField::new("foo", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta.clone());
+        let field3 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![new_packed_field].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field3, &LanceFileVersion::V2_2).is_ok());
+
+        let conflict_field = ArrowField::new(
+            "packed",
+            DataType::Struct(vec![ArrowField::new("new_col", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta);
+        let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
+        assert!(check_field_conflict(&field1, &field4, &LanceFileVersion::V2_2).is_err());
     }
 }

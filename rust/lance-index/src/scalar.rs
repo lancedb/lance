@@ -19,7 +19,7 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use serde::Serialize;
 use snafu::location;
@@ -32,13 +32,13 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
-pub mod flat;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+pub mod zoned;
 pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -684,20 +684,40 @@ impl AnyQuery for TokenQuery {
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
-    Exact(RowAddrTreeMap),
+    Exact(NullableRowAddrSet),
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
-    AtMost(RowAddrTreeMap),
+    AtMost(NullableRowAddrSet),
     /// All of the given row ids satisfy the query but there may be more
     ///
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
-    AtLeast(RowAddrTreeMap),
+    AtLeast(NullableRowAddrSet),
 }
 
 impl SearchResult {
-    pub fn row_addrs(&self) -> &RowAddrTreeMap {
+    pub fn exact(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::Exact(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_most(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtMost(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_least(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtLeast(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn with_nulls(self, nulls: impl Into<RowAddrTreeMap>) -> Self {
+        match self {
+            Self::Exact(row_ids) => Self::Exact(row_ids.with_nulls(nulls.into())),
+            Self::AtMost(row_ids) => Self::AtMost(row_ids.with_nulls(nulls.into())),
+            Self::AtLeast(row_ids) => Self::AtLeast(row_ids.with_nulls(nulls.into())),
+        }
+    }
+
+    pub fn row_addrs(&self) -> &NullableRowAddrSet {
         match self {
             Self::Exact(row_addrs) => row_addrs,
             Self::AtMost(row_addrs) => row_addrs,

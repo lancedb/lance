@@ -184,7 +184,7 @@ impl<T> LanceOptionExt<T> for Option<T> {
     }
 }
 
-trait ToSnafuLocation {
+pub trait ToSnafuLocation {
     fn to_snafu_location(&'static self) -> snafu::Location;
 }
 
