@@ -1492,32 +1492,32 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let part_page_files: Vec<&str> = if let Some(ranges_to_files) = &self.ranges_to_files {
-                    // Range-based Index: Directly collect references to the file paths.
-                    ranges_to_files
-                        .iter()
-                        .map(|(_, (path, _))| path.as_str())
-                        .collect()
-                } else {
-                    // Basic Index: There is only one source page file.
-                    vec![BTREE_PAGES_NAME]
-                };
+            // Range-based Index: Directly collect references to the file paths.
+            ranges_to_files
+                .iter()
+                .map(|(_, (path, _))| path.as_str())
+                .collect()
+        } else {
+            // Basic Index: There is only one source page file.
+            vec![BTREE_PAGES_NAME]
+        };
 
         for page_file in part_page_files {
-                    // Remap and write the pages
-                            let schema = Arc::new(self.flat_schema());
-                            let mut sub_index_file = dest_store.new_index_file(BTREE_PAGES_NAME, schema).await?;
+            // Remap and write the pages
+            let schema = Arc::new(self.flat_schema());
+            let mut sub_index_file = dest_store.new_index_file(page_file, schema).await?;
 
-                            let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-                            let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-                                .await
-                                .buffered(self.store.io_parallelism());
-                            while let Some(serialized) = reader_stream.try_next().await? {
-                                let remapped = FlatIndex::remap_batch(serialized, mapping)?;
-                                sub_index_file.write_record_batch(remapped).await?;
-                            }
+            let sub_index_reader = self.store.open_index_file(page_file).await?;
+            let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
+                .await
+                .buffered(self.store.io_parallelism());
+            while let Some(serialized) = reader_stream.try_next().await? {
+                let remapped = FlatIndex::remap_batch(serialized, mapping)?;
+                sub_index_file.write_record_batch(remapped).await?;
+            }
 
-                    sub_index_file.finish().await?;
-                }
+            sub_index_file.finish().await?;
+        }
 
         // Copy the lookup file as-is
         self.store
@@ -3399,7 +3399,7 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(batch.schema(), stream));
 
         // Train the btree index with FlatIndexMetadata as sub-index
-        super::train_btree_index(stream, store.as_ref(), 256, None)
+        super::train_btree_index(stream, store.as_ref(), 256, None, None)
             .await
             .unwrap();
 
@@ -3509,8 +3509,6 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
-
         // Method 1: Build complete index directly using the same data
         // Create deterministic data for comparison - use 4 * DEFAULT_BTREE_BATCH_SIZE for testing
         let total_count = 4 * DEFAULT_BTREE_BATCH_SIZE;
@@ -3525,7 +3523,6 @@ mod tests {
 
         train_btree_index(
             full_data_source,
-            &sub_index_trainer,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -3550,7 +3547,6 @@ mod tests {
 
         train_btree_index(
             range1_data_source,
-            &sub_index_trainer,
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -3578,7 +3574,6 @@ mod tests {
 
         train_btree_index(
             range2_data_source,
-            &sub_index_trainer,
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -3854,8 +3849,6 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
-
         // Create range 1 index, intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
         let range1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
@@ -3871,7 +3864,6 @@ mod tests {
 
         train_btree_index(
             range1_data_source,
-            &sub_index_trainer,
             old_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -3899,7 +3891,6 @@ mod tests {
 
         train_btree_index(
             range2_data_source,
-            &sub_index_trainer,
             old_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -3976,11 +3967,11 @@ mod tests {
         match query_result {
             SearchResult::Exact(row_id_map) => {
                 assert!(
-                    row_id_map.contains(updated_value as u64),
+                    row_id_map.selected(updated_value as u64),
                     "Updated index should contain original rowids."
                 );
                 assert!(
-                    row_id_map.contains((updated_value + row_id_delta) as u64),
+                    row_id_map.selected((updated_value + row_id_delta) as u64),
                     "Updated index should contain new rowids"
                 );
             }

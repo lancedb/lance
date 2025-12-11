@@ -856,9 +856,15 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
 
-        train_btree_index(data, index_store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
-            .await
-            .unwrap();
+        train_btree_index(
+            data,
+            index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let index = BTreeIndexPlugin
             .load_index(
