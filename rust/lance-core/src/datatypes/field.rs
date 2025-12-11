@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
     json::{is_arrow_json_field, is_json_field},
-    DataTypeExt, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
+    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
@@ -1031,8 +1031,8 @@ impl TryFrom<&ArrowField> for Field {
 
         if is_blob_v2 {
             metadata
-                .entry(BLOB_META_KEY.to_string())
-                .or_insert_with(|| "true".to_string());
+                .entry(ARROW_EXT_NAME_KEY.to_string())
+                .or_insert_with(|| BLOB_V2_EXT_NAME.to_string());
         }
 
         // Check for JSON extension types (both Arrow and Lance)
@@ -1080,11 +1080,6 @@ impl From<&Field> for ArrowField {
         let mut metadata = field.metadata.clone();
 
         if field.logical_type.is_blob() {
-            metadata.insert(
-                ARROW_EXT_NAME_KEY.to_string(),
-                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
-            );
-            metadata.entry(ARROW_EXT_META_KEY.to_string()).or_default();
             metadata
                 .entry(BLOB_META_KEY.to_string())
                 .or_insert_with(|| "true".to_string());
