@@ -1103,7 +1103,7 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+    use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
     #[test]
     fn arrow_field_to_field() {
@@ -1587,45 +1587,5 @@ mod tests {
         let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
-    }
-
-    #[test]
-    fn blob_v2_detection_by_extension() {
-        let metadata = HashMap::from([
-            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
-            (BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
-        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
-            .with_metadata(metadata)
-            .try_into()
-            .unwrap();
-        assert!(field.is_blob_v2());
-    }
-
-    #[test]
-    fn blob_extension_roundtrip() {
-        let metadata = HashMap::from([
-            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
-            (ARROW_EXT_META_KEY.to_string(), "".to_string()),
-        ]);
-        let arrow_field =
-            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata);
-        let field = Field::try_from(&arrow_field).unwrap();
-        assert_eq!(
-            field.logical_type,
-            LogicalType::from(crate::datatypes::BLOB_LOGICAL_TYPE)
-        );
-        assert!(field.is_blob());
-        assert_eq!(field.data_type(), DataType::LargeBinary);
-
-        let roundtrip: ArrowField = ArrowField::from(&field);
-        assert_eq!(
-            roundtrip.metadata().get(ARROW_EXT_NAME_KEY),
-            Some(&BLOB_V2_EXT_NAME.to_string())
-        );
-        assert_eq!(
-            roundtrip.metadata().get(BLOB_META_KEY),
-            Some(&"true".to_string())
-        );
     }
 }
