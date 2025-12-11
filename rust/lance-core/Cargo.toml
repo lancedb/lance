@@ -51,6 +51,7 @@ libc = { version = "0.2" }
 [dev-dependencies]
 lance-testing.workspace = true
 proptest.workspace = true
+rstest.workspace = true
 
 [features]
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
