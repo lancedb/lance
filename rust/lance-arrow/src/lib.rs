@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -604,6 +604,9 @@ pub trait RecordBatchExt {
 
     /// Create a new RecordBatch with compacted memory after slicing.
     fn shrink_to_fit(&self) -> Result<RecordBatch>;
+
+    /// Helper method to sort the RecordBatch by a column
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -777,6 +780,18 @@ impl RecordBatchExt for RecordBatch {
     fn shrink_to_fit(&self) -> Result<Self> {
         // Deep copy the sliced record batch, instead of whole batch
         crate::deepcopy::deep_copy_batch_sliced(self)
+    }
+
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<Self> {
+        if column >= self.num_columns() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Column index out of bounds: {}",
+                column
+            )));
+        }
+        let column = self.column(column);
+        let sorted = arrow_ord::sort::sort_to_indices(column, options, None)?;
+        self.take(&sorted)
     }
 }
 

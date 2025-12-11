@@ -11,10 +11,9 @@ use std::{
 };
 
 use super::{
-    flat::FlatIndexMetadata, AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter,
-    MetricsCollector, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
-use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -24,6 +23,7 @@ use crate::{
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
+use crate::{pbold, scalar::btree::flat::FlatIndex};
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -61,6 +61,8 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
 use tracing::info;
+
+mod flat;
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -570,17 +572,52 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-    /// Pages where the value may be null
+    /// Pages where the value may be null (does not include all_null_pages)
     null_pages: Vec<u32>,
+    /// Pages that are entirely null
+    all_null_pages: Vec<u32>,
 }
 
 impl BTreeLookup {
-    fn new(tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>, null_pages: Vec<u32>) -> Self {
-        Self { tree, null_pages }
+    fn empty() -> Self {
+        Self {
+            tree: BTreeMap::new(),
+            null_pages: Vec::new(),
+            all_null_pages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Matches {
+    Some(u32),
+    All(u32),
+}
+
+impl Matches {
+    fn page_id(&self) -> u32 {
+        match self {
+            Self::Some(page_id) => *page_id,
+            Self::All(page_id) => *page_id,
+        }
+    }
+}
+
+impl BTreeLookup {
+    fn new(
+        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
+        null_pages: Vec<u32>,
+        all_null_pages: Vec<u32>,
+    ) -> Self {
+        Self {
+            tree,
+            null_pages,
+            all_null_pages,
+        }
     }
 
     // All pages that could have a value equal to val
-    fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
+    fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<Matches> {
         if query.0.is_null() {
             self.pages_null()
         } else {
@@ -589,10 +626,16 @@ impl BTreeLookup {
     }
 
     // All pages that could have a value equal to one of the values
-    fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<u32> {
+    fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<Matches> {
+        // TODO: Right now we convert all Matches::All into Matches::Some.  We could refine this.
+        // It would improve performance on low cardinality data.
         let page_lists = values
             .into_iter()
-            .map(|val| self.pages_eq(&val))
+            .map(|val| {
+                self.pages_eq(&val)
+                    .into_iter()
+                    .map(|matches| matches.page_id())
+            })
             .collect::<Vec<_>>();
         let total_size = page_lists.iter().map(|set| set.len()).sum();
         let mut heap = BinaryHeap::with_capacity(total_size);
@@ -601,14 +644,14 @@ impl BTreeLookup {
         }
         let mut all_pages = heap.into_sorted_vec();
         all_pages.dedup();
-        all_pages
+        all_pages.into_iter().map(Matches::Some).collect()
     }
 
     // All pages that could have a value in the range
     fn pages_between(
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
-    ) -> Vec<u32> {
+    ) -> Vec<Matches> {
         // We need to grab a little bit left of the given range because the query might be 7
         // and the first page might be something like 5-10.
         let lower_bound = match range.0 {
@@ -662,25 +705,85 @@ impl BTreeLookup {
             _ => {}
         }
 
-        let candidates = self
-            .tree
-            .range((lower_bound, upper_bound))
-            .flat_map(|val| val.1);
-        match lower_bound {
-            Bound::Unbounded => candidates.map(|val| val.page_number).collect(),
-            Bound::Included(lower_bound) => candidates
-                .filter(|val| val.max.cmp(lower_bound) != Ordering::Less)
-                .map(|val| val.page_number)
-                .collect(),
-            Bound::Excluded(lower_bound) => candidates
-                .filter(|val| val.max.cmp(lower_bound) == Ordering::Greater)
-                .map(|val| val.page_number)
-                .collect(),
+        let mut matches = Vec::new();
+
+        for (min, page_records) in self.tree.range((lower_bound, upper_bound)) {
+            for page_record in page_records {
+                match lower_bound {
+                    Bound::Unbounded => {}
+                    Bound::Included(lower) => {
+                        if page_record.max.cmp(lower) == Ordering::Less {
+                            continue;
+                        }
+                    }
+                    Bound::Excluded(lower) => {
+                        if page_record.max.cmp(lower) != Ordering::Greater {
+                            continue;
+                        }
+                    }
+                }
+                // At this point we know the page record matches at least some values.
+                // We should test to see if ALL values are a match.
+
+                if min.0.is_null() || page_record.max.0.is_null() {
+                    // If there are nulls then we just use Matches::Some
+                    matches.push(Matches::Some(page_record.page_number));
+                    continue;
+                }
+
+                match range.0 {
+                    // range.0 < X therefore if the smallest value is not strictly greater than
+                    // the lower bound we only have partial match
+                    Bound::Excluded(lower) => {
+                        if min.cmp(lower) != Ordering::Greater {
+                            matches.push(Matches::Some(page_record.page_number));
+                            continue;
+                        }
+                    }
+                    // range.0 <= X therefore if the smallest value is not greater than or equal
+                    // to the lower bound we only have partial match
+                    Bound::Included(lower) => {
+                        if min.cmp(lower) == Ordering::Less {
+                            matches.push(Matches::Some(page_record.page_number));
+                            continue;
+                        }
+                    }
+                    Bound::Unbounded => {}
+                }
+                match range.1 {
+                    // X < range.1 therefore if the largest value is not strictly less than
+                    // the upper bound we only have partial match
+                    Bound::Excluded(upper) => {
+                        if page_record.max.cmp(upper) != Ordering::Less {
+                            matches.push(Matches::Some(page_record.page_number));
+                            continue;
+                        }
+                    }
+                    // X <= range.1 therefore if the largest value is not less than or equal to
+                    // the upper bound we only have partial match
+                    Bound::Included(upper) => {
+                        if page_record.max.cmp(upper) == Ordering::Greater {
+                            matches.push(Matches::Some(page_record.page_number));
+                            continue;
+                        }
+                    }
+                    Bound::Unbounded => {}
+                }
+                // The min is greater than the lower bound and the max is less than the upper bound
+                // so we have a full match
+                matches.push(Matches::All(page_record.page_number));
+            }
         }
+
+        matches
     }
 
-    fn pages_null(&self) -> Vec<u32> {
-        self.null_pages.clone()
+    fn pages_null(&self) -> Vec<Matches> {
+        self.null_pages
+            .iter()
+            .map(|page_id| Matches::Some(*page_id))
+            .chain(self.all_null_pages.iter().copied().map(Matches::All))
+            .collect()
     }
 }
 
@@ -743,7 +846,7 @@ pub struct BTreePageKey {
 }
 
 impl CacheKey for BTreePageKey {
-    type ValueType = CachedScalarIndex;
+    type ValueType = FlatIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("page-{}", self.page_number).into()
@@ -757,7 +860,7 @@ pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     index_cache: WeakLanceCache,
     store: Arc<dyn IndexStore>,
-    sub_index: Arc<dyn BTreeSubIndex>,
+    data_type: DataType,
     batch_size: u64,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
@@ -772,20 +875,18 @@ impl DeepSizeOf for BTreeIndex {
 
 impl BTreeIndex {
     fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
+        page_lookup: Arc<BTreeLookup>,
         store: Arc<dyn IndexStore>,
+        data_type: DataType,
         index_cache: WeakLanceCache,
-        sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
-        let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
         Self {
             page_lookup,
             store,
+            data_type,
             index_cache,
-            sub_index,
             batch_size,
             frag_reuse_index,
         }
@@ -796,14 +897,12 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>> {
+    ) -> Result<Arc<FlatIndex>> {
         self.index_cache
             .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
-                let result = self.read_page(page_number, index_reader, metrics).await?;
-                Ok(CachedScalarIndex::new(result))
+                self.read_page(page_number, index_reader, metrics).await
             })
             .await
-            .map(|v| v.as_ref().clone().into_inner())
     }
 
     async fn read_page(
@@ -811,7 +910,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>> {
+    ) -> Result<FlatIndex> {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -822,27 +921,32 @@ impl BTreeIndex {
             serialized_page =
                 frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
-        let result = self.sub_index.load_subindex(serialized_page).await?;
-        Ok(result)
+        FlatIndex::try_new(serialized_page)
     }
 
     async fn search_page(
         &self,
         query: &SargableQuery,
-        page_number: u32,
+        matches: Matches,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
-        // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
-        // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
-        // to search for X IN [5, 3]
-        match subindex.search(query, metrics).await? {
-            SearchResult::Exact(map) => Ok(map),
-            _ => Err(Error::Internal {
-                message: "BTree sub-indices need to return exact results".to_string(),
-                location: location!(),
+        let subindex = self
+            .lookup_page(matches.page_id(), index_reader, metrics)
+            .await?;
+
+        match matches {
+            Matches::Some(_) => {
+                // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
+                // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
+                // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
+                // to search for X IN [5, 3]
+                subindex.search(query, metrics)
+            }
+            Matches::All(_) => Ok(match query {
+                // This means we hit an all-null page so just grab all row ids as true
+                SargableQuery::IsNull() => subindex.all_ignore_nulls(),
+                _ => subindex.all(),
             }),
         }
     }
@@ -855,17 +959,19 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
+        // Pages that have at least one null value
         let mut null_pages = Vec::<u32>::new();
+        // Pages that are entirely null
+        let mut all_null_pages = Vec::<u32>::new();
 
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
-            let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
+            let page_lookup = Arc::new(BTreeLookup::empty());
             return Ok(Self::new(
-                map,
-                null_pages,
+                page_lookup,
                 store,
+                data_type,
                 WeakLanceCache::from(index_cache),
-                sub_index,
                 batch_size,
                 frag_reuse_index,
             ));
@@ -891,7 +997,11 @@ impl BTreeIndex {
             let page_number = page_numbers.values()[idx];
 
             // If the page is entirely null don't even bother putting it in the tree
-            if !max.0.is_null() {
+            if max.0.is_null() {
+                all_null_pages.push(page_number);
+                // continue so we don't add it to the null_pages
+                continue;
+            } else {
                 map.entry(min)
                     .or_default()
                     .push(PageRecord { max, page_number });
@@ -907,15 +1017,13 @@ impl BTreeIndex {
 
         let data_type = mins.data_type();
 
-        // TODO: Support other page types?
-        let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
+        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
 
         Ok(Self::new(
-            map,
-            null_pages,
+            page_lookup,
             store,
+            data_type.clone(),
             WeakLanceCache::from(index_cache),
-            sub_index,
             batch_size,
             frag_reuse_index,
         ))
@@ -946,13 +1054,24 @@ impl BTreeIndex {
         )?))
     }
 
+    // For legacy reasons a btree index expects the training input to use value/_rowid
+    fn train_schema(&self) -> Schema {
+        let value_field = Field::new(VALUE_COLUMN_NAME, self.data_type.clone(), true);
+        let row_id_field = Field::new(ROW_ID, DataType::UInt64, false);
+        Schema::new(vec![value_field, row_id_field])
+    }
+
+    // For legacy reasons a btree index expects the serialized schema to be values/ids
+    fn flat_schema(&self) -> Schema {
+        let value_field = Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true);
+        let row_id_field = Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false);
+        Schema::new(vec![value_field, row_id_field])
+    }
+
     /// Create a stream of all the data in the index, in the same format used to train the index
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-        let schema = self.sub_index.schema().clone();
-        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
-        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
         let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
         let batches = reader_stream
@@ -1085,7 +1204,7 @@ impl Index for BTreeIndex {
                     &BTreePageKey {
                         page_number: page_idx,
                     },
-                    Arc::new(CachedScalarIndex::new(page)),
+                    Arc::new(page),
                 )
                 .await;
 
@@ -1131,8 +1250,8 @@ impl Index for BTreeIndex {
             .await
             .buffered(self.store.io_parallelism());
         while let Some(serialized) = reader_stream.try_next().await? {
-            let page = self.sub_index.load_subindex(serialized).await?;
-            frag_ids |= page.calculate_included_frags().await?;
+            let page = FlatIndex::try_new(serialized)?;
+            frag_ids |= page.calculate_included_frags()?;
         }
 
         Ok(frag_ids)
@@ -1197,16 +1316,15 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // Remap and write the pages
-        let mut sub_index_file = dest_store
-            .new_index_file(BTREE_PAGES_NAME, self.sub_index.schema().clone())
-            .await?;
+        let schema = Arc::new(self.flat_schema());
+        let mut sub_index_file = dest_store.new_index_file(BTREE_PAGES_NAME, schema).await?;
 
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
             .await
             .buffered(self.store.io_parallelism());
         while let Some(serialized) = reader_stream.try_next().await? {
-            let remapped = self.sub_index.remap_subindex(serialized, mapping).await?;
+            let remapped = FlatIndex::remap_batch(serialized, mapping)?;
             sub_index_file.write_record_batch(remapped).await?;
         }
 
@@ -1234,14 +1352,7 @@ impl ScalarIndex for BTreeIndex {
             .clone()
             .combine_old_new(new_data, self.batch_size)
             .await?;
-        train_btree_index(
-            merged_data_source,
-            self.sub_index.as_ref(),
-            dest_store,
-            self.batch_size,
-            None,
-        )
-        .await?;
+        train_btree_index(merged_data_source, dest_store, self.batch_size, None).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1329,11 +1440,20 @@ struct EncodedBatch {
 async fn train_btree_page(
     batch: RecordBatch,
     batch_idx: u32,
-    sub_index_trainer: &dyn BTreeSubIndex,
     writer: &mut dyn IndexWriter,
+    schema: Arc<Schema>,
 ) -> Result<EncodedBatch> {
     let stats = analyze_batch(&batch)?;
-    let trained = sub_index_trainer.train(batch).await?;
+
+    // Renames from value/_rowid to values/ids
+    let trained = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
+            batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+        ],
+    )?;
+
     writer.write_record_batch(trained).await?;
     Ok(EncodedBatch {
         stats,
@@ -1380,7 +1500,6 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Resu
 /// a work in progress
 pub async fn train_btree_index(
     batches_source: SendableRecordBatchStream,
-    sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
@@ -1396,16 +1515,25 @@ pub async fn train_btree_index(
         }
     });
 
+    let flat_schema = Arc::new(Schema::new(vec![
+        Field::new(
+            BTREE_VALUES_COLUMN,
+            batches_source.schema().field(0).data_type().clone(),
+            true,
+        ),
+        Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+    ]));
+
     let mut sub_index_file;
     if fragment_mask.is_none() {
         sub_index_file = index_store
-            .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
+            .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
             .await?;
     } else {
         sub_index_file = index_store
             .new_index_file(
                 part_page_data_file_path(fragment_mask.unwrap()).as_str(),
-                sub_index_trainer.schema().clone(),
+                flat_schema.clone(),
             )
             .await?;
     }
@@ -1423,7 +1551,13 @@ pub async fn train_btree_index(
 
     while let Some(batch) = batches_source.try_next().await? {
         encoded_batches.push(
-            train_btree_page(batch, batch_idx, sub_index_trainer, sub_index_file.as_mut()).await?,
+            train_btree_page(
+                batch,
+                batch_idx,
+                sub_index_file.as_mut(),
+                flat_schema.clone(),
+            )
+            .await?,
         );
         batch_idx += 1;
     }
@@ -1968,15 +2102,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
             .unwrap();
-        let value_type = data
-            .schema()
-            .field_with_name(VALUE_COLUMN_NAME)?
-            .data_type()
-            .clone();
-        let flat_index_trainer = FlatIndexMetadata::new(value_type);
         train_btree_index(
             data,
-            &flat_index_trainer,
             index_store,
             request
                 .parameters
@@ -2010,7 +2137,6 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{record_batch, FixedSizeListArray};
-    use arrow_schema::DataType;
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
@@ -2032,7 +2158,6 @@ mod tests {
         metrics::NoOpMetricsCollector,
         scalar::{
             btree::{BTreeIndex, BTREE_PAGES_NAME},
-            flat::FlatIndexMetadata,
             lance_format::LanceIndexStore,
             IndexStore, SargableQuery, ScalarIndex, SearchResult,
         },
@@ -2075,9 +2200,8 @@ mod tests {
             )
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 5000, None)
+        train_btree_index(stream, test_store.as_ref(), 5000, None)
             .await
             .unwrap();
 
@@ -2158,9 +2282,7 @@ mod tests {
         let stream =
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
 
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
-
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
+        train_btree_index(stream, test_store.as_ref(), 64, None)
             .await
             .unwrap();
 
@@ -2199,9 +2321,8 @@ mod tests {
         let stream = stream.map_err(DataFusionError::from);
         let stream =
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
+        train_btree_index(stream, test_store.as_ref(), 64, None)
             .await
             .unwrap();
 
@@ -2235,8 +2356,6 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
-
         // Method 1: Build complete index directly using the same data
         // Create deterministic data for comparison - use 2 * DEFAULT_BTREE_BATCH_SIZE for testing
         let total_count = 2 * DEFAULT_BTREE_BATCH_SIZE;
@@ -2251,7 +2370,6 @@ mod tests {
 
         train_btree_index(
             full_data_source,
-            &sub_index_trainer,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -2273,7 +2391,6 @@ mod tests {
 
         train_btree_index(
             fragment1_data_source,
-            &sub_index_trainer,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             Some(vec![1]), // fragment_id = 1
@@ -2297,7 +2414,6 @@ mod tests {
 
         train_btree_index(
             fragment2_data_source,
-            &sub_index_trainer,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             Some(vec![2]), // fragment_id = 2
@@ -2419,8 +2535,6 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
-
         // Use 3 * DEFAULT_BTREE_BATCH_SIZE for more comprehensive boundary testing
         let total_count = 3 * DEFAULT_BTREE_BATCH_SIZE;
 
@@ -2436,7 +2550,6 @@ mod tests {
 
         train_btree_index(
             full_data_source,
-            &sub_index_trainer,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
@@ -2458,7 +2571,6 @@ mod tests {
 
         train_btree_index(
             fragment1_data_source,
-            &sub_index_trainer,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             Some(vec![1]),
@@ -2482,7 +2594,6 @@ mod tests {
 
         train_btree_index(
             fragment2_data_source,
-            &sub_index_trainer,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             Some(vec![2]),
@@ -2506,7 +2617,6 @@ mod tests {
 
         train_btree_index(
             fragment3_data_source,
-            &sub_index_trainer,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             Some(vec![3]),
@@ -2900,8 +3010,7 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(batch.schema(), stream));
 
         // Train the btree index with FlatIndexMetadata as sub-index
-        let sub_index_trainer = super::FlatIndexMetadata::new(DataType::Int32);
-        super::train_btree_index(stream, &sub_index_trainer, store.as_ref(), 256, None)
+        super::train_btree_index(stream, store.as_ref(), 256, None)
             .await
             .unwrap();
 

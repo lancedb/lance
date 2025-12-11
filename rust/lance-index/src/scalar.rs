@@ -32,7 +32,6 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
-pub mod flat;
 pub mod inverted;
 pub mod json;
 pub mod label_list;

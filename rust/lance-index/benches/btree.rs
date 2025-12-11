@@ -19,7 +19,6 @@ use std::{
     time::Duration,
 };
 
-use arrow_schema::DataType;
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion_common::ScalarValue;
@@ -27,7 +26,6 @@ use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{train_btree_index, BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE};
-use lance_index::scalar::flat::FlatIndexMetadata;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex};
@@ -107,17 +105,10 @@ async fn create_int_unique_index(
     use_cache: bool,
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_unique_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Int64);
 
-    train_btree_index(
-        stream,
-        &sub_index,
-        store.as_ref(),
-        DEFAULT_BTREE_BATCH_SIZE,
-        None,
-    )
-    .await
-    .unwrap();
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+        .await
+        .unwrap();
 
     let cache = get_cache(use_cache, "int_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -135,17 +126,10 @@ async fn create_int_low_card_index(
     use_cache: bool,
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_low_cardinality_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Int64);
 
-    train_btree_index(
-        stream,
-        &sub_index,
-        store.as_ref(),
-        DEFAULT_BTREE_BATCH_SIZE,
-        None,
-    )
-    .await
-    .unwrap();
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+        .await
+        .unwrap();
 
     let cache = get_cache(use_cache, "int_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -163,17 +147,10 @@ async fn create_string_unique_index(
     use_cache: bool,
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_unique_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Utf8);
 
-    train_btree_index(
-        stream,
-        &sub_index,
-        store.as_ref(),
-        DEFAULT_BTREE_BATCH_SIZE,
-        None,
-    )
-    .await
-    .unwrap();
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+        .await
+        .unwrap();
 
     let cache = get_cache(use_cache, "string_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -191,17 +168,10 @@ async fn create_string_low_card_index(
     use_cache: bool,
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_low_cardinality_stream();
-    let sub_index = FlatIndexMetadata::new(DataType::Utf8);
 
-    train_btree_index(
-        stream,
-        &sub_index,
-        store.as_ref(),
-        DEFAULT_BTREE_BATCH_SIZE,
-        None,
-    )
-    .await
-    .unwrap();
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+        .await
+        .unwrap();
 
     let cache = get_cache(use_cache, "string_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
