@@ -29,7 +29,6 @@ use arrow_arith::numeric::add;
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
@@ -731,7 +730,8 @@ impl LazyIndexReader {
 /// Index reader to dispatch page query to corresponding ranged page-files.
 struct LazyRangedIndexReader {
     #[allow(clippy::type_complexity)]
-    readers: Arc<DashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>,
+    readers:
+        Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>>,
     store: Arc<dyn IndexStore>,
     ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
 }
@@ -742,7 +742,7 @@ impl LazyRangedIndexReader {
         ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
     ) -> Self {
         Self {
-            readers: Arc::new(DashMap::new()),
+            readers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             store,
             ranges_to_files,
         }
@@ -750,12 +750,11 @@ impl LazyRangedIndexReader {
 
     async fn get_reader(&self, file_name: &str) -> Result<Arc<dyn IndexReader>> {
         let reader_cell = {
-            let guard = self
-                .readers
+            let mut guard = self.readers.lock().await;
+            guard
                 .entry(file_name.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
-
-            Arc::clone(&*guard)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
         };
         let reader = reader_cell
             .get_or_try_init(|| async { self.store.open_index_file(file_name).await })
@@ -767,9 +766,13 @@ impl LazyRangedIndexReader {
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
-        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).unwrap_or_else(|| {
-            panic!("Unexpected page index, index {} is out of range.", page_idx)
-        });
+        let (page_file_name, offset) =
+            self.ranges_to_files
+                .get(&page_idx)
+                .ok_or_else(|| Error::Internal {
+                    message: format!("Unexpected page index, index {} is out of range.", page_idx),
+                    location: location!(),
+                })?;
         let reader = self.get_reader(page_file_name).await?;
         Ok((reader.clone(), page_idx - *offset))
     }
