@@ -67,6 +67,7 @@ impl BenchmarkFixture {
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
+            None,
         )
         .await
         .unwrap();

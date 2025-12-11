@@ -4789,6 +4789,7 @@ dependencies = [
  "protobuf-src",
  "rand 0.9.2",
  "rand_distr 0.5.1",
+ "rangemap",
  "rayon",
  "roaring",
  "rstest",

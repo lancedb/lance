@@ -106,7 +106,7 @@ async fn create_int_unique_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_unique_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
         .await
         .unwrap();
 
@@ -127,7 +127,7 @@ async fn create_int_low_card_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_low_cardinality_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
         .await
         .unwrap();
 
@@ -148,7 +148,7 @@ async fn create_string_unique_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_unique_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
         .await
         .unwrap();
 
@@ -169,7 +169,7 @@ async fn create_string_low_card_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_low_cardinality_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None)
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
         .await
         .unwrap();
 

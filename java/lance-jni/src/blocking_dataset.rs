@@ -39,6 +39,7 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
@@ -718,12 +719,13 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,       // Optional<String>
-    params_jobj: JObject,     // IndexParams
-    replace_jobj: jboolean,   // replace
-    train_jobj: jboolean,     // train
-    fragments_jobj: JObject,  // List<Integer>
-    index_uuid_jobj: JObject, // String
+    name_jobj: JObject,              // Optional<String>
+    params_jobj: JObject,            // IndexParams
+    replace_jobj: jboolean,          // replace
+    train_jobj: jboolean,            // train
+    fragments_jobj: JObject,         // List<Integer>
+    index_uuid_jobj: JObject,        // String
+    arrow_stream_addr_jobj: JObject, // Optional<Long>
 ) {
     ok_or_throw_without_return!(
         env,
@@ -737,7 +739,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
             replace_jobj,
             train_jobj,
             fragments_jobj,
-            index_uuid_jobj
+            index_uuid_jobj,
+            arrow_stream_addr_jobj,
         )
     );
 }
@@ -748,12 +751,13 @@ fn inner_create_index(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,       // Optional<String>
-    params_jobj: JObject,     // IndexParams
-    replace_jobj: jboolean,   // replace
-    train_jobj: jboolean,     // train
-    fragments_jobj: JObject,  // Optional<List<String>>
-    index_uuid_jobj: JObject, // Optional<String>
+    name_jobj: JObject,              // Optional<String>
+    params_jobj: JObject,            // IndexParams
+    replace_jobj: jboolean,          // replace
+    train_jobj: jboolean,            // train
+    fragments_jobj: JObject,         // Optional<List<String>>
+    index_uuid_jobj: JObject,        // Optional<String>
+    arrow_stream_addr_jobj: JObject, // Optional<Long>
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -765,6 +769,17 @@ fn inner_create_index(
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
     let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
+    let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
+    let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
+        let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+        Some(reader)
+    } else {
+        None
+    };
+
+    // we should skip committing index when building distributed indices.
+    let mut skip_commit = fragment_ids.is_some();
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -780,8 +795,9 @@ fn inner_create_index(
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
                 index_type: index_type_str,
-                params: params_opt,
+                params: params_opt.clone(),
             };
+            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -818,8 +834,6 @@ fn inner_create_index(
         index_builder = index_builder.name(name);
     }
 
-    let has_fragment_ids = fragment_ids.is_some();
-
     if let Some(fragment_ids) = fragment_ids {
         index_builder = index_builder.fragments(fragment_ids);
     }
@@ -828,13 +842,31 @@ fn inner_create_index(
         index_builder = index_builder.index_uuid(index_uuid);
     }
 
-    if has_fragment_ids {
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if skip_commit {
         RT.block_on(index_builder.execute_uncommitted())?;
     } else {
         RT.block_on(index_builder.into_future())?
     }
 
     Ok(())
+}
+
+fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
+    match index_type {
+        IndexType::BTree => {
+            // Should defer the commit if we are building range-based BTree index
+            if let Some(params) = params_opt {
+                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
+                return Ok(btree_parameters.range_id.is_some());
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[no_mangle]

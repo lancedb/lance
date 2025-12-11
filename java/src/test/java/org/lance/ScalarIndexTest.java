@@ -18,17 +18,32 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.lance.operation.CreateIndex;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -154,6 +169,155 @@ public class ScalarIndexTest {
           assertEquals(datasetVersion + 1, newDataset.version());
           assertTrue(newDataset.listIndexes().contains("test_index"));
         }
+      }
+    }
+  }
+
+  @Test
+  public void testRangedBTreeIndex() throws Exception {
+    String datasetPath = tempDir.resolve("ranged_btree_map").toString();
+    UUID indexUUID = UUID.randomUUID();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // 1. write some data
+      try (Dataset dataset = testDataset.write(1, 200)) {
+
+        // 2. scan data out
+        List<long[]> data = new ArrayList<>();
+        try (LanceScanner scanner =
+                dataset.newScan(
+                    new ScanOptions.Builder()
+                        .withRowId(true)
+                        .columns(Collections.singletonList("id"))
+                        .build());
+            ArrowReader arrowReader = scanner.scanBatches(); ) {
+          while (arrowReader.loadNextBatch()) {
+            VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+            UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+            IntVector idVec = (IntVector) root.getVector("id");
+            for (int i = 0; i < root.getRowCount(); i++) {
+              data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
+            }
+          }
+        }
+
+        // 3. sort data globally (This will be done by computing engines in production)
+        data.sort((d1, d2) -> (int) (d1[0] - d2[0]));
+        int mid = data.size() / 2;
+
+        // 4. divide sorted data into ranges and build index for each range
+        createBtreeIndexForRange(dataset, data.subList(0, mid), 1, allocator, indexUUID);
+        createBtreeIndexForRange(dataset, data.subList(mid, data.size()), 2, allocator, indexUUID);
+
+        // 5. merge index.
+        dataset.mergeIndexMetadata(indexUUID.toString(), IndexType.BTREE, Optional.empty());
+
+        // 6. commit index
+        long datasetVersion = dataset.version();
+        int fieldId =
+            dataset.getLanceSchema().fields().stream()
+                .filter(f -> f.getName().equals("id"))
+                .findAny()
+                .orElseThrow(() -> new RuntimeException("Cannot find 'id' field for TestDataset"))
+                .getId();
+        Index index =
+            Index.builder()
+                .uuid(indexUUID)
+                .name("test_index")
+                .fields(Collections.singletonList(fieldId))
+                .datasetVersion(datasetVersion)
+                .indexVersion(0)
+                .fragments(
+                    dataset.getFragments().stream()
+                        .map(Fragment::getId)
+                        .collect(Collectors.toList()))
+                .build();
+
+        CreateIndex createIndexOp =
+            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
+
+        Transaction createIndexTx =
+            dataset.newTransactionBuilder().operation(createIndexOp).build();
+
+        try (Dataset newDataset = createIndexTx.commit()) {
+          // new dataset should contain that index
+          assertEquals(datasetVersion + 1, newDataset.version());
+          assertTrue(newDataset.listIndexes().contains("test_index"));
+
+          // 7. compare results
+          // force use index should get the right value
+          ScanOptions scanOptions =
+              new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
+          try (LanceScanner scanner = newDataset.newScan(scanOptions);
+              ArrowReader arrowReader = scanner.scanBatches(); ) {
+            List<Integer> ids = new ArrayList<>();
+            while (arrowReader.loadNextBatch()) {
+              VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+              IntVector idVec = (IntVector) root.getVector("id");
+              for (int i = 0; i < idVec.getValueCount(); i++) {
+                ids.add(idVec.get(i));
+              }
+            }
+            Collections.sort(ids);
+            Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
+          }
+        }
+      }
+    }
+  }
+
+  private void createBtreeIndexForRange(
+      Dataset dataset,
+      List<long[]> preprocessedData,
+      int rangeId,
+      BufferAllocator allocator,
+      UUID indexUUID) {
+    // Note that the indexing column is called 'value' in btree.
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true)),
+                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+            null);
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("value");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      for (int i = 0; i < preprocessedData.size(); i++) {
+        long[] dataPair = preprocessedData.get(i);
+        idVec.set(i, (int) dataPair[0]);
+        rowIdVec.setSafe(i, dataPair[1]);
+      }
+      root.setRowCount(preprocessedData.size());
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      } catch (IOException e) {
+        throw new RuntimeException("Cannot write schema root", e);
+      }
+
+      byte[] arrowData = out.toByteArray();
+      ByteArrayInputStream in = new ByteArrayInputStream(arrowData);
+
+      try (ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+
+        ScalarIndexParams scalarParams =
+            ScalarIndexParams.create("btree", String.format("{\"range_id\": %s}", rangeId));
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexUUID(indexUUID.toString())
+                .withPreprocessedData(stream)
+                .build());
+      } catch (Exception e) {
+        throw new RuntimeException("Cannot read arrow stream.", e);
       }
     }
   }

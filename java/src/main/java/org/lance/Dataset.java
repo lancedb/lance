@@ -783,7 +783,8 @@ public class Dataset implements Closeable {
           options.isReplace(),
           options.isTrain(),
           options.getFragmentIds(),
-          options.getIndexUUID());
+          options.getIndexUUID(),
+          options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
     }
   }
 
@@ -795,7 +796,8 @@ public class Dataset implements Closeable {
       boolean replace,
       boolean train,
       Optional<List<Integer>> fragments,
-      Optional<String> indexUUID);
+      Optional<String> indexUUID,
+      Optional<Long> arrowStreamMemoryAddress);
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
