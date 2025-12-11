@@ -4131,7 +4131,6 @@ dependencies = [
  "bitvec",
  "bytes",
  "crossbeam-queue",
- "dashmap",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",

@@ -4751,7 +4751,6 @@ dependencies = [
  "chrono",
  "criterion",
  "crossbeam-queue",
- "dashmap",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
