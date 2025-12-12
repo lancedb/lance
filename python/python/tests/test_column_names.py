@@ -261,3 +261,119 @@ class TestSpecialCharacterColumnNames:
 
         result = dataset.to_table()
         assert result.num_rows == 150
+
+
+class TestNestedFieldColumnNames:
+    """
+    Test that column names with mixed case and special characters work
+    properly within nested (struct) fields.
+
+    This tests nested field paths like:
+    - metadata.userId (mixed case in nested field)
+    - metadata.user-id (special chars in nested field)
+    """
+
+    @pytest.fixture
+    def nested_mixed_case_table(self):
+        """Create a table with mixed-case nested column names."""
+        return pa.table(
+            {
+                "id": range(100),
+                "metadata": [{"userId": i, "itemCount": i * 10} for i in range(100)],
+            }
+        )
+
+    @pytest.fixture
+    def nested_mixed_case_dataset(self, tmp_path: Path, nested_mixed_case_table):
+        """Create a dataset with mixed-case nested column names."""
+        return lance.write_dataset(
+            nested_mixed_case_table, tmp_path / "nested_mixed_case"
+        )
+
+    def test_create_table_with_nested_mixed_case(self, nested_mixed_case_dataset):
+        """Verify table creation with nested mixed-case columns preserves names."""
+        schema = nested_mixed_case_dataset.schema
+        assert "metadata" in [f.name for f in schema]
+        metadata_field = schema.field("metadata")
+        nested_names = [f.name for f in metadata_field.type]
+        assert "userId" in nested_names
+        assert "itemCount" in nested_names
+
+    def test_filter_with_nested_mixed_case(self, nested_mixed_case_dataset):
+        """Filter expressions should work with mixed-case nested column names."""
+        result = nested_mixed_case_dataset.to_table(filter="metadata.userId > 50")
+        assert result.num_rows == 49
+
+        result = nested_mixed_case_dataset.to_table(filter="metadata.itemCount >= 500")
+        assert result.num_rows == 50
+
+    def test_scalar_index_with_nested_mixed_case(self, nested_mixed_case_dataset):
+        """Scalar index creation should work with mixed-case nested column names."""
+        nested_mixed_case_dataset.create_scalar_index(
+            "metadata.userId", index_type="BTREE"
+        )
+
+        indices = nested_mixed_case_dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["fields"] == ["metadata.userId"]
+
+        # Query using the indexed column
+        result = nested_mixed_case_dataset.to_table(filter="metadata.userId = 50")
+        assert result.num_rows == 1
+
+    @pytest.fixture
+    def nested_special_char_table(self):
+        """Create a table with special character nested column names."""
+        return pa.table(
+            {
+                "id": range(100),
+                "meta-data": [{"user-id": i, "item:count": i * 10} for i in range(100)],
+            }
+        )
+
+    @pytest.fixture
+    def nested_special_char_dataset(self, tmp_path: Path, nested_special_char_table):
+        """Create a dataset with special character nested column names."""
+        return lance.write_dataset(
+            nested_special_char_table, tmp_path / "nested_special_char"
+        )
+
+    def test_create_table_with_nested_special_chars(self, nested_special_char_dataset):
+        """Verify table creation with nested special char columns preserves names."""
+        schema = nested_special_char_dataset.schema
+        assert "meta-data" in [f.name for f in schema]
+        metadata_field = schema.field("meta-data")
+        nested_names = [f.name for f in metadata_field.type]
+        assert "user-id" in nested_names
+        assert "item:count" in nested_names
+
+    def test_filter_with_nested_special_chars(self, nested_special_char_dataset):
+        """Filter expressions work with special char nested columns using backticks."""
+        # Both the parent and child need backticks when they contain special chars
+        result = nested_special_char_dataset.to_table(
+            filter="`meta-data`.`user-id` > 50"
+        )
+        assert result.num_rows == 49
+
+        result = nested_special_char_dataset.to_table(
+            filter="`meta-data`.`item:count` >= 500"
+        )
+        assert result.num_rows == 50
+
+    def test_scalar_index_with_nested_special_chars(self, nested_special_char_dataset):
+        """Scalar index creation should work with special char nested column names."""
+        # Use backtick syntax for nested field path with special chars
+        nested_special_char_dataset.create_scalar_index(
+            "`meta-data`.`user-id`", index_type="BTREE"
+        )
+
+        indices = nested_special_char_dataset.list_indices()
+        assert len(indices) == 1
+        # Backticks are stripped when storing the field path
+        assert indices[0]["fields"] == ["meta-data.user-id"]
+
+        # Query using the indexed column (backticks required in filter)
+        result = nested_special_char_dataset.to_table(
+            filter="`meta-data`.`user-id` = 50"
+        )
+        assert result.num_rows == 1

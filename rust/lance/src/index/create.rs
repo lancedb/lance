@@ -105,15 +105,27 @@ impl<'a> CreateIndexBuilder<'a> {
             });
         }
         let column = &self.columns[0];
-        // Use case-insensitive lookup to handle lowercased column names from SQL parsing
-        let Some(field) = self.dataset.schema().field_case_insensitive(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
+        // Use case-insensitive lookup to handle lowercased column names
+        // For nested paths, use exact match; for simple columns, try case-insensitive
+        let (column, field) = if column.contains('.') {
+            // Nested field path - validate it exists and use exact path
+            let Some(field) = self.dataset.schema().field(column) else {
+                return Err(Error::Index {
+                    message: format!("CreateIndex: column '{column}' does not exist"),
+                    location: location!(),
+                });
+            };
+            (column.as_str(), field)
+        } else {
+            // Simple column - use case-insensitive lookup and resolved name
+            let Some(field) = self.dataset.schema().field_case_insensitive(column) else {
+                return Err(Error::Index {
+                    message: format!("CreateIndex: column '{column}' does not exist"),
+                    location: location!(),
+                });
+            };
+            (field.name.as_str(), field)
         };
-        // Use the actual field name from the schema (preserving original case)
-        let column = &field.name;
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
