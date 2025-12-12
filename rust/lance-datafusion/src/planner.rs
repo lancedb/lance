@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::exec::{get_session_context, LanceExecutionOptions};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::logical_expr::{
+    coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_column_names, resolve_expr,
+};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -827,6 +829,9 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
+        // First resolve column names using case-insensitive matching
+        // (SQL parsers lowercase unquoted identifiers)
+        let expr = resolve_column_names(&expr, &schema);
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
             Error::invalid_input(
                 format!("Error resolving filter expression {filter}: {e}"),
@@ -842,13 +847,19 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        // First check if it's a simple column reference (no operators, functions, etc.)
+        // Use direct Column construction to preserve case (col() parses as SQL and lowercases)
         if self.schema.field_with_name(expr).is_ok() {
-            return Ok(col(expr));
+            return Ok(Expr::Column(Column::from_name(expr)));
         }
 
+        // Parse as SQL expression
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
+        // Resolve column names using case-insensitive matching
+        // (SQL parsers lowercase unquoted identifiers)
+        let expr = resolve_column_names(&expr, &schema);
         let resolved = resolve_expr(&expr, &schema)?;
         Ok(resolved)
     }

@@ -105,12 +105,15 @@ impl<'a> CreateIndexBuilder<'a> {
             });
         }
         let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
+        // Use case-insensitive lookup to handle lowercased column names from SQL parsing
+        let Some(field) = self.dataset.schema().field_case_insensitive(column) else {
             return Err(Error::Index {
                 message: format!("CreateIndex: column '{column}' does not exist"),
                 location: location!(),
             });
         };
+        // Use the actual field name from the schema (preserving original case)
+        let column = &field.name;
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {

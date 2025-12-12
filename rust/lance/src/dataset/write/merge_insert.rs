@@ -374,10 +374,29 @@ impl MergeInsertBuilder {
                 location!(),
             ));
         }
+
+        // Resolve column names using case-insensitive matching to handle
+        // lowercased column names from SQL parsing or user input
+        let resolved_on = on
+            .iter()
+            .map(|col| {
+                dataset
+                    .schema()
+                    .field_case_insensitive(col)
+                    .map(|f| f.name.clone())
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            format!("Merge insert key column '{}' does not exist in schema", col),
+                            location!(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
             dataset,
             params: MergeInsertParams {
-                on,
+                on: resolved_on,
                 when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
@@ -1273,12 +1292,14 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
+        // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
             .params
             .on
             .iter()
-            .map(|name| name.as_str())
+            .map(|name| format!("\"{}\"", name))
             .collect::<Vec<_>>();
+        let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
@@ -1289,7 +1310,13 @@ impl MergeInsertJob {
         };
         let dataset_schema: Schema = self.dataset.schema().into();
         let df = scan_aliased
-            .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
+            .join(
+                source_df_aliased,
+                join_type,
+                &on_cols_refs,
+                &on_cols_refs,
+                None,
+            )?
             .with_column(
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, Some(&dataset_schema))?,

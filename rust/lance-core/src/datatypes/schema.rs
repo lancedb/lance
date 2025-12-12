@@ -433,6 +433,62 @@ impl Schema {
         self.resolve(name).and_then(|fields| fields.last().copied())
     }
 
+    /// Get a field by its path, with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    /// Field names containing dots must be quoted: parent."child.with.dot"
+    pub fn field_case_insensitive(&self, name: &str) -> Option<&Field> {
+        self.resolve_case_insensitive(name)
+            .and_then(|fields| fields.last().copied())
+    }
+
+    /// Given a string column reference, resolve the path of fields with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual fields from the schema (preserving original case).
+    pub fn resolve_case_insensitive(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let split = parse_field_path(column.as_ref()).ok()?;
+        if split.is_empty() {
+            return None;
+        }
+
+        if split.len() == 1 {
+            let field_name = &split[0];
+            // Try exact match first
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
+            }
+            // Fall back to case-insensitive match
+            if let Some(field) = self
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field_name))
+            {
+                return Some(vec![field]);
+            }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
+        let mut fields = Vec::with_capacity(split.len());
+        let first = &split[0];
+
+        // Find the first field (try exact match, then case-insensitive)
+        let field = self.fields.iter().find(|f| &f.name == first).or_else(|| {
+            self.fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(first))
+        })?;
+
+        let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+        if field.resolve(&mut split_refs, &mut fields) {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
     pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
