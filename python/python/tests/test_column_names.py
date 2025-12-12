@@ -26,15 +26,6 @@ class TestMixedCaseColumnNames:
     Users coming from TypeScript/JavaScript commonly use camelCase column names.
     These should work in filter expressions, order by, scalar indices, etc.
     without requiring backtick escaping.
-
-    Current behavior:
-    - Table creation: WORKS
-    - Filter with SQL string: FAILS (column names are lowercased)
-    - Order by: WORKS (uses column name directly, not SQL parsing)
-    - Scalar index: FAILS (column name is lowercased during validation)
-    - Alter column: WORKS
-    - Drop column: WORKS
-    - Merge insert: FAILS (column names lowercased in join expressions)
     """
 
     @pytest.fixture
@@ -97,9 +88,13 @@ class TestMixedCaseColumnNames:
         assert len(indices) == 1
         assert indices[0]["fields"] == ["userId"]
 
-        # Query using the indexed column (would also fail due to filter issue)
+        # Query using the indexed column
         result = mixed_case_dataset.to_table(filter="userId = 50")
         assert result.num_rows == 1
+
+        # Verify the index is actually used in the query plan
+        plan = mixed_case_dataset.scanner(filter="userId = 50").explain_plan()
+        assert "ScalarIndexQuery" in plan
 
     def test_alter_column_with_mixed_case(self, mixed_case_dataset):
         """Altering columns works with mixed-case column names."""
@@ -149,15 +144,6 @@ class TestSpecialCharacterColumnNames:
 
     Note: Column names with `.` are NOT allowed at the top level since `.` is
     used for nested field paths. This test uses `-` and `:` instead.
-
-    Current behavior:
-    - Table creation: WORKS
-    - Filter with backticks: WORKS
-    - Order by: WORKS (uses column name directly, not SQL parsing)
-    - Scalar index: WORKS
-    - Alter column: WORKS
-    - Drop column: WORKS
-    - Merge insert: FAILS (column name causes parsing issues in join expressions)
     """
 
     @pytest.fixture
@@ -222,6 +208,10 @@ class TestSpecialCharacterColumnNames:
         # Query using the indexed column (requires backticks in filter)
         result = special_char_dataset.to_table(filter="`user-id` = 50")
         assert result.num_rows == 1
+
+        # Verify the index is actually used in the query plan
+        plan = special_char_dataset.scanner(filter="`user-id` = 50").explain_plan()
+        assert "ScalarIndexQuery" in plan
 
     def test_alter_column_with_special_chars(self, special_char_dataset):
         """Altering columns works with special character column names."""
@@ -321,6 +311,12 @@ class TestNestedFieldColumnNames:
         result = nested_mixed_case_dataset.to_table(filter="metadata.userId = 50")
         assert result.num_rows == 1
 
+        # Verify the index is actually used in the query plan
+        plan = nested_mixed_case_dataset.scanner(
+            filter="metadata.userId = 50"
+        ).explain_plan()
+        assert "ScalarIndexQuery" in plan
+
     @pytest.fixture
     def nested_special_char_table(self):
         """Create a table with special character nested column names."""
@@ -377,3 +373,9 @@ class TestNestedFieldColumnNames:
             filter="`meta-data`.`user-id` = 50"
         )
         assert result.num_rows == 1
+
+        # Verify the index is actually used in the query plan
+        plan = nested_special_char_dataset.scanner(
+            filter="`meta-data`.`user-id` = 50"
+        ).explain_plan()
+        assert "ScalarIndexQuery" in plan
