@@ -9,66 +9,36 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    builder::LargeBinaryBuilder, builder::StringBuilder, Array, ArrayRef, StructArray,
-};
+use arrow_array::{builder::LargeBinaryBuilder, builder::StringBuilder, ArrayRef, StructArray};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
 
 use crate::{Error, Result};
 
-/// A typed wrapper around the blob v2 input struct column.
-pub struct BlobArray {
-    inner: StructArray,
+/// Construct the Arrow field for a blob v2 column.
+///
+/// Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
+/// tagged with `ARROW:extension:name = "lance.blob.v2"`.
+pub fn blob_field(name: &str, nullable: bool) -> Field {
+    let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+        .into_iter()
+        .collect();
+    Field::new(
+        name,
+        DataType::Struct(
+            vec![
+                Field::new("data", DataType::LargeBinary, true),
+                Field::new("uri", DataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        nullable,
+    )
+    .with_metadata(metadata)
 }
 
-impl BlobArray {
-    /// Construct the Arrow field for a blob v2 column.
-    pub fn field(name: &str, nullable: bool) -> Field {
-        let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
-            .into_iter()
-            .collect();
-        Field::new(
-            name,
-            DataType::Struct(
-                vec![
-                    Field::new("data", DataType::LargeBinary, true),
-                    Field::new("uri", DataType::Utf8, true),
-                ]
-                .into(),
-            ),
-            nullable,
-        )
-        .with_metadata(metadata)
-    }
-
-    /// Borrow the underlying struct array.
-    pub fn as_struct(&self) -> &StructArray {
-        &self.inner
-    }
-
-    /// Number of rows.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn null_count(&self) -> usize {
-        self.inner.null_count()
-    }
-}
-
-impl From<BlobArray> for ArrayRef {
-    fn from(value: BlobArray) -> Self {
-        Arc::new(value.inner)
-    }
-}
-
-/// Builder for [`BlobArray`].
+/// Builder for blob v2 input struct columns.
 ///
 /// The builder enforces that each row contains exactly one of `data` or `uri` (or is null).
 pub struct BlobArrayBuilder {
@@ -138,8 +108,8 @@ impl BlobArrayBuilder {
         Ok(())
     }
 
-    /// Finish building and return the [`BlobArray`].
-    pub fn finish(mut self) -> Result<BlobArray> {
+    /// Finish building and return an Arrow struct array.
+    pub fn finish(mut self) -> Result<ArrayRef> {
         if self.len != self.expected_len {
             return Err(Error::invalid_input(
                 format!(
@@ -164,9 +134,7 @@ impl BlobArrayBuilder {
             validity,
         )?;
 
-        Ok(BlobArray {
-            inner: struct_array,
-        })
+        Ok(Arc::new(struct_array))
     }
 
     fn ensure_capacity(&self) -> Result<()> {
@@ -189,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_field_metadata() {
-        let field = BlobArray::field("blob", true);
+        let field = blob_field("blob", true);
         assert!(field.metadata().get(ARROW_EXT_NAME_KEY).is_some());
         assert_eq!(
             field.metadata().get(ARROW_EXT_NAME_KEY).unwrap(),

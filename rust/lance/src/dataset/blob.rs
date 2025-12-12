@@ -797,7 +797,7 @@ mod tests {
 
     use super::data_file_key_from_path;
     use crate::{
-        blob::{BlobArray, BlobArrayBuilder},
+        blob::{blob_field, BlobArrayBuilder},
         dataset::WriteParams,
         utils::test::TestDatasetGenerator,
         Dataset,
@@ -1070,12 +1070,12 @@ mod tests {
         let mut blob_builder = BlobArrayBuilder::new(2);
         blob_builder.push_bytes(b"hello").unwrap();
         blob_builder.push_bytes(b"world").unwrap();
-        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap().into();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
 
         let id_array: arrow_array::ArrayRef = Arc::new(UInt32Array::from(vec![0, 1]));
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
-            BlobArray::field("blob", true),
+            blob_field("blob", true),
         ]));
 
         let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
