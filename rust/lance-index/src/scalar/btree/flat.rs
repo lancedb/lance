@@ -18,6 +18,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::Result;
 use roaring::RoaringBitmap;
+use tracing::instrument;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::btree::BTREE_VALUES_COLUMN;
@@ -46,6 +47,7 @@ impl DeepSizeOf for FlatIndex {
 }
 
 impl FlatIndex {
+    #[instrument(name = "FlatIndex::try_new", level = "debug", skip_all)]
     pub fn try_new(data: RecordBatch) -> Result<Self> {
         // Sort by row id to make bitmap construction more efficient
         let data = data.sort_by_column(IDS_COL_IDX, None)?;

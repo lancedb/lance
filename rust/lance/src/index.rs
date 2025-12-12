@@ -1268,6 +1268,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn open_scalar_index(
         &self,
         column: &str,
