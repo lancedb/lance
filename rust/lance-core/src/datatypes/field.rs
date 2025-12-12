@@ -753,6 +753,17 @@ impl Field {
                 location: location!(),
             });
         }
+
+        if self.is_blob() != other.is_blob() {
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to intersect blob and non-blob field: {}",
+                    self.name
+                ),
+                location: location!(),
+            });
+        }
+
         let self_type = self.data_type();
         let other_type = other.data_type();
 
@@ -763,7 +774,7 @@ impl Field {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
             // input struct (data/uri). When intersecting schemas for projection we want to keep
             // the projected blob layout instead of intersecting by child names.
-            if self.is_blob() && other.is_blob() {
+            if self.is_blob() {
                 return Ok(self.clone());
             }
 
