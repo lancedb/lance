@@ -876,6 +876,7 @@ impl Dataset {
                 let request = DescribeTableRequest {
                     id: Some(table_id.clone()),
                     version: None,
+                    with_table_uri: None,
                 };
                 let response =
                     namespace

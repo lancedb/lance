@@ -20,7 +20,7 @@ use super::take::TakeBuilder;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
-use lance_core::utils::blob::{dedicated_blob_path, pack_blob_path};
+use lance_core::utils::blob::blob_path;
 use lance_core::{utils::address::RowAddress, Error, Result};
 use lance_io::traits::Reader;
 
@@ -37,8 +37,8 @@ const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 
-// Maintains rolling `.pack` sidecar files for packed blobs.
-// Layout: data/{data_file_key}/{blob_id:08x}.pack where each file is an
+// Maintains rolling `.blob` sidecar files for packed blobs.
+// Layout: data/{data_file_key}/{blob_id:08x}.blob where each file is an
 // unframed concatenation of blob payloads; descriptors store (blob_id,
 // position, size) to locate each slice. A dedicated struct keeps path state
 // and rolling size separate from the per-batch preprocessor logic, so we can
@@ -67,7 +67,7 @@ impl PackWriter {
     }
 
     async fn start_new_pack(&mut self, blob_id: u32) -> Result<()> {
-        let path = pack_blob_path(&self.data_dir, &self.data_file_key, blob_id);
+        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let writer = self.object_store.create(&path).await?;
         self.writer = Some(writer);
         self.current_blob_id = Some(blob_id);
@@ -75,7 +75,7 @@ impl PackWriter {
         Ok(())
     }
 
-    /// Append `data` to the current `.pack` file, rolling to a new file when
+    /// Append `data` to the current `.blob` file, rolling to a new file when
     /// `max_pack_size` would be exceeded.
     ///
     /// alloc_blob_id: called only when a new pack file is opened; returns the
@@ -156,7 +156,7 @@ impl BlobPreprocessor {
     }
 
     async fn write_dedicated(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
-        let path = dedicated_blob_path(&self.data_dir, &self.data_file_key, blob_id);
+        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
         writer.write_all(data).await?;
         writer.shutdown().await?;
@@ -732,7 +732,7 @@ async fn collect_blob_files_v2(
                         })?;
 
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
-                let path = dedicated_blob_path(&dataset.data_dir(), data_file_key, blob_id);
+                let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
             }
             BlobKind::Packed => {
@@ -754,7 +754,7 @@ async fn collect_blob_files_v2(
                             location: location!(),
                         })?;
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
-                let path = pack_blob_path(&dataset.data_dir(), data_file_key, blob_id);
+                let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_packed(dataset.clone(), path, position, size));
             }
             BlobKind::External => {

@@ -2477,3 +2477,127 @@ fn inner_cleanup_with_policy<'local>(
 
     Ok(jstats)
 }
+
+//////////////////////////////
+// Index operation Methods   //
+//////////////////////////////
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexes<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_indexes(&mut env, java_dataset))
+}
+
+fn inner_get_indexes<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let indexes = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.list_indexes()?
+    };
+
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+
+    for index_meta in indexes.iter() {
+        let java_index = index_meta.into_java(env)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_index)],
+        )?;
+    }
+
+    Ok(array_list)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jfragment_ids: JObject, // Optional<List<Integer>>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_indexed_rows(&mut env, java_dataset, jindex_name, jfilter, jfragment_ids),
+        -1
+    )
+}
+
+fn inner_count_indexed_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    _jindex_name: JString,
+    jfilter: JString,
+    jfragment_ids: JObject, // Optional<List<Integer>>
+) -> Result<i64> {
+    let filter: String = jfilter.extract(env)?;
+
+    // Extract optional fragment IDs
+    let fragment_ids: Option<Vec<u32>> = if env
+        .call_method(&jfragment_ids, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let list_obj = env
+            .call_method(&jfragment_ids, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let list = env.get_list(&list_obj)?;
+        let mut ids = Vec::new();
+        let mut iter = list.iter(env)?;
+        while let Some(elem) = iter.next(env)? {
+            let int_val = env.call_method(&elem, "intValue", "()I", &[])?.i()?;
+            ids.push(int_val as u32);
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let count = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+        // Use a scanner with fragment filtering to count rows
+        // This ensures we only count rows in the specified fragments
+        let inner = dataset_guard.inner.clone();
+
+        RT.block_on(async {
+            let mut scanner = inner.scan();
+
+            // Apply filter
+            if !filter.is_empty() {
+                scanner.filter(&filter)?;
+            }
+
+            // Empty projection and enable row_id for count_rows to work
+            // count_rows() requires metadata-only projection
+            scanner.project::<String>(&[])?;
+            scanner.with_row_id();
+
+            // Apply fragment filter if specified
+            if let Some(frag_ids) = fragment_ids {
+                // Convert FileFragment to Fragment by extracting metadata
+                let filtered_fragments: Vec<_> = inner
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|f| frag_ids.contains(&(f.id() as u32)))
+                    .map(|f| f.metadata().clone())
+                    .collect();
+                scanner.with_fragments(filtered_fragments);
+            }
+
+            // Use the scanner's count_rows method
+            let count = scanner.count_rows().await?;
+
+            Ok::<i64, lance::Error>(count as i64)
+        })?
+    };
+
+    Ok(count)
+}
