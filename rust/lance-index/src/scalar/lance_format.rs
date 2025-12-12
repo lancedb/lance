@@ -312,7 +312,6 @@ pub mod tests {
     use crate::scalar::{
         bitmap::BitmapIndex,
         btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
-        flat::FlatIndexMetadata,
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
     };
 
@@ -353,6 +352,7 @@ pub mod tests {
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         let params = BTreeParameters {
             zone_size: Some(batch_size),
+            range_id: None,
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
@@ -855,13 +855,12 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
         train_btree_index(
             data,
-            &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
             None,
         )
         .await

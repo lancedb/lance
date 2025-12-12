@@ -9,19 +9,29 @@ use lance_core::{Error, Result};
 use snafu::Location;
 
 use lance_namespace_reqwest_client::models::{
-    AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse,
-    InsertIntoTableRequest, InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTablesRequest, ListTablesResponse,
+    AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest, CreateEmptyTableRequest, CreateEmptyTableResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
+    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
+    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
+    InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse,
+    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 /// Base trait for Lance Namespace implementations.
@@ -273,6 +283,195 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTransactionResponse> {
         Err(Error::NotSupported {
             source: "alter_transaction not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Create a scalar index on a table.
+    async fn create_table_scalar_index(
+        &self,
+        _request: CreateTableIndexRequest,
+    ) -> Result<CreateTableScalarIndexResponse> {
+        Err(Error::NotSupported {
+            source: "create_table_scalar_index not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Drop a table index.
+    async fn drop_table_index(
+        &self,
+        _request: DropTableIndexRequest,
+    ) -> Result<DropTableIndexResponse> {
+        Err(Error::NotSupported {
+            source: "drop_table_index not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// List all tables across all namespaces.
+    async fn list_all_tables(&self, _request: ListTablesRequest) -> Result<ListTablesResponse> {
+        Err(Error::NotSupported {
+            source: "list_all_tables not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Restore a table to a specific version.
+    async fn restore_table(&self, _request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        Err(Error::NotSupported {
+            source: "restore_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Rename a table.
+    async fn rename_table(&self, _request: RenameTableRequest) -> Result<RenameTableResponse> {
+        Err(Error::NotSupported {
+            source: "rename_table not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// List all versions of a table.
+    async fn list_table_versions(
+        &self,
+        _request: ListTableVersionsRequest,
+    ) -> Result<ListTableVersionsResponse> {
+        Err(Error::NotSupported {
+            source: "list_table_versions not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Update table schema metadata.
+    async fn update_table_schema_metadata(
+        &self,
+        _request: UpdateTableSchemaMetadataRequest,
+    ) -> Result<UpdateTableSchemaMetadataResponse> {
+        Err(Error::NotSupported {
+            source: "update_table_schema_metadata not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Get table statistics.
+    async fn get_table_stats(
+        &self,
+        _request: GetTableStatsRequest,
+    ) -> Result<GetTableStatsResponse> {
+        Err(Error::NotSupported {
+            source: "get_table_stats not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Explain a table query plan.
+    async fn explain_table_query_plan(
+        &self,
+        _request: ExplainTableQueryPlanRequest,
+    ) -> Result<String> {
+        Err(Error::NotSupported {
+            source: "explain_table_query_plan not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Analyze a table query plan.
+    async fn analyze_table_query_plan(
+        &self,
+        _request: AnalyzeTableQueryPlanRequest,
+    ) -> Result<String> {
+        Err(Error::NotSupported {
+            source: "analyze_table_query_plan not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Add columns to a table.
+    async fn alter_table_add_columns(
+        &self,
+        _request: AlterTableAddColumnsRequest,
+    ) -> Result<AlterTableAddColumnsResponse> {
+        Err(Error::NotSupported {
+            source: "alter_table_add_columns not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Alter columns in a table.
+    async fn alter_table_alter_columns(
+        &self,
+        _request: AlterTableAlterColumnsRequest,
+    ) -> Result<AlterTableAlterColumnsResponse> {
+        Err(Error::NotSupported {
+            source: "alter_table_alter_columns not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Drop columns from a table.
+    async fn alter_table_drop_columns(
+        &self,
+        _request: AlterTableDropColumnsRequest,
+    ) -> Result<AlterTableDropColumnsResponse> {
+        Err(Error::NotSupported {
+            source: "alter_table_drop_columns not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// List all tags for a table.
+    async fn list_table_tags(
+        &self,
+        _request: ListTableTagsRequest,
+    ) -> Result<ListTableTagsResponse> {
+        Err(Error::NotSupported {
+            source: "list_table_tags not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Get the version for a specific tag.
+    async fn get_table_tag_version(
+        &self,
+        _request: GetTableTagVersionRequest,
+    ) -> Result<GetTableTagVersionResponse> {
+        Err(Error::NotSupported {
+            source: "get_table_tag_version not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Create a tag for a table.
+    async fn create_table_tag(
+        &self,
+        _request: CreateTableTagRequest,
+    ) -> Result<CreateTableTagResponse> {
+        Err(Error::NotSupported {
+            source: "create_table_tag not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Delete a tag from a table.
+    async fn delete_table_tag(
+        &self,
+        _request: DeleteTableTagRequest,
+    ) -> Result<DeleteTableTagResponse> {
+        Err(Error::NotSupported {
+            source: "delete_table_tag not implemented".into(),
+            location: Location::new(file!(), line!(), column!()),
+        })
+    }
+
+    /// Update a tag for a table.
+    async fn update_table_tag(
+        &self,
+        _request: UpdateTableTagRequest,
+    ) -> Result<UpdateTableTagResponse> {
+        Err(Error::NotSupported {
+            source: "update_table_tag not implemented".into(),
             location: Location::new(file!(), line!(), column!()),
         })
     }

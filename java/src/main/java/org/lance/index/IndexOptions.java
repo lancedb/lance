@@ -13,6 +13,7 @@
  */
 package org.lance.index;
 
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.List;
@@ -28,6 +29,7 @@ public class IndexOptions {
   private final List<String> columns;
   private final IndexType indexType;
   private final IndexParams indexParams;
+  private final ArrowArrayStream preprocessedData;
 
   private IndexOptions(
       String indexName,
@@ -37,7 +39,8 @@ public class IndexOptions {
       boolean replace,
       boolean train,
       List<Integer> fragmentIds,
-      String indexUUID) {
+      String indexUUID,
+      ArrowArrayStream preprocessedData) {
     this.replace = replace;
     this.train = train;
     this.fragmentIds = fragmentIds;
@@ -46,6 +49,7 @@ public class IndexOptions {
     this.columns = columns;
     this.indexType = indexType;
     this.indexParams = indexParams;
+    this.preprocessedData = preprocessedData;
   }
 
   public Optional<String> getIndexUUID() {
@@ -80,6 +84,10 @@ public class IndexOptions {
     return columns;
   }
 
+  public Optional<ArrowArrayStream> getPreprocessedData() {
+    return Optional.ofNullable(preprocessedData);
+  }
+
   public static Builder builder(
       List<String> columns, IndexType indexType, IndexParams indexParams) {
     return new Builder(columns, indexType, indexParams);
@@ -92,6 +100,7 @@ public class IndexOptions {
     private List<Integer> fragmentIds = null;
     private String indexUUID = null;
     private String indexName = null;
+    private ArrowArrayStream preprocessedData = null;
     private final List<String> columns;
     private final IndexType indexType;
     private final IndexParams indexParams;
@@ -158,9 +167,28 @@ public class IndexOptions {
       return this;
     }
 
+    /**
+     * Optional preprocessed data. Some index types can consume it to avoid heavy computation e.g.
+     * For ranged btree index, data can be ranged and sorted by distributed computing engines.
+     *
+     * @param preprocessedData preprocessed data.
+     */
+    public Builder withPreprocessedData(ArrowArrayStream preprocessedData) {
+      this.preprocessedData = preprocessedData;
+      return this;
+    }
+
     public IndexOptions build() {
       return new IndexOptions(
-          indexName, columns, indexType, indexParams, replace, train, fragmentIds, indexUUID);
+          indexName,
+          columns,
+          indexType,
+          indexParams,
+          replace,
+          train,
+          fragmentIds,
+          indexUUID,
+          preprocessedData);
     }
   }
 }

@@ -39,6 +39,7 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
@@ -718,12 +719,13 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,       // Optional<String>
-    params_jobj: JObject,     // IndexParams
-    replace_jobj: jboolean,   // replace
-    train_jobj: jboolean,     // train
-    fragments_jobj: JObject,  // List<Integer>
-    index_uuid_jobj: JObject, // String
+    name_jobj: JObject,              // Optional<String>
+    params_jobj: JObject,            // IndexParams
+    replace_jobj: jboolean,          // replace
+    train_jobj: jboolean,            // train
+    fragments_jobj: JObject,         // List<Integer>
+    index_uuid_jobj: JObject,        // String
+    arrow_stream_addr_jobj: JObject, // Optional<Long>
 ) {
     ok_or_throw_without_return!(
         env,
@@ -737,7 +739,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
             replace_jobj,
             train_jobj,
             fragments_jobj,
-            index_uuid_jobj
+            index_uuid_jobj,
+            arrow_stream_addr_jobj,
         )
     );
 }
@@ -748,12 +751,13 @@ fn inner_create_index(
     java_dataset: JObject,
     columns_jobj: JObject, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,       // Optional<String>
-    params_jobj: JObject,     // IndexParams
-    replace_jobj: jboolean,   // replace
-    train_jobj: jboolean,     // train
-    fragments_jobj: JObject,  // Optional<List<String>>
-    index_uuid_jobj: JObject, // Optional<String>
+    name_jobj: JObject,              // Optional<String>
+    params_jobj: JObject,            // IndexParams
+    replace_jobj: jboolean,          // replace
+    train_jobj: jboolean,            // train
+    fragments_jobj: JObject,         // Optional<List<String>>
+    index_uuid_jobj: JObject,        // Optional<String>
+    arrow_stream_addr_jobj: JObject, // Optional<Long>
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -765,6 +769,17 @@ fn inner_create_index(
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
     let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
+    let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
+    let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
+        let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+        Some(reader)
+    } else {
+        None
+    };
+
+    // we should skip committing index when building distributed indices.
+    let mut skip_commit = fragment_ids.is_some();
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -780,8 +795,9 @@ fn inner_create_index(
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
                 index_type: index_type_str,
-                params: params_opt,
+                params: params_opt.clone(),
             };
+            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -818,8 +834,6 @@ fn inner_create_index(
         index_builder = index_builder.name(name);
     }
 
-    let has_fragment_ids = fragment_ids.is_some();
-
     if let Some(fragment_ids) = fragment_ids {
         index_builder = index_builder.fragments(fragment_ids);
     }
@@ -828,13 +842,31 @@ fn inner_create_index(
         index_builder = index_builder.index_uuid(index_uuid);
     }
 
-    if has_fragment_ids {
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if skip_commit {
         RT.block_on(index_builder.execute_uncommitted())?;
     } else {
         RT.block_on(index_builder.into_future())?
     }
 
     Ok(())
+}
+
+fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
+    match index_type {
+        IndexType::BTree => {
+            // Should defer the commit if we are building range-based BTree index
+            if let Some(params) = params_opt {
+                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
+                return Ok(btree_parameters.range_id.is_some());
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[no_mangle]
@@ -2444,4 +2476,128 @@ fn inner_cleanup_with_policy<'local>(
     )?;
 
     Ok(jstats)
+}
+
+//////////////////////////////
+// Index operation Methods   //
+//////////////////////////////
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexes<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_indexes(&mut env, java_dataset))
+}
+
+fn inner_get_indexes<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let indexes = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.list_indexes()?
+    };
+
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+
+    for index_meta in indexes.iter() {
+        let java_index = index_meta.into_java(env)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_index)],
+        )?;
+    }
+
+    Ok(array_list)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jfragment_ids: JObject, // Optional<List<Integer>>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_indexed_rows(&mut env, java_dataset, jindex_name, jfilter, jfragment_ids),
+        -1
+    )
+}
+
+fn inner_count_indexed_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    _jindex_name: JString,
+    jfilter: JString,
+    jfragment_ids: JObject, // Optional<List<Integer>>
+) -> Result<i64> {
+    let filter: String = jfilter.extract(env)?;
+
+    // Extract optional fragment IDs
+    let fragment_ids: Option<Vec<u32>> = if env
+        .call_method(&jfragment_ids, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let list_obj = env
+            .call_method(&jfragment_ids, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let list = env.get_list(&list_obj)?;
+        let mut ids = Vec::new();
+        let mut iter = list.iter(env)?;
+        while let Some(elem) = iter.next(env)? {
+            let int_val = env.call_method(&elem, "intValue", "()I", &[])?.i()?;
+            ids.push(int_val as u32);
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let count = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+        // Use a scanner with fragment filtering to count rows
+        // This ensures we only count rows in the specified fragments
+        let inner = dataset_guard.inner.clone();
+
+        RT.block_on(async {
+            let mut scanner = inner.scan();
+
+            // Apply filter
+            if !filter.is_empty() {
+                scanner.filter(&filter)?;
+            }
+
+            // Empty projection and enable row_id for count_rows to work
+            // count_rows() requires metadata-only projection
+            scanner.project::<String>(&[])?;
+            scanner.with_row_id();
+
+            // Apply fragment filter if specified
+            if let Some(frag_ids) = fragment_ids {
+                // Convert FileFragment to Fragment by extracting metadata
+                let filtered_fragments: Vec<_> = inner
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|f| frag_ids.contains(&(f.id() as u32)))
+                    .map(|f| f.metadata().clone())
+                    .collect();
+                scanner.with_fragments(filtered_fragments);
+            }
+
+            // Use the scanner's count_rows method
+            let count = scanner.count_rows().await?;
+
+            Ok::<i64, lance::Error>(count as i64)
+        })?
+    };
+
+    Ok(count)
 }

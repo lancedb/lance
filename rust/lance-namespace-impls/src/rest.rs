@@ -9,22 +9,32 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use lance_namespace::apis::{
-    configuration::Configuration, namespace_api, table_api, transaction_api,
+    configuration::Configuration, namespace_api, table_api, tag_api, transaction_api,
 };
 use lance_namespace::models::{
-    AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse,
-    InsertIntoTableRequest, InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTablesRequest, ListTablesResponse,
+    AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest, CreateEmptyTableRequest, CreateEmptyTableResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
+    DeregisterTableRequest, DeregisterTableResponse, DescribeNamespaceRequest,
+    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
+    InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse,
+    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 use lance_core::{box_error, Error, Result};
@@ -456,9 +466,15 @@ impl LanceNamespace for RestNamespace {
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::describe_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
-            .await
-            .map_err(convert_api_error)
+        table_api::describe_table(
+            &self.reqwest_config,
+            &id,
+            request.clone(),
+            Some(&self.delimiter),
+            request.with_table_uri,
+        )
+        .await
+        .map_err(convert_api_error)
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
@@ -480,7 +496,7 @@ impl LanceNamespace for RestNamespace {
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
-        table_api::drop_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        table_api::drop_table(&self.reqwest_config, &id, Some(&self.delimiter))
             .await
             .map_err(convert_api_error)
     }
@@ -511,26 +527,12 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<CreateTableResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
-        let properties_json = request
-            .properties
-            .as_ref()
-            .map(|props| serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string()));
-
-        use lance_namespace::models::create_table_request::Mode;
-        let mode = request.mode.as_ref().map(|m| match m {
-            Mode::Create => "create",
-            Mode::ExistOk => "exist_ok",
-            Mode::Overwrite => "overwrite",
-        });
-
         table_api::create_table(
             &self.reqwest_config,
             &id,
             request_data.to_vec(),
             Some(&self.delimiter),
-            mode,
-            request.location.as_deref(),
-            properties_json.as_deref(),
+            request.mode.as_deref(),
         )
         .await
         .map_err(convert_api_error)
@@ -554,18 +556,12 @@ impl LanceNamespace for RestNamespace {
     ) -> Result<InsertIntoTableResponse> {
         let id = object_id_str(&request.id, &self.delimiter)?;
 
-        use lance_namespace::models::insert_into_table_request::Mode;
-        let mode = request.mode.as_ref().map(|m| match m {
-            Mode::Append => "append",
-            Mode::Overwrite => "overwrite",
-        });
-
         table_api::insert_into_table(
             &self.reqwest_config,
             &id,
             request_data.to_vec(),
             Some(&self.delimiter),
-            mode,
+            request.mode.as_deref(),
         )
         .await
         .map_err(convert_api_error)
@@ -594,6 +590,8 @@ impl LanceNamespace for RestNamespace {
             request.when_not_matched_insert_all,
             request.when_not_matched_by_source_delete,
             request.when_not_matched_by_source_delete_filt.as_deref(),
+            request.timeout.as_deref(),
+            request.use_index,
         )
         .await
         .map_err(convert_api_error)
@@ -710,6 +708,254 @@ impl LanceNamespace for RestNamespace {
         .map_err(convert_api_error)
     }
 
+    async fn create_table_scalar_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableScalarIndexResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::create_table_scalar_index(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn drop_table_index(
+        &self,
+        request: DropTableIndexRequest,
+    ) -> Result<DropTableIndexResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        let index_name = request.index_name.as_deref().unwrap_or("");
+
+        table_api::drop_table_index(&self.reqwest_config, &id, index_name, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        table_api::list_all_tables(
+            &self.reqwest_config,
+            Some(&self.delimiter),
+            request.page_token.as_deref(),
+            request.limit,
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::restore_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::rename_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn list_table_versions(
+        &self,
+        request: ListTableVersionsRequest,
+    ) -> Result<ListTableVersionsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::list_table_versions(
+            &self.reqwest_config,
+            &id,
+            Some(&self.delimiter),
+            request.page_token.as_deref(),
+            request.limit,
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn update_table_schema_metadata(
+        &self,
+        request: UpdateTableSchemaMetadataRequest,
+    ) -> Result<UpdateTableSchemaMetadataResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        let metadata = request.metadata.unwrap_or_default();
+
+        let result = table_api::update_table_schema_metadata(
+            &self.reqwest_config,
+            &id,
+            metadata,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)?;
+
+        Ok(UpdateTableSchemaMetadataResponse {
+            metadata: Some(result),
+            ..Default::default()
+        })
+    }
+
+    async fn get_table_stats(
+        &self,
+        request: GetTableStatsRequest,
+    ) -> Result<GetTableStatsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::get_table_stats(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn explain_table_query_plan(
+        &self,
+        request: ExplainTableQueryPlanRequest,
+    ) -> Result<String> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::explain_table_query_plan(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn analyze_table_query_plan(
+        &self,
+        request: AnalyzeTableQueryPlanRequest,
+    ) -> Result<String> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::analyze_table_query_plan(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn alter_table_add_columns(
+        &self,
+        request: AlterTableAddColumnsRequest,
+    ) -> Result<AlterTableAddColumnsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::alter_table_add_columns(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn alter_table_alter_columns(
+        &self,
+        request: AlterTableAlterColumnsRequest,
+    ) -> Result<AlterTableAlterColumnsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::alter_table_alter_columns(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn alter_table_drop_columns(
+        &self,
+        request: AlterTableDropColumnsRequest,
+    ) -> Result<AlterTableDropColumnsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        table_api::alter_table_drop_columns(
+            &self.reqwest_config,
+            &id,
+            request,
+            Some(&self.delimiter),
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn list_table_tags(
+        &self,
+        request: ListTableTagsRequest,
+    ) -> Result<ListTableTagsResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        tag_api::list_table_tags(
+            &self.reqwest_config,
+            &id,
+            Some(&self.delimiter),
+            request.page_token.as_deref(),
+            request.limit,
+        )
+        .await
+        .map_err(convert_api_error)
+    }
+
+    async fn get_table_tag_version(
+        &self,
+        request: GetTableTagVersionRequest,
+    ) -> Result<GetTableTagVersionResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        tag_api::get_table_tag_version(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn create_table_tag(
+        &self,
+        request: CreateTableTagRequest,
+    ) -> Result<CreateTableTagResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        tag_api::create_table_tag(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn delete_table_tag(
+        &self,
+        request: DeleteTableTagRequest,
+    ) -> Result<DeleteTableTagResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        tag_api::delete_table_tag(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
+    async fn update_table_tag(
+        &self,
+        request: UpdateTableTagRequest,
+    ) -> Result<UpdateTableTagResponse> {
+        let id = object_id_str(&request.id, &self.delimiter)?;
+
+        tag_api::update_table_tag(&self.reqwest_config, &id, request, Some(&self.delimiter))
+            .await
+            .map_err(convert_api_error)
+    }
+
     fn namespace_id(&self) -> String {
         format!(
             "RestNamespace {{ endpoint: {:?}, delimiter: {:?} }}",
@@ -722,7 +968,6 @@ impl LanceNamespace for RestNamespace {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use lance_namespace::models::{create_table_request, insert_into_table_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1023,9 +1268,7 @@ mod tests {
                 "namespace".to_string(),
                 "table".to_string(),
             ]),
-            location: None,
-            mode: Some(create_table_request::Mode::Create),
-            properties: None,
+            mode: Some("Create".to_string()),
         };
 
         let data = Bytes::from("arrow data here");
@@ -1045,7 +1288,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "version": 2
+                "transaction_id": "txn-123"
             })))
             .mount(&mock_server)
             .await;
@@ -1062,7 +1305,7 @@ mod tests {
                 "namespace".to_string(),
                 "table".to_string(),
             ]),
-            mode: Some(insert_into_table_request::Mode::Append),
+            mode: Some("Append".to_string()),
         };
 
         let data = Bytes::from("arrow data here");
@@ -1071,6 +1314,6 @@ mod tests {
         // Should succeed with mock server
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.version, Some(2));
+        assert_eq!(response.transaction_id, Some("txn-123".to_string()));
     }
 }

@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
+import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
@@ -783,7 +784,8 @@ public class Dataset implements Closeable {
           options.isReplace(),
           options.isTrain(),
           options.getFragmentIds(),
-          options.getIndexUUID());
+          options.getIndexUUID(),
+          options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
     }
   }
 
@@ -795,7 +797,8 @@ public class Dataset implements Closeable {
       boolean replace,
       boolean train,
       Optional<List<Integer>> fragments,
-      Optional<String> indexUUID);
+      Optional<String> indexUUID,
+      Optional<Long> arrowStreamMemoryAddress);
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
@@ -833,6 +836,31 @@ public class Dataset implements Closeable {
   }
 
   private native long nativeCountRows(Optional<String> filter);
+
+  /**
+   * Count rows matching a filter using a specific scalar index. This directly queries the index and
+   * counts matching row addresses, which is more efficient than scanning when the index covers the
+   * filter column.
+   *
+   * @param indexName the name of the scalar index to use
+   * @param filter the filter expression (e.g., "column = 5")
+   * @param fragmentIds optional list of fragment IDs to restrict the count to
+   * @return count of matching rows
+   */
+  public long countIndexedRows(
+      String indexName, String filter, Optional<List<Integer>> fragmentIds) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+      Preconditions.checkArgument(
+          filter != null && !filter.isEmpty(), "filter cannot be null or empty");
+      return nativeCountIndexedRows(indexName, filter, fragmentIds);
+    }
+  }
+
+  private native long nativeCountIndexedRows(
+      String indexName, String filter, Optional<List<Integer>> fragmentIds);
 
   /**
    * Calculate the size of the dataset.
@@ -927,6 +955,20 @@ public class Dataset implements Closeable {
   }
 
   private native List<String> nativeListIndexes();
+
+  /**
+   * Get all indexes with full metadata.
+   *
+   * @return list of Index objects with complete metadata including index type and fragment coverage
+   */
+  public List<Index> getIndexes() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetIndexes();
+    }
+  }
+
+  private native List<Index> nativeGetIndexes();
 
   /**
    * Get the table config of the dataset.
