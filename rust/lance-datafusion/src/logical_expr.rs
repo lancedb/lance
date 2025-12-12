@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Like, Operator};
+use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
 use datafusion::logical_expr::{Between, ScalarUDF, ScalarUDFImpl};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
@@ -81,85 +81,6 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
         }
     }
     Some(field.data_type())
-}
-
-/// Resolve column names in an expression using case-insensitive matching.
-///
-/// SQL parsers typically lowercase unquoted identifiers. This function
-/// resolves column names to their actual case in the schema.
-///
-/// Parameters
-///
-/// - *expr*: a datafusion logical expression
-/// - *schema*: lance schema
-pub fn resolve_column_names(expr: &Expr, schema: &Schema) -> Expr {
-    match expr {
-        Expr::Column(col) => {
-            // Try to find the column using case-insensitive matching
-            if let Some(field) = schema.field_case_insensitive(&col.name) {
-                Expr::Column(datafusion::common::Column::new(
-                    col.relation.clone(),
-                    &field.name,
-                ))
-            } else {
-                expr.clone()
-            }
-        }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(resolve_column_names(left, schema)),
-            op: *op,
-            right: Box::new(resolve_column_names(right, schema)),
-        }),
-        Expr::Not(inner) => Expr::Not(Box::new(resolve_column_names(inner, schema))),
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(resolve_column_names(inner, schema))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(resolve_column_names(inner, schema))),
-        Expr::Negative(inner) => Expr::Negative(Box::new(resolve_column_names(inner, schema))),
-        Expr::Between(Between {
-            expr: inner_expr,
-            low,
-            high,
-            negated,
-        }) => Expr::Between(Between {
-            expr: Box::new(resolve_column_names(inner_expr, schema)),
-            low: Box::new(resolve_column_names(low, schema)),
-            high: Box::new(resolve_column_names(high, schema)),
-            negated: *negated,
-        }),
-        Expr::Like(Like {
-            negated,
-            expr: inner_expr,
-            pattern,
-            escape_char,
-            case_insensitive,
-        }) => Expr::Like(Like {
-            negated: *negated,
-            expr: Box::new(resolve_column_names(inner_expr, schema)),
-            pattern: Box::new(resolve_column_names(pattern, schema)),
-            escape_char: *escape_char,
-            case_insensitive: *case_insensitive,
-        }),
-        Expr::InList(in_list) => Expr::in_list(
-            resolve_column_names(&in_list.expr, schema),
-            in_list
-                .list
-                .iter()
-                .map(|e| resolve_column_names(e, schema))
-                .collect(),
-            in_list.negated,
-        ),
-        Expr::ScalarFunction(sf) => {
-            // Resolve column names in function arguments
-            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction {
-                func: sf.func.clone(),
-                args: sf
-                    .args
-                    .iter()
-                    .map(|a| resolve_column_names(a, schema))
-                    .collect(),
-            })
-        }
-        _ => expr.clone(),
-    }
 }
 
 /// Resolve logical expression `expr`.

@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use crate::exec::{get_session_context, LanceExecutionOptions};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{
-    coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_column_names, resolve_expr,
-};
+use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -40,7 +38,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, Between, BinaryExpr, Like, Operator},
+    logical_expr::{Between, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -254,6 +252,23 @@ impl Planner {
         self
     }
 
+    /// Resolve a column name using case-insensitive matching against the schema.
+    /// Returns the actual field name if found, otherwise returns the original name.
+    fn resolve_column_name(&self, name: &str) -> String {
+        // Try exact match first
+        if self.schema.field_with_name(name).is_ok() {
+            return name.to_string();
+        }
+        // Fall back to case-insensitive match
+        for field in self.schema.fields() {
+            if field.name().eq_ignore_ascii_case(name) {
+                return field.name().clone();
+            }
+        }
+        // Not found in schema - return original (might be computed column, system column, etc.)
+        name.to_string()
+    }
+
     fn column(&self, idents: &[Ident]) -> Expr {
         fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
             for ident in idents {
@@ -270,14 +285,16 @@ impl Planner {
         if self.enable_relations && idents.len() > 1 {
             // Create qualified column reference (relation.column)
             let relation = &idents[0].value;
-            let column_name = &idents[1].value;
-            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let column_name = self.resolve_column_name(&idents[1].value);
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name));
             let mut result = column;
             handle_remaining_idents(&mut result, &idents[2..]);
             result
         } else {
             // Default behavior - treat as struct field access
-            let mut column = col(&idents[0].value);
+            // Use resolved column name to handle case-insensitive matching
+            let resolved_name = self.resolve_column_name(&idents[0].value);
+            let mut column = Expr::Column(Column::from_name(resolved_name));
             handle_remaining_idents(&mut column, &idents[1..]);
             column
         }
@@ -829,9 +846,6 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        // First resolve column names using case-insensitive matching
-        // (SQL parsers lowercase unquoted identifiers)
-        let expr = resolve_column_names(&expr, &schema);
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
             Error::invalid_input(
                 format!("Error resolving filter expression {filter}: {e}"),
@@ -848,18 +862,20 @@ impl Planner {
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
-        // Use direct Column construction to preserve case (col() parses as SQL and lowercases)
+        // Try exact match
         if self.schema.field_with_name(expr).is_ok() {
             return Ok(Expr::Column(Column::from_name(expr)));
+        }
+        // Try case-insensitive match for simple column reference
+        let resolved_name = self.resolve_column_name(expr);
+        if self.schema.field_with_name(&resolved_name).is_ok() {
+            return Ok(Expr::Column(Column::from_name(resolved_name)));
         }
 
         // Parse as SQL expression
         let ast_expr = parse_sql_expr(expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        // Resolve column names using case-insensitive matching
-        // (SQL parsers lowercase unquoted identifiers)
-        let expr = resolve_column_names(&expr, &schema);
         let resolved = resolve_expr(&expr, &schema)?;
         Ok(resolved)
     }
@@ -1010,7 +1026,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
-        logical_expr::{lit, Cast},
+        logical_expr::{col, lit, Cast},
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
