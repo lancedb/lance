@@ -98,10 +98,8 @@ fn inner_native_build<'local>(
         let mut builder = dataset_guard.inner.delta();
         if let Some(compared) = compared_against {
             builder = builder.compared_against_version(compared);
-        } else if let Some(begin) = begin_version {
-            builder = builder.with_begin_version(begin);
-        } else if let Some(end) = end_version {
-            builder = builder.with_end_version(end);
+        } else if let (Some(begin), Some(end)) = (begin_version, end_version) {
+            builder = builder.with_begin_version(begin).with_end_version(end);
         }
         builder.build()?
     };
