@@ -7,7 +7,7 @@ Row addressing enables efficient random access to rows within the table through 
 Stable row IDs provide persistent identifiers that remain constant throughout a row's lifetime, even as its physical location changes.
 Row version tracking records when rows were created and last modified, enabling incremental processing, change data capture, and time-travel queries.
 
-## Row Identification Forms
+## Row Identifier Forms
 
 A row in Lance has two identification forms:
 
