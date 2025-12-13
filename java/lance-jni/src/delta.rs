@@ -195,11 +195,12 @@ fn inner_get_updated_rows<'local>(
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_releaseNativeDelta(
     mut env: JNIEnv,
     obj: JObject,
+    handle: jlong,
 ) {
-    ok_or_throw_without_return!(env, inner_release_native_delta(&mut env, obj));
+    ok_or_throw_without_return!(env, inner_release_native_delta(&mut env, obj, handle));
 }
 
-fn inner_release_native_delta(env: &mut JNIEnv, obj: JObject) -> Result<()> {
+fn inner_release_native_delta(env: &mut JNIEnv, obj: JObject, _handle: jlong) -> Result<()> {
     let _: BlockingDatasetDelta = unsafe { env.take_rust_field(obj, NATIVE_DELTA) }?;
     Ok(())
 }
