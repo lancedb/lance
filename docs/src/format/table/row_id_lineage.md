@@ -9,7 +9,7 @@ Row version tracking records when rows were created and last modified, enabling 
 
 ## Row Identifier Forms
 
-A row in Lance has two identification forms:
+A row in Lance has two forms of row identifiers:
 
 - **Row address** - a physical identifier that encodes where the row is stored in the dataset.
 - **Row ID** - a logical identifier. When stable row IDs are enabled, this remains stable for the lifetime of a logical row. When disabled(default mode), it totally equals to the physical row address.
