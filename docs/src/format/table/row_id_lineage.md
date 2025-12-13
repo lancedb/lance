@@ -62,9 +62,9 @@ Row IDs are assigned using a monotonically increasing `next_row_id` counter stor
 2. Writer assigns row IDs sequentially starting from `next_row_id` for new rows
 3. Writer updates `next_row_id` in the new manifest to `next_row_id + num_new_rows`
 4. If commit fails due to conflict, writer rebases:
-    - Re-reads the new `next_row_id` from the latest version
-    - Reassigns row IDs to new rows using the updated counter
-    - Retries commit
+   - Re-reads the new `next_row_id` from the latest version
+   - Reassigns row IDs to new rows using the updated counter
+   - Retries commit
 
 This protocol mirrors fragment ID assignment and ensures row IDs are unique across all table versions.
 
