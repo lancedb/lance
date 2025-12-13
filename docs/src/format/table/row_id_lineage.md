@@ -30,7 +30,7 @@ Row address is currently the primary form of identifier used for indexing purpos
 Secondary indices (vector indices, scalar indices, full-text search indices) reference rows by their row addresses.
 
 !!! note
-Work to support stable row IDs in indices is in progress.
+      Work to support stable row IDs in indices is in progress.
 
 ### Row ID
 
@@ -47,8 +47,8 @@ See the next section for more details on assignment and update semantics.
 Historically, the term "row id" was often used to refer to the physical row address (`_rowaddr`), which is not stable across compaction or updates.
 
 !!! warning
-With the introduction of stable row IDs, there may still be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
-Please raise a PR if you find any place incorrect or confusing.
+      With the introduction of stable row IDs, there may still be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
+      Please raise a PR if you find any place incorrect or confusing.
 
 ## Stable Row ID
 
