@@ -867,7 +867,8 @@ impl ObjectStore {
         let store = match wrapper {
             Some(wrapper) => {
                 let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
-                    .calculate_object_store_prefix(location.as_ref(), storage_options).unwrap();
+                    .calculate_object_store_prefix(location.as_ref(), storage_options)
+                    .unwrap();
                 wrapper.wrap(&store_prefix, store)
             }
             None => store,
@@ -878,7 +879,8 @@ impl ObjectStore {
         let tracked_store = io_tracker.wrap("", store);
 
         let store_prefix = DEFAULT_OBJECT_STORE_REGISTRY
-            .calculate_object_store_prefix(location.as_ref(), storage_options).unwrap();
+            .calculate_object_store_prefix(location.as_ref(), storage_options)
+            .unwrap();
         Self {
             inner: tracked_store,
             scheme: scheme.into(),
