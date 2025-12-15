@@ -37,6 +37,7 @@ half.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
 jsonb.workspace = true
+libloading = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-datafusion.workspace = true
@@ -94,6 +95,7 @@ jieba-rs = ["tokenizer-jieba"]
 lindera = ["tokenizer-lindera"]
 tokenizer-lindera = ["lance-tokenizer/tokenizer-lindera"]
 tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
+tokenizer-plugin = ["dep:libloading"]
 
 [build-dependencies]
 prost-build.workspace = true

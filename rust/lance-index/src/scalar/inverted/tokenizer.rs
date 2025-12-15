@@ -12,6 +12,9 @@ pub mod document_tokenizer;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
+#[cfg(feature = "tokenizer-plugin")]
+pub mod plugin;
+
 #[cfg(feature = "tokenizer-jieba")]
 use jieba::JiebaTokenizerBuilder;
 
@@ -118,6 +121,17 @@ pub struct InvertedIndexParams {
     /// The effective worker count is clamped to `[1, num_cpus - 2]`.
     #[serde(rename = "num_workers", skip_serializing, default)]
     pub(crate) num_workers: Option<usize>,
+
+    /// Path to a tokenizer plugin shared library.
+    /// When set, the plugin will be loaded and used instead of built-in tokenizers.
+    /// Requires the `tokenizer-plugin` feature.
+    #[serde(default)]
+    pub(crate) plugin_library: Option<String>,
+
+    /// JSON configuration for the tokenizer plugin.
+    /// The format depends on the specific plugin being used.
+    #[serde(default)]
+    pub(crate) plugin_config: Option<String>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -165,6 +179,9 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             prefix_only: details.prefix_only,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
+            // Plugin settings are not persisted in protobuf, use defaults
+            plugin_library: None,
+            plugin_config: None,
         })
     }
 }
@@ -218,6 +235,8 @@ impl InvertedIndexParams {
             prefix_only: false,
             memory_limit_mb: None,
             num_workers: None,
+            plugin_library: None,
+            plugin_config: None,
         }
     }
 
@@ -341,7 +360,44 @@ impl InvertedIndexParams {
         Ok(value)
     }
 
+    /// Set a tokenizer plugin to use.
+    ///
+    /// When a plugin is set, it will be used instead of the built-in tokenizers.
+    /// Requires the `tokenizer-plugin` feature to be enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `library_path` - Path to the plugin shared library (.so, .dylib, or .dll)
+    /// * `config` - Optional JSON configuration for the plugin
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let params = InvertedIndexParams::default()
+    ///     .plugin(
+    ///         "/usr/local/lib/lance/libtokenizer_sudachi.so".to_string(),
+    ///         Some(r#"{"mode": "C"}"#.to_string()),
+    ///     );
+    /// ```
+    pub fn plugin(mut self, library_path: String, config: Option<String>) -> Self {
+        self.plugin_library = Some(library_path);
+        self.plugin_config = config;
+        self
+    }
+
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
+        // Check if a plugin is configured
+        #[cfg(feature = "tokenizer-plugin")]
+        if let Some(ref plugin_path) = self.plugin_library {
+            return self.build_plugin_tokenizer(plugin_path);
+        }
+
+        #[cfg(not(feature = "tokenizer-plugin"))]
+        if self.plugin_library.is_some() {
+            return Err(Error::invalid_input(
+                "tokenizer-plugin feature is not enabled, cannot use plugin tokenizers",
+            ));
+        }
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -378,6 +434,16 @@ impl InvertedIndexParams {
                 self.lance_tokenizer.as_ref().unwrap()
             ))),
         }
+    }
+
+    /// Build a tokenizer from a plugin library.
+    #[cfg(feature = "tokenizer-plugin")]
+    fn build_plugin_tokenizer(&self, plugin_path: &str) -> Result<Box<dyn LanceTokenizer>> {
+        use plugin::PluginTokenizer;
+
+        let config = self.plugin_config.as_deref().unwrap_or("{}");
+        let tokenizer = PluginTokenizer::new(plugin_path, config)?;
+        Ok(Box::new(tokenizer))
     }
 
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {

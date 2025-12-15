@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Example tokenizer plugin implementation.
+//!
+//! This is a simple whitespace tokenizer that demonstrates how to implement
+//! a tokenizer plugin for Lance. It can be compiled as a shared library and
+//! loaded at runtime.
+//!
+//! ## Building
+//!
+//! To build this as a shared library:
+//!
+//! ```bash
+//! # Create a new library crate
+//! cargo new --lib my_tokenizer
+//! cd my_tokenizer
+//!
+//! # Add to Cargo.toml:
+//! # [lib]
+//! # crate-type = ["cdylib"]
+//!
+//! # Copy this file as src/lib.rs
+//! # Build:
+//! cargo build --release
+//! ```
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! let params = InvertedIndexParams::default()
+//!     .plugin(
+//!         "/path/to/libmy_tokenizer.so".to_string(),
+//!         Some(r#"{"lowercase": true}"#.to_string()),
+//!     );
+//! ```
+
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::ptr;
+use std::sync::Mutex;
+
+/// Plugin API version - must match LANCE_TOKENIZER_PLUGIN_API_VERSION
+const PLUGIN_API_VERSION: u32 = 1;
+
+/// Token structure matching the C ABI
+#[repr(C)]
+pub struct LanceToken {
+    pub offset_from: u32,
+    pub offset_to: u32,
+    pub position: u32,
+    pub text: *const c_char,
+    pub text_len: u32,
+    pub position_length: u32,
+}
+
+/// Plugin interface structure
+#[repr(C)]
+pub struct LanceTokenizerPlugin {
+    pub api_version: unsafe extern "C" fn() -> u32,
+    pub create_factory: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
+    pub destroy_factory: unsafe extern "C" fn(*mut c_void),
+    pub create_tokenizer: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    pub destroy_tokenizer: unsafe extern "C" fn(*mut c_void),
+    pub create_stream: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_void,
+    pub destroy_stream: unsafe extern "C" fn(*mut c_void),
+    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken) -> i32,
+    pub get_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    pub name: unsafe extern "C" fn() -> *const c_char,
+    pub version: unsafe extern "C" fn() -> *const c_char,
+}
+
+/// Configuration for the tokenizer
+#[derive(Default)]
+struct Config {
+    lowercase: bool,
+}
+
+/// Factory that creates tokenizers with shared configuration
+struct Factory {
+    config: Config,
+    last_error: Mutex<Option<CString>>,
+}
+
+/// Tokenizer instance
+struct Tokenizer {
+    config: Config,
+}
+
+/// Token stream for iterating over tokens
+struct TokenStream {
+    text: String,
+    tokens: Vec<(usize, usize, String)>, // (start, end, text)
+    index: usize,
+    current_token_text: CString,
+}
+
+impl Factory {
+    fn new(config_json: &str) -> Result<Self, String> {
+        let config = if config_json.is_empty() || config_json == "{}" {
+            Config::default()
+        } else {
+            // Simple JSON parsing (in production, use serde_json)
+            let lowercase = config_json.contains("\"lowercase\":true")
+                || config_json.contains("\"lowercase\": true");
+            Config { lowercase }
+        };
+
+        Ok(Self {
+            config,
+            last_error: Mutex::new(None),
+        })
+    }
+
+    fn set_error(&self, error: &str) {
+        let mut guard = self.last_error.lock().unwrap();
+        *guard = Some(CString::new(error).unwrap_or_default());
+    }
+
+    fn get_error(&self) -> *const c_char {
+        let guard = self.last_error.lock().unwrap();
+        match &*guard {
+            Some(s) => s.as_ptr(),
+            None => ptr::null(),
+        }
+    }
+}
+
+impl Tokenizer {
+    fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<(usize, usize, String)> {
+        let mut tokens = Vec::new();
+        let mut start = 0;
+        let mut in_word = false;
+
+        for (i, c) in text.char_indices() {
+            if c.is_whitespace() {
+                if in_word {
+                    let word = &text[start..i];
+                    let token_text = if self.config.lowercase {
+                        word.to_lowercase()
+                    } else {
+                        word.to_string()
+                    };
+                    tokens.push((start, i, token_text));
+                    in_word = false;
+                }
+            } else if !in_word {
+                start = i;
+                in_word = true;
+            }
+        }
+
+        // Handle last word
+        if in_word {
+            let word = &text[start..];
+            let token_text = if self.config.lowercase {
+                word.to_lowercase()
+            } else {
+                word.to_string()
+            };
+            tokens.push((start, text.len(), token_text));
+        }
+
+        tokens
+    }
+}
+
+impl TokenStream {
+    fn new(text: String, tokens: Vec<(usize, usize, String)>) -> Self {
+        Self {
+            text,
+            tokens,
+            index: 0,
+            current_token_text: CString::default(),
+        }
+    }
+
+    fn next(&mut self, token: &mut LanceToken) -> bool {
+        if self.index >= self.tokens.len() {
+            return false;
+        }
+
+        let (start, end, ref text) = self.tokens[self.index];
+
+        // Store the CString to keep it alive
+        self.current_token_text = CString::new(text.as_str()).unwrap_or_default();
+
+        token.offset_from = start as u32;
+        token.offset_to = end as u32;
+        token.position = self.index as u32;
+        token.text = self.current_token_text.as_ptr();
+        token.text_len = text.len() as u32;
+        token.position_length = 1;
+
+        self.index += 1;
+        true
+    }
+}
+
+// --- C ABI Functions ---
+
+unsafe extern "C" fn api_version() -> u32 {
+    PLUGIN_API_VERSION
+}
+
+unsafe extern "C" fn create_factory(config_json: *const c_char, config_len: u32) -> *mut c_void {
+    let config_str = if config_json.is_null() || config_len == 0 {
+        ""
+    } else {
+        let slice = std::slice::from_raw_parts(config_json as *const u8, config_len as usize);
+        std::str::from_utf8(slice).unwrap_or("{}")
+    };
+
+    match Factory::new(config_str) {
+        Ok(factory) => Box::into_raw(Box::new(factory)) as *mut c_void,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
+    if !factory.is_null() {
+        drop(Box::from_raw(factory as *mut Factory));
+    }
+}
+
+unsafe extern "C" fn create_tokenizer(factory: *mut c_void) -> *mut c_void {
+    if factory.is_null() {
+        return ptr::null_mut();
+    }
+
+    let factory = &*(factory as *const Factory);
+    let tokenizer = Tokenizer::new(Config {
+        lowercase: factory.config.lowercase,
+    });
+    Box::into_raw(Box::new(tokenizer)) as *mut c_void
+}
+
+unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
+    if !tokenizer.is_null() {
+        drop(Box::from_raw(tokenizer as *mut Tokenizer));
+    }
+}
+
+unsafe extern "C" fn create_stream(
+    tokenizer: *mut c_void,
+    text: *const c_char,
+    text_len: u32,
+) -> *mut c_void {
+    if tokenizer.is_null() || text.is_null() {
+        return ptr::null_mut();
+    }
+
+    let tokenizer = &*(tokenizer as *const Tokenizer);
+    let text_slice = std::slice::from_raw_parts(text as *const u8, text_len as usize);
+    let text_str = String::from_utf8_lossy(text_slice).into_owned();
+
+    let tokens = tokenizer.tokenize(&text_str);
+    let stream = TokenStream::new(text_str, tokens);
+
+    Box::into_raw(Box::new(stream)) as *mut c_void
+}
+
+unsafe extern "C" fn destroy_stream(stream: *mut c_void) {
+    if !stream.is_null() {
+        drop(Box::from_raw(stream as *mut TokenStream));
+    }
+}
+
+unsafe extern "C" fn next_token(stream: *mut c_void, token: *mut LanceToken) -> i32 {
+    if stream.is_null() || token.is_null() {
+        return -1;
+    }
+
+    let stream = &mut *(stream as *mut TokenStream);
+    let token = &mut *token;
+
+    if stream.next(token) {
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn get_error(factory: *mut c_void) -> *const c_char {
+    if factory.is_null() {
+        return ptr::null();
+    }
+
+    let factory = &*(factory as *const Factory);
+    factory.get_error()
+}
+
+unsafe extern "C" fn name() -> *const c_char {
+    static NAME: &[u8] = b"simple_whitespace\0";
+    NAME.as_ptr() as *const c_char
+}
+
+unsafe extern "C" fn version() -> *const c_char {
+    static VERSION: &[u8] = b"1.0.0\0";
+    VERSION.as_ptr() as *const c_char
+}
+
+/// Plugin interface singleton
+static PLUGIN: LanceTokenizerPlugin = LanceTokenizerPlugin {
+    api_version,
+    create_factory,
+    destroy_factory,
+    create_tokenizer,
+    destroy_tokenizer,
+    create_stream,
+    destroy_stream,
+    next_token,
+    get_error,
+    name,
+    version,
+};
+
+/// Entry point - must be exported with this exact name
+#[no_mangle]
+pub extern "C" fn lance_tokenizer_get_plugin() -> *const LanceTokenizerPlugin {
+    &PLUGIN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tokenizer_basic() {
+        let tokenizer = Tokenizer::new(Config { lowercase: false });
+        let tokens = tokenizer.tokenize("Hello World");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].2, "Hello");
+        assert_eq!(tokens[1].2, "World");
+    }
+
+    #[test]
+    fn test_tokenizer_lowercase() {
+        let tokenizer = Tokenizer::new(Config { lowercase: true });
+        let tokens = tokenizer.tokenize("Hello World");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].2, "hello");
+        assert_eq!(tokens[1].2, "world");
+    }
+
+    #[test]
+    fn test_tokenizer_multiple_spaces() {
+        let tokenizer = Tokenizer::new(Config { lowercase: false });
+        let tokens = tokenizer.tokenize("  Hello   World  ");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].0, 2); // offset
+        assert_eq!(tokens[0].1, 7);
+        assert_eq!(tokens[1].0, 10);
+        assert_eq!(tokens[1].1, 15);
+    }
+}
