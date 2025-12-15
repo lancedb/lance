@@ -135,17 +135,11 @@ impl TryFrom<pb::fragment_reuse_index_details::Version> for FragReuseVersion {
 
 impl FragReuseVersion {
     pub fn old_frag_ids(&self) -> Vec<u64> {
-        self.groups
-            .iter()
-            .flat_map(|g| g.old_frags.iter().map(|f| f.id))
-            .collect::<Vec<_>>()
+        self.groups.iter().flat_map(|g| g.old_frags.iter().map(|f| f.id)).collect::<Vec<_>>()
     }
 
     pub fn new_frag_ids(&self) -> Vec<u64> {
-        self.groups
-            .iter()
-            .flat_map(|g| g.new_frags.iter().map(|f| f.id))
-            .collect::<Vec<_>>()
+        self.groups.iter().flat_map(|g| g.new_frags.iter().map(|f| f.id)).collect::<Vec<_>>()
     }
 
     pub fn new_frag_bitmap(&self) -> RoaringBitmap {
@@ -195,9 +189,7 @@ impl TryFrom<InlineContent> for FragReuseIndexDetails {
 impl FragReuseIndexDetails {
     pub fn new_frag_bitmap(&self) -> RoaringBitmap {
         RoaringBitmap::from_iter(
-            self.versions
-                .iter()
-                .flat_map(|v| v.new_frag_ids().into_iter().map(|id| id as u32)),
+            self.versions.iter().flat_map(|v| v.new_frag_ids().into_iter().map(|id| id as u32)),
         )
     }
 }
@@ -224,21 +216,15 @@ impl FragReuseIndex {
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
-        Self {
-            uuid,
-            row_id_maps,
-            details,
-        }
+        Self { uuid, row_id_maps, details }
     }
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
         for row_id_map in self.row_id_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_id_map
-                    .get(&mapped_value.unwrap())
-                    .copied()
-                    .unwrap_or(mapped_value);
+                mapped_value =
+                    row_id_map.get(&mapped_value.unwrap()).copied().unwrap_or(mapped_value);
             }
         }
 
@@ -256,44 +242,54 @@ impl FragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    /// Remap a record batch that contains a row_id column at index `row_id_idx`
-    /// Currently this assumes there are only 2 columns in the schema,
-    /// which is the case for all indexes.
-    /// For example, for btree, the schema is (value, row_id).
-    /// For vector index storage, the schema is (row_id, vector).
+    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Remaps row IDs in a record batch using the fragment reuse index.
+    ///
+    /// Supports batches with any number of columns. The row_id_idx specifies
+    /// which column contains the row IDs to be remapped.
+    ///
+    /// For example:
+    /// - btree: schema is (value, row_id), row_id_idx = 1
+    /// - vector: schema is (row_id, vector), row_id_idx = 0
+    /// - compound: schema is (col0, col1, ..., colN, row_id), row_id_idx = N
     pub fn remap_row_ids_record_batch(
         &self,
         batch: RecordBatch,
         row_id_idx: usize,
     ) -> Result<RecordBatch> {
-        assert_eq!(batch.schema().fields().len(), 2);
-        let other_column_idx = 1 - row_id_idx;
+        let num_columns = batch.schema().fields().len();
+        assert!(
+            row_id_idx < num_columns,
+            "row_id_idx {} is out of bounds for batch with {} columns",
+            row_id_idx,
+            num_columns
+        );
+
         let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
         let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = row_ids
             .values()
             .iter()
             .enumerate()
             .filter_map(|(idx, old_id)| {
-                self.remap_row_id(*old_id)
-                    .map(|new_id| (idx as u64, new_id))
+                self.remap_row_id(*old_id).map(|new_id| (idx as u64, new_id))
             })
             .unzip();
-        let new_val_indices = UInt64Array::from_iter_values(val_indices);
-        let new_vals =
-            arrow_select::take::take(batch.column(other_column_idx), &new_val_indices, None)?;
+        let take_indices = UInt64Array::from_iter_values(val_indices);
 
-        let mut batch_data: Vec<(usize, ArrayRef)> = vec![
-            (
-                row_id_idx,
-                Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
-            ),
-            (other_column_idx, Arc::new(new_vals)),
-        ];
-        batch_data.sort_by_key(|(i, _)| *i);
-        Ok(RecordBatch::try_new(
-            batch.schema(),
-            batch_data.into_iter().map(|(_, item)| item).collect(),
-        )?)
+        // Build new columns: take from all non-row_id columns, replace row_id column
+        let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(num_columns);
+        for col_idx in 0..num_columns {
+            if col_idx == row_id_idx {
+                // Replace row_id column with remapped values
+                new_columns.push(Arc::new(UInt64Array::from_iter_values(new_row_ids.clone())));
+            } else {
+                // Take matching rows from other columns
+                let taken = arrow_select::take::take(batch.column(col_idx), &take_indices, None)?;
+                new_columns.push(taken);
+            }
+        }
+
+        Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
     }
 
     pub fn remap_row_ids_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
@@ -367,9 +363,7 @@ impl Index for FragReuseIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let stats = FragReuseStatistics {
-            num_versions: self.details.versions.len(),
-        };
+        let stats = FragReuseStatistics { num_versions: self.details.versions.len() };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
             message: format!("failed to serialize fragment reuse index statistics: {}", e),
             location: location!(),
@@ -401,22 +395,10 @@ pub mod tests {
             dataset_version: 2,
             groups: vec![FragReuseGroup {
                 changed_row_addrs: vec![1, 2, 3],
-                old_frags: vec![FragDigest {
-                    id: 1,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                }],
+                old_frags: vec![FragDigest { id: 1, physical_rows: 1, num_deleted_rows: 0 }],
                 new_frags: vec![
-                    FragDigest {
-                        id: 2,
-                        physical_rows: 1,
-                        num_deleted_rows: 0,
-                    },
-                    FragDigest {
-                        id: 3,
-                        physical_rows: 1,
-                        num_deleted_rows: 0,
-                    },
+                    FragDigest { id: 2, physical_rows: 1, num_deleted_rows: 0 },
+                    FragDigest { id: 3, physical_rows: 1, num_deleted_rows: 0 },
                 ],
             }],
         };
@@ -425,30 +407,16 @@ pub mod tests {
             dataset_version: 1,
             groups: vec![FragReuseGroup {
                 changed_row_addrs: vec![4, 5, 6],
-                old_frags: vec![FragDigest {
-                    id: 2,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                }],
+                old_frags: vec![FragDigest { id: 2, physical_rows: 1, num_deleted_rows: 0 }],
                 new_frags: vec![
-                    FragDigest {
-                        id: 4,
-                        physical_rows: 1,
-                        num_deleted_rows: 0,
-                    },
-                    FragDigest {
-                        id: 5,
-                        physical_rows: 1,
-                        num_deleted_rows: 0,
-                    },
+                    FragDigest { id: 4, physical_rows: 1, num_deleted_rows: 0 },
+                    FragDigest { id: 5, physical_rows: 1, num_deleted_rows: 0 },
                 ],
             }],
         };
 
         // Create FragReuseIndexDetails with versions in reverse order
-        let details = FragReuseIndexDetails {
-            versions: vec![version1, version2],
-        };
+        let details = FragReuseIndexDetails { versions: vec![version1, version2] };
 
         // Convert to protobuf format
         let inline_content: InlineContent = (&details).into();
@@ -461,61 +429,31 @@ pub mod tests {
 
         // Verify versions are sorted by dataset_version (oldest to latest)
         assert_eq!(roundtrip_details.versions[0].dataset_version, 1);
-        assert_eq!(
-            roundtrip_details.versions[0].groups[0].changed_row_addrs,
-            vec![4, 5, 6]
-        );
+        assert_eq!(roundtrip_details.versions[0].groups[0].changed_row_addrs, vec![4, 5, 6]);
         assert_eq!(
             roundtrip_details.versions[0].groups[0].new_frags,
             vec![
-                FragDigest {
-                    id: 4,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                },
-                FragDigest {
-                    id: 5,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                }
+                FragDigest { id: 4, physical_rows: 1, num_deleted_rows: 0 },
+                FragDigest { id: 5, physical_rows: 1, num_deleted_rows: 0 }
             ]
         );
         assert_eq!(
             roundtrip_details.versions[0].groups[0].old_frags,
-            vec![FragDigest {
-                id: 2,
-                physical_rows: 1,
-                num_deleted_rows: 0,
-            }]
+            vec![FragDigest { id: 2, physical_rows: 1, num_deleted_rows: 0 }]
         );
 
         assert_eq!(roundtrip_details.versions[1].dataset_version, 2);
-        assert_eq!(
-            roundtrip_details.versions[1].groups[0].changed_row_addrs,
-            vec![1, 2, 3]
-        );
+        assert_eq!(roundtrip_details.versions[1].groups[0].changed_row_addrs, vec![1, 2, 3]);
         assert_eq!(
             roundtrip_details.versions[1].groups[0].new_frags,
             vec![
-                FragDigest {
-                    id: 2,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                },
-                FragDigest {
-                    id: 3,
-                    physical_rows: 1,
-                    num_deleted_rows: 0,
-                }
+                FragDigest { id: 2, physical_rows: 1, num_deleted_rows: 0 },
+                FragDigest { id: 3, physical_rows: 1, num_deleted_rows: 0 }
             ]
         );
         assert_eq!(
             roundtrip_details.versions[1].groups[0].old_frags,
-            vec![FragDigest {
-                id: 1,
-                physical_rows: 1,
-                num_deleted_rows: 0,
-            }]
+            vec![FragDigest { id: 1, physical_rows: 1, num_deleted_rows: 0 }]
         );
     }
 }

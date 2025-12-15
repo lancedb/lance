@@ -165,5 +165,9 @@ harness = false
 name = "random_access"
 harness = false
 
+[[bench]]
+name = "compound_index_comparison"
+harness = false
+
 [lints]
 workspace = true

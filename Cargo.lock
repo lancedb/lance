@@ -2687,6 +2687,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-proto-common"
+version = "50.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7b628ba0f7bd1fa9565f80b19a162bcb3cbc082bbc42b29c4619760621f4e32"
+dependencies = [
+ "arrow",
+ "datafusion-common",
+ "pbjson",
+ "prost",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "datafusion-pruning"
 version = "51.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5025,6 +5039,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-channel 2.5.0",
@@ -5040,6 +5055,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-expr",
+ "datafusion-proto-common",
  "datafusion-sql",
  "deepsize",
  "dirs 6.0.0",
@@ -5073,6 +5089,7 @@ dependencies = [
  "num-traits",
  "object_store",
  "pprof",
+ "proptest",
  "prost",
  "prost-build",
  "prost-types",

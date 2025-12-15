@@ -31,10 +31,14 @@ use lance_index::scalar::registry::{
 };
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::{
-    bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
+    bitmap::BITMAP_LOOKUP_NAME,
+    compound_btree::{CompoundBTreeParameters, COMPOUND_LOOKUP_NAME},
+    inverted::INVERT_LIST_FILE,
+    lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
+use lance_index::pb::CompoundBTreeIndexDetails;
 use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
@@ -292,6 +296,221 @@ pub(super) async fn build_scalar_index(
         .await
 }
 
+/// Build a Compound BTree Index for multiple columns
+///
+/// This creates an index that supports efficient lookups on multi-column predicates
+/// like `WHERE col1 = 'a' AND col2 = 'b'`.
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn build_compound_btree_index(
+    dataset: &Dataset,
+    columns: &[&str],
+    uuid: &str,
+    _params: &ScalarIndexParams,
+    train: bool,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<CreatedIndex> {
+    // Validate all columns exist
+    let fields: Vec<arrow_schema::Field> = columns
+        .iter()
+        .map(|col| {
+            dataset
+                .schema()
+                .field(col)
+                .ok_or_else(|| Error::InvalidInput {
+                    source: format!("No column with name {}", col).into(),
+                    location: location!(),
+                })
+                .map(|f| f.into())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if fields.is_empty() {
+        return Err(Error::InvalidInput {
+            source: "Compound index requires at least one column".into(),
+            location: location!(),
+        });
+    }
+
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
+
+    // Get the CompoundBTree plugin
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name("compoundbtree")?;
+
+    // Create training request with column names embedded in params
+    let compound_params = CompoundBTreeParameters {
+        page_size: None, // Use default
+        column_names: columns.iter().map(|s| s.to_string()).collect(),
+    };
+    let params_json = serde_json::to_string(&compound_params).map_err(|e| Error::Internal {
+        message: format!("Failed to serialize compound params: {}", e),
+        location: location!(),
+    })?;
+
+    // Use first field for training request (plugin extracts all columns from schema)
+    let training_request = plugin.new_training_request(&params_json, &fields[0])?;
+
+    // Load multi-column training data
+    let training_data = load_compound_training_data(
+        dataset,
+        columns,
+        training_request.criteria(),
+        train,
+        fragment_ids.clone(),
+    )
+    .await?;
+
+    plugin
+        .train_index(training_data, &index_store, training_request, fragment_ids)
+        .await
+}
+
+/// Load training data for compound (multi-column) index
+///
+/// Unlike single-column training data, this:
+/// - Projects multiple columns (keeping original names)
+/// - Orders by compound key (all columns in order)
+pub(crate) async fn load_compound_training_data(
+    dataset: &Dataset,
+    columns: &[&str],
+    criteria: &TrainingCriteria,
+    train: bool,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<SendableRecordBatchStream> {
+    if !train {
+        return create_empty_compound_stream(dataset, columns, criteria).await;
+    }
+
+    // Handle fragment filtering
+    let fragments = if let Some(ref frag_ids) = fragment_ids {
+        let frag_ids = frag_ids.iter().copied().sorted().dedup().collect_vec();
+        let frags = dataset.get_frags_from_ordered_ids(&frag_ids);
+        let frags: Result<Vec<_>> = frag_ids
+            .iter()
+            .zip(frags)
+            .map(|(id, frag)| {
+                let Some(frag) = frag else {
+                    return Err(Error::InvalidInput {
+                        source: format!("No fragment with id {}", id).into(),
+                        location: location!(),
+                    });
+                };
+                Ok(frag.metadata().clone())
+            })
+            .collect();
+        Some(frags?)
+    } else {
+        None
+    };
+
+    scan_compound_training_data(dataset, columns, criteria, fragments).await
+}
+
+/// Scan training data for compound index
+async fn scan_compound_training_data(
+    dataset: &Dataset,
+    columns: &[&str],
+    criteria: &TrainingCriteria,
+    fragments: Option<Vec<Fragment>>,
+) -> Result<SendableRecordBatchStream> {
+    let num_rows = dataset.count_all_rows().await?;
+
+    let mut scan = dataset.scan();
+
+    // Project all columns (keep original names, not renaming to "value")
+    scan.project(columns)?;
+
+    // Order by compound key (all columns in order)
+    if TrainingOrdering::Values == criteria.ordering {
+        let ordering: Vec<ColumnOrdering> = columns
+            .iter()
+            .map(|c| ColumnOrdering::asc_nulls_first(c.to_string()))
+            .collect();
+        scan.order_by(Some(ordering))?;
+    }
+
+    if criteria.needs_row_ids {
+        scan.with_row_id();
+    }
+    if criteria.needs_row_addrs {
+        scan.with_row_address();
+    }
+
+    if let Some(frags) = fragments {
+        scan.with_fragments(frags);
+    }
+
+    let batches = scan
+        .try_into_dfstream(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })
+        .await?;
+
+    let schema = batches.schema();
+    let mut rows_processed = 0;
+    let mut next_update = TRAINING_UPDATE_FREQ;
+    let training_uuid = uuid::Uuid::new_v4().to_string();
+    let columns_str = columns.join(", ");
+    info!(
+        "Starting compound index training job with id {} on columns [{}]",
+        training_uuid, columns_str
+    );
+    info!(
+        "Training compound index (job_id={}): 0/{}",
+        training_uuid, num_rows
+    );
+    let batches = batches.map_ok(move |batch| {
+        rows_processed += batch.num_rows();
+        if rows_processed >= next_update {
+            next_update += TRAINING_UPDATE_FREQ;
+            info!(
+                "Training compound index (job_id={}): {}/{}",
+                training_uuid, rows_processed, num_rows
+            );
+        }
+        batch
+    });
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+}
+
+/// Create an empty stream for compound index when train=false
+async fn create_empty_compound_stream(
+    dataset: &Dataset,
+    columns: &[&str],
+    criteria: &TrainingCriteria,
+) -> Result<SendableRecordBatchStream> {
+    let mut fields: Vec<arrow_schema::Field> = columns
+        .iter()
+        .map(|col| {
+            let field = dataset.schema().field(col).ok_or_else(|| Error::InvalidInput {
+                source: format!("No column with name {}", col).into(),
+                location: location!(),
+            })?;
+            Ok(arrow_schema::Field::from(field))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if criteria.needs_row_ids {
+        fields.push(arrow_schema::Field::new(
+            ROW_ID,
+            arrow_schema::DataType::UInt64,
+            false,
+        ));
+    }
+    if criteria.needs_row_addrs {
+        fields.push(arrow_schema::Field::new(
+            ROW_ADDR,
+            arrow_schema::DataType::UInt64,
+            false,
+        ));
+    }
+
+    let schema = Arc::new(arrow_schema::Schema::new(fields));
+    let empty_stream = futures::stream::empty();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, empty_stream)))
+}
+
 /// Fetches the scalar index plugin for a given index metadata
 ///
 /// The fast path, on newer datasets, is just a plugin lookup by the type URL of the index details.
@@ -381,7 +600,31 @@ pub(crate) async fn infer_scalar_index_details(
     {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
-        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
+        // Check for compound index by looking for compound_page_lookup.lance
+        let compound_lookup = index_dir.child(COMPOUND_LOOKUP_NAME);
+        if dataset.object_store.exists(&compound_lookup).await? {
+            // Infer compound index details from the index metadata fields
+            // The column names should come from the index's field IDs
+            let column_names: Vec<String> = index
+                .fields
+                .iter()
+                .filter_map(|field_id| {
+                    dataset
+                        .schema()
+                        .field_by_id(*field_id)
+                        .map(|f| f.name.clone())
+                })
+                .collect();
+
+            prost_types::Any::from_msg(&CompoundBTreeIndexDetails {
+                column_names: column_names.clone(),
+                num_columns: column_names.len() as u32,
+            })
+            .unwrap()
+        } else {
+            // Default to BTree for single-column indices
+            prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
+        }
     };
 
     let index_details = Arc::new(index_details);

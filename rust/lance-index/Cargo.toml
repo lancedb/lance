@@ -18,6 +18,7 @@ arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-arith.workspace = true
+arrow-row.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
@@ -83,6 +84,7 @@ env_logger = "0.11.6"
 geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
+proptest.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
@@ -161,6 +163,10 @@ harness = false
 
 [[bench]]
 name = "geo"
+harness = false
+
+[[bench]]
+name = "compound_btree"
 harness = false
 
 [lints]
