@@ -1640,12 +1640,11 @@ class LanceDataset(pa.dataset.Dataset):
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
         elif addresses is not None:
-            # ROW ids and Row address are the same until stable ROW ID is implemented.
-            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
         elif indices is not None:
             lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
         else:
-            raise ValueError("Either ids or indices must be specified")
+            raise ValueError("Either ids, addresses, or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
