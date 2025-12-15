@@ -457,10 +457,33 @@ impl StructuralEncodingStrategy {
                             location: location!(),
                         });
                     }
-                    let entries_child = field
-                        .children
-                        .first()
-                        .expect("Map should have an entries child");
+                    let entries_child = field.children.first().ok_or_else(|| Error::Schema {
+                        message: "Map should have an entries child".to_string(),
+                        location: location!(),
+                    })?;
+                    let DataType::Struct(struct_fields) = entries_child.data_type() else {
+                        return Err(Error::Schema {
+                            message: "Map entries field must be a Struct<key, value>".to_string(),
+                            location: location!(),
+                        });
+                    };
+                    if struct_fields.len() < 2 {
+                        return Err(Error::Schema {
+                            message: "Map entries struct must contain both key and value fields"
+                                .to_string(),
+                            location: location!(),
+                        });
+                    }
+                    let key_field = &struct_fields[0];
+                    if key_field.is_nullable() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                                key_field.name()
+                            ),
+                            location: location!(),
+                        });
+                    }
                     let child_encoder = self.do_create_field_encoder(
                         _encoding_strategy_root,
                         entries_child,
