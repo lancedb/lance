@@ -15,6 +15,7 @@ FILTERS = [None, "bools IS TRUE"]
 
 @pytest.mark.parametrize("columns", COLUMNS, ids=COLUMN_LABELS)
 @pytest.mark.parametrize("filt", FILTERS)
+@pytest.mark.skipif(not is_on_google(), reason="Not on Google Cloud")
 def test_eda_search(benchmark, columns, filt):
     dataset_uri = get_dataset_uri("image_eda")
 
@@ -63,6 +64,7 @@ BTREE_FILTER_LABELS = [
 @pytest.mark.parametrize("filt", BTREE_FILTERS, ids=BTREE_FILTER_LABELS)
 @pytest.mark.parametrize("payload", [None, "image_widths"], ids=["none", "integers"])
 @pytest.mark.parametrize("use_cache", [True, False], ids=["cache", "no_cache"])
+@pytest.mark.skipif(not is_on_google(), reason="Not on Google Cloud")
 def test_eda_btree_search(
     benchmark, filt: str | None, payload: str | None, use_cache: bool
 ):
