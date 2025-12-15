@@ -3,10 +3,12 @@
 
 //! Benchmark comparing query performance across different index strategies:
 //! - No index (full scan with filter)
-//! - BTree index on first column only
-//! - Compound index on multiple columns
+//! - BTree index on first column only (tenant_id)
+//! - Two separate BTree indices (tenant_id + timestamp)
+//! - Compound index on multiple columns (tenant_id, timestamp)
 //!
-//! This demonstrates where compound indices provide value over single-column indices.
+//! This demonstrates where compound indices provide value over single-column indices,
+//! and how a single compound index compares to maintaining two separate indices.
 
 use std::sync::Arc;
 
@@ -36,9 +38,11 @@ const TIMESTAMPS_PER_FRAGMENT: i64 = TIMESTAMPS_PER_TENANT / NUM_FRAGMENTS; // 1
 struct ComparisonFixture {
     _no_index_dir: TempStrDir,
     _btree_dir: TempStrDir,
+    _dual_btree_dir: TempStrDir,
     _compound_dir: TempStrDir,
     no_index_dataset: Arc<Dataset>,
     btree_dataset: Arc<Dataset>,
+    dual_btree_dataset: Arc<Dataset>,
     compound_dataset: Arc<Dataset>,
 }
 
@@ -75,18 +79,21 @@ impl ComparisonFixture {
         let batch = generate_test_data();
         let schema = batch.schema();
 
-        // Create three separate directories for each dataset variant
+        // Create four separate directories for each dataset variant
         let no_index_dir = TempStrDir::default();
         let btree_dir = TempStrDir::default();
+        let dual_btree_dir = TempStrDir::default();
         let compound_dir = TempStrDir::default();
 
         let no_index_uri = format!("file://{}", no_index_dir.as_str());
         let btree_uri = format!("file://{}", btree_dir.as_str());
+        let dual_btree_uri = format!("file://{}", dual_btree_dir.as_str());
         let compound_uri = format!("file://{}", compound_dir.as_str());
 
-        // Write the same data to all three locations
+        // Write the same data to all four locations
         let batches_no_index = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         let batches_btree = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let batches_dual_btree = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
         let batches_compound = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
 
         let no_index_dataset = Arc::new(
@@ -98,6 +105,10 @@ impl ComparisonFixture {
         let mut btree_dataset = Dataset::write(batches_btree, &btree_uri, None)
             .await
             .expect("Failed to write btree dataset");
+
+        let mut dual_btree_dataset = Dataset::write(batches_dual_btree, &dual_btree_uri, None)
+            .await
+            .expect("Failed to write dual_btree dataset");
 
         let mut compound_dataset = Dataset::write(batches_compound, &compound_uri, None)
             .await
@@ -115,6 +126,29 @@ impl ComparisonFixture {
             )
             .await
             .expect("Failed to create btree index");
+
+        // Create two separate BTree indices on tenant_id and timestamp
+        dual_btree_dataset
+            .create_index(
+                &["tenant_id"],
+                IndexType::BTree,
+                Some("btree_tenant_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("Failed to create btree tenant index for dual_btree");
+
+        dual_btree_dataset
+            .create_index(
+                &["timestamp"],
+                IndexType::BTree,
+                Some("btree_timestamp_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("Failed to create btree timestamp index for dual_btree");
 
         // Create Compound index on (tenant_id, timestamp)
         compound_dataset
@@ -134,6 +168,11 @@ impl ComparisonFixture {
                 .await
                 .expect("Failed to reopen btree dataset"),
         );
+        let dual_btree_dataset = Arc::new(
+            Dataset::open(&dual_btree_uri)
+                .await
+                .expect("Failed to reopen dual_btree dataset"),
+        );
         let compound_dataset = Arc::new(
             Dataset::open(&compound_uri)
                 .await
@@ -143,9 +182,11 @@ impl ComparisonFixture {
         Self {
             _no_index_dir: no_index_dir,
             _btree_dir: btree_dir,
+            _dual_btree_dir: dual_btree_dir,
             _compound_dir: compound_dir,
             no_index_dataset,
             btree_dataset,
+            dual_btree_dataset,
             compound_dataset,
         }
     }
@@ -215,6 +256,9 @@ fn bench_tenant_only(c: &mut Criterion) {
     
     let btree_rows = rt.block_on(query_tenant_only(&fixture.btree_dataset));
     assert_eq!(btree_rows, expected_rows, "btree returned wrong row count");
+
+    let dual_btree_rows = rt.block_on(query_tenant_only(&fixture.dual_btree_dataset));
+    assert_eq!(dual_btree_rows, expected_rows, "dual_btree returned wrong row count");
     
     let compound_rows = rt.block_on(query_tenant_only(&fixture.compound_dataset));
     assert_eq!(compound_rows, expected_rows, "compound returned wrong row count");
@@ -227,6 +271,10 @@ fn bench_tenant_only(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_only(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_only(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -248,6 +296,9 @@ fn bench_tenant_narrow_range(c: &mut Criterion) {
     
     let btree_rows = rt.block_on(query_tenant_narrow_range(&fixture.btree_dataset));
     assert_eq!(btree_rows, expected_rows, "btree returned wrong row count");
+
+    let dual_btree_rows = rt.block_on(query_tenant_narrow_range(&fixture.dual_btree_dataset));
+    assert_eq!(dual_btree_rows, expected_rows, "dual_btree returned wrong row count");
     
     let compound_rows = rt.block_on(query_tenant_narrow_range(&fixture.compound_dataset));
     assert_eq!(compound_rows, expected_rows, "compound returned wrong row count");
@@ -260,6 +311,10 @@ fn bench_tenant_narrow_range(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_narrow_range(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_narrow_range(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -281,6 +336,9 @@ fn bench_tenant_wide_range(c: &mut Criterion) {
     
     let btree_rows = rt.block_on(query_tenant_wide_range(&fixture.btree_dataset));
     assert_eq!(btree_rows, expected_rows, "btree returned wrong row count");
+
+    let dual_btree_rows = rt.block_on(query_tenant_wide_range(&fixture.dual_btree_dataset));
+    assert_eq!(dual_btree_rows, expected_rows, "dual_btree returned wrong row count");
     
     let compound_rows = rt.block_on(query_tenant_wide_range(&fixture.compound_dataset));
     assert_eq!(compound_rows, expected_rows, "compound returned wrong row count");
@@ -293,6 +351,10 @@ fn bench_tenant_wide_range(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_wide_range(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_wide_range(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -314,6 +376,9 @@ fn bench_tenant_full_range(c: &mut Criterion) {
     
     let btree_rows = rt.block_on(query_tenant_full_range(&fixture.btree_dataset));
     assert_eq!(btree_rows, expected_rows, "btree returned wrong row count");
+
+    let dual_btree_rows = rt.block_on(query_tenant_full_range(&fixture.dual_btree_dataset));
+    assert_eq!(dual_btree_rows, expected_rows, "dual_btree returned wrong row count");
     
     let compound_rows = rt.block_on(query_tenant_full_range(&fixture.compound_dataset));
     assert_eq!(compound_rows, expected_rows, "compound returned wrong row count");
@@ -326,6 +391,10 @@ fn bench_tenant_full_range(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_full_range(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_full_range(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -347,6 +416,9 @@ fn bench_timestamp_only(c: &mut Criterion) {
     
     let btree_rows = rt.block_on(query_timestamp_only(&fixture.btree_dataset));
     assert_eq!(btree_rows, expected_rows, "btree returned wrong row count");
+
+    let dual_btree_rows = rt.block_on(query_timestamp_only(&fixture.dual_btree_dataset));
+    assert_eq!(dual_btree_rows, expected_rows, "dual_btree returned wrong row count");
     
     let compound_rows = rt.block_on(query_timestamp_only(&fixture.compound_dataset));
     assert_eq!(compound_rows, expected_rows, "compound returned wrong row count");
@@ -359,6 +431,11 @@ fn bench_timestamp_only(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_timestamp_only(&fixture.btree_dataset)))
+    });
+
+    // dual_btree has a timestamp index, so it should help here
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_timestamp_only(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -423,9 +500,11 @@ fn generate_fragment_data(start_timestamp: i64, end_timestamp: i64) -> RecordBat
 struct MultiFragmentFixture {
     _no_index_dir: TempStrDir,
     _btree_dir: TempStrDir,
+    _dual_btree_dir: TempStrDir,
     _compound_dir: TempStrDir,
     no_index_dataset: Arc<Dataset>,
     btree_dataset: Arc<Dataset>,
+    dual_btree_dataset: Arc<Dataset>,
     compound_dataset: Arc<Dataset>,
 }
 
@@ -433,13 +512,15 @@ impl MultiFragmentFixture {
     async fn open() -> Self {
         use lance::dataset::WriteParams;
 
-        // Create three separate directories for each dataset variant
+        // Create four separate directories for each dataset variant
         let no_index_dir = TempStrDir::default();
         let btree_dir = TempStrDir::default();
+        let dual_btree_dir = TempStrDir::default();
         let compound_dir = TempStrDir::default();
 
         let no_index_uri = format!("file://{}", no_index_dir.as_str());
         let btree_uri = format!("file://{}", btree_dir.as_str());
+        let dual_btree_uri = format!("file://{}", dual_btree_dir.as_str());
         let compound_uri = format!("file://{}", compound_dir.as_str());
 
         // Write first fragment to create datasets
@@ -461,6 +542,14 @@ impl MultiFragmentFixture {
         )
         .await
         .expect("Failed to write btree dataset");
+
+        let mut dual_btree_dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first_batch.clone())], schema.clone()),
+            &dual_btree_uri,
+            None,
+        )
+        .await
+        .expect("Failed to write dual_btree dataset");
 
         let mut compound_dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(first_batch.clone())], schema.clone()),
@@ -497,6 +586,14 @@ impl MultiFragmentFixture {
             .await
             .expect("Failed to append to btree dataset");
 
+            dual_btree_dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+                &dual_btree_uri,
+                Some(write_params.clone()),
+            )
+            .await
+            .expect("Failed to append to dual_btree dataset");
+
             compound_dataset = Dataset::write(
                 RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
                 &compound_uri,
@@ -520,6 +617,12 @@ impl MultiFragmentFixture {
             NUM_FRAGMENTS
         );
         assert_eq!(
+            dual_btree_dataset.count_fragments(),
+            NUM_FRAGMENTS as usize,
+            "dual_btree should have {} fragments",
+            NUM_FRAGMENTS
+        );
+        assert_eq!(
             compound_dataset.count_fragments(),
             NUM_FRAGMENTS as usize,
             "compound should have {} fragments",
@@ -539,6 +642,29 @@ impl MultiFragmentFixture {
             .await
             .expect("Failed to create btree index");
 
+        // Create two separate BTree indices on tenant_id and timestamp
+        dual_btree_dataset
+            .create_index(
+                &["tenant_id"],
+                IndexType::BTree,
+                Some("btree_tenant_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("Failed to create btree tenant index for dual_btree");
+
+        dual_btree_dataset
+            .create_index(
+                &["timestamp"],
+                IndexType::BTree,
+                Some("btree_timestamp_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("Failed to create btree timestamp index for dual_btree");
+
         // Create Compound index on (tenant_id, timestamp)
         compound_dataset
             .create_index(
@@ -557,6 +683,11 @@ impl MultiFragmentFixture {
                 .await
                 .expect("Failed to reopen btree dataset"),
         );
+        let dual_btree_dataset = Arc::new(
+            Dataset::open(&dual_btree_uri)
+                .await
+                .expect("Failed to reopen dual_btree dataset"),
+        );
         let compound_dataset = Arc::new(
             Dataset::open(&compound_uri)
                 .await
@@ -566,9 +697,11 @@ impl MultiFragmentFixture {
         Self {
             _no_index_dir: no_index_dir,
             _btree_dir: btree_dir,
+            _dual_btree_dir: dual_btree_dir,
             _compound_dir: compound_dir,
             no_index_dataset: Arc::new(no_index_dataset),
             btree_dataset,
+            dual_btree_dataset,
             compound_dataset,
         }
     }
@@ -595,6 +728,12 @@ fn bench_multi_fragment_tenant_only(c: &mut Criterion) {
         "multi_fragment btree returned wrong row count"
     );
 
+    let dual_btree_rows = rt.block_on(query_tenant_only(&fixture.dual_btree_dataset));
+    assert_eq!(
+        dual_btree_rows, expected_rows,
+        "multi_fragment dual_btree returned wrong row count"
+    );
+
     let compound_rows = rt.block_on(query_tenant_only(&fixture.compound_dataset));
     assert_eq!(
         compound_rows, expected_rows,
@@ -609,6 +748,10 @@ fn bench_multi_fragment_tenant_only(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_only(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_only(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -638,6 +781,12 @@ fn bench_multi_fragment_narrow_range(c: &mut Criterion) {
         "multi_fragment btree returned wrong row count"
     );
 
+    let dual_btree_rows = rt.block_on(query_tenant_narrow_range(&fixture.dual_btree_dataset));
+    assert_eq!(
+        dual_btree_rows, expected_rows,
+        "multi_fragment dual_btree returned wrong row count"
+    );
+
     let compound_rows = rt.block_on(query_tenant_narrow_range(&fixture.compound_dataset));
     assert_eq!(
         compound_rows, expected_rows,
@@ -652,6 +801,10 @@ fn bench_multi_fragment_narrow_range(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_narrow_range(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_narrow_range(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -682,6 +835,12 @@ fn bench_multi_fragment_medium_range(c: &mut Criterion) {
         "multi_fragment btree returned wrong row count"
     );
 
+    let dual_btree_rows = rt.block_on(query_tenant_wide_range(&fixture.dual_btree_dataset));
+    assert_eq!(
+        dual_btree_rows, expected_rows,
+        "multi_fragment dual_btree returned wrong row count"
+    );
+
     let compound_rows = rt.block_on(query_tenant_wide_range(&fixture.compound_dataset));
     assert_eq!(
         compound_rows, expected_rows,
@@ -696,6 +855,10 @@ fn bench_multi_fragment_medium_range(c: &mut Criterion) {
 
     group.bench_function("btree_tenant", |b| {
         b.iter(|| rt.block_on(query_tenant_wide_range(&fixture.btree_dataset)))
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| rt.block_on(query_tenant_wide_range(&fixture.dual_btree_dataset)))
     });
 
     group.bench_function("compound", |b| {
@@ -732,6 +895,15 @@ fn bench_multi_fragment_wide_range(c: &mut Criterion) {
         "multi_fragment btree returned wrong row count"
     );
 
+    let dual_btree_rows = rt.block_on(run_query(
+        &fixture.dual_btree_dataset,
+        "tenant_id = 'tenant_50' AND timestamp > 9000",
+    ));
+    assert_eq!(
+        dual_btree_rows, expected_rows,
+        "multi_fragment dual_btree returned wrong row count"
+    );
+
     let compound_rows = rt.block_on(run_query(
         &fixture.compound_dataset,
         "tenant_id = 'tenant_50' AND timestamp > 9000",
@@ -756,6 +928,15 @@ fn bench_multi_fragment_wide_range(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(run_query(
                 &fixture.btree_dataset,
+                "tenant_id = 'tenant_50' AND timestamp > 9000",
+            ))
+        })
+    });
+
+    group.bench_function("dual_btree", |b| {
+        b.iter(|| {
+            rt.block_on(run_query(
+                &fixture.dual_btree_dataset,
                 "tenant_id = 'tenant_50' AND timestamp > 9000",
             ))
         })
