@@ -1,0 +1,11 @@
+[package]
+name = "lance-test-tokenizer-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Prevent cargo from treating this as part of the parent workspace
+[workspace]
