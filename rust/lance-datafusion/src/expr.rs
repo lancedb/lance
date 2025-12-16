@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
 

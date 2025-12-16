@@ -64,8 +64,13 @@ async fn test_query_integer(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: add zone map and bloom filter once we fix https://github.com/lancedb/lance/issues/4758
-            [None, Some(IndexType::Bitmap), Some(IndexType::BTree)],
+            [
+                None,
+                Some(IndexType::Bitmap),
+                Some(IndexType::BTree),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
@@ -91,9 +96,13 @@ async fn test_query_float(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: Add bloom filter after https://github.com/lancedb/lance/issues/5171 is fixed
-            // TODO: Add zone map after https://github.com/lancedb/lance/issues/4758 is fixed
-            [None, Some(IndexType::BTree), Some(IndexType::Bitmap)],
+            [
+                None,
+                Some(IndexType::BTree),
+                Some(IndexType::Bitmap),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
@@ -150,9 +159,13 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: Add bloom filter after https://github.com/lancedb/lance/issues/5171 is fixed
-            // TODO: Add zone map after https://github.com/lancedb/lance/issues/4758 is fixed
-            [None, Some(IndexType::BTree), Some(IndexType::Bitmap)],
+            [
+                None,
+                Some(IndexType::BTree),
+                Some(IndexType::Bitmap),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
@@ -182,9 +195,13 @@ async fn test_query_date(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: Add bloom filter after https://github.com/lancedb/lance/issues/5171 is fixed
-            // TODO: Add zone map after https://github.com/lancedb/lance/issues/4758 is fixed
-            [None, Some(IndexType::Bitmap), Some(IndexType::BTree)],
+            [
+                None,
+                Some(IndexType::Bitmap),
+                Some(IndexType::BTree),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
@@ -213,8 +230,13 @@ async fn test_query_timestamp(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: test with indices once lance_datagen::rand_timestamp is fixed
-            [None, Some(IndexType::BTree), Some(IndexType::Bitmap)],
+            [
+                None,
+                Some(IndexType::BTree),
+                Some(IndexType::Bitmap),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
@@ -263,16 +285,19 @@ async fn test_query_string(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: Add bloom filter after https://github.com/lancedb/lance/issues/5171 is fixed
-            // TODO: Add zone map after https://github.com/lancedb/lance/issues/4758 is fixed
-            [None, Some(IndexType::Bitmap), Some(IndexType::BTree)],
+            [
+                None,
+                Some(IndexType::Bitmap),
+                Some(IndexType::BTree),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value = 'hello'").await;
-            // TODO: enable after we fix https://github.com/lancedb/lance/issues/4756
-            // test_filter(&original, &ds, "value != 'hello'").await;
+            test_filter(&original, &ds, "value != 'hello'").await;
             test_filter(&original, &ds, "value = ''").await;
             test_filter(&original, &ds, "value > 'hello'").await;
             test_filter(&original, &ds, "value is null").await;
@@ -317,16 +342,19 @@ async fn test_query_binary(#[case] data_type: DataType) {
     DatasetTestCases::from_data(batch)
         .with_index_types(
             "value",
-            // TODO: Add bloom filter after https://github.com/lancedb/lance/issues/5171 is fixed
-            // TODO: Add zone map after https://github.com/lancedb/lance/issues/4758 is fixed
-            [None, Some(IndexType::Bitmap), Some(IndexType::BTree)],
+            [
+                None,
+                Some(IndexType::Bitmap),
+                Some(IndexType::BTree),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
         )
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value = X'68656C6C6F'").await; // 'hello' in hex
-                                                                        // Enable after fixing https://github.com/lancedb/lance/issues/4756
-                                                                        // test_filter(&original, &ds, "value != X'68656C6C6F'").await;
+            test_filter(&original, &ds, "value != X'68656C6C6F'").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
         })
