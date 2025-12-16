@@ -3,8 +3,7 @@
 
 import io
 from dataclasses import dataclass
-from typing import Any
-from typing import IO, Iterator, Optional, Union
+from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
@@ -29,11 +28,11 @@ class Blob:
             raise ValueError("Blob uri cannot be empty")
 
     @staticmethod
-    def bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
+    def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
         return Blob(data=bytes(data))
 
     @staticmethod
-    def uri(uri: str) -> "Blob":
+    def from_uri(uri: str) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         return Blob(uri=uri)
@@ -245,26 +244,6 @@ class BlobFile(io.RawIOBase):
         Returns the size of the blob in bytes.
         """
         return self.inner.size()
-
-    @property
-    def kind(self) -> str:
-        """Returns the blob storage kind (inline / packed / dedicated / external)."""
-        return self.inner.kind()
-
-    @property
-    def uri(self) -> Optional[str]:
-        """Returns the blob URI for external blobs."""
-        return self.inner.uri()
-
-    @property
-    def position(self) -> int:
-        """Returns the byte offset within the backing file (inline/packed)."""
-        return self.inner.position()
-
-    @property
-    def data_path(self) -> str:
-        """Returns the object-store path of the backing file."""
-        return self.inner.data_path()
 
     def readall(self) -> bytes:
         return self.inner.readall()

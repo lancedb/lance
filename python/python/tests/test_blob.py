@@ -259,17 +259,19 @@ def test_scan_blob(tmp_path, dataset_with_blobs):
 
 def test_blob_extension_write_inline(tmp_path):
     table = pa.table({"blob": lance.blob_array([b"foo", b"bar"])})
-    ds = lance.write_dataset(
-        table, tmp_path / "test_ds_v2", data_storage_version="2.2"
-    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds_v2", data_storage_version="2.2")
 
     desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
     assert pa.types.is_struct(desc.type)
-    assert [f.name for f in desc.type] == ["kind", "position", "size", "blob_id", "blob_uri"]
+    assert [f.name for f in desc.type] == [
+        "kind",
+        "position",
+        "size",
+        "blob_id",
+        "blob_uri",
+    ]
 
     blobs = ds.take_blobs("blob", indices=[0, 1])
-    assert blobs[0].kind == "inline"
-    assert blobs[0].uri is None
     with blobs[0] as f:
         assert f.read() == b"foo"
 
@@ -285,8 +287,6 @@ def test_blob_extension_write_external(tmp_path):
     )
 
     blob = ds.take_blobs("blob", indices=[0])[0]
-    assert blob.kind == "external"
-    assert blob.uri == uri
     assert blob.size() == 5
     with blob as f:
         assert f.read() == b"hello"
