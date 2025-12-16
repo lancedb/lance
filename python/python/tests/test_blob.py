@@ -142,8 +142,6 @@ def test_blob_files_by_address_with_stable_row_ids(tmp_path):
     )
 
     t = ds.to_table(columns=["idx"], with_row_address=True)
-    # Pick a row from the second fragment. With stable row ids enabled, the row address
-    # is not a valid row id, so calling the row-id based API would fail.
     row_idx = t.column("idx").to_pylist().index(1)
     addr = t.column("_rowaddr").to_pylist()[row_idx]
 
