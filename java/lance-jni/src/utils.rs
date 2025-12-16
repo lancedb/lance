@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::storage_options::JavaStorageOptionsProvider;
 
+use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::Query;
 use lance_io::object_store::StorageOptionsProvider;
 use std::collections::HashMap;
@@ -49,6 +50,8 @@ pub fn extract_write_params(
     storage_options_obj: &JObject,
     storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: &JObject, // Optional<Long>
+    initial_bases: &JObject,                // Optional<BasePath>
+    target_bases: &JObject,                 // Optional<String>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -91,6 +94,16 @@ pub fn extract_write_params(
         .get_long_opt(s3_credentials_refresh_offset_seconds_obj)?
         .map(|v| std::time::Duration::from_secs(v as u64))
         .unwrap_or_else(|| std::time::Duration::from_secs(10));
+
+    if let Some(initial_bases) =
+        env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
+    {
+        write_params.initial_bases = Some(initial_bases);
+    }
+
+    if let Some(names) = env.get_strings_opt(target_bases)? {
+        write_params.target_base_names_or_paths = Some(names);
+    }
 
     write_params.store_params = Some(ObjectStoreParams {
         storage_options: Some(storage_options),

@@ -7,9 +7,13 @@ Row addressing enables efficient random access to rows within the table through 
 Stable row IDs provide persistent identifiers that remain constant throughout a row's lifetime, even as its physical location changes.
 Row version tracking records when rows were created and last modified, enabling incremental processing, change data capture, and time-travel queries.
 
-## Row ID Styles
+## Row Identifier Forms
 
-Lance uses two different styles of row IDs:
+A row in Lance has two forms of row identifiers:
+
+- **Row address** - the current physical location of the row in the dataset.
+- **Row ID** - a logical identifier of the row. When stable row IDs are enabled, this remains stable for the lifetime of a logical row. When disabled (default mode), it is exactly equal to the row address.
+
 
 ### Row Address
 
@@ -28,16 +32,22 @@ Secondary indices (vector indices, scalar indices, full-text search indices) ref
 !!! note
       Work to support stable row IDs in indices is in progress.
 
-### Stable Row ID
+### Row ID
 
-Stable Row ID is a unique auto-incrementing u64 identifier assigned to each row that remains constant throughout the row's lifetime, 
-even when the row's physical location (row address) changes.
-See the next section for more details.
+Row ID is a logical identifier for a row.
+
+#### Stable Row ID
+
+When a dataset is created with stable row IDs enabled, each row is assigned a unique auto-incrementing `u64` identifier that remains constant throughout the row's lifetime, even when the row's physical location (row address) changes.
+The `_rowid` system column exposes this logical identifier to users.
+See the next section for more details on assignment and update semantics.
+
+#### Historical/unstable usage
+
+Historically, the term "row id" was often used to refer to the physical row address (`_rowaddr`), which is not stable across compaction or updates.
 
 !!! warning
-      Historically, "row ID" was used to mean row address interchangeably. 
-      With the introduction of stable row IDs, 
-      there could be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
+      With the introduction of stable row IDs, there may still be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
       Please raise a PR if you find any place incorrect or confusing.
 
 ## Stable Row ID
@@ -58,20 +68,29 @@ Row IDs are assigned using a monotonically increasing `next_row_id` counter stor
 
 This protocol mirrors fragment ID assignment and ensures row IDs are unique across all table versions.
 
+### Enabling Stable Row IDs
+
+Stable row IDs are a dataset-level feature recorded in the table manifest.
+
+- Stable row IDs **must be enabled when the dataset is first created**.
+- Currently, they **cannot be turned on later** for an existing dataset. Attempts to write with `enable_stable_row_ids = true` against a dataset that was created without stable row IDs will not change the dataset's configuration.
+- When stable row IDs are disabled, the `_rowid` column (if requested) is not stable and should not be used as a persistent identifier.
+
+Row-level version tracking (`_row_created_at_version`, `_row_last_updated_at_version`) and the row ID index described below are only available when stable row IDs are enabled.
+
 ### Row ID Behavior on Updates
 
-When a row is updated, it is typically assigned a new row ID rather than reusing the old one.
-This avoids the complexity of updating secondary indices that may reference the old values.
+When stable row IDs are enabled, updates preserve the logical row ID and remap it to a new physical address instead of assigning a new ID.
 
 **Update Workflow:**
 
-1. Original row with ID `R` exists at address `(F1, O1)`
-2. Update operation creates new row with ID `R'` at address `(F2, O2)`
-3. Deletion vector marks row ID `R` as deleted in fragment `F1`
-4. Secondary indices referencing old row ID `R` are invalidated through fragment bitmap updates
-5. New row ID `R'` requires index rebuild for affected columns
+1. Original row with `_rowid = R` exists at address `(F1, O1)`.
+2. An update operation writes a new physical row with the updated values at address `(F2, O2)`.
+3. The new physical row is assigned the same `_rowid = R`, so the logical identifier is preserved.
+4. The original physical row at `(F1, O1)` is marked deleted using the deletion vector for fragment `F1`.
+5. The row ID index for the new dataset version maps `_rowid = R` to `(F2, O2)`, and uses deletion vectors and fragment bitmaps to avoid returning the tombstoned row at `(F1, O1)`.
 
-This approach ensures secondary indices do not reference stale data.
+This design keeps `_rowid` stable for the lifetime of a logical row while allowing physical storage and secondary indices to be maintained independently.
 
 ### Row ID Sequences
 
@@ -198,48 +217,52 @@ This creates a mapping from row ID to current row address.
 
 #### Index Invalidation with Updates
 
-When rows are updated, the row ID index must account for stale mappings:
+When rows are updated and stable row IDs are enabled, the row ID index for a given dataset version only contains mappings for live physical rows. Tombstoned rows are excluded using deletion vectors, and logical row IDs whose contents have changed simply map to new row addresses.
 
 **Example Scenario:**
 
-1. Initial state: Fragment 1 contains rows with IDs `[1, 2, 3]` at offsets `[0, 1, 2]`
-2. Update operation modifies row 2:
-   - New fragment 2 created with row ID `4` (new ID assigned)
-   - Deletion vector marks row ID `2` as deleted in fragment 1
-3. Row ID index:
-   - `1 → (1, 0)` ✓ Valid
-   - `2 → (1, 1)` ✗ Invalid (deleted)
-   - `3 → (1, 2)` ✓ Valid
-   - `4 → (2, 0)` ✓ Valid (new row)
+1. Initial state (version V): Fragment 1 contains rows with IDs `[1, 2, 3]` at offsets `[0, 1, 2]`.
+2. An update operation modifies the row with `_rowid = 2`:
+    - A new fragment 2 is created with a row for `_rowid = 2` at offset `0`.
+    - In fragment 1, the original physical row at offset `1` is marked deleted in the deletion vector.
+3. Row ID index in version V+1:
+    - `1 → (1, 0)` ✓ Valid
+    - `2 → (2, 0)` ✓ Valid (updated row in fragment 2)
+    - `3 → (1, 2)` ✓ Valid
+
+The address `(1, 1)` is no longer reachable via the row ID index because it is filtered out by the deletion vector when the index is constructed.
 
 #### Fragment Bitmaps for Index Masking
 
 Secondary indices use fragment bitmaps to track which row IDs remain valid:
 
-**Without Row ID Updates:**
+**Without Row Updates:**
 
 ```
 String Index on column "str":
   Fragment Bitmap: {1, 2}  (covers fragments 1 and 2)
-  All indexed row IDs are valid
+  All indexed row addresses are valid
 ```
 
-**With Row ID Updates:**
+**With Row Updates:**
 
 ```
 Vector Index on column "vec":
   Fragment Bitmap: {1}  (only fragment 1)
-  Row ID 2 was updated, so index entry for ID 2 is stale
-  Index query filters out ID 2 using deletion vectors
+  The row with _rowid = 2 was updated, so the index entry that points to its old physical address is stale
+  Index queries filter out the stale address using deletion vectors while returning the row at its new address
 ```
 
 This bitmap-based approach allows indices to remain immutable while accounting for row modifications.
 
 ## Row Version Tracking
 
+Row version tracking is available for datasets that use stable row IDs. Version sequences are aligned with the stable `_rowid` ordering within each fragment.
+
 ### Created At Version
 
 Each row tracks the version at which it was created.
+For rows that are later updated, this creation version remains the version in which the row first appeared; updates do not change it.
 The sequence uses run-length encoding for efficient storage, where each run specifies a span of consecutive rows and the version they were created in.
 
 Example: Fragment with 1000 rows created in version 5:
@@ -278,16 +301,19 @@ message DataFragment {
 
 Each row tracks the version at which it was last modified.
 When a row is created, `last_updated_at_version` equals `created_at_version`.
-When a row is updated, a new row is created with both `created_at_version` and `last_updated_at_version` set to the current version, and the old row is marked deleted.
+
+When stable row IDs are enabled and a row is updated, Lance writes a new physical row for the same logical `_rowid` while tombstoning the old physical row. The `created_at_version` for that logical row is preserved from the original row, and `last_updated_at_version` is set to the current dataset version at the time of the update.
 
 Example: Row created in version 3, updated in version 7:
 ```
-Old row (marked deleted):
+Old physical row (tombstoned):
+  _rowid: R
   created_at_version: 3
   last_updated_at_version: 3
 
-New row:
-  created_at_version: 7
+New physical row (current):
+  _rowid: R
+  created_at_version: 3
   last_updated_at_version: 7
 ```
 

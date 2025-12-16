@@ -62,12 +62,19 @@ pub trait JNIEnvExt {
     /// Get Option<&[u8]> from Java Optional<ByteBuffer>.
     fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>>;
 
+    /// Get Option<Vec<T>> from Java Optional<List<T>>
+    fn get_list_opt<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<Vec<T>>>
+    where
+        F: Fn(&mut JNIEnv, &JObject) -> Result<T>;
+
     // Get String from Java Object with given method name.
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String>;
     // Get float array from Java Object with given method name.
     fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>>;
     // Get int as usize from Java Object with given method name.
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize>;
+    // Get u32 int from Java Object with given method name.
+    fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32>;
     // Get u64 int from Java Object with given method name.
     fn get_u64_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u64>;
     // Get boolean from Java Object with given method name.
@@ -277,6 +284,25 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_list_opt<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<Vec<T>>>
+    where
+        F: Fn(&mut JNIEnv, &JObject) -> Result<T>,
+    {
+        self.get_optional(obj, |env, opt_obj| {
+            let list_obj = env
+                .call_method(opt_obj, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            let list = env.get_list(&list_obj)?;
+            let mut iter = list.iter(env)?;
+            let mut items: Vec<T> = Vec::with_capacity(list.size(env)? as usize);
+            while let Some(elem) = iter.next(env)? {
+                items.push(f(env, &elem)?);
+            }
+
+            Ok(items)
+        })
+    }
+
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
         let string_obj = self
             .call_method(obj, method_name, "()Ljava/lang/String;", &[])?
@@ -296,6 +322,10 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize> {
         Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as usize)
+    }
+
+    fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32> {
+        Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as u32)
     }
 
     fn get_u64_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u64> {
