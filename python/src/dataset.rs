@@ -1178,10 +1178,7 @@ impl Dataset {
         blob_column: &str,
     ) -> PyResult<Vec<LanceBlobFile>> {
         let blobs = rt()
-            .block_on(
-                Some(self_.py()),
-                self_.ds.take_blobs(&row_ids, blob_column),
-            )?
+            .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
     }
