@@ -1912,3 +1912,88 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_vector_index_distance_range(tmp_path):
+    """Ensure vector index honors distance_range."""
+    ndim = 128
+    rng = np.random.default_rng(seed=42)
+    base = rng.standard_normal((509, ndim)).astype(np.float32)
+    zero_vec = np.zeros((1, ndim), dtype=np.float32)
+    near_vec = np.full((1, ndim), 0.01, dtype=np.float32)
+    far_vec = np.full((1, ndim), 500.0, dtype=np.float32)
+    matrix = np.concatenate([zero_vec, near_vec, far_vec, base], axis=0)
+    tbl = vec_to_table(data=matrix).append_column(
+        "id", pa.array(np.arange(matrix.shape[0], dtype=np.int64))
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "vrange")
+    indexed = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
+
+    q = zero_vec[0]
+    distance_range = (0.0, 0.5)
+    nprobes_all = 4
+
+    # Brute force baseline (exact):
+    # get full distance distribution and build expected in-range ids.
+    all_results = indexed.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": matrix.shape[0],
+            "use_index": False,
+        },
+    )
+    all_distances = all_results["_distance"].to_numpy()
+    assert len(all_distances) == matrix.shape[0]
+    assert all_distances.min() == 0.0
+    assert (
+        all_distances.max() > distance_range[1]
+    )  # ensure some values are out of range
+
+    in_range_mask = (all_distances >= distance_range[0]) & (
+        all_distances < distance_range[1]
+    )
+    expected_ids = set(all_results["id"].to_numpy()[in_range_mask].tolist())
+    assert len(expected_ids) > 0
+
+    # Compare distance_range results:
+    # brute-force vs index path should match exactly for IVF_FLAT
+    brute_results = indexed.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": matrix.shape[0],
+            "distance_range": distance_range,
+            "use_index": False,
+        },
+    )
+
+    index_results = indexed.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": matrix.shape[0],
+            "distance_range": distance_range,
+            "nprobes": nprobes_all,
+        },
+    )
+
+    brute_ids = brute_results["id"].to_numpy()
+    index_ids = index_results["id"].to_numpy()
+    brute_distances = brute_results["_distance"].to_numpy()
+    index_distances = index_results["_distance"].to_numpy()
+
+    assert set(brute_ids.tolist()).issubset(expected_ids)
+    assert set(index_ids.tolist()).issubset(expected_ids)
+    assert len(brute_ids) == len(index_ids)
+    assert np.array_equal(brute_ids, index_ids)
+    assert np.all(brute_distances >= distance_range[0]) and np.all(
+        brute_distances < distance_range[1]
+    )
+    assert np.all(index_distances >= distance_range[0]) and np.all(
+        index_distances < distance_range[1]
+    )
+    assert np.allclose(brute_distances, index_distances, rtol=0.0, atol=0.0)
