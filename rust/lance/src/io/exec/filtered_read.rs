@@ -408,6 +408,7 @@ impl FilteredReadStream {
         let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
             SchedulerConfig {
                 io_buffer_size_bytes,
+                use_lite_scheduler: false,
             }
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())

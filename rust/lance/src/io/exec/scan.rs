@@ -273,6 +273,7 @@ impl LanceStream {
             dataset.object_store.clone(),
             SchedulerConfig {
                 io_buffer_size_bytes: config.io_buffer_size,
+                use_lite_scheduler: false,
             },
         )?;
 

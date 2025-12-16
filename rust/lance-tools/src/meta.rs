@@ -41,6 +41,7 @@ impl LanceToolFileMetadata {
             object_store,
             SchedulerConfig {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+                use_lite_scheduler: false,
             },
         )?;
         let file_scheduler = scan_scheduler
