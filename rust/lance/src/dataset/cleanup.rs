@@ -58,7 +58,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
-use tracing::{info, instrument, Span};
+use tracing::{debug, info, instrument, Span};
 
 use super::refs::TagContents;
 use crate::{utils::temporal::utc_now, Dataset};
@@ -397,6 +397,10 @@ impl<'a> CleanupTask<'a> {
                 // These files are not referenced directly by the manifest.  Instead, treat them
                 // as referenced if their parent data file is referenced.
                 if !relative_path.as_ref().starts_with("data") {
+                    debug!(
+                        path = relative_path.as_ref(),
+                        "Will not garbage collect blob file because it does not follow convention"
+                    );
                     return Ok(None);
                 }
 
@@ -406,9 +410,17 @@ impl<'a> CleanupTask<'a> {
                 let blob_file = parts.next();
                 // Be conservative: only handle the expected 3-part layout.
                 if data_dir.is_none() || data_file_key.is_none() || blob_file.is_none() {
+                    debug!(
+                        path = relative_path.as_ref(),
+                        "Will not garbage collect blob file because it does not follow convention"
+                    );
                     return Ok(None);
                 }
                 if parts.next().is_some() {
+                    debug!(
+                        path = relative_path.as_ref(),
+                        "Will not garbage collect blob file because it does not follow convention"
+                    );
                     return Ok(None);
                 }
 
@@ -416,6 +428,11 @@ impl<'a> CleanupTask<'a> {
                 let Ok(parent_data_path) =
                     Path::parse(format!("data/{}.lance", data_file_key.as_ref()))
                 else {
+                    debug!(
+                        path = relative_path.as_ref(),
+                        derived_parent = format!("data/{}.lance", data_file_key.as_ref()),
+                        "Will not garbage collect blob file because derived parent data file path is invalid"
+                    );
                     return Ok(None);
                 };
 
