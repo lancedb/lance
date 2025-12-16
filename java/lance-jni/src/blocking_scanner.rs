@@ -71,6 +71,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     with_row_address: jboolean,    // boolean
     batch_readahead: jint,         // int
     column_orderings: JObject,     // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,    // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -88,7 +89,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             with_row_id,
             with_row_address,
             batch_readahead,
-            column_orderings
+            column_orderings,
+            use_scalar_index
         )
     )
 }
@@ -109,6 +111,7 @@ fn inner_create_scanner<'local>(
     with_row_address: jboolean,
     batch_readahead: jint,
     column_orderings: JObject,
+    use_scalar_index: jboolean,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
@@ -163,6 +166,12 @@ fn inner_create_scanner<'local>(
 
     if with_row_address == JNI_TRUE {
         scanner.with_row_address();
+    }
+
+    if use_scalar_index == JNI_TRUE {
+        scanner.use_scalar_index(true);
+    } else {
+        scanner.use_scalar_index(false);
     }
 
     let query_is_present = env.call_method(&query_obj, "isPresent", "()Z", &[])?.z()?;

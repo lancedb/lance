@@ -34,6 +34,7 @@ public class ScanOptions {
   private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
+  private final boolean useScalarIndex;
 
   /**
    * Constructor for LanceScanOptions.
@@ -51,6 +52,7 @@ public class ScanOptions {
    * @param withRowAddress Whether to include the row address in the results.
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
+   * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
    */
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -64,7 +66,8 @@ public class ScanOptions {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
-      Optional<List<ColumnOrdering>> columnOrderings) {
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -80,6 +83,7 @@ public class ScanOptions {
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
+    this.useScalarIndex = useScalarIndex;
   }
 
   /**
@@ -185,6 +189,15 @@ public class ScanOptions {
     return columnOrderings;
   }
 
+  /**
+   * Get whether to use scalar indices for the scan.
+   *
+   * @return true if scalar indices should be used, false otherwise.
+   */
+  public boolean isUseScalarIndex() {
+    return useScalarIndex;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -202,6 +215,7 @@ public class ScanOptions {
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
+        .add("useScalarIndex", useScalarIndex)
         .toString();
   }
 
@@ -219,6 +233,7 @@ public class ScanOptions {
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
+    private boolean useScalarIndex = true;
 
     public Builder() {}
 
@@ -240,6 +255,7 @@ public class ScanOptions {
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
+      this.useScalarIndex = options.isUseScalarIndex();
     }
 
     /**
@@ -369,6 +385,21 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to use scalar indices for the scan.
+     *
+     * <p>Scans will use scalar indices, when available, to optimize queries with filters. However,
+     * in some corner cases, scalar indices may make performance worse. This parameter allows users
+     * to disable scalar indices in these cases.
+     *
+     * @param useScalarIndex true to use scalar indices, false otherwise. Default is true.
+     * @return Builder instance for method chaining.
+     */
+    public Builder useScalarIndex(boolean useScalarIndex) {
+      this.useScalarIndex = useScalarIndex;
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -386,7 +417,8 @@ public class ScanOptions {
           withRowId,
           withRowAddress,
           batchReadahead,
-          columnOrderings);
+          columnOrderings,
+          useScalarIndex);
     }
   }
 }
