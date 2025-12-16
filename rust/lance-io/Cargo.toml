@@ -47,6 +47,7 @@ tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
+hdfs-native = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -54,6 +55,7 @@ test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
+serial_test.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -63,7 +65,7 @@ name = "scheduler"
 harness = false
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = ["aws", "azure", "gcp", "hdfs"]
 gcs-test = []
 gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]
 aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
@@ -71,6 +73,7 @@ azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "dep:ob
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 hdfs = ["dep:opendal", "opendal/services-hdfs-native", "dep:object_store_opendal" ]
+hdfs-test = ["hdfs", "dep:hdfs-native","hdfs-native/integration-test"]
 test-util = []
 
 [lints]

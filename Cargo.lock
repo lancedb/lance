@@ -632,9 +632,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.117.0"
+version = "1.118.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c134e2d1ad1ad23a8cf88ceccf39d515914f385e670ffc12226013bd16dfe825"
+checksum = "d3e6b7079f85d9ea9a70643c9f89f50db70f5ada868fa9cfe08c1ffdf51abc13"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1478,9 +1478,9 @@ checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
 name = "cmake"
-version = "0.1.55"
+version = "0.1.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d49d74c227b6cc9f3c51a2c7c667a05b6453f7f0f952a5f8e4493bb9e731d68e"
+checksum = "b042e5d8a74ae91bb0961acd039822472ec99f8ab0948cbf6d1369588f8be586"
 dependencies = [
  "cc",
 ]
@@ -3004,6 +3004,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
+
+[[package]]
 name = "env_logger"
 version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3694,9 +3700,9 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "860af1e9aa848f175bf5b9127548a42270017bd382d29fd6bca59691db4b01d9"
+checksum = "588a47148201def3d6922371f6de676068c7ea08a7c29e59457660f76bdc0918"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -3730,6 +3736,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "which",
  "whoami",
 ]
 
@@ -4925,6 +4932,7 @@ dependencies = [
  "criterion",
  "deepsize",
  "futures",
+ "hdfs-native",
  "lance-arrow",
  "lance-core",
  "lance-namespace",
@@ -4941,6 +4949,7 @@ dependencies = [
  "rand 0.9.2",
  "rstest",
  "serde",
+ "serial_test",
  "shellexpand",
  "snafu",
  "test-log",
@@ -5018,9 +5027,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b748e89a3a0e5d9fb1b51e4382f783f8aa6b620d755012d4856180968014e619"
+checksum = "00a21b43fe2a373896727b97927adedd2683d2907683f294f62cf8815fbf6a01"
 dependencies = [
  "reqwest",
  "serde",
@@ -6774,7 +6783,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.111",
@@ -7217,9 +7226,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.25"
+version = "0.12.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6eff9328d40131d43bd911d42d79eb6a47312002a4daefc9e37f17e74a7701a"
+checksum = "3b4c14b2d9afca6a60277086b0cc6a6ae0b568f6f7916c943a8cdc79f8be240f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -7582,6 +7591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7646,6 +7664,12 @@ dependencies = [
  "ring",
  "untrusted",
 ]
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "sec1"
@@ -7824,6 +7848,31 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "serial_test"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b258109f244e1d6891bf1053a55d63a5cd4f8f4c30cf9a1280989f80e7a1fa9"
+dependencies = [
+ "futures",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d69265a08751de7844521fd15003ae0a888e035773ba05695c5c759a6f89eef"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -9353,6 +9402,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fabb953106c3c8eea8306e4393700d7657561cb43122571b172bbfb7c7ba1d"
+dependencies = [
+ "env_home",
+ "rustix 1.1.2",
+ "winsafe",
+]
+
+[[package]]
 name = "whoami"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9792,6 +9852,12 @@ checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wiremock"
