@@ -216,7 +216,10 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         let entries = array
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .expect("Map entries should be a StructArray")
+            .ok_or_else(|| Error::Schema {
+                message: "Map entries should be a StructArray".to_string(),
+                location: location!(),
+            })?
             .clone();
 
         // Build the MapArray from offsets, entries, validity, and keys_sorted
