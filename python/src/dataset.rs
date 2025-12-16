@@ -1199,6 +1199,20 @@ impl Dataset {
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
     }
 
+    fn take_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = rt()
+            .block_on(
+                Some(self_.py()),
+                self_.ds.take_blobs_by_addresses(&row_addresses, blob_column),
+            )?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,

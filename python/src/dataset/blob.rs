@@ -22,6 +22,7 @@ use pyo3::{
 };
 
 use lance::dataset::BlobFile as InnerBlobFile;
+use lance_core::datatypes::BlobKind;
 
 use crate::{error::PythonErrorExt, rt};
 
@@ -54,6 +55,27 @@ impl LanceBlobFile {
 
     pub fn size(&self) -> u64 {
         self.inner.size()
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self.inner.kind() {
+            BlobKind::Inline => "inline",
+            BlobKind::Packed => "packed",
+            BlobKind::Dedicated => "dedicated",
+            BlobKind::External => "external",
+        }
+    }
+
+    pub fn uri(&self) -> Option<String> {
+        self.inner.uri().map(|v| v.to_string())
+    }
+
+    pub fn position(&self) -> u64 {
+        self.inner.position()
+    }
+
+    pub fn data_path(&self) -> String {
+        self.inner.data_path().to_string()
     }
 
     pub fn readall<'a>(&'a self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
