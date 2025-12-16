@@ -797,7 +797,7 @@ impl CoreFieldDecoderStrategy {
                 let blob_scheduler = Box::new(BlobFieldScheduler::new(desc_scheduler.into()));
                 return Ok(blob_scheduler);
             }
-            if let Some(page_info) = column_info.page_infos.first() {
+            return if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
                     page_info.encoding.as_legacy(),
                     pb::ArrayEncoding {
@@ -817,8 +817,7 @@ impl CoreFieldDecoderStrategy {
                         field.name.clone(),
                         list_type,
                         field.nullable,
-                    ))
-                    .unwrap();
+                    ))?;
                     let list_scheduler = self.create_list_scheduler(
                         &list_field,
                         column_infos,
@@ -829,15 +828,15 @@ impl CoreFieldDecoderStrategy {
                         list_scheduler.into(),
                         field.data_type(),
                     ));
-                    return Ok(binary_scheduler);
+                    Ok(binary_scheduler)
                 } else {
                     let scheduler =
                         self.create_primitive_scheduler(field, &column_info, buffers)?;
-                    return Ok(scheduler);
+                    Ok(scheduler)
                 }
             } else {
-                return self.create_primitive_scheduler(field, &column_info, buffers);
-            }
+                self.create_primitive_scheduler(field, &column_info, buffers)
+            };
         }
         match &data_type {
             DataType::FixedSizeList(inner, _dimension) => {
