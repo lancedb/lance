@@ -278,16 +278,6 @@ class _Dataset:
         row_indices: List[int],
         blob_column: str,
     ) -> List[LanceBlobFile]: ...
-    def take_blobs_by_addresses(
-        self,
-        row_addresses: List[int],
-        blob_column: str,
-    ) -> List[LanceBlobFile]: ...
-    def take_blobs_by_indices(
-        self,
-        row_indices: List[int],
-        blob_column: str,
-    ) -> List[LanceBlobFile]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
