@@ -3312,6 +3312,139 @@ def test_backward_compatibility_changed_index_protos(tmp_path):
     assert results.column("x").to_pylist() == [100]
 
 
+def test_ranged_btree_index(tmp_path):
+    """
+    Test ranged B-tree index build with globally sorted preprocessed data.
+
+    The workflow simulates what distributed compute engines do:
+    1. Write data to the dataset
+    2. Scan data with row IDs
+    3. Sort data globally (simulating external compute engine sorting)
+    4. Divide sorted data into ranges and build index for each range
+       using preprocessed_data with range_id
+    5. Merge index metadata
+    6. Commit the index
+    7. Verify results with queries
+    """
+    import uuid
+
+    # 1. Create dataset with some data (equivalent to testDataset.write(1, 200))
+    num_rows = 200
+    row_per_fragment = 50
+    data = pa.table(
+        {
+            "id": pa.array(range(num_rows), type=pa.int32()),
+            "name": pa.array([f"name_{i}" for i in range(num_rows)]),
+        }
+    )
+    ds = lance.write_dataset(
+        data, tmp_path / "ranged_btree_test", max_rows_per_file=row_per_fragment
+    )
+
+    # 2. Scan data with row IDs
+    scanned_data = []
+    table = ds.scanner(columns=["id"], with_row_id=True).to_table()
+    scanned_data = list(
+        zip(table.column("id").to_pylist(), table.column("_rowid").to_pylist())
+    )
+
+    # 3. Sort data globally by id (simulating external compute engine sorting)
+    scanned_data.sort(key=lambda x: x[0])
+    mid = len(scanned_data) // 2
+
+    # Divide sorted data into ranges
+    range1_data = scanned_data[:mid]
+    range2_data = scanned_data[mid:]
+
+    # Helper function to create preprocessed data table
+    # Note: the indexing column is called 'value' in btree
+    def create_preprocessed_table(data_range):
+        values = pa.array([row[0] for row in data_range], type=pa.int32())
+        rowids = pa.array([row[1] for row in data_range], type=pa.uint64())
+        return pa.table({"value": values, "_rowid": rowids})
+
+    # 4. Build B-tree indices for each range using preprocessed_data
+    index_uuid = str(uuid.uuid4())
+    index_name = "test_index"
+
+    # Create index for range 1 (with range_id=1)
+    range1_table = create_preprocessed_table(range1_data)
+    ds.create_scalar_index(
+        column="id",
+        index_type="BTREE",
+        name=index_name,
+        replace=False,
+        index_uuid=index_uuid,
+        preprocessed_data=pa.RecordBatchReader.from_batches(
+            range1_table.schema, range1_table.to_batches()
+        ),
+        range_id=1,
+    )
+
+    # Create index for range 2 (with range_id=2)
+    range2_table = create_preprocessed_table(range2_data)
+    ds.create_scalar_index(
+        column="id",
+        index_type="BTREE",
+        name=index_name,
+        replace=False,
+        index_uuid=index_uuid,
+        preprocessed_data=pa.RecordBatchReader.from_batches(
+            range2_table.schema, range2_table.to_batches()
+        ),
+        range_id=2,
+    )
+
+    # 5. Merge index metadata
+    ds.merge_index_metadata(index_uuid, index_type="BTREE")
+
+    # 6. Commit index
+    from lance.dataset import Index
+
+    field_id = ds.schema.get_field_index("id")
+    dataset_version = ds.version
+    fragments = list(ds.get_fragments())
+    fragment_ids = [f.fragment_id for f in fragments]
+
+    index = Index(
+        uuid=index_uuid,
+        name=index_name,
+        fields=[field_id],
+        dataset_version=dataset_version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    new_ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    # Verify the index was created
+    assert new_ds.version == dataset_version + 1
+
+    # Verify index is in the list
+    indices = new_ds.list_indices()
+    index_names = [idx["name"] for idx in indices]
+    assert index_name in index_names, (
+        f"Expected '{index_name}' in indices list, but got {index_names}"
+    )
+
+    # 7. Verify results with IN query
+    test_values = [10, 20, 30]
+    filter_expr = f"id in ({','.join(str(v) for v in test_values)})"
+    results = new_ds.scanner(filter=filter_expr).to_table()
+
+    result_ids = sorted(results.column("id").to_pylist())
+    assert result_ids == test_values, f"Expected {test_values}, but got {result_ids}"
+
+
 def test_distribute_btree_index_build(tmp_path):
     """
     Test distributed B-tree index build similar to test_distribute_fts_index_build.

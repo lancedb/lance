@@ -2349,6 +2349,8 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
+        preprocessed_data: Optional[pa.RecordBatchReader] = None,
+        range_id: Optional[int] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2448,6 +2450,17 @@ class LanceDataset(pa.dataset.Dataset):
             multiple fragment-level indices need to share UUID for later merging.
             If not provided, a new UUID will be generated. This parameter is passed via
             kwargs internally.
+        preprocessed_data : pa.RecordBatchReader, optional
+            Pre-sorted data to use for building a ranged B-tree index. The data should
+            be a PyArrow RecordBatchReader with columns "value" (indexed column values)
+            and "_rowid" (the corresponding row IDs). This is used for distributed index
+            building where data is globally sorted by an external compute engine.
+            Must be used together with ``range_id``.
+        range_id : int, optional
+            The range identifier for ranged B-tree index building. When building a
+            distributed B-tree index with globally sorted data, each range should have
+            a unique range_id. All values in range N must be <= all values in range N+1.
+            Must be used together with ``preprocessed_data``.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2614,6 +2627,12 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["fragment_ids"] = fragment_ids
         if index_uuid is not None:
             kwargs["index_uuid"] = index_uuid
+
+        # Add preprocessed_data and range_id for ranged B-tree index
+        if preprocessed_data is not None:
+            kwargs["preprocessed_data"] = preprocessed_data
+        if range_id is not None:
+            kwargs["range_id"] = range_id
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 

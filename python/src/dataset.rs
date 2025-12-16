@@ -1787,11 +1787,29 @@ impl Dataset {
         };
 
         log::info!("Creating index: type={}", index_type);
+
+        // Extract range_id for BTREE index (used with preprocessed_data)
+        let range_id: Option<u32> = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("range_id")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+        } else {
+            None
+        };
+
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::new(ScalarIndexParams {
-                index_type: "btree".to_string(),
-                params: None,
-            }),
+            "BTREE" => {
+                let btree_params = if let Some(r_id) = range_id {
+                    Some(format!("{{\"range_id\": {}}}", r_id))
+                } else {
+                    None
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "btree".to_string(),
+                    params: btree_params,
+                })
+            }
             "BITMAP" => Box::new(ScalarIndexParams {
                 index_type: "bitmap".to_string(),
                 params: None,
@@ -1929,11 +1947,54 @@ impl Dataset {
             builder = builder.index_uuid(index_uuid);
         }
 
+        // Extract preprocessed_data (PyArrow RecordBatchReader) for ranged BTree index
+        let preprocessed_reader: Option<Box<dyn RecordBatchReader + Send>> =
+            if let Some(kwargs) = kwargs {
+                if let Some(preprocessed_data) = kwargs.get_item("preprocessed_data")? {
+                    if !preprocessed_data.is_none() {
+                        Some(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+                            &preprocessed_data,
+                        )?))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(reader) = preprocessed_reader {
+            builder = builder.preprocessed_data(reader);
+        }
+
         use std::future::IntoFuture;
 
-        // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
-        if has_fragment_ids {
-            // For fragment-level indexing, use execute_uncommitted
+        // Check if range_id is present in IndexConfig params (for SCALAR type)
+        let has_range_id_in_config = if let Some(kwargs) = kwargs {
+            if let Some(config) = kwargs.get_item("config")? {
+                if !config.is_none() {
+                    let config: PyIndexConfig = config.extract()?;
+                    // Parse the config JSON to check for range_id
+                    config.config.contains("range_id")
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Use execute_uncommitted if:
+        // - fragment_ids is provided (fragment-level indexing), or
+        // - range_id is provided (ranged BTree index with preprocessed data)
+        let skip_commit = has_fragment_ids || range_id.is_some() || has_range_id_in_config;
+
+        if skip_commit {
+            // For fragment-level or ranged indexing, use execute_uncommitted
             let _index_metadata = rt()
                 .block_on(None, builder.execute_uncommitted())?
                 .infer_error()?;
