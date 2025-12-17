@@ -32,6 +32,38 @@ string array might both be stored in the same layout but, at read time, we will 
 the size of the offsets returned to the user. There is no requirement the output Arrow type matches the input Arrow
 type. For example, it is acceptable to write an array as "large string" and then read it back as "string".
 
+Lance supports the following Arrow data types, organized by their encoding strategy:
+
+### Primitive Types
+These types are encoded using `PrimitiveStructuralEncoder`:
+
+| Data Type Category | Data Types                                               | Notes                   |
+|--------------------|----------------------------------------------------------|-------------------------|
+| **Integer**        | Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64 | Basic integer types     |
+| **Float**          | Float16, Float32, Float64                                | Floating-point types    |
+| **Boolean**        | Boolean                                                  | Boolean type            |
+| **Date/Time**      | Date32, Date64, Time32, Time64, Timestamp, Duration      | Temporal types          |
+| **Decimal**        | Decimal128, Decimal256                                   | High-precision decimals |
+| **Binary/String**  | Binary, LargeBinary, Utf8, LargeUtf8                     | Variable-width data     |
+| **Fixed-size**     | FixedSizeBinary, FixedSizeList                           | Fixed-width arrays      |
+| **Special**        | Null                                                     | Null type               |
+
+### Nested Types
+These types use specialized logical encoders:
+
+| Data Type                | Encoding Strategy                                                            | Version Notes                                          |
+|--------------------------|------------------------------------------------------------------------------|--------------------------------------------------------|
+| **Struct**               | `StructStructuralEncoder` (or `PrimitiveStructuralEncoder` for packed/empty) | Supported in 2.1+                                      |
+| **List** / **LargeList** | `ListStructuralEncoder`                                                      | Supported in 2.1+                                      |
+| **Dictionary**           | `PrimitiveStructuralEncoder` (for primitive values only)                     | Supported in 2.1+                                      |
+| **Map**                  | `MapStructuralEncoder`                                                       | **Supported in 2.2+** *(keys_sorted=false only)*       |
+| **Blob v2 struct**       | `BlobV2StructuralEncoder`                                                    | **Supported in 2.2+** *(must be marked as blob field)* |
+
+**Important limitations:**
+- Dictionary with logical/non-primitive value types is not supported
+- Map type requires `keys_sorted=false`
+- Blob v2 struct requires the field to be marked as blob metadata
+
 ## Search Cache
 
 The search cache is a key component of the Lance file reader. Random access requires that we locate the physical
