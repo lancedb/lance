@@ -239,7 +239,6 @@ use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
 use crate::encodings::logical::list::StructuralListScheduler;
-use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
@@ -774,7 +773,7 @@ impl CoreFieldDecoderStrategy {
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
-            DataType::Map(_, keys_sorted) => {
+            DataType::Map(entries_field, keys_sorted) => {
                 // TODO: We only support keys_sorted=false for now,
                 //  because converting a rust arrow map field to the python arrow field will
                 //  lose the keys_sorted property.
@@ -784,14 +783,14 @@ impl CoreFieldDecoderStrategy {
                         location: location!(),
                     });
                 }
-                let entries_child = field
-                    .children
-                    .first()
-                    .expect("Map field must have an entries child");
-                let child_scheduler =
-                    self.create_structural_field_scheduler(entries_child, column_infos)?;
-                Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
-                    as Box<dyn StructuralFieldScheduler>)
+
+                let list_field = Field::try_from(ArrowField::new(
+                    field.name.clone(),
+                    DataType::List(entries_field.clone()),
+                    field.nullable,
+                ))?;
+
+                self.create_structural_field_scheduler(&list_field, column_infos)
             }
             _ => todo!("create_structural_field_scheduler for {}", data_type),
         }

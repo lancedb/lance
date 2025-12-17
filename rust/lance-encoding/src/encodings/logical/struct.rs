@@ -284,9 +284,14 @@ impl StructuralStructDecoder {
                         location: location!(),
                     });
                 }
-                let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
+                let list_field = Arc::new(arrow_schema::Field::new(
+                    field.name().clone(),
+                    DataType::List(entries_field.clone()),
+                    field.is_nullable(),
+                ));
+                let list_decoder = Self::field_to_decoder(&list_field, should_validate)?;
                 Ok(Box::new(StructuralMapDecoder::new(
-                    child_decoder,
+                    list_decoder,
                     field.data_type().clone(),
                 )))
             }
