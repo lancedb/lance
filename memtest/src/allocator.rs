@@ -1,23 +1,123 @@
 use crate::stats::STATS;
 use libc::{c_void, size_t};
 
-extern "C" {
-    #[link_name = "__libc_malloc"]
-    fn libc_malloc(size: size_t) -> *mut c_void;
-    #[link_name = "__libc_calloc"]
-    fn libc_calloc(count: size_t, element_size: size_t) -> *mut c_void;
-    #[link_name = "__libc_realloc"]
-    fn libc_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
-    #[link_name = "__libc_free"]
-    fn libc_free(ptr: *mut c_void);
-    #[link_name = "__libc_memalign"]
-    fn libc_memalign(alignment: size_t, size: size_t) -> *mut c_void;
+#[cfg(target_os = "linux")]
+mod sys {
+    use super::*;
+
+    extern "C" {
+        #[link_name = "__libc_malloc"]
+        fn libc_malloc(size: size_t) -> *mut c_void;
+        #[link_name = "__libc_calloc"]
+        fn libc_calloc(count: size_t, element_size: size_t) -> *mut c_void;
+        #[link_name = "__libc_realloc"]
+        fn libc_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
+        #[link_name = "__libc_free"]
+        fn libc_free(ptr: *mut c_void);
+        #[link_name = "__libc_memalign"]
+        fn libc_memalign(alignment: size_t, size: size_t) -> *mut c_void;
+    }
+
+    pub(super) unsafe fn malloc(size: size_t) -> *mut c_void {
+        libc_malloc(size)
+    }
+
+    pub(super) unsafe fn calloc(count: size_t, element_size: size_t) -> *mut c_void {
+        libc_calloc(count, element_size)
+    }
+
+    pub(super) unsafe fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
+        libc_realloc(ptr, size)
+    }
+
+    pub(super) unsafe fn free(ptr: *mut c_void) {
+        libc_free(ptr);
+    }
+
+    pub(super) unsafe fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
+        libc_memalign(alignment, size)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    use super::*;
+
+    #[repr(C)]
+    pub(super) struct malloc_zone_t {
+        _private: [u8; 0],
+    }
+
+    extern "C" {
+        fn malloc_default_zone() -> *mut malloc_zone_t;
+        fn malloc_zone_malloc(zone: *mut malloc_zone_t, size: size_t) -> *mut c_void;
+        fn malloc_zone_calloc(
+            zone: *mut malloc_zone_t,
+            count: size_t,
+            element_size: size_t,
+        ) -> *mut c_void;
+        fn malloc_zone_memalign(
+            zone: *mut malloc_zone_t,
+            alignment: size_t,
+            size: size_t,
+        ) -> *mut c_void;
+        fn malloc_zone_realloc(
+            zone: *mut malloc_zone_t,
+            ptr: *mut c_void,
+            size: size_t,
+        ) -> *mut c_void;
+        fn malloc_zone_free(zone: *mut malloc_zone_t, ptr: *mut c_void);
+        fn malloc_zone_from_ptr(ptr: *const c_void) -> *mut malloc_zone_t;
+        fn malloc_size(ptr: *const c_void) -> size_t;
+    }
+
+    #[inline]
+    unsafe fn zone_for_ptr(ptr: *const c_void) -> *mut malloc_zone_t {
+        let zone = malloc_zone_from_ptr(ptr);
+        if zone.is_null() {
+            malloc_default_zone()
+        } else {
+            zone
+        }
+    }
+
+    pub(super) unsafe fn malloc(size: size_t) -> *mut c_void {
+        malloc_zone_malloc(malloc_default_zone(), size)
+    }
+
+    pub(super) unsafe fn calloc(count: size_t, element_size: size_t) -> *mut c_void {
+        malloc_zone_calloc(malloc_default_zone(), count, element_size)
+    }
+
+    pub(super) unsafe fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
+        malloc_zone_memalign(malloc_default_zone(), alignment, size)
+    }
+
+    pub(super) unsafe fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
+        if ptr.is_null() {
+            return malloc(size);
+        }
+        malloc_zone_realloc(zone_for_ptr(ptr), ptr, size)
+    }
+
+    pub(super) unsafe fn free(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        malloc_zone_free(zone_for_ptr(ptr), ptr);
+    }
+
+    pub(super) unsafe fn usable_size(ptr: *const c_void) -> size_t {
+        malloc_size(ptr)
+    }
 }
 
 // Magic number to identify our allocations
+#[cfg(target_os = "linux")]
 const MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
 
 /// Header stored before each tracked allocation
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct AllocationHeader {
     magic: u64,
@@ -28,9 +128,11 @@ struct AllocationHeader {
     actual_ptr: u64,
 }
 
+#[cfg(target_os = "linux")]
 const HEADER_SIZE: usize = std::mem::size_of::<AllocationHeader>();
 
 /// Check if a pointer was allocated by us
+#[cfg(target_os = "linux")]
 unsafe fn is_ours(virtual_ptr: *mut c_void) -> bool {
     if virtual_ptr.is_null() {
         return false;
@@ -40,6 +142,7 @@ unsafe fn is_ours(virtual_ptr: *mut c_void) -> bool {
 }
 
 /// Extract size, alignment, and actual pointer from a virtual pointer
+#[cfg(target_os = "linux")]
 unsafe fn extract(virtual_ptr: *mut c_void) -> (usize, usize, *mut c_void) {
     let header_ptr = (virtual_ptr as *mut u8).sub(HEADER_SIZE) as *const AllocationHeader;
     let header = &*header_ptr;
@@ -59,6 +162,7 @@ unsafe fn extract(virtual_ptr: *mut c_void) -> (usize, usize, *mut c_void) {
 }
 
 /// Take an allocated pointer and size, store header, and return the adjusted pointer
+#[cfg(target_os = "linux")]
 unsafe fn to_virtual(actual_ptr: *mut c_void, size: usize, alignment: usize) -> *mut c_void {
     if actual_ptr.is_null() {
         return std::ptr::null_mut();
@@ -99,26 +203,64 @@ unsafe fn to_virtual(actual_ptr: *mut c_void, size: usize, alignment: usize) -> 
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
-    STATS.record_allocation(size);
-    to_virtual(libc_malloc(size.saturating_add(HEADER_SIZE)), size, 0)
+#[cfg(target_os = "macos")]
+#[inline]
+fn is_power_of_two(value: usize) -> bool {
+    value != 0 && (value & (value - 1)) == 0
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn is_valid_posix_memalign_alignment(alignment: usize) -> bool {
+    is_power_of_two(alignment) && alignment >= std::mem::size_of::<*mut c_void>()
 }
 
 #[no_mangle]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
+    STATS.record_allocation(size);
+    to_virtual(sys::malloc(size.saturating_add(HEADER_SIZE)), size, 0)
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn calloc(size: size_t, element_size: size_t) -> *mut c_void {
     let Some(total_size) = size.checked_mul(element_size) else {
         return std::ptr::null_mut();
     };
     STATS.record_allocation(total_size);
     to_virtual(
-        libc_calloc(total_size.saturating_add(HEADER_SIZE), 1),
+        sys::calloc(total_size.saturating_add(HEADER_SIZE), 1),
         total_size,
         0,
     )
 }
 
 #[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_malloc(size: size_t) -> *mut c_void {
+    let ptr = sys::malloc(size);
+    if !ptr.is_null() {
+        STATS.record_allocation(sys::usable_size(ptr) as usize);
+    }
+    ptr
+}
+
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_calloc(count: size_t, element_size: size_t) -> *mut c_void {
+    let Some(_total_size) = count.checked_mul(element_size) else {
+        return std::ptr::null_mut();
+    };
+    let ptr = sys::calloc(count, element_size);
+    if !ptr.is_null() {
+        STATS.record_allocation(sys::usable_size(ptr) as usize);
+    }
+    ptr
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
@@ -128,14 +270,25 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
         // It's ours - extract size and track
         let (size, _alignment, actual_ptr) = extract(ptr);
         STATS.record_deallocation(size);
-        libc_free(actual_ptr);
+        sys::free(actual_ptr);
     } else {
         // Not ours - just free it without tracking
-        libc_free(ptr);
+        sys::free(ptr);
     }
 }
 
 #[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    STATS.record_deallocation(sys::usable_size(ptr) as usize);
+    sys::free(ptr);
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
     let (old_size, actual_ptr) = if ptr.is_null() || !is_ours(ptr) {
         // Either null or not ours - don't track
@@ -143,7 +296,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void 
             (0, std::ptr::null_mut())
         } else {
             // Not ours - just realloc without tracking
-            return libc_realloc(ptr, size);
+            return sys::realloc(ptr, size);
         }
     } else {
         let (s, _align, a) = extract(ptr);
@@ -153,21 +306,49 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void 
     STATS.record_deallocation(old_size);
     STATS.record_allocation(size);
 
-    let new_ptr = libc_realloc(actual_ptr, size.saturating_add(HEADER_SIZE));
+    let new_ptr = sys::realloc(actual_ptr, size.saturating_add(HEADER_SIZE));
     to_virtual(new_ptr, size, 0)
 }
 
 #[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
+    if ptr.is_null() {
+        let new_ptr = sys::realloc(std::ptr::null_mut(), size);
+        if !new_ptr.is_null() {
+            STATS.record_allocation(sys::usable_size(new_ptr) as usize);
+        }
+        return new_ptr;
+    }
+
+    let old_size = sys::usable_size(ptr);
+    let new_ptr = sys::realloc(ptr, size);
+    if new_ptr.is_null() {
+        // For size == 0, some implementations free and return NULL.
+        if size == 0 {
+            STATS.record_deallocation(old_size as usize);
+        }
+        return std::ptr::null_mut();
+    }
+
+    STATS.record_deallocation(old_size as usize);
+    STATS.record_allocation(sys::usable_size(new_ptr) as usize);
+    new_ptr
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
     // Allocate extra space for header + padding to maintain alignment
     // We need: header (24 bytes) + actual_ptr (8 bytes) + padding to reach alignment
     let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
-    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    let actual_ptr = sys::memalign(alignment, size.saturating_add(extra));
     to_virtual(actual_ptr, size, alignment)
 }
 
 #[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut c_void,
     alignment: size_t,
@@ -175,7 +356,7 @@ pub unsafe extern "C" fn posix_memalign(
 ) -> i32 {
     STATS.record_allocation(size);
     let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
-    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    let actual_ptr = sys::memalign(alignment, size.saturating_add(extra));
     if actual_ptr.is_null() {
         return libc::ENOMEM;
     }
@@ -184,23 +365,77 @@ pub unsafe extern "C" fn posix_memalign(
 }
 
 #[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
     let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
-    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    let actual_ptr = sys::memalign(alignment, size.saturating_add(extra));
     to_virtual(actual_ptr, size, alignment)
 }
 
 #[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn valloc(size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
     let page_size = libc::sysconf(libc::_SC_PAGESIZE) as size_t;
     let extra = page_size.saturating_add(HEADER_SIZE).saturating_add(8);
-    let actual_ptr = libc_memalign(page_size, size.saturating_add(extra));
+    let actual_ptr = sys::memalign(page_size, size.saturating_add(extra));
     to_virtual(actual_ptr, size, page_size)
 }
 
 #[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_posix_memalign(
+    memptr: *mut *mut c_void,
+    alignment: size_t,
+    size: size_t,
+) -> i32 {
+    if memptr.is_null() {
+        return libc::EINVAL;
+    }
+    if !is_valid_posix_memalign_alignment(alignment as usize) {
+        return libc::EINVAL;
+    }
+
+    let ptr = sys::memalign(alignment, size);
+    if ptr.is_null() {
+        return libc::ENOMEM;
+    }
+    STATS.record_allocation(sys::usable_size(ptr) as usize);
+    *memptr = ptr;
+    0
+}
+
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void {
+    if !is_valid_posix_memalign_alignment(alignment as usize) {
+        return std::ptr::null_mut();
+    }
+    if size % alignment != 0 {
+        return std::ptr::null_mut();
+    }
+
+    let ptr = sys::memalign(alignment, size);
+    if !ptr.is_null() {
+        STATS.record_allocation(sys::usable_size(ptr) as usize);
+    }
+    ptr
+}
+
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_valloc(size: size_t) -> *mut c_void {
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as size_t;
+    let ptr = sys::memalign(page_size, size);
+    if !ptr.is_null() {
+        STATS.record_allocation(sys::usable_size(ptr) as usize);
+    }
+    ptr
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn reallocarray(
     old_ptr: *mut c_void,
     count: size_t,
@@ -213,6 +448,7 @@ pub unsafe extern "C" fn reallocarray(
 }
 
 #[no_mangle]
+#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> size_t {
     if ptr.is_null() {
         return 0;
@@ -227,3 +463,67 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> size_t {
         0
     }
 }
+
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn memtest_malloc_usable_size(ptr: *mut c_void) -> size_t {
+    if ptr.is_null() {
+        return 0;
+    }
+    sys::usable_size(ptr)
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Interpose {
+    replacement: *const c_void,
+    original: *const c_void,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Sync for Interpose {}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn malloc(size: size_t) -> *mut c_void;
+    fn calloc(count: size_t, element_size: size_t) -> *mut c_void;
+    fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
+    fn free(ptr: *mut c_void);
+    fn posix_memalign(memptr: *mut *mut c_void, alignment: size_t, size: size_t) -> i32;
+    fn aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void;
+    fn valloc(size: size_t) -> *mut c_void;
+}
+
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__interpose"]
+static INTERPOSE_TABLE: [Interpose; 7] = [
+    Interpose {
+        replacement: memtest_malloc as *const () as *const c_void,
+        original: malloc as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_calloc as *const () as *const c_void,
+        original: calloc as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_realloc as *const () as *const c_void,
+        original: realloc as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_free as *const () as *const c_void,
+        original: free as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_posix_memalign as *const () as *const c_void,
+        original: posix_memalign as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_aligned_alloc as *const () as *const c_void,
+        original: aligned_alloc as *const () as *const c_void,
+    },
+    Interpose {
+        replacement: memtest_valloc as *const () as *const c_void,
+        original: valloc as *const () as *const c_void,
+    },
+];

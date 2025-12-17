@@ -1,6 +1,7 @@
 """Integration tests for memtest with real allocations."""
 
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -10,7 +11,7 @@ import memtest
 
 
 def test_preload_environment():
-    """Test that LD_PRELOAD works correctly."""
+    """Test that preloading works correctly."""
     lib_path = memtest.get_library_path()
 
     # Create a small Python script that uses memtest
@@ -36,7 +37,10 @@ assert stats['total_bytes_allocated'] > 0, "Should see bytes allocated"
 
     try:
         env = os.environ.copy()
-        env["LD_PRELOAD"] = str(lib_path)
+        if platform.system() == "Linux":
+            env["LD_PRELOAD"] = str(lib_path)
+        else:
+            env["DYLD_INSERT_LIBRARIES"] = str(lib_path)
 
         result = subprocess.run(
             [sys.executable, script_path],

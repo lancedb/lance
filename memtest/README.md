@@ -16,6 +16,12 @@ To activate the memory tracking, you need to set the `LD_PRELOAD` environment va
 export LD_PRELOAD=$(lance-memtest)
 ```
 
+On macOS, use `DYLD_INSERT_LIBRARIES` instead:
+
+```shell
+export DYLD_INSERT_LIBRARIES=$(lance-memtest)
+```
+
 Then you can write Python code that tracks memory allocations:
 
 ```python

@@ -1,5 +1,6 @@
 """Basic tests for memtest functionality."""
 
+import platform
 import subprocess
 import sys
 
@@ -10,7 +11,10 @@ def test_get_library_path():
     """Test that we can get the library path."""
     lib_path = memtest.get_library_path()
     assert lib_path.exists()
-    assert lib_path.suffix == ".so"
+    if platform.system() == "Linux":
+        assert lib_path.suffix == ".so"
+    else:
+        assert lib_path.suffix == ".dylib"
 
 
 def test_get_stats():
@@ -110,7 +114,10 @@ def test_cli_path():
     )
 
     assert result.returncode == 0
-    assert ".so" in result.stdout
+    if platform.system() == "Linux":
+        assert ".so" in result.stdout
+    else:
+        assert ".dylib" in result.stdout
 
 
 def test_cli_stats():

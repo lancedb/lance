@@ -10,10 +10,10 @@ from contextlib import contextmanager
 __version__ = "0.1.0"
 
 # Platform support check
-_SUPPORTED_PLATFORM = platform.system() == "Linux"
+_SUPPORTED_PLATFORM = platform.system() in ("Linux", "Darwin")
 if not _SUPPORTED_PLATFORM:
     warnings.warn(
-        f"lance-memtest only supports Linux (current platform: {platform.system()}). "
+        f"lance-memtest only supports Linux/macOS (current platform: {platform.system()}). "
         "Memory statistics will not be available.",
         RuntimeWarning,
         stacklevel=2,
@@ -41,7 +41,12 @@ def _load_library():
     # Find the library relative to this module
     module_dir = Path(__file__).parent
 
-    lib_path = module_dir / "libmemtest.so"
+    if platform.system() == "Linux":
+        lib_filename = "libmemtest.so"
+    else:
+        lib_filename = "libmemtest.dylib"
+
+    lib_path = module_dir / lib_filename
     if lib_path.exists():
         lib = ctypes.CDLL(str(lib_path))
 
@@ -74,16 +79,16 @@ def _empty_stats() -> Dict[str, int]:
 
 
 def get_library_path() -> Optional[Path]:
-    """Get the path to the memtest shared library for use with LD_PRELOAD.
+    """Get the path to the memtest shared library for use with preloading.
 
     Returns:
-        Path to the .so file that can be used with LD_PRELOAD, or None on
-        unsupported platforms.
+        Path to the library that can be used with `LD_PRELOAD` (Linux) or
+        `DYLD_INSERT_LIBRARIES` (macOS), or None on unsupported platforms.
 
     Example:
         >>> lib_path = get_library_path()
         >>> if lib_path:
-        ...     os.environ['LD_PRELOAD'] = str(lib_path)
+        ...     os.environ['LD_PRELOAD'] = str(lib_path)  # Linux
     """
     return _lib_path
 
@@ -206,10 +211,11 @@ def print_stats(stats: Optional[Dict[str, int]] = None) -> None:
 
 
 def is_preloaded() -> bool:
-    """Check if libmemtest.so is preloaded and actively tracking allocations.
+    """Check if libmemtest is preloaded and actively tracking allocations.
 
     Returns:
-        True if the library is preloaded via LD_PRELOAD, False otherwise.
+        True if the library is preloaded via `LD_PRELOAD` (Linux) or
+        `DYLD_INSERT_LIBRARIES` (macOS), False otherwise.
 
     Example:
         >>> if is_preloaded():
@@ -218,15 +224,18 @@ def is_preloaded() -> bool:
     """
     import os
 
-    ld_preload = os.environ.get("LD_PRELOAD", "")
-    return "libmemtest" in ld_preload
+    if platform.system() == "Linux":
+        preload = os.environ.get("LD_PRELOAD", "")
+    else:
+        preload = os.environ.get("DYLD_INSERT_LIBRARIES", "")
+    return "libmemtest" in preload
 
 
 def is_supported() -> bool:
     """Check if memory tracking is supported on this platform.
 
     Returns:
-        True if on Linux (the only supported platform), False otherwise.
+        True if on Linux/macOS, False otherwise.
 
     Example:
         >>> if is_supported():
