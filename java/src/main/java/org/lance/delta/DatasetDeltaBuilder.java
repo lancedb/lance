@@ -51,7 +51,6 @@ public class DatasetDeltaBuilder {
     return this;
   }
 
-  /** Set begin version (exclusive) for explicit range. */
   /**
    * Set the beginning version for the delta (exclusive). Must be used together with
    * `with_end_version`.
