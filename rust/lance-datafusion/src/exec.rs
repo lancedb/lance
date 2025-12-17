@@ -662,7 +662,12 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             // Write operator with elapsed time inserted after the name
             match calcs.index_to_elapsed.get(&self.highest_index) {
                 Some(elapsed) => match plan_str.find(": ") {
-                    Some(i) => write!(f, "{}: elapsed={elapsed:?}, {}", &plan_str[..i], &plan_str[i + 2..])?,
+                    Some(i) => write!(
+                        f,
+                        "{}: elapsed={elapsed:?}, {}",
+                        &plan_str[..i],
+                        &plan_str[i + 2..]
+                    )?,
                     None => write!(f, "{plan_str}, elapsed={elapsed:?}")?,
                 },
                 None => write!(f, "{plan_str}")?,
